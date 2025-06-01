@@ -74,7 +74,7 @@ import os
 import torch
 from datetime import datetime
 
-from rsl_rl.runners import OnPolicyRunner
+from isaaclab_rl.rsl_rl.runners import *
 
 from isaaclab.envs import (
     DirectMARLEnv,
@@ -142,7 +142,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     # convert to single-agent instance if required by the RL algorithm
     if isinstance(env.unwrapped, DirectMARLEnv):
-        env = multi_agent_to_single_agent(env)
+        env = multi_agent_to_single_agent(env) # type: ignore
 
     # save resume path before creating a new log_dir
     if agent_cfg.resume or agent_cfg.algorithm.class_name == "Distillation":
@@ -161,10 +161,11 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         env = gym.wrappers.RecordVideo(env, **video_kwargs)
 
     # wrap around environment for rsl-rl
-    env = RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
+    env = RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions) # type: ignore
 
     # create runner from rsl-rl
-    runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=log_dir, device=agent_cfg.device)
+    runner_class = agent_cfg.class_name if hasattr(agent_cfg, "class_name") else "OnPolicyRunner"
+    runner = eval(runner_class)(env, agent_cfg.to_dict(), log_dir=log_dir, device=agent_cfg.device) # type: ignore
     # write git state to logs
     runner.add_git_repo_to_log(__file__)
     # load the checkpoint
@@ -188,6 +189,6 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
 if __name__ == "__main__":
     # run the main function
-    main()
+    main() # type: ignore
     # close sim app
     simulation_app.close()

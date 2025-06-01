@@ -86,11 +86,23 @@ class RslRlPpoAlgorithmCfg:
     gamma: float = MISSING
     """The discount factor."""
 
+    gamma_f: float = MISSING
+    """The discount factor for the forward return."""
+
+    gamma_r: float = MISSING
+    """The discount factor for the backward return."""
+
     lam: float = MISSING
     """The lambda parameter for Generalized Advantage Estimation (GAE)."""
 
+    alpha: float = MISSING
+    """The alpha parameter for the hybrid return."""
+
     entropy_coef: float = MISSING
     """The coefficient for the entropy loss."""
+
+    kl_coef: float = MISSING
+    """The coefficient for the KL divergence."""
 
     desired_kl: float = MISSING
     """The desired KL divergence."""
@@ -131,6 +143,9 @@ class RslRlPpoAlgorithmCfg:
 @configclass
 class RslRlOnPolicyRunnerCfg:
     """Configuration of the runner for on-policy algorithms."""
+    
+    class_name: str = "OnPolicyRunner"
+    """The runner class name. Default is OnPolicyRunner."""
 
     seed: int = 42
     """The seed for the experiment. Default is 42."""
@@ -174,7 +189,7 @@ class RslRlOnPolicyRunnerCfg:
     ``{time-stamp}_{run_name}``.
     """
 
-    logger: Literal["tensorboard", "neptune", "wandb"] = "tensorboard"
+    logger: Literal["tensorboard", "neptune", "wandb"] = "wandb"
     """The logger to use. Default is tensorboard."""
 
     neptune_project: str = "isaaclab"

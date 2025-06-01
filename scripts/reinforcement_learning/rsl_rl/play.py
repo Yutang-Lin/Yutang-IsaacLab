@@ -49,7 +49,7 @@ import os
 import time
 import torch
 
-from rsl_rl.runners import OnPolicyRunner
+from isaaclab_rl.rsl_rl.runners import *
 
 from isaaclab.envs import DirectMARLEnv, multi_agent_to_single_agent
 from isaaclab.utils.assets import retrieve_file_path
@@ -111,8 +111,9 @@ def main():
     env = RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
 
     print(f"[INFO]: Loading model checkpoint from: {resume_path}")
-    # load previously trained model
-    ppo_runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
+    # create runner from rsl-rl
+    runner_class = agent_cfg.class_name if hasattr(agent_cfg, "class_name") else "OnPolicyRunner"
+    ppo_runner = eval(runner_class)(env, agent_cfg.to_dict(), log_dir=log_dir, device=agent_cfg.device) # type: ignore
     ppo_runner.load(resume_path)
 
     # obtain the trained policy for inference

@@ -9,31 +9,34 @@ from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlPpoActorCriticCfg, R
 
 
 @configclass
-class CartpolePPORunnerCfg(RslRlOnPolicyRunnerCfg):
+class AntPPORunnerCfg(RslRlOnPolicyRunnerCfg):
     class_name = "BaseRunner"
-    
-    num_steps_per_env = 16
-    max_iterations = 150
+
+    num_steps_per_env = 32
+    max_iterations = 1000
     save_interval = 50
-    experiment_name = "cartpole_direct"
+    experiment_name = "ant_direct"
     empirical_normalization = False
     policy = RslRlPpoActorCriticCfg(
         init_noise_std=1.0,
-        actor_hidden_dims=[32, 32],
-        critic_hidden_dims=[32, 32],
+        actor_hidden_dims=[400, 200, 100],
+        critic_hidden_dims=[400, 200, 100],
         activation="elu",
     )
     algorithm = RslRlPpoAlgorithmCfg(
+        class_name="HRPO",
         value_loss_coef=1.0,
         use_clipped_value_loss=True,
         clip_param=0.2,
-        entropy_coef=0.005,
+        entropy_coef=0.0,
+        kl_coef=0.0,
         num_learning_epochs=5,
         num_mini_batches=4,
-        learning_rate=1.0e-3,
+        learning_rate=5.0e-4,
         schedule="adaptive",
-        gamma=0.99,
-        lam=0.95,
+        gamma_f=0.999,
+        gamma_r=0.999,
+        alpha=0.75,
         desired_kl=0.01,
         max_grad_norm=1.0,
     )
