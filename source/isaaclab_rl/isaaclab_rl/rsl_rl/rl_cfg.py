@@ -13,6 +13,7 @@ from isaaclab.utils import configclass
 from .distillation_cfg import RslRlDistillationAlgorithmCfg, RslRlDistillationStudentTeacherCfg
 from .rnd_cfg import RslRlRndCfg
 from .symmetry_cfg import RslRlSymmetryCfg
+from .amp_cfg import RslRlAmpCfg
 
 #########################
 # Policy configurations #
@@ -40,6 +41,12 @@ class RslRlPpoActorCriticCfg:
 
     activation: str = MISSING
     """The activation function for the actor and critic networks."""
+
+    layer_norm: bool = False
+    """Whether to use layer normalization."""
+
+    dropout_rate: float = 0.0
+    """The dropout rate for the actor and critic networks."""
 
 
 @configclass
@@ -134,7 +141,6 @@ class RslRlPpoAlgorithmCfg:
     in which case RND is not used.
     """
 
-
 #########################
 # Runner configurations #
 #########################
@@ -178,6 +184,9 @@ class RslRlOnPolicyRunnerCfg:
     save_interval: int = MISSING
     """The number of iterations between saves."""
 
+    upload_checkpoint: bool = True
+    """Whether to upload the checkpoint to the cloud. Default is True."""
+
     experiment_name: str = MISSING
     """The experiment name."""
 
@@ -211,4 +220,9 @@ class RslRlOnPolicyRunnerCfg:
     """The checkpoint file to load. Default is ``"model_.*.pt"`` (all).
 
     If regex expression, the latest (alphabetical order) matching file will be loaded.
+    """
+
+    amp_cfg: RslRlAmpCfg | None = None
+    """The configuration for the Adversarial Model Priors (AMP) module. Default is None,
+    in which case AMP is not used.
     """

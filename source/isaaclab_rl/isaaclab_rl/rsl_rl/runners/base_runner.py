@@ -13,10 +13,12 @@ import torch
 import rsl_rl
 from rsl_rl.env import VecEnv
 from rsl_rl.runners import OnPolicyRunner
+from rsl_rl.utils import store_code_state
 
 from isaaclab_rl.rsl_rl.algorithms import *
 from isaaclab_rl.rsl_rl.modules import *
 
+from collections import deque
 
 class BaseRunner(OnPolicyRunner):
     """On-policy runner for training and evaluation."""
@@ -30,6 +32,9 @@ class BaseRunner(OnPolicyRunner):
 
         # check if multi-gpu is enabled
         self._configure_multi_gpu()
+
+        # check if checkpoint should be uploaded
+        self.upload_checkpoint = self.cfg.get("upload_checkpoint", True)
 
         # resolve training type depending on the algorithm
         if self.alg_cfg["class_name"] == "PPO":
@@ -113,6 +118,22 @@ class BaseRunner(OnPolicyRunner):
             [self.env.num_actions],
         )
 
+        # init AMP reward
+        if "amp_cfg" in self.cfg and self.cfg["amp_cfg"] is not None:
+            # add AMP to observation space
+            amp_obs = extras["observations"]["amp_policy"]
+            num_amp_obs = amp_obs.shape[1]
+
+            self.cfg["amp_cfg"].pop("input_dim")
+            self.amp_reward = AmpReward(num_amp_obs, training=True, 
+                                        num_envs=self.env.num_envs,
+                                        num_steps_per_env=self.num_steps_per_env,
+                                        device=self.device, 
+                                        multi_gpu_cfg=self.multi_gpu_cfg,
+                                        **self.cfg["amp_cfg"])
+        else:
+            self.amp_reward = None
+
         # Decide whether to disable logging
         # We only log from the process with rank 0 (main process)
         self.disable_logs = self.is_distributed and self.gpu_global_rank != 0
@@ -123,3 +144,370 @@ class BaseRunner(OnPolicyRunner):
         self.tot_time = 0
         self.current_learning_iteration = 0
         self.git_status_repos = [rsl_rl.__file__]
+
+    def learn(self, num_learning_iterations: int, init_at_random_ep_len: bool = False):  # noqa: C901
+        # initialize writer
+        if self.log_dir is not None and self.writer is None and not self.disable_logs:
+            # Launch either Tensorboard or Neptune & Tensorboard summary writer(s), default: Tensorboard.
+            self.logger_type = self.cfg.get("logger", "tensorboard")
+            self.logger_type = self.logger_type.lower()
+
+            if self.logger_type == "neptune":
+                from rsl_rl.utils.neptune_utils import NeptuneSummaryWriter
+
+                self.writer = NeptuneSummaryWriter(log_dir=self.log_dir, flush_secs=10, cfg=self.cfg)
+                self.writer.log_config(self.env.cfg, self.cfg, self.alg_cfg, self.policy_cfg)
+            elif self.logger_type == "wandb":
+                from rsl_rl.utils.wandb_utils import WandbSummaryWriter
+
+                self.writer = WandbSummaryWriter(log_dir=self.log_dir, flush_secs=10, cfg=self.cfg)
+                self.writer.log_config(self.env.cfg, self.cfg, self.alg_cfg, self.policy_cfg)
+            elif self.logger_type == "tensorboard":
+                from torch.utils.tensorboard import SummaryWriter # type: ignore
+
+                self.writer = SummaryWriter(log_dir=self.log_dir, flush_secs=10)
+            else:
+                raise ValueError("Logger type not found. Please choose 'neptune', 'wandb' or 'tensorboard'.")
+
+        # check if teacher is loaded
+        if self.training_type == "distillation" and not self.alg.policy.loaded_teacher:
+            raise ValueError("Teacher model parameters not loaded. Please load a teacher model to distill.")
+
+        # randomize initial episode lengths (for exploration)
+        if init_at_random_ep_len:
+            self.env.episode_length_buf = torch.randint_like(
+                self.env.episode_length_buf, high=int(self.env.max_episode_length)
+            )
+
+        # start learning
+        obs, extras = self.env.get_observations()
+        privileged_obs = extras["observations"].get(self.privileged_obs_type, obs)
+        obs, privileged_obs = obs.to(self.device), privileged_obs.to(self.device)
+        self.train_mode()  # switch to train mode (for dropout for example)
+
+        # Book keeping
+        ep_infos = []
+        rewbuffer = deque(maxlen=100)
+        lenbuffer = deque(maxlen=100)
+        cur_reward_sum = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
+        cur_episode_length = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
+
+        # create buffers for logging extrinsic and intrinsic rewards
+        if self.alg.rnd:
+            erewbuffer = deque(maxlen=100)
+            irewbuffer = deque(maxlen=100)
+            cur_ereward_sum = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
+            cur_ireward_sum = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
+
+        # Ensure all parameters are in-synced
+        if self.is_distributed:
+            print(f"Synchronizing parameters for rank {self.gpu_global_rank}...")
+            self.alg.broadcast_parameters()
+            # TODO: Do we need to synchronize empirical normalizers?
+            #   Right now: No, because they all should converge to the same values "asymptotically".
+
+        if self.amp_reward is not None:
+            amp_reward_storage = torch.zeros(self.env.num_envs, device=self.device)
+            self.amp_reward.reset_storage()
+
+        # Start training
+        start_iter = self.current_learning_iteration
+        tot_iter = start_iter + num_learning_iterations
+        for it in range(start_iter, tot_iter):
+            start = time.time()
+            # Rollout
+            with torch.inference_mode():
+                for _ in range(self.num_steps_per_env):
+                    # Sample actions
+                    actions = self.alg.act(obs, privileged_obs)
+                    # Step the environment
+                    obs, rewards, dones, infos = self.env.step(actions.to(self.env.device)) # type: ignore
+                    # Move to device
+                    obs, rewards, dones = (obs.to(self.device), rewards.to(self.device), dones.to(self.device))
+                    # perform normalization
+                    obs = self.obs_normalizer(obs)
+                    if self.privileged_obs_type is not None:
+                        privileged_obs = self.privileged_obs_normalizer(
+                            infos["observations"][self.privileged_obs_type].to(self.device)
+                        )
+                    else:
+                        privileged_obs = obs
+                    # try to get all resets
+                    resets = infos.get("resets", dones).to(self.device)
+
+                    if self.amp_reward is not None:
+                        gen_obs = infos["observations"]["amp_policy"].to(self.device)
+                        ref_obs = infos["observations"]["amp_motion"].to(self.device)
+                        self.amp_reward.update_storage(gen_obs, ref_obs)
+
+                        amp_rewards = self.amp_reward.compute_reward(gen_obs)
+                        amp_reward_storage += amp_rewards
+                        rewards += amp_rewards
+
+                        infos["episode"]["rew_amp"] = amp_reward_storage.mean().item()
+                        amp_reward_storage[resets] = 0.
+
+                    # process the step
+                    self.alg.process_env_step(rewards, dones, infos)
+
+                    # Extract intrinsic rewards (only for logging)
+                    intrinsic_rewards = self.alg.intrinsic_rewards if self.alg.rnd else None # type: ignore
+
+                    # book keeping
+                    if self.log_dir is not None:
+                        if "episode" in infos:
+                            ep_infos.append(infos["episode"])
+                        elif "log" in infos:
+                            ep_infos.append(infos["log"])
+                        # Update rewards
+                        if self.alg.rnd:
+                            cur_ereward_sum += rewards
+                            cur_ireward_sum += intrinsic_rewards  # type: ignore
+                            cur_reward_sum += rewards + intrinsic_rewards
+                        else:
+                            cur_reward_sum += rewards
+                        # Update episode length
+                        cur_episode_length += 1
+                        # Clear data for completed episodes
+                        # -- common
+                        new_ids = (dones > 0).nonzero(as_tuple=False)
+                        rewbuffer.extend(cur_reward_sum[new_ids][:, 0].cpu().numpy().tolist())
+                        lenbuffer.extend(cur_episode_length[new_ids][:, 0].cpu().numpy().tolist())
+                        cur_reward_sum[new_ids] = 0
+                        cur_episode_length[new_ids] = 0
+                        # -- intrinsic and extrinsic rewards
+                        if self.alg.rnd:
+                            erewbuffer.extend(cur_ereward_sum[new_ids][:, 0].cpu().numpy().tolist())
+                            irewbuffer.extend(cur_ireward_sum[new_ids][:, 0].cpu().numpy().tolist())
+                            cur_ereward_sum[new_ids] = 0
+                            cur_ireward_sum[new_ids] = 0
+
+                stop = time.time()
+                collection_time = stop - start
+                start = stop
+
+                # compute returns
+                if self.training_type == "rl":
+                    self.alg.compute_returns(privileged_obs) # type: ignore
+
+            loss_dict = self.alg.update()
+            # update policy
+            if self.amp_reward is not None:
+                self.amp_reward.train()
+                amp_loss = self.amp_reward.update()
+                loss_dict["amp"] = amp_loss
+                self.amp_reward.eval()
+
+            stop = time.time()
+            learn_time = stop - start
+            self.current_learning_iteration = it
+            # log info
+            if self.log_dir is not None and not self.disable_logs:
+                # Log information
+                self.log(locals())
+                # Save model
+                if it % self.save_interval == 0:
+                    self.save(os.path.join(self.log_dir, f"model_{it}.pt"))
+
+            # Clear episode infos
+            ep_infos.clear()
+            # Save code state
+            if it == start_iter and not self.disable_logs:
+                # obtain all the diff files
+                git_file_paths = store_code_state(self.log_dir, self.git_status_repos)
+                # if possible store them to wandb
+                if self.logger_type in ["wandb", "neptune"] and git_file_paths:
+                    for path in git_file_paths:
+                        self.writer.save_file(path) # type: ignore
+
+        # Save the final model after training
+        if self.log_dir is not None and not self.disable_logs:
+            self.save(os.path.join(self.log_dir, f"model_{self.current_learning_iteration}.pt"))
+
+
+    def log(self, locs: dict, width: int = 80, pad: int = 35):
+        # Compute the collection size
+        collection_size = self.num_steps_per_env * self.env.num_envs * self.gpu_world_size
+        # Update total time-steps and time
+        self.tot_timesteps += collection_size
+        self.tot_time += locs["collection_time"] + locs["learn_time"]
+        iteration_time = locs["collection_time"] + locs["learn_time"]
+
+        # -- Episode info
+        ep_string = ""
+        if locs["ep_infos"]:
+            for key in locs["ep_infos"][0]:
+                infotensor = torch.tensor([], device=self.device)
+                for ep_info in locs["ep_infos"]:
+                    # handle scalar and zero dimensional tensor infos
+                    if key not in ep_info:
+                        continue
+                    if not isinstance(ep_info[key], torch.Tensor):
+                        ep_info[key] = torch.Tensor([ep_info[key]])
+                    if len(ep_info[key].shape) == 0:
+                        ep_info[key] = ep_info[key].unsqueeze(0)
+                    infotensor = torch.cat((infotensor, ep_info[key].to(self.device)))
+                value = torch.mean(infotensor)
+                # log to logger and terminal
+                if "/" in key:
+                    self.writer.add_scalar(key, value, locs["it"])
+                    ep_string += f"""{f'{key}:':>{pad}} {value:.4f}\n"""
+                else:
+                    self.writer.add_scalar("Episode/" + key, value, locs["it"])
+                    ep_string += f"""{f'Mean episode {key}:':>{pad}} {value:.4f}\n"""
+
+        mean_std = self.alg.policy.action_std.mean()
+        fps = int(collection_size / (locs["collection_time"] + locs["learn_time"]))
+
+        # -- Losses
+        for key, value in locs["loss_dict"].items():
+            self.writer.add_scalar(f"Loss/{key}", value, locs["it"])
+        self.writer.add_scalar("Loss/learning_rate", self.alg.learning_rate, locs["it"])
+
+        # -- Policy
+        self.writer.add_scalar("Policy/mean_noise_std", mean_std.item(), locs["it"])
+
+        # -- Performance
+        self.writer.add_scalar("Perf/total_fps", fps, locs["it"])
+        self.writer.add_scalar("Perf/collection time", locs["collection_time"], locs["it"])
+        self.writer.add_scalar("Perf/learning_time", locs["learn_time"], locs["it"])
+
+        # -- Training
+        if len(locs["rewbuffer"]) > 0:
+            # separate logging for intrinsic and extrinsic rewards
+            if self.alg.rnd:
+                self.writer.add_scalar("Rnd/mean_extrinsic_reward", statistics.mean(locs["erewbuffer"]), locs["it"])
+                self.writer.add_scalar("Rnd/mean_intrinsic_reward", statistics.mean(locs["irewbuffer"]), locs["it"])
+                self.writer.add_scalar("Rnd/weight", self.alg.rnd.weight, locs["it"])
+            # everything else
+            self.writer.add_scalar("Train/mean_reward", statistics.mean(locs["rewbuffer"]), locs["it"])
+            self.writer.add_scalar("Train/mean_episode_length", statistics.mean(locs["lenbuffer"]), locs["it"])
+            if self.logger_type != "wandb":  # wandb does not support non-integer x-axis logging
+                self.writer.add_scalar("Train/mean_reward/time", statistics.mean(locs["rewbuffer"]), self.tot_time)
+                self.writer.add_scalar(
+                    "Train/mean_episode_length/time", statistics.mean(locs["lenbuffer"]), self.tot_time
+                )
+
+        str = f" \033[1m Learning iteration {locs['it']}/{locs['tot_iter']} \033[0m "
+
+        if len(locs["rewbuffer"]) > 0:
+            log_string = (
+                f"""{'#' * width}\n"""
+                f"""{str.center(width, ' ')}\n\n"""
+                f"""{'Computation:':>{pad}} {fps:.0f} steps/s (collection: {locs[
+                    'collection_time']:.3f}s, learning {locs['learn_time']:.3f}s)\n"""
+                f"""{'Mean action noise std:':>{pad}} {mean_std.item():.2f}\n"""
+            )
+            # -- Losses
+            for key, value in locs["loss_dict"].items():
+                log_string += f"""{f'Mean {key} loss:':>{pad}} {value:.4f}\n"""
+            # -- Rewards
+            if self.alg.rnd:
+                log_string += (
+                    f"""{'Mean extrinsic reward:':>{pad}} {statistics.mean(locs['erewbuffer']):.2f}\n"""
+                    f"""{'Mean intrinsic reward:':>{pad}} {statistics.mean(locs['irewbuffer']):.2f}\n"""
+                )
+            log_string += f"""{'Mean reward:':>{pad}} {statistics.mean(locs['rewbuffer']):.2f}\n"""
+            # -- episode info
+            log_string += f"""{'Mean episode length:':>{pad}} {statistics.mean(locs['lenbuffer']):.2f}\n"""
+        else:
+            log_string = (
+                f"""{'#' * width}\n"""
+                f"""{str.center(width, ' ')}\n\n"""
+                f"""{'Computation:':>{pad}} {fps:.0f} steps/s (collection: {locs[
+                    'collection_time']:.3f}s, learning {locs['learn_time']:.3f}s)\n"""
+                f"""{'Mean action noise std:':>{pad}} {mean_std.item():.2f}\n"""
+            )
+            for key, value in locs["loss_dict"].items():
+                log_string += f"""{f'{key}:':>{pad}} {value:.4f}\n"""
+
+        log_string += ep_string
+        log_string += (
+            f"""{'-' * width}\n"""
+            f"""{'Total timesteps:':>{pad}} {self.tot_timesteps}\n"""
+            f"""{'Iteration time:':>{pad}} {iteration_time:.2f}s\n"""
+            f"""{'Time elapsed:':>{pad}} {time.strftime("%H:%M:%S", time.gmtime(self.tot_time))}\n"""
+            f"""{'ETA:':>{pad}} {time.strftime(
+                "%H:%M:%S",
+                time.gmtime(
+                    self.tot_time / (locs['it'] - locs['start_iter'] + 1)
+                    * (locs['start_iter'] + locs['num_learning_iterations'] - locs['it'])
+                )
+            )}\n"""
+        )
+        print(log_string)
+
+    
+    def save(self, path: str, infos=None):
+        # -- Save model
+        saved_dict = {
+            "model_state_dict": self.alg.policy.state_dict(),
+            "optimizer_state_dict": self.alg.optimizer.state_dict(),
+            "iter": self.current_learning_iteration,
+            "infos": infos,
+        }
+        # -- Save RND model if used
+        if self.alg.rnd:
+            saved_dict["rnd_state_dict"] = self.alg.rnd.state_dict()
+            saved_dict["rnd_optimizer_state_dict"] = self.alg.rnd_optimizer.state_dict() # type: ignore
+        # -- Save AMP model if used
+        if self.amp_reward is not None:
+            saved_dict["amp_state_dict"] = self.amp_reward.network.state_dict()
+            saved_dict["amp_optimizer_state_dict"] = self.amp_reward.optimizer.state_dict()
+        # -- Save observation normalizer if used
+        if self.empirical_normalization:
+            saved_dict["obs_norm_state_dict"] = self.obs_normalizer.state_dict()
+            saved_dict["privileged_obs_norm_state_dict"] = self.privileged_obs_normalizer.state_dict()
+
+        # save model
+        torch.save(saved_dict, path)
+
+        # upload model to external logging service
+        if self.logger_type in ["neptune", "wandb"] and not self.disable_logs and self.upload_checkpoint:
+            self.writer.save_model(path, self.current_learning_iteration) # type: ignore
+
+    def load(self, path: str, load_optimizer: bool = True):
+        loaded_dict = torch.load(path, weights_only=False)
+        # -- Load model
+        resumed_training = self.alg.policy.load_state_dict(loaded_dict["model_state_dict"])
+        # -- Load RND model if used
+        if self.alg.rnd:
+            self.alg.rnd.load_state_dict(loaded_dict["rnd_state_dict"])
+        # -- Load AMP model if used
+        if self.amp_reward is not None:
+            amp_loaded = False
+            if 'amp_state_dict' in loaded_dict:
+                try:
+                    self.amp_reward.network.load_state_dict(loaded_dict["amp_state_dict"])
+                    amp_loaded = True
+                except Exception as e:
+                    print(f"[WARNING]: Failed to load AMP model. Error: {e}. Initializing new AMP model.")
+            else:
+                print("[WARNING]: No AMP model found in the checkpoint. AMP reward will not be loaded.")
+        # -- Load observation normalizer if used
+        if self.empirical_normalization:
+            if resumed_training:
+                # if a previous training is resumed, the actor/student normalizer is loaded for the actor/student
+                # and the critic/teacher normalizer is loaded for the critic/teacher
+                self.obs_normalizer.load_state_dict(loaded_dict["obs_norm_state_dict"])
+                self.privileged_obs_normalizer.load_state_dict(loaded_dict["privileged_obs_norm_state_dict"])
+            else:
+                # if the training is not resumed but a model is loaded, this run must be distillation training following
+                # an rl training. Thus the actor normalizer is loaded for the teacher model. The student's normalizer
+                # is not loaded, as the observation space could differ from the previous rl training.
+                self.privileged_obs_normalizer.load_state_dict(loaded_dict["obs_norm_state_dict"])
+        # -- load optimizer if used
+        if load_optimizer and resumed_training:
+            # -- algorithm optimizer
+            self.alg.optimizer.load_state_dict(loaded_dict["optimizer_state_dict"])
+            # -- RND optimizer if used
+            if self.alg.rnd:
+                self.alg.rnd_optimizer.load_state_dict(loaded_dict["rnd_optimizer_state_dict"]) # type: ignore
+            # -- AMP optimizer if used
+            if self.amp_reward is not None and 'amp_optimizer_state_dict' in loaded_dict and amp_loaded:
+                self.amp_reward.optimizer.load_state_dict(loaded_dict["amp_optimizer_state_dict"])
+                
+        # -- load current learning iteration
+        # if resumed_training:
+        #     self.current_learning_iteration = loaded_dict["iter"]
+        return loaded_dict["infos"]
