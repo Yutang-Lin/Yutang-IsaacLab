@@ -17,4 +17,4 @@ class ActorCritic(BaseActorCritic):
         else:
             raise ValueError(f"Unknown standard deviation type: {self.noise_std_type}. Should be 'scalar' or 'log'")
         # create distribution
-        self.distribution = Normal(mean, std + 1e-6) # add small epsilon to avoid log(0)
+        self.distribution = Normal(mean, std + 1e-3) # add small epsilon to avoid log(0)
