@@ -469,7 +469,8 @@ class BaseRunner(OnPolicyRunner):
     def load(self, path: str, load_optimizer: bool = True):
         loaded_dict = torch.load(path, weights_only=False)
         # -- Load model
-        resumed_training = self.alg.policy.load_state_dict(loaded_dict["model_state_dict"])
+        # loaded_dict["model_state_dict"].pop('log_std')
+        resumed_training = self.alg.policy.load_state_dict(loaded_dict["model_state_dict"], strict=False)
         # -- Load RND model if used
         if self.alg.rnd:
             self.alg.rnd.load_state_dict(loaded_dict["rnd_state_dict"])
