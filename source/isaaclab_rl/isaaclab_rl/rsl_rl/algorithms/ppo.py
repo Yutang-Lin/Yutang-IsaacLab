@@ -161,7 +161,7 @@ class PPO(RslRlPPO):
             # Surrogate loss
             ratio = torch.exp(actions_log_prob_batch - torch.squeeze(old_actions_log_prob_batch))
             num_all_ratios += ratio.numel()
-            num_clipped_ratios += ((ratio > (1.0 + self.clip_param)) + (ratio < (1.0 - self.clip_param))).sum().item()
+            num_clipped_ratios += ((ratio > (1.0 + self.clip_param)).long() + (ratio < (1.0 - self.clip_param)).long()).sum().item()
             
             surrogate = -torch.squeeze(advantages_batch) * ratio
             surrogate_clipped = -torch.squeeze(advantages_batch) * torch.clamp(
