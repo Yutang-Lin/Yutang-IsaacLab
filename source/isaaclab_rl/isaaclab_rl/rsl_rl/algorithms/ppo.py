@@ -24,3 +24,10 @@ class PPO(RslRlPPO):
             # Distributed training parameters
             multi_gpu_cfg=kwargs.pop("multi_gpu_cfg", None),
         )
+
+    def compute_returns(self, last_critic_obs, **kwargs):
+        # compute value for the last step
+        last_values = self.policy.evaluate(last_critic_obs).detach()
+        self.storage.compute_returns(
+            last_values, self.gamma, self.lam, normalize_advantage=not self.normalize_advantage_per_mini_batch
+        )

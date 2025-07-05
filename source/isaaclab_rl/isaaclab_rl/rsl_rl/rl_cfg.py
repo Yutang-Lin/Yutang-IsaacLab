@@ -50,6 +50,50 @@ class RslRlPpoActorCriticCfg:
 
 
 @configclass
+class RslRlPpoActorCriticOUCfg:
+    """Configuration for the PPO actor-critic networks."""
+
+    class_name: str = "ActorCriticOU"
+    """The policy class name. Default is ActorCriticOU."""
+
+    init_noise_std: float = MISSING
+    """The initial noise standard deviation for the policy."""
+
+    step_dt: float = 0.02
+    """The time step for the OU process."""
+
+    init_theta: float = 0.25
+    """The initial theta for the OU process."""
+
+    init_sigma: float = 0.10
+    """The initial sigma for the OU process."""
+
+    theta_range: list[float, float] = [0.1, 0.9]
+    """The range of theta for the OU process."""
+
+    sigma_range: list[float, float] = [0.1, 5.0]
+    """The range of sigma for the OU process."""
+
+    noise_std_type: Literal["scalar", "log"] = "scalar"
+    """The type of noise standard deviation for the policy. Default is scalar."""
+
+    actor_hidden_dims: list[int] = MISSING
+    """The hidden dimensions of the actor network."""
+
+    critic_hidden_dims: list[int] = MISSING
+    """The hidden dimensions of the critic network."""
+
+    activation: str = MISSING
+    """The activation function for the actor and critic networks."""
+
+    layer_norm: bool = False
+    """Whether to use layer normalization."""
+
+    dropout_rate: float = 0.0
+    """The dropout rate for the actor and critic networks."""
+
+
+@configclass
 class RslRlPpoActorCriticRecurrentCfg(RslRlPpoActorCriticCfg):
     """Configuration for the PPO actor-critic networks with recurrent layers."""
 
