@@ -13,7 +13,7 @@ from torch.distributions import Normal
 from rsl_rl.utils import resolve_nn_activation
 
 
-class ActorCriticOU(nn.Module):
+class ActorDoubleCritic(nn.Module):
     is_recurrent = False
 
     def __init__(
@@ -38,7 +38,7 @@ class ActorCriticOU(nn.Module):
     ):
         if kwargs:
             print(
-                "ActorCriticOU.__init__ got unexpected arguments, which will be ignored: "
+                "ActorDoubleCritic.__init__ got unexpected arguments, which will be ignored: "
                 + str([key for key in kwargs.keys()])
             )
         super().__init__()
@@ -76,10 +76,11 @@ class ActorCriticOU(nn.Module):
                 critic_layers.append(activation)
                 if dropout_rate > 0:
                     critic_layers.append(nn.Dropout(dropout_rate))
-        self.critic = nn.Sequential(*critic_layers)
+        self.critic_behave = nn.Sequential(*critic_layers)
+        self.critic_target = nn.Sequential(*critic_layers)
 
         print(f"Actor MLP: {self.actor}")
-        print(f"Critic MLP: {self.critic}")
+        print(f"Critic MLP: {self.critic_behave}")
 
         # Action noise
         self.noise_std_type = noise_std_type
@@ -127,8 +128,11 @@ class ActorCriticOU(nn.Module):
         ]
 
     def reset(self, dones=None):
-        if self.ou_noise is not None and dones is not None:
-            self.ou_noise[dones] = 0.
+        if self.ou_noise is not None:
+            if dones is not None:
+                self.ou_noise[dones] = 0.
+            else:
+                self.ou_noise.zero_()
 
     def forward(self):
         raise NotImplementedError
@@ -171,8 +175,9 @@ class ActorCriticOU(nn.Module):
         return actions_mean
 
     def evaluate(self, critic_observations, **kwargs):
-        value = self.critic(critic_observations)
-        return value
+        value_behave = self.critic_behave(critic_observations)
+        value_target = self.critic_target(critic_observations)
+        return value_behave, value_target
 
     def load_state_dict(self, state_dict, strict=True):
         """Load the parameters of the actor-critic model.

@@ -3,7 +3,7 @@ import torch.nn as nn
 from rsl_rl.algorithms.ppo import PPO as RslRlPPO
 from isaaclab_rl.rsl_rl.modules import ActorCritic
 
-class PPO(RslRlPPO):
+class PPOKL(RslRlPPO):
     policy: ActorCritic
 
     def __init__(self, *args, **kwargs):
@@ -31,6 +31,16 @@ class PPO(RslRlPPO):
         )
         self.importance_sample_value = kwargs.pop("importance_sample_value", False)
         self.centralize_log_prob = kwargs.pop("centralize_log_prob", False)
+        self.init_beta = kwargs.pop("init_beta", 0.1)
+        self.beta_range = kwargs.pop("beta_range", [0.001, 1.0])
+        self.beta = self.init_beta
+
+    def compute_returns(self, last_critic_obs, **kwargs):
+        # compute value for the last step
+        last_values = self.policy.evaluate(last_critic_obs).detach()
+        self.storage.compute_returns(
+            last_values, self.gamma, self.lam, normalize_advantage=not self.normalize_advantage_per_mini_batch
+        )
 
     def act(self, obs, critic_obs):
         if self.policy.is_recurrent:
@@ -41,7 +51,7 @@ class PPO(RslRlPPO):
         self.transition.actions_log_prob = self.policy.get_actions_log_prob(
             self.transition.actions,
             collecting=True
-        ).detach()
+        ).detach() 
 
         self.transition.action_mean = self.policy.action_mean.detach()
         self.transition.action_sigma = self.policy.action_std.detach()
@@ -50,17 +60,11 @@ class PPO(RslRlPPO):
         self.transition.privileged_observations = critic_obs
         return self.transition.actions
 
-    def compute_returns(self, last_critic_obs, **kwargs):
-        # compute value for the last step
-        last_values = self.policy.evaluate(last_critic_obs).detach()
-        self.storage.compute_returns(
-            last_values, self.gamma, self.lam, normalize_advantage=not self.normalize_advantage_per_mini_batch
-        )
-
     def update(self):  # noqa: C901
         mean_value_loss = 0
         mean_surrogate_loss = 0
         mean_entropy = 0
+        mean_kl_loss = 0
 
         # to track the ratio of clipped and unclipped ratios
         num_all_ratios = 0
@@ -145,57 +149,61 @@ class PPO(RslRlPPO):
             entropy_batch = self.policy.entropy[:original_batch_size]
 
             # KL
-            if self.desired_kl is not None and self.schedule == "adaptive":
-                with torch.inference_mode():
-                    kl = torch.sum(
-                        torch.log(sigma_batch / old_sigma_batch + 1.0e-5)
-                        + (torch.square(old_sigma_batch) + torch.square(old_mu_batch - mu_batch)) # type: ignore
-                        / (2.0 * torch.square(sigma_batch))
-                        - 0.5,
-                        axis=-1,
-                    ) # type: ignore
-                    kl_mean = torch.mean(kl)
+            kl = torch.sum(
+                torch.log(sigma_batch / old_sigma_batch + 1.0e-5)
+                + (torch.square(old_sigma_batch) + torch.square(old_mu_batch - mu_batch)) # type: ignore
+                / (2.0 * torch.square(sigma_batch))
+                - 0.5,
+                axis=-1,
+            ) # type: ignore
+            kl_mean = torch.mean(kl)
 
-                    # Reduce the KL divergence across all GPUs
-                    if self.is_multi_gpu:
-                        torch.distributed.all_reduce(kl_mean, op=torch.distributed.ReduceOp.SUM)
-                        kl_mean /= self.gpu_world_size
+            # Reduce the KL divergence across all GPUs
+            if self.is_multi_gpu:
+                torch.distributed.all_reduce(kl_mean, op=torch.distributed.ReduceOp.SUM)
+                kl_mean /= self.gpu_world_size
 
-                    # Update the learning rate
-                    # Perform this adaptation only on the main process
-                    # TODO: Is this needed? If KL-divergence is the "same" across all GPUs,
-                    #       then the learning rate should be the same across all GPUs.
-                    if self.gpu_global_rank == 0:
-                        if kl_mean > self.desired_kl * 2.0:
-                            self.learning_rate = max(1e-5, self.learning_rate / 1.5)
-                        elif kl_mean < self.desired_kl / 2.0 and kl_mean > 0.0:
-                            self.learning_rate = min(1e-2, self.learning_rate * 1.5)
+            # Update the learning rate
+            # Perform this adaptation only on the main process
+            # TODO: Is this needed? If KL-divergence is the "same" across all GPUs,
+            #       then the learning rate should be the same across all GPUs.
+            if self.gpu_global_rank == 0:
+                if kl_mean > self.desired_kl * 2.0:
+                    self.learning_rate = max(1e-5, self.learning_rate / 1.5)
+                    self.beta = min(self.beta_range[1], self.beta * 1.5 )
+                elif kl_mean < self.desired_kl / 2.0 and kl_mean > 0.0:
+                    self.learning_rate = min(1e-2, self.learning_rate * 1.5)
+                    self.beta = max(self.beta_range[0], self.beta / 1.5)
 
-                    # Update the learning rate for all GPUs
-                    if self.is_multi_gpu:
-                        lr_tensor = torch.tensor(self.learning_rate, device=self.device)
-                        torch.distributed.broadcast(lr_tensor, src=0)
-                        self.learning_rate = lr_tensor.item()
+            # Update the learning rate for all GPUs
+            if self.is_multi_gpu:
+                lr_tensor = torch.tensor(self.learning_rate, device=self.device)
+                torch.distributed.broadcast(lr_tensor, src=0)
+                self.learning_rate = lr_tensor.item()
 
-                    # Update the learning rate for all parameter groups
-                    for param_group in self.optimizer.param_groups:
-                        param_group["lr"] = self.learning_rate
+                beta_tensor = torch.tensor(self.beta, device=self.device)
+                torch.distributed.broadcast(beta_tensor, src=0)
+                self.beta = beta_tensor.item()
 
-            # Surrogate loss
+            # Update the learning rate for all parameter groups
+            for param_group in self.optimizer.param_groups:
+                param_group["lr"] = self.learning_rate
+
             if self.centralize_log_prob:
                 log_prob_shift = old_actions_log_prob_batch.mean() - actions_log_prob_batch.mean()
                 ratio = torch.exp(actions_log_prob_batch + log_prob_shift - torch.squeeze(old_actions_log_prob_batch)) # type: ignore
             else:
                 ratio = torch.exp(actions_log_prob_batch - torch.squeeze(old_actions_log_prob_batch)) # type: ignore
-            
+
+            # Surrogate loss
             num_all_ratios += ratio.numel()
-            num_clipped_ratios += ((ratio > (1.0 + self.clip_param)).long() + (ratio < (1.0 - self.clip_param)).long()).sum().item()
+            num_clipped_ratios += (ratio > 1 + self.clip_param).long().sum() + (ratio < 1 - self.clip_param).long().sum()
             
-            surrogate = -torch.squeeze(advantages_batch) * ratio
-            surrogate_clipped = -torch.squeeze(advantages_batch) * torch.clamp(
-                ratio, 1.0 - self.clip_param, 1.0 + self.clip_param
+            surrogate = -torch.squeeze(advantages_batch) * ratio.clamp(
+                1 - self.clip_param, 1 + self.clip_param
             )
-            surrogate_loss = torch.max(surrogate, surrogate_clipped).mean()
+            surrogate_loss = torch.max(surrogate, surrogate).mean()
+            kl_loss = self.beta * kl_mean
 
             # Value function loss
             if self.importance_sample_value:
@@ -213,7 +221,7 @@ class PPO(RslRlPPO):
             else:
                 value_loss = (returns_batch - value_batch).pow(2).mean()
 
-            loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy_batch.mean()
+            loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy_batch.mean() + kl_loss
 
             # Symmetry loss
             if self.symmetry:
@@ -284,6 +292,7 @@ class PPO(RslRlPPO):
             mean_value_loss += value_loss.item()
             mean_surrogate_loss += surrogate_loss.item()
             mean_entropy += entropy_batch.mean().item()
+            mean_kl_loss += kl_loss.item()
             # -- RND loss
             if mean_rnd_loss is not None:
                 mean_rnd_loss += rnd_loss.item()
@@ -296,6 +305,8 @@ class PPO(RslRlPPO):
         mean_value_loss /= num_updates
         mean_surrogate_loss /= num_updates
         mean_entropy /= num_updates
+        mean_kl_loss /= num_updates
+        mean_ratio = num_clipped_ratios / num_all_ratios
         # -- For RND
         if mean_rnd_loss is not None:
             mean_rnd_loss /= num_updates
@@ -310,7 +321,9 @@ class PPO(RslRlPPO):
             "value_function": mean_value_loss,
             "surrogate": mean_surrogate_loss,
             "entropy": mean_entropy,
-            "clipping_ratio": (num_clipped_ratios / num_all_ratios) if num_all_ratios > 0 else 0,
+            "beta": self.beta,
+            "clipping_ratio": mean_ratio,
+            "kl_loss": mean_kl_loss,
         }
         if self.rnd:
             loss_dict["rnd"] = mean_rnd_loss

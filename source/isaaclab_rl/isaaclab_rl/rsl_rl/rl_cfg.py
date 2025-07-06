@@ -94,6 +94,50 @@ class RslRlPpoActorCriticOUCfg:
 
 
 @configclass
+class RslRlPpoActorDoubleCriticCfg:
+    """Configuration for the PPO actor-critic networks."""
+
+    class_name: str = "ActorDoubleCritic"
+    """The policy class name. Default is ActorDoubleCritic."""
+
+    init_noise_std: float = MISSING
+    """The initial noise standard deviation for the policy."""
+
+    step_dt: float = 0.02
+    """The time step for the OU process."""
+
+    init_theta: float = 0.25
+    """The initial theta for the OU process."""
+
+    init_sigma: float = 0.10
+    """The initial sigma for the OU process."""
+
+    theta_range: list[float, float] = [0.1, 0.9]
+    """The range of theta for the OU process."""
+
+    sigma_range: list[float, float] = [0.1, 5.0]
+    """The range of sigma for the OU process."""
+
+    noise_std_type: Literal["scalar", "log"] = "scalar"
+    """The type of noise standard deviation for the policy. Default is scalar."""
+
+    actor_hidden_dims: list[int] = MISSING
+    """The hidden dimensions of the actor network."""
+
+    critic_hidden_dims: list[int] = MISSING
+    """The hidden dimensions of the critic network."""
+
+    activation: str = MISSING
+    """The activation function for the actor and critic networks."""
+
+    layer_norm: bool = False
+    """Whether to use layer normalization."""
+
+    dropout_rate: float = 0.0
+    """The dropout rate for the actor and critic networks."""
+
+
+@configclass
 class RslRlPpoActorCriticRecurrentCfg(RslRlPpoActorCriticCfg):
     """Configuration for the PPO actor-critic networks with recurrent layers."""
 
@@ -108,6 +152,23 @@ class RslRlPpoActorCriticRecurrentCfg(RslRlPpoActorCriticCfg):
 
     rnn_num_layers: int = MISSING
     """The number of RNN layers."""
+
+
+@configclass
+class RslRlTd3ActorCriticCfg:
+    """Configuration for the TD3 actor-critic networks."""
+
+    class_name: str = "TwinDelayed"
+    """The policy class name. Default is ActorCriticTd3."""
+
+    actor_hidden_dims: list[int] = MISSING
+    """The hidden dimensions of the actor network."""
+
+    critic_hidden_dims: list[int] = MISSING
+    """The hidden dimensions of the critic network."""
+
+    activation: str = MISSING
+    """The activation function for the actor and critic networks."""
 
 
 ############################
@@ -169,6 +230,78 @@ class RslRlPpoAlgorithmCfg:
 
     clip_param: float = MISSING
     """The clipping parameter for the policy."""
+
+    normalize_advantage_per_mini_batch: bool = False
+    """Whether to normalize the advantage per mini-batch. Default is False.
+
+    If True, the advantage is normalized over the mini-batches only.
+    Otherwise, the advantage is normalized over the entire collected trajectories.
+    """
+
+    symmetry_cfg: RslRlSymmetryCfg | None = None
+    """The symmetry configuration. Default is None, in which case symmetry is not used."""
+
+    rnd_cfg: RslRlRndCfg | None = None
+    """The configuration for the Random Network Distillation (RND) module. Default is None,
+    in which case RND is not used.
+    """
+
+    importance_sample_value: bool = False
+    """Whether to use importance sampling for the value function. Default is False."""
+
+    centralize_log_prob: bool = False
+    """Whether to centralize the log probability. Default is False."""
+
+    init_beta: float = 0.01
+    """The initial beta for the PPOKL. Default is 0.01."""
+
+    beta_range: list[float, float] = [0.01, 1.0]
+    """The range of beta for the PPOKL. Default is [0.01, 1.0]."""
+
+    
+
+@configclass
+class RslRlTd3AlgorithmCfg:
+    """Configuration for the TD3 algorithm."""
+
+    class_name: str = "TD3"
+    """The algorithm class name. Default is TD3."""
+
+    num_learning_epochs: int = MISSING
+    """The number of learning epochs per update."""
+
+    num_mini_batches: int = MISSING
+    """The number of mini-batches per update."""
+
+    learning_rate: float = MISSING
+    """The learning rate for the policy."""
+
+    gamma: float = MISSING
+    """The discount factor."""
+
+    lam: float = MISSING
+    """The lambda parameter for Generalized Advantage Estimation (GAE)."""
+
+    max_grad_norm: float = MISSING
+    """The maximum gradient norm."""
+
+    tau: float = MISSING
+    """The target smoothing coefficient."""
+
+    epsilon: float = MISSING
+    """The epsilon parameter for the TD3 algorithm."""
+
+    max_epsilon: float = MISSING
+    """The maximum epsilon parameter for the TD3 algorithm."""
+
+    num_critic_updates: int = MISSING
+    """The number of critic updates per update."""
+
+    exploration_type: Literal["ou", "normal"] = "ou"
+    """The type of exploration to use. Default is ou."""
+
+    exploration_params: dict = MISSING
+    """The parameters for the exploration. Default is None."""
 
     normalize_advantage_per_mini_batch: bool = False
     """Whether to normalize the advantage per mini-batch. Default is False.

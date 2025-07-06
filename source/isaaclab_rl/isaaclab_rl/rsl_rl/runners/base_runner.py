@@ -217,6 +217,8 @@ class BaseRunner(OnPolicyRunner):
             start = time.time()
             # Rollout
             with torch.inference_mode():
+                self.alg.policy.reset()
+
                 for _ in range(self.num_steps_per_env):
                     # Sample actions
                     actions = self.alg.act(obs, privileged_obs)
@@ -234,6 +236,8 @@ class BaseRunner(OnPolicyRunner):
                         privileged_obs = obs
                     # try to get all resets
                     resets = infos.get("resets", dones).to(self.device)
+                    if hasattr(self.alg.policy, "reset"):  
+                        self.alg.policy.reset(resets) # type: ignore
 
                     if self.amp_reward is not None:
                         gen_obs = infos["observations"]["amp_policy"].to(self.device)
@@ -288,7 +292,7 @@ class BaseRunner(OnPolicyRunner):
 
                 # compute returns
                 if self.training_type == "rl":
-                    self.alg.compute_returns(privileged_obs) # type: ignore
+                    self.alg.compute_returns(privileged_obs, actions=actions) # type: ignore
 
             loss_dict = self.alg.update()
             # update policy
@@ -355,8 +359,10 @@ class BaseRunner(OnPolicyRunner):
                 else:
                     self.writer.add_scalar("Episode/" + key, value, locs["it"])
                     ep_string += f"""{f'Mean episode {key}:':>{pad}} {value:.4f}\n"""
-
-        mean_std = self.alg.policy.action_std.mean()
+        
+        mean_std = self.alg.policy.action_std
+        if isinstance(mean_std, torch.Tensor):
+            mean_std = mean_std.mean().item()
         fps = int(collection_size / (locs["collection_time"] + locs["learn_time"]))
 
         # -- Losses
@@ -365,7 +371,7 @@ class BaseRunner(OnPolicyRunner):
         self.writer.add_scalar("Loss/learning_rate", self.alg.learning_rate, locs["it"])
 
         # -- Policy
-        self.writer.add_scalar("Policy/mean_noise_std", mean_std.item(), locs["it"])
+        self.writer.add_scalar("Policy/mean_noise_std", mean_std, locs["it"])
 
         # -- Performance
         self.writer.add_scalar("Perf/total_fps", fps, locs["it"])
@@ -396,7 +402,7 @@ class BaseRunner(OnPolicyRunner):
                 f"""{str.center(width, ' ')}\n\n"""
                 f"""{'Computation:':>{pad}} {fps:.0f} steps/s (collection: {locs[
                     'collection_time']:.3f}s, learning {locs['learn_time']:.3f}s)\n"""
-                f"""{'Mean action noise std:':>{pad}} {mean_std.item():.2f}\n"""
+                f"""{'Mean action noise std:':>{pad}} {mean_std:.2f}\n"""
             )
             # -- Losses
             for key, value in locs["loss_dict"].items():
@@ -416,7 +422,7 @@ class BaseRunner(OnPolicyRunner):
                 f"""{str.center(width, ' ')}\n\n"""
                 f"""{'Computation:':>{pad}} {fps:.0f} steps/s (collection: {locs[
                     'collection_time']:.3f}s, learning {locs['learn_time']:.3f}s)\n"""
-                f"""{'Mean action noise std:':>{pad}} {mean_std.item():.2f}\n"""
+                f"""{'Mean action noise std:':>{pad}} {mean_std:.2f}\n"""
             )
             for key, value in locs["loss_dict"].items():
                 log_string += f"""{f'{key}:':>{pad}} {value:.4f}\n"""
@@ -440,12 +446,21 @@ class BaseRunner(OnPolicyRunner):
     
     def save(self, path: str, infos=None):
         # -- Save model
-        saved_dict = {
-            "model_state_dict": self.alg.policy.state_dict(),
-            "optimizer_state_dict": self.alg.optimizer.state_dict(),
-            "iter": self.current_learning_iteration,
-            "infos": infos,
-        }
+        if isinstance(self.alg, TD3):
+            saved_dict = {
+                "model_state_dict": self.alg.policy.state_dict(),
+                "actor_optimizer_state_dict": self.alg.actor_optimizer.state_dict(),
+                "critic_optimizer_state_dict": self.alg.critic_optimizer.state_dict(),
+                "iter": self.current_learning_iteration,
+                "infos": infos,
+            }
+        else:
+            saved_dict = {
+                "model_state_dict": self.alg.policy.state_dict(),
+                "optimizer_state_dict": self.alg.optimizer.state_dict(),
+                "iter": self.current_learning_iteration,
+                "infos": infos,
+            }
         # -- Save RND model if used
         if self.alg.rnd:
             saved_dict["rnd_state_dict"] = self.alg.rnd.state_dict()
@@ -497,16 +512,26 @@ class BaseRunner(OnPolicyRunner):
                 # an rl training. Thus the actor normalizer is loaded for the teacher model. The student's normalizer
                 # is not loaded, as the observation space could differ from the previous rl training.
                 self.privileged_obs_normalizer.load_state_dict(loaded_dict["obs_norm_state_dict"])
+
+        if not (load_optimizer and resumed_training):
+            return loaded_dict["infos"]
+
         # -- load optimizer if used
-        if load_optimizer and resumed_training:
+        if self.amp_reward is not None and 'amp_optimizer_state_dict' in loaded_dict and amp_loaded:
+            self.amp_reward.optimizer.load_state_dict(loaded_dict["amp_optimizer_state_dict"])
+
+        if not isinstance(self.alg, TD3):
             # -- algorithm optimizer
             self.alg.optimizer.load_state_dict(loaded_dict["optimizer_state_dict"])
             # -- RND optimizer if used
             if self.alg.rnd:
                 self.alg.rnd_optimizer.load_state_dict(loaded_dict["rnd_optimizer_state_dict"]) # type: ignore
             # -- AMP optimizer if used
-            if self.amp_reward is not None and 'amp_optimizer_state_dict' in loaded_dict and amp_loaded:
-                self.amp_reward.optimizer.load_state_dict(loaded_dict["amp_optimizer_state_dict"])
+        else:
+            # -- actor optimizer
+            self.alg.actor_optimizer.load_state_dict(loaded_dict["actor_optimizer_state_dict"])
+            # -- critic optimizer
+            self.alg.critic_optimizer.load_state_dict(loaded_dict["critic_optimizer_state_dict"])
                 
         # -- load current learning iteration
         # if resumed_training:

@@ -78,6 +78,9 @@ class ActorCritic(RslRlActorCritic):
         # disable args validation for speedup
         Normal.set_default_validate_args(False)
 
+    def get_actions_log_prob(self, actions, **kwargs):
+        return self.distribution.log_prob(actions).sum(dim=-1) # type: ignore
+
     def update_distribution(self, observations):
         # compute mean
         mean = self.actor(observations)

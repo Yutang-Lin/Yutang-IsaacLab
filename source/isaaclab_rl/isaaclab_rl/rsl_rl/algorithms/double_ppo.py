@@ -1,10 +1,11 @@
 import torch
 import torch.nn as nn
 from rsl_rl.algorithms.ppo import PPO as RslRlPPO
-from isaaclab_rl.rsl_rl.modules import ActorCritic
+from isaaclab_rl.rsl_rl.modules import ActorDoubleCritic
+from isaaclab_rl.rsl_rl.storage import DoubleCriticStorage
 
-class PPO(RslRlPPO):
-    policy: ActorCritic
+class DoublePPO(RslRlPPO):
+    policy: ActorDoubleCritic
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args,
@@ -29,19 +30,84 @@ class PPO(RslRlPPO):
             # Distributed training parameters
             multi_gpu_cfg=kwargs.pop("multi_gpu_cfg", None),
         )
-        self.importance_sample_value = kwargs.pop("importance_sample_value", False)
         self.centralize_log_prob = kwargs.pop("centralize_log_prob", False)
+        self.init_beta = kwargs.pop("init_beta", 0.1)
+        self.beta_range = kwargs.pop("beta_range", [0.001, 1.0])
+        self.beta = self.init_beta
+
+        # Create rollout storage
+        self.storage: DoubleCriticStorage = None  # type: ignore
+        self.transition = DoubleCriticStorage.Transition()
+
+    def init_storage(
+        self, training_type, num_envs, num_transitions_per_env, actor_obs_shape, critic_obs_shape, actions_shape
+    ):
+        # create memory for RND as well :)
+        if self.rnd:
+            rnd_state_shape = [self.rnd.num_states]
+        else:
+            rnd_state_shape = None
+        # create rollout storage
+        self.storage = DoubleCriticStorage(
+            training_type,
+            num_envs,
+            num_transitions_per_env,
+            actor_obs_shape,
+            critic_obs_shape,
+            actions_shape,
+            rnd_state_shape,
+            self.device,
+        )
+
+    def process_env_step(self, rewards, dones, infos):
+        # Record the rewards and dones
+        # Note: we clone here because later on we bootstrap the rewards based on timeouts
+        self.transition.rewards = rewards.clone()
+        self.transition.dones = dones
+
+        # Compute the intrinsic rewards and add to extrinsic rewards
+        if self.rnd:
+            # Obtain curiosity gates / observations from infos
+            rnd_state = infos["observations"]["rnd_state"]
+            # Compute the intrinsic rewards
+            # note: rnd_state is the gated_state after normalization if normalization is used
+            self.intrinsic_rewards, rnd_state = self.rnd.get_intrinsic_reward(rnd_state)
+            # Add intrinsic rewards to extrinsic rewards
+            self.transition.rewards += self.intrinsic_rewards
+            # Record the curiosity gates
+            self.transition.rnd_state = rnd_state.clone()
+
+        # Bootstrapping on time outs
+        if "time_outs" in infos:
+            self.transition.rewards += self.gamma * torch.squeeze(
+                self.transition.values_behave * infos["time_outs"].unsqueeze(1).to(self.device), 1
+            )
+
+        # record the transition
+        self.storage.add_transitions(self.transition)
+        self.transition.clear()
+        self.policy.reset(dones)
+
+    def compute_returns(self, last_critic_obs, **kwargs):
+        # compute value for the last step
+        last_behave, last_target = self.policy.evaluate(last_critic_obs)
+        self.storage.compute_returns(
+            last_behave.detach(), last_target.detach(), self.gamma, self.lam, normalize_advantage=not self.normalize_advantage_per_mini_batch
+        )
 
     def act(self, obs, critic_obs):
         if self.policy.is_recurrent:
             self.transition.hidden_states = self.policy.get_hidden_states()
         # compute the actions and values
         self.transition.actions = self.policy.act(obs).detach() # type: ignore
-        self.transition.values = self.policy.evaluate(critic_obs).detach()
+        behave, target = self.policy.evaluate(critic_obs)
+        self.transition.values_behave = behave.detach()
+        self.transition.values_target = target.detach()
+
         self.transition.actions_log_prob = self.policy.get_actions_log_prob(
             self.transition.actions,
             collecting=True
-        ).detach()
+        ).detach() 
 
         self.transition.action_mean = self.policy.action_mean.detach()
         self.transition.action_sigma = self.policy.action_std.detach()
@@ -50,17 +116,11 @@ class PPO(RslRlPPO):
         self.transition.privileged_observations = critic_obs
         return self.transition.actions
 
-    def compute_returns(self, last_critic_obs, **kwargs):
-        # compute value for the last step
-        last_values = self.policy.evaluate(last_critic_obs).detach()
-        self.storage.compute_returns(
-            last_values, self.gamma, self.lam, normalize_advantage=not self.normalize_advantage_per_mini_batch
-        )
-
     def update(self):  # noqa: C901
         mean_value_loss = 0
         mean_surrogate_loss = 0
         mean_entropy = 0
+        mean_kl_loss = 0
 
         # to track the ratio of clipped and unclipped ratios
         num_all_ratios = 0
@@ -104,6 +164,8 @@ class PPO(RslRlPPO):
             num_aug = 1
             # original batch size
             original_batch_size = obs_batch.shape[0]
+            behave_return, target_return_rew, target_return_nxt = returns_batch
+            behave_next_value, target_next_value = target_values_batch
 
             # check if we should normalize advantages per mini batch
             if self.normalize_advantage_per_mini_batch:
@@ -127,9 +189,11 @@ class PPO(RslRlPPO):
                 # -- actor
                 old_actions_log_prob_batch = old_actions_log_prob_batch.repeat(num_aug, 1)
                 # -- critic
-                target_values_batch = target_values_batch.repeat(num_aug, 1)
+                behave_next_value = behave_next_value.repeat(num_aug, 1)
+                target_next_value = target_next_value.repeat(num_aug, 1)
                 advantages_batch = advantages_batch.repeat(num_aug, 1)
-                returns_batch = returns_batch.repeat(num_aug, 1)
+                behave_return = behave_return.repeat(num_aug, 1)
+                target_return = target_return.repeat(num_aug, 1)
 
             # Recompute actions log prob and entropy for current batch of transitions
             # Note: we need to do this because we updated the policy with the new parameters
@@ -137,7 +201,7 @@ class PPO(RslRlPPO):
             self.policy.act(obs_batch, masks=masks_batch, hidden_states=hid_states_batch[0])
             actions_log_prob_batch = self.policy.get_actions_log_prob(actions_batch)
             # -- critic
-            value_batch = self.policy.evaluate(critic_obs_batch, masks=masks_batch, hidden_states=hid_states_batch[1])
+            value_behave, value_target = self.policy.evaluate(critic_obs_batch, masks=masks_batch, hidden_states=hid_states_batch[1])
             # -- entropy
             # we only keep the entropy of the first augmentation (the original one)
             mu_batch = self.policy.action_mean[:original_batch_size]
@@ -145,75 +209,86 @@ class PPO(RslRlPPO):
             entropy_batch = self.policy.entropy[:original_batch_size]
 
             # KL
-            if self.desired_kl is not None and self.schedule == "adaptive":
-                with torch.inference_mode():
-                    kl = torch.sum(
-                        torch.log(sigma_batch / old_sigma_batch + 1.0e-5)
-                        + (torch.square(old_sigma_batch) + torch.square(old_mu_batch - mu_batch)) # type: ignore
-                        / (2.0 * torch.square(sigma_batch))
-                        - 0.5,
-                        axis=-1,
-                    ) # type: ignore
-                    kl_mean = torch.mean(kl)
+            kl = torch.sum(
+                torch.log(sigma_batch / old_sigma_batch + 1.0e-5)
+                + (torch.square(old_sigma_batch) + torch.square(old_mu_batch - mu_batch)) # type: ignore
+                / (2.0 * torch.square(sigma_batch))
+                - 0.5,
+                axis=-1,
+            ) # type: ignore
+            kl_mean = torch.mean(kl)
 
-                    # Reduce the KL divergence across all GPUs
-                    if self.is_multi_gpu:
-                        torch.distributed.all_reduce(kl_mean, op=torch.distributed.ReduceOp.SUM)
-                        kl_mean /= self.gpu_world_size
+            # Reduce the KL divergence across all GPUs
+            if self.is_multi_gpu:
+                torch.distributed.all_reduce(kl_mean, op=torch.distributed.ReduceOp.SUM)
+                kl_mean /= self.gpu_world_size
 
-                    # Update the learning rate
-                    # Perform this adaptation only on the main process
-                    # TODO: Is this needed? If KL-divergence is the "same" across all GPUs,
-                    #       then the learning rate should be the same across all GPUs.
-                    if self.gpu_global_rank == 0:
-                        if kl_mean > self.desired_kl * 2.0:
-                            self.learning_rate = max(1e-5, self.learning_rate / 1.5)
-                        elif kl_mean < self.desired_kl / 2.0 and kl_mean > 0.0:
-                            self.learning_rate = min(1e-2, self.learning_rate * 1.5)
+            # Update the learning rate
+            # Perform this adaptation only on the main process
+            # TODO: Is this needed? If KL-divergence is the "same" across all GPUs,
+            #       then the learning rate should be the same across all GPUs.
+            if self.gpu_global_rank == 0:
+                if kl_mean > self.desired_kl * 2.0:
+                    self.learning_rate = max(1e-5, self.learning_rate / 1.5)
+                    self.beta = min(self.beta_range[1], self.beta * 1.5 )
+                elif kl_mean < self.desired_kl / 2.0 and kl_mean > 0.0:
+                    self.learning_rate = min(1e-2, self.learning_rate * 1.5)
+                    self.beta = max(self.beta_range[0], self.beta / 1.5)
 
-                    # Update the learning rate for all GPUs
-                    if self.is_multi_gpu:
-                        lr_tensor = torch.tensor(self.learning_rate, device=self.device)
-                        torch.distributed.broadcast(lr_tensor, src=0)
-                        self.learning_rate = lr_tensor.item()
+            # Update the learning rate for all GPUs
+            if self.is_multi_gpu:
+                lr_tensor = torch.tensor(self.learning_rate, device=self.device)
+                torch.distributed.broadcast(lr_tensor, src=0)
+                self.learning_rate = lr_tensor.item()
 
-                    # Update the learning rate for all parameter groups
-                    for param_group in self.optimizer.param_groups:
-                        param_group["lr"] = self.learning_rate
+                beta_tensor = torch.tensor(self.beta, device=self.device)
+                torch.distributed.broadcast(beta_tensor, src=0)
+                self.beta = beta_tensor.item()
 
-            # Surrogate loss
+            # Update the learning rate for all parameter groups
+            for param_group in self.optimizer.param_groups:
+                param_group["lr"] = self.learning_rate
+
             if self.centralize_log_prob:
                 log_prob_shift = old_actions_log_prob_batch.mean() - actions_log_prob_batch.mean()
                 ratio = torch.exp(actions_log_prob_batch + log_prob_shift - torch.squeeze(old_actions_log_prob_batch)) # type: ignore
             else:
                 ratio = torch.exp(actions_log_prob_batch - torch.squeeze(old_actions_log_prob_batch)) # type: ignore
-            
+
+            # Surrogate loss
             num_all_ratios += ratio.numel()
-            num_clipped_ratios += ((ratio > (1.0 + self.clip_param)).long() + (ratio < (1.0 - self.clip_param)).long()).sum().item()
+            num_clipped_ratios += (ratio < 1 - self.clip_param).long().sum() + (ratio > 1 + self.clip_param).long().sum()
             
-            surrogate = -torch.squeeze(advantages_batch) * ratio
-            surrogate_clipped = -torch.squeeze(advantages_batch) * torch.clamp(
-                ratio, 1.0 - self.clip_param, 1.0 + self.clip_param
+            surrogate = -torch.squeeze(advantages_batch) * ratio.clamp(
+                1 - self.clip_param, 1 + self.clip_param
             )
-            surrogate_loss = torch.max(surrogate, surrogate_clipped).mean()
+            surrogate_loss = torch.max(surrogate, surrogate).mean()
+            kl_loss = self.beta * kl_mean
 
             # Value function loss
-            if self.importance_sample_value:
-                returns_batch = returns_batch * ratio.detach().clamp(
-                    1 - self.clip_param, 1 + self.clip_param
-                )
+            target_return = target_return_rew * ratio.detach().clamp(
+                1 - self.clip_param, 1 + self.clip_param
+            ) + target_return_nxt
                 
             if self.use_clipped_value_loss:
-                value_clipped = target_values_batch + (value_batch - target_values_batch).clamp(
+                value_clipped = behave_next_value + (value_behave - behave_next_value).clamp(
                     -self.clip_param, self.clip_param
                 )
-                value_losses = (value_batch - returns_batch).pow(2)
-                value_losses_clipped = (value_clipped - returns_batch).pow(2)
+                value_losses = (value_behave - behave_return).pow(2)
+                value_losses_clipped = (value_clipped - behave_return).pow(2)
                 value_loss = torch.max(value_losses, value_losses_clipped).mean()
-            else:
-                value_loss = (returns_batch - value_batch).pow(2).mean()
 
-            loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy_batch.mean()
+                value_clipped = target_next_value + (value_target - target_next_value).clamp(
+                    -self.clip_param, self.clip_param
+                )
+                value_losses = (value_target - target_return).pow(2)
+                value_losses_clipped = (value_clipped - target_return).pow(2)
+                value_loss += torch.max(value_losses, value_losses_clipped).mean()
+            else:
+                value_loss = (behave_return - value_behave).pow(2).mean()
+                value_loss += (target_return - value_target).pow(2).mean()
+
+            loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy_batch.mean() + kl_loss
 
             # Symmetry loss
             if self.symmetry:
@@ -284,6 +359,7 @@ class PPO(RslRlPPO):
             mean_value_loss += value_loss.item()
             mean_surrogate_loss += surrogate_loss.item()
             mean_entropy += entropy_batch.mean().item()
+            mean_kl_loss += kl_loss.item()
             # -- RND loss
             if mean_rnd_loss is not None:
                 mean_rnd_loss += rnd_loss.item()
@@ -296,6 +372,8 @@ class PPO(RslRlPPO):
         mean_value_loss /= num_updates
         mean_surrogate_loss /= num_updates
         mean_entropy /= num_updates
+        mean_kl_loss /= num_updates
+        mean_ratio = num_clipped_ratios / num_all_ratios
         # -- For RND
         if mean_rnd_loss is not None:
             mean_rnd_loss /= num_updates
@@ -310,7 +388,9 @@ class PPO(RslRlPPO):
             "value_function": mean_value_loss,
             "surrogate": mean_surrogate_loss,
             "entropy": mean_entropy,
-            "clipping_ratio": (num_clipped_ratios / num_all_ratios) if num_all_ratios > 0 else 0,
+            "beta": self.beta,
+            "clipping_ratio": mean_ratio,
+            "kl_loss": mean_kl_loss,
         }
         if self.rnd:
             loss_dict["rnd"] = mean_rnd_loss
