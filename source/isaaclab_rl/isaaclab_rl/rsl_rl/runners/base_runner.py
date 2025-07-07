@@ -217,8 +217,6 @@ class BaseRunner(OnPolicyRunner):
             start = time.time()
             # Rollout
             with torch.inference_mode():
-                self.alg.policy.reset()
-
                 for _ in range(self.num_steps_per_env):
                     # Sample actions
                     actions = self.alg.act(obs, privileged_obs)
