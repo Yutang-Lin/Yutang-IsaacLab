@@ -217,6 +217,9 @@ class BaseRunner(OnPolicyRunner):
             start = time.time()
             # Rollout
             with torch.inference_mode():
+                if getattr(self.alg, "collect_reset", False):
+                    self.alg.policy.reset() # type: ignore
+
                 for _ in range(self.num_steps_per_env):
                     # Sample actions
                     actions = self.alg.act(obs, privileged_obs)
@@ -234,7 +237,7 @@ class BaseRunner(OnPolicyRunner):
                         privileged_obs = obs
                     # try to get all resets
                     resets = infos.get("resets", dones).to(self.device)
-                    if hasattr(self.alg.policy, "reset"):  
+                    if getattr(self.alg, "done_reset", False) and hasattr(self.alg.policy, "reset"):  
                         self.alg.policy.reset(resets) # type: ignore
 
                     if self.amp_reward is not None:
@@ -370,6 +373,9 @@ class BaseRunner(OnPolicyRunner):
 
         # -- Policy
         self.writer.add_scalar("Policy/mean_noise_std", mean_std, locs["it"])
+        if hasattr(self.alg.policy, "log_theta") and hasattr(self.alg.policy, "log_sigma"):
+            self.writer.add_scalar("Policy/mean_theta", torch.exp(self.alg.policy.log_theta).mean().item(), locs["it"])
+            self.writer.add_scalar("Policy/mean_sigma", torch.exp(self.alg.policy.log_sigma).mean().item(), locs["it"])
 
         # -- Performance
         self.writer.add_scalar("Perf/total_fps", fps, locs["it"])

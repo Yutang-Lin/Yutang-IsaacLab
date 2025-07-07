@@ -81,23 +81,18 @@ class ActorCriticOU(nn.Module):
         print(f"Actor MLP: {self.actor}")
         print(f"Critic MLP: {self.critic}")
 
-        # Action noise
-        self.noise_std_type = noise_std_type
-        if self.noise_std_type == "scalar":
-            self.std = nn.Parameter(init_noise_std * torch.ones(num_actions))
-        elif self.noise_std_type == "log":
-            self.log_std = nn.Parameter(torch.log(init_noise_std * torch.ones(num_actions)))
-        else:
-            raise ValueError(f"Unknown standard deviation type: {self.noise_std_type}. Should be 'scalar' or 'log'")
-
         # OU noise
-        self.theta = init_theta
-        self.sigma = init_sigma
+        self.log_theta = nn.Parameter(torch.log(init_theta * torch.ones(num_actions)))
+        self.log_sigma = nn.Parameter(torch.log(init_sigma * torch.ones(num_actions)))
         self.theta_range = theta_range
         self.sigma_range = sigma_range
+        self.log_theta_range = [np.log(theta_range[0]), np.log(theta_range[1])]
+        self.log_sigma_range = [np.log(sigma_range[0]), np.log(sigma_range[1])]
+
         self.step_dt = step_dt
         self.sqrt_step_dt = np.sqrt(step_dt)
         self.ou_noise: torch.Tensor = None # type: ignore
+        self.last_ou_noise: torch.Tensor = None # type: ignore
 
         # Action distribution (populated in update_distribution)
         self.distribution: Normal = None # type: ignore
@@ -108,15 +103,16 @@ class ActorCriticOU(nn.Module):
     def update_distribution(self, observations):
         # compute mean
         mean = self.actor(observations)
+        self.mean = mean
         # compute standard deviation
-        if self.noise_std_type == "scalar":
-            std = self.std.expand_as(mean)
-        elif self.noise_std_type == "log":
-            std = torch.exp(self.log_std).expand_as(mean)
-        else:
-            raise ValueError(f"Unknown standard deviation type: {self.noise_std_type}. Should be 'scalar' or 'log'")
-        # create distribution
-        self.distribution = Normal(mean, std + 1e-3) # add small epsilon to avoid log(0)
+        theta = torch.exp(self.log_theta).expand_as(mean)
+        sigma = torch.exp(self.log_sigma).expand_as(mean)
+
+        if self.ou_noise is None or mean.shape != self.ou_noise.shape:
+            self.ou_noise = torch.zeros_like(mean)
+
+        ou_mean = (1 - theta * self.step_dt) * self.ou_noise + mean
+        self.ou_distribution = Normal(ou_mean, sigma * self.sqrt_step_dt)
 
     @staticmethod
     # not used at the moment
@@ -127,44 +123,39 @@ class ActorCriticOU(nn.Module):
         ]
 
     def reset(self, dones=None):
-        if self.ou_noise is not None and dones is not None:
-            self.ou_noise[dones] = 0.
+        return
+    
+        if self.ou_noise is not None:
+            if dones is not None:
+                self.ou_noise[dones] = 0.
+            else:
+                self.ou_noise.zero_()
 
     def forward(self):
         raise NotImplementedError
 
     @property
     def action_mean(self):
-        return self.distribution.mean
+        return self.ou_distribution.mean
 
     @property
     def action_std(self):
-        return self.distribution.stddev
+        return self.ou_distribution.stddev
 
     @property
     def entropy(self):
-        return self.distribution.entropy().sum(dim=-1)
+        return self.ou_distribution.entropy().sum(dim=-1)
     
     def act(self, observations, **kwargs):
         self.update_distribution(observations)
-        mean = self.action_mean
-
-        with torch.no_grad():
-            if self.ou_noise is None or mean.shape != self.ou_noise.shape:
-                self.ou_noise = torch.zeros_like(mean)
-
-            ou_mean = (1 - self.theta * self.step_dt) * self.ou_noise + mean
-            self.ou_distribution = Normal(ou_mean, self.sigma * torch.ones_like(ou_mean) * self.sqrt_step_dt)
-            actions = self.ou_distribution.sample()
-
-            self.ou_noise = actions - mean
+        actions = self.ou_distribution.sample()
+        
+        self.last_ou_noise = self.ou_noise.detach()
+        self.ou_noise = actions - self.mean
         return actions
 
-    def get_actions_log_prob(self, actions, collecting: bool = False, **kwargs):
-        if collecting:
-            return self.ou_distribution.log_prob(actions).sum(dim=-1)
-        else:
-            return self.distribution.log_prob(actions).sum(dim=-1)
+    def get_actions_log_prob(self, actions, **kwargs):
+        return self.ou_distribution.log_prob(actions).sum(dim=-1)
 
     def act_inference(self, observations):
         actions_mean = self.actor(observations)
