@@ -11,9 +11,10 @@ import numpy as np
 from torch.distributions import Normal
 
 from rsl_rl.utils import resolve_nn_activation
+from .actor_critic import ActorCritic
 
 
-class ActorDoubleCritic(nn.Module):
+class ActorDoubleCritic(ActorCritic):
     is_recurrent = False
 
     def __init__(
@@ -41,7 +42,7 @@ class ActorDoubleCritic(nn.Module):
                 "ActorDoubleCritic.__init__ got unexpected arguments, which will be ignored: "
                 + str([key for key in kwargs.keys()])
             )
-        super().__init__()
+        nn.Module.__init__(self)
         activation = resolve_nn_activation(activation) # type: ignore
 
         mlp_input_dim_a = num_actor_obs
@@ -106,27 +107,6 @@ class ActorDoubleCritic(nn.Module):
         # disable args validation for speedup
         Normal.set_default_validate_args(False)
 
-    def update_distribution(self, observations):
-        # compute mean
-        mean = self.actor(observations)
-        # compute standard deviation
-        if self.noise_std_type == "scalar":
-            std = self.std.expand_as(mean)
-        elif self.noise_std_type == "log":
-            std = torch.exp(self.log_std).expand_as(mean)
-        else:
-            raise ValueError(f"Unknown standard deviation type: {self.noise_std_type}. Should be 'scalar' or 'log'")
-        # create distribution
-        self.distribution = Normal(mean, std + 1e-3) # add small epsilon to avoid log(0)
-
-    @staticmethod
-    # not used at the moment
-    def init_weights(sequential, scales):
-        [
-            torch.nn.init.orthogonal_(module.weight, gain=scales[idx])
-            for idx, module in enumerate(mod for mod in sequential if isinstance(mod, nn.Linear))
-        ]
-
     def reset(self, dones=None):
         if self.ou_noise is not None:
             if dones is not None:
@@ -136,18 +116,6 @@ class ActorDoubleCritic(nn.Module):
 
     def forward(self):
         raise NotImplementedError
-
-    @property
-    def action_mean(self):
-        return self.distribution.mean
-
-    @property
-    def action_std(self):
-        return self.distribution.stddev
-
-    @property
-    def entropy(self):
-        return self.distribution.entropy().sum(dim=-1)
     
     def act(self, observations, **kwargs):
         self.update_distribution(observations)
@@ -170,27 +138,7 @@ class ActorDoubleCritic(nn.Module):
         else:
             return self.distribution.log_prob(actions).sum(dim=-1)
 
-    def act_inference(self, observations):
-        actions_mean = self.actor(observations)
-        return actions_mean
-
     def evaluate(self, critic_observations, **kwargs):
         value_behave = self.critic_behave(critic_observations)
         value_target = self.critic_target(critic_observations)
         return value_behave, value_target
-
-    def load_state_dict(self, state_dict, strict=True):
-        """Load the parameters of the actor-critic model.
-
-        Args:
-            state_dict (dict): State dictionary of the model.
-            strict (bool): Whether to strictly enforce that the keys in state_dict match the keys returned by this
-                           module's state_dict() function.
-
-        Returns:
-            bool: Whether this training resumes a previous training. This flag is used by the `load()` function of
-                  `OnPolicyRunner` to determine how to load further parameters (relevant for, e.g., distillation).
-        """
-
-        super().load_state_dict(state_dict, strict=strict)
-        return True

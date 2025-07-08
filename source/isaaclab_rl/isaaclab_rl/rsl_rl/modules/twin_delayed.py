@@ -10,6 +10,7 @@ import torch.nn as nn
 
 from rsl_rl.utils import resolve_nn_activation
 from copy import deepcopy
+from .actor_critic import ActorCritic
 
 class DoubleCritic(nn.Module):
     def __init__(self, num_critic_obs, critic_hidden_dims=[256, 256, 256], activation="elu"):
@@ -38,7 +39,7 @@ class DoubleCritic(nn.Module):
         value_1, value_2 = self(critic_observations)
         return torch.min(value_1, value_2)
 
-class TwinDelayed(nn.Module):
+class TwinDelayed(ActorCritic):
     '''Deterministic Twin Delayed Model for TD3'''
     is_recurrent = False
 
@@ -57,7 +58,7 @@ class TwinDelayed(nn.Module):
                 "ActorCritic.__init__ got unexpected arguments, which will be ignored: "
                 + str([key for key in kwargs.keys()])
             )
-        super().__init__()
+        nn.Module.__init__(self)
         self.activation = resolve_nn_activation(activation)
 
         mlp_input_dim_a = num_actor_obs
@@ -80,20 +81,6 @@ class TwinDelayed(nn.Module):
 
         self._action_mean = None
 
-    @staticmethod
-    # not used at the moment
-    def init_weights(sequential, scales):
-        [
-            torch.nn.init.orthogonal_(module.weight, gain=scales[idx])
-            for idx, module in enumerate(mod for mod in sequential if isinstance(mod, nn.Linear))
-        ]
-
-    def reset(self, dones=None):
-        pass
-
-    def forward(self):
-        raise NotImplementedError
-
     @property
     def action_mean(self):
         return self._action_mean
@@ -113,10 +100,6 @@ class TwinDelayed(nn.Module):
     def get_actions_log_prob(self, actions):
         raise ValueError("Log probability is not defined for deterministic models")
 
-    def act_inference(self, observations):
-        actions = self.actor(observations)
-        return actions
-
     def evaluate(self, critic_observations, actions, return_both=False, **kwargs):
         critic_observations = torch.cat([critic_observations, actions], dim=1)
         value_1, value_2 = self.critic(critic_observations)
@@ -124,19 +107,3 @@ class TwinDelayed(nn.Module):
             return value_1, value_2
         else:
             return torch.min(value_1, value_2)
-
-    def load_state_dict(self, state_dict, strict=True):
-        """Load the parameters of the actor-critic model.
-
-        Args:
-            state_dict (dict): State dictionary of the model.
-            strict (bool): Whether to strictly enforce that the keys in state_dict match the keys returned by this
-                           module's state_dict() function.
-
-        Returns:
-            bool: Whether this training resumes a previous training. This flag is used by the `load()` function of
-                  `OnPolicyRunner` to determine how to load further parameters (relevant for, e.g., distillation).
-        """
-
-        super().load_state_dict(state_dict, strict=strict)
-        return True

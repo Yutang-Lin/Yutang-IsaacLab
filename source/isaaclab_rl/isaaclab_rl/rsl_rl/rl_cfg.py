@@ -50,6 +50,47 @@ class RslRlPpoActorCriticCfg:
 
 
 @configclass
+class RslRlPpoActorCriticMoECfg:
+    """Configuration for the PPO actor-critic networks."""
+
+    class_name: str = "ActorCriticMoE"
+    """The policy class name. Default is ActorCriticMoE."""
+
+    init_noise_std: float = MISSING
+    """The initial noise standard deviation for the policy."""
+
+    noise_std_type: Literal["scalar", "log"] = "scalar"
+    """The type of noise standard deviation for the policy. Default is scalar."""
+
+    actor_hidden_dims: list[int] = MISSING
+    """The hidden dimensions of the actor network."""
+
+    critic_hidden_dims: list[int] = MISSING
+    """The hidden dimensions of the critic network."""
+
+    num_experts: int = MISSING
+    """The number of experts."""
+
+    top_k: int = MISSING
+    """The top k for the MoE."""
+
+    balance_tolerance: float = MISSING
+    """The balance tolerance for the MoE."""
+
+    balance_loss_weight: float = MISSING
+    """The balance loss weight for the MoE."""
+
+    activation: str = MISSING
+    """The activation function for the actor and critic networks."""
+
+    layer_norm: bool = False
+    """Whether to use layer normalization."""
+
+    dropout_rate: float = 0.0
+    """The dropout rate for the actor and critic networks."""
+
+
+@configclass
 class RslRlPpoActorCriticOUCfg:
     """Configuration for the PPO actor-critic networks."""
 

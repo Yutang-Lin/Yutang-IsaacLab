@@ -61,6 +61,7 @@ class PPO(RslRlPPO):
         mean_value_loss = 0
         mean_surrogate_loss = 0
         mean_entropy = 0
+        mean_extra_loss = {}
 
         # to track the ratio of clipped and unclipped ratios
         num_all_ratios = 0
@@ -82,6 +83,9 @@ class PPO(RslRlPPO):
             generator = self.storage.recurrent_mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
         else:
             generator = self.storage.mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
+
+        if hasattr(self.policy, "pre_train"):
+            self.policy.pre_train()
 
         # iterate over batches
         for (
@@ -143,6 +147,13 @@ class PPO(RslRlPPO):
             mu_batch = self.policy.action_mean[:original_batch_size]
             sigma_batch = self.policy.action_std[:original_batch_size]
             entropy_batch = self.policy.entropy[:original_batch_size]
+
+            if hasattr(self.policy, "extra_loss"):
+                extra_loss = self.policy.extra_loss()
+                for key, value in extra_loss.items():
+                    if key not in mean_extra_loss:
+                        mean_extra_loss[key] = 0.0
+                    mean_extra_loss[key] += value.item()
 
             # KL
             if self.desired_kl is not None and self.schedule == "adaptive":
@@ -214,6 +225,9 @@ class PPO(RslRlPPO):
                 value_loss = (returns_batch - value_batch).pow(2).mean()
 
             loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy_batch.mean()
+            if hasattr(self.policy, "extra_loss"):
+                for key, value in extra_loss.items():
+                    loss += value
 
             # Symmetry loss
             if self.symmetry:
@@ -296,6 +310,8 @@ class PPO(RslRlPPO):
         mean_value_loss /= num_updates
         mean_surrogate_loss /= num_updates
         mean_entropy /= num_updates
+        for key, value in mean_extra_loss.items():
+            mean_extra_loss[key] /= num_updates
         # -- For RND
         if mean_rnd_loss is not None:
             mean_rnd_loss /= num_updates
@@ -304,6 +320,8 @@ class PPO(RslRlPPO):
             mean_symmetry_loss /= num_updates
         # -- Clear the storage
         self.storage.clear()
+        if hasattr(self.policy, "after_train"):
+            self.policy.after_train()
 
         # construct the loss dictionary
         loss_dict = {
@@ -311,6 +329,7 @@ class PPO(RslRlPPO):
             "surrogate": mean_surrogate_loss,
             "entropy": mean_entropy,
             "clipping_ratio": (num_clipped_ratios / num_all_ratios) if num_all_ratios > 0 else 0,
+            **mean_extra_loss,
         }
         if self.rnd:
             loss_dict["rnd"] = mean_rnd_loss
