@@ -30,6 +30,9 @@ class RslRlPpoActorCriticCfg:
     init_noise_std: float = MISSING
     """The initial noise standard deviation for the policy."""
 
+    load_noise_std: bool = True
+    """Whether to load the noise std from the checkpoint. Default is True."""
+
     noise_std_type: Literal["scalar", "log"] = "scalar"
     """The type of noise standard deviation for the policy. Default is scalar."""
 
@@ -50,23 +53,11 @@ class RslRlPpoActorCriticCfg:
 
 
 @configclass
-class RslRlPpoActorCriticMoECfg:
+class RslRlPpoActorCriticMoECfg(RslRlPpoActorCriticCfg):
     """Configuration for the PPO actor-critic networks."""
 
     class_name: str = "ActorCriticMoE"
     """The policy class name. Default is ActorCriticMoE."""
-
-    init_noise_std: float = MISSING
-    """The initial noise standard deviation for the policy."""
-
-    noise_std_type: Literal["scalar", "log"] = "scalar"
-    """The type of noise standard deviation for the policy. Default is scalar."""
-
-    actor_hidden_dims: list[int] = MISSING
-    """The hidden dimensions of the actor network."""
-
-    critic_hidden_dims: list[int] = MISSING
-    """The hidden dimensions of the critic network."""
 
     num_experts: int = MISSING
     """The number of experts."""
@@ -80,26 +71,14 @@ class RslRlPpoActorCriticMoECfg:
     balance_loss_weight: float = MISSING
     """The balance loss weight for the MoE."""
 
-    activation: str = MISSING
-    """The activation function for the actor and critic networks."""
-
-    layer_norm: bool = False
-    """Whether to use layer normalization."""
-
-    dropout_rate: float = 0.0
-    """The dropout rate for the actor and critic networks."""
-
 
 @configclass
-class RslRlPpoActorCriticOUCfg:
+class RslRlPpoActorCriticOUCfg(RslRlPpoActorCriticCfg):
     """Configuration for the PPO actor-critic networks."""
 
     class_name: str = "ActorCriticOU"
     """The policy class name. Default is ActorCriticOU."""
 
-    init_noise_std: float = MISSING
-    """The initial noise standard deviation for the policy."""
-
     step_dt: float = 0.02
     """The time step for the OU process."""
 
@@ -115,35 +94,14 @@ class RslRlPpoActorCriticOUCfg:
     sigma_range: list[float, float] = [0.1, 5.0]
     """The range of sigma for the OU process."""
 
-    noise_std_type: Literal["scalar", "log"] = "scalar"
-    """The type of noise standard deviation for the policy. Default is scalar."""
-
-    actor_hidden_dims: list[int] = MISSING
-    """The hidden dimensions of the actor network."""
-
-    critic_hidden_dims: list[int] = MISSING
-    """The hidden dimensions of the critic network."""
-
-    activation: str = MISSING
-    """The activation function for the actor and critic networks."""
-
-    layer_norm: bool = False
-    """Whether to use layer normalization."""
-
-    dropout_rate: float = 0.0
-    """The dropout rate for the actor and critic networks."""
-
 
 @configclass
-class RslRlPpoActorDoubleCriticCfg:
+class RslRlPpoActorDoubleCriticCfg(RslRlPpoActorCriticCfg):
     """Configuration for the PPO actor-critic networks."""
 
     class_name: str = "ActorDoubleCritic"
     """The policy class name. Default is ActorDoubleCritic."""
 
-    init_noise_std: float = MISSING
-    """The initial noise standard deviation for the policy."""
-
     step_dt: float = 0.02
     """The time step for the OU process."""
 
@@ -158,24 +116,6 @@ class RslRlPpoActorDoubleCriticCfg:
 
     sigma_range: list[float, float] = [0.1, 5.0]
     """The range of sigma for the OU process."""
-
-    noise_std_type: Literal["scalar", "log"] = "scalar"
-    """The type of noise standard deviation for the policy. Default is scalar."""
-
-    actor_hidden_dims: list[int] = MISSING
-    """The hidden dimensions of the actor network."""
-
-    critic_hidden_dims: list[int] = MISSING
-    """The hidden dimensions of the critic network."""
-
-    activation: str = MISSING
-    """The activation function for the actor and critic networks."""
-
-    layer_norm: bool = False
-    """Whether to use layer normalization."""
-
-    dropout_rate: float = 0.0
-    """The dropout rate for the actor and critic networks."""
 
 
 @configclass

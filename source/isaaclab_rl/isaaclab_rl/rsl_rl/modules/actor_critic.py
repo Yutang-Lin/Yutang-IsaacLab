@@ -14,6 +14,7 @@ class ActorCritic(RslRlActorCritic):
         critic_hidden_dims=[256, 256, 256],
         activation="elu",
         init_noise_std=1.0,
+        load_noise_std: bool = True,
         noise_std_type: str = "scalar",
         layer_norm: bool = False,
         dropout_rate: float = 0.0,
@@ -26,6 +27,8 @@ class ActorCritic(RslRlActorCritic):
             )
         super(RslRlActorCritic, self).__init__()
         activation = resolve_nn_activation(activation)
+
+        self.load_noise_std = load_noise_std
 
         mlp_input_dim_a = num_actor_obs
         mlp_input_dim_c = num_critic_obs
@@ -99,3 +102,30 @@ class ActorCritic(RslRlActorCritic):
 
     def after_train(self):
         pass
+
+    def load_state_dict(self, state_dict, strict=True):
+        """Load the parameters of the actor-critic model.
+
+        Args:
+            state_dict (dict): State dictionary of the model.
+            strict (bool): Whether to strictly enforce that the keys in state_dict match the keys returned by this
+                           module's state_dict() function.
+
+        Returns:
+            bool: Whether this training resumes a previous training. This flag is used by the `load()` function of
+                  `OnPolicyRunner` to determine how to load further parameters (relevant for, e.g., distillation).
+        """
+        if hasattr(self, "std") and not self.load_noise_std and 'std' in state_dict:
+            del state_dict["std"]
+            super().load_state_dict(state_dict, strict=False)
+            print('[WARNING]: Ignoring std in state_dict, setting strict to False')
+            return True
+        
+        elif hasattr(self, "log_std") and not self.load_noise_std and 'log_std' in state_dict:
+            del state_dict["log_std"]
+            super().load_state_dict(state_dict, strict=False)
+            print('[WARNING]: Ignoring log_std in state_dict, setting strict to False')
+            return True
+
+        super().load_state_dict(state_dict, strict=strict)
+        return True

@@ -10,10 +10,12 @@ class MoELayer(nn.Module):
         self.num_experts = num_experts
         self.top_k = top_k
         self.store_logits = store_logits
-        self.logits = None
+        self.logits = torch.tensor(0.0)
 
         self.input_dim = input_dim
         self.output_dim = output_dim
+        self.in_features = input_dim
+        self.out_features = output_dim
         self.experts = nn.ModuleList([nn.Linear(input_dim, output_dim) for _ in range(num_experts)])
         self.router = nn.Linear(input_dim, num_experts)
 
