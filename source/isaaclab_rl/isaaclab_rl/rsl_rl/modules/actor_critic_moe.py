@@ -54,6 +54,7 @@ class ActorCriticMoE(ActorCritic):
 
         activation="elu",
         init_noise_std=1.0,
+        load_noise_std: bool = True,
         noise_std_type: str = "scalar",
         layer_norm: bool = False,
         dropout_rate: float = 0.0,
@@ -72,6 +73,8 @@ class ActorCriticMoE(ActorCritic):
         self.balance_loss_weight = balance_loss_weight  
         self.num_experts = num_experts
         self.top_k = top_k
+
+        self.load_noise_std = load_noise_std
 
         mlp_input_dim_a = num_actor_obs
         mlp_input_dim_c = num_critic_obs

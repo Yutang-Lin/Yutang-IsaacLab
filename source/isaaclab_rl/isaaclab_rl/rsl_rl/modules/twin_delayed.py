@@ -51,6 +51,7 @@ class TwinDelayed(ActorCritic):
         actor_hidden_dims=[256, 256, 256],
         critic_hidden_dims=[256, 256, 256],
         activation="elu",
+        load_noise_std: bool = True,
         **kwargs,
     ):
         if kwargs:
@@ -60,6 +61,7 @@ class TwinDelayed(ActorCritic):
             )
         nn.Module.__init__(self)
         self.activation = resolve_nn_activation(activation)
+        self.load_noise_std = load_noise_std
 
         mlp_input_dim_a = num_actor_obs
         mlp_input_dim_c = num_critic_obs + num_actions

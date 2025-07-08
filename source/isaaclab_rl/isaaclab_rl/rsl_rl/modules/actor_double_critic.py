@@ -26,6 +26,7 @@ class ActorDoubleCritic(ActorCritic):
         critic_hidden_dims: list[int] = [256, 256, 256],
         activation: str = "elu",
         init_noise_std: float = 1.0,
+        load_noise_std: bool = True,
 
         step_dt: float = 0.02,
         init_theta: float = 0.25,
@@ -44,6 +45,8 @@ class ActorDoubleCritic(ActorCritic):
             )
         nn.Module.__init__(self)
         activation = resolve_nn_activation(activation) # type: ignore
+
+        self.load_noise_std = load_noise_std    
 
         mlp_input_dim_a = num_actor_obs
         mlp_input_dim_c = num_critic_obs
