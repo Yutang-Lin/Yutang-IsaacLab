@@ -345,8 +345,8 @@ class RslRlOnPolicyRunnerCfg:
     save_interval: int = MISSING
     """The number of iterations between saves."""
 
-    upload_checkpoint: bool = True
-    """Whether to upload the checkpoint to the cloud. Default is True."""
+    upload_checkpoint: bool = False
+    """Whether to upload the checkpoint to the cloud. Default is False."""
 
     experiment_name: str = MISSING
     """The experiment name."""
