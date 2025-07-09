@@ -71,6 +71,9 @@ class RslRlPpoActorCriticMoECfg(RslRlPpoActorCriticCfg):
     balance_loss_weight: float = MISSING
     """The balance loss weight for the MoE."""
 
+    moe_critic: bool = False
+    """Whether to use the MoE critic."""
+
 
 @configclass
 class RslRlPpoActorCriticOUCfg(RslRlPpoActorCriticCfg):

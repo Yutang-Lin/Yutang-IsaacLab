@@ -47,6 +47,7 @@ class ActorCriticMoE(ActorCritic):
         actor_hidden_dims=[256, 256, 256],
         critic_hidden_dims=[256, 256, 256],
 
+        moe_critic=False,
         num_experts=1,
         top_k=1,
         balance_tolerance=0.25,
@@ -73,7 +74,7 @@ class ActorCriticMoE(ActorCritic):
         self.balance_loss_weight = balance_loss_weight  
         self.num_experts = num_experts
         self.top_k = top_k
-
+        self.moe_critic = moe_critic
         self.load_noise_std = load_noise_std
 
         mlp_input_dim_a = num_actor_obs
@@ -96,13 +97,20 @@ class ActorCriticMoE(ActorCritic):
 
         # Value function
         critic_layers = []
-        critic_layers.append(nn.Linear(mlp_input_dim_c, critic_hidden_dims[0]))
+        if self.moe_critic:
+            critic_layers.append(MoELayer(mlp_input_dim_c, critic_hidden_dims[0], num_experts, top_k, self.store_logits))
+        else:
+            critic_layers.append(nn.Linear(mlp_input_dim_c, critic_hidden_dims[0]))
         critic_layers.append(activation)
         for layer_index in range(len(critic_hidden_dims)):
             if layer_index == len(critic_hidden_dims) - 1:
                 critic_layers.append(nn.Linear(critic_hidden_dims[layer_index], 1))
             else:
-                critic_layers.append(nn.Linear(critic_hidden_dims[layer_index], critic_hidden_dims[layer_index + 1]))
+                if self.moe_critic:
+                    critic_layers.append(MoELayer(critic_hidden_dims[layer_index], critic_hidden_dims[layer_index + 1], num_experts, top_k, self.store_logits))
+                else:
+                    critic_layers.append(nn.Linear(critic_hidden_dims[layer_index], critic_hidden_dims[layer_index + 1]))
+                
                 if layer_norm:
                     critic_layers.append(nn.LayerNorm(critic_hidden_dims[layer_index + 1]))
                 critic_layers.append(activation)
@@ -139,9 +147,19 @@ class ActorCriticMoE(ActorCritic):
                 activation = torch.softmax(layer.logits, dim=-1).mean(dim=0)
                 balance_loss = (activation - upper_bound).clamp(min=0.0).sum(dim=-1) + \
                             (lower_bound - activation).clamp(min=0.0).sum(dim=-1)
-
                 layer.logits = None
                 all_balance_loss += balance_loss
+
+        if self.moe_critic:
+            for layer in self.critic:
+                if isinstance(layer, MoELayer):
+                    assert layer.logits is not None
+                    activation = torch.softmax(layer.logits, dim=-1).mean(dim=0)
+                    balance_loss = (activation - upper_bound).clamp(min=0.0).sum(dim=-1) + \
+                                (lower_bound - activation).clamp(min=0.0).sum(dim=-1)
+                    layer.logits = None
+                    all_balance_loss += balance_loss
+
         return {"moe_balance": all_balance_loss * self.balance_loss_weight}
     
     def set_store_logits(self, store_logits):
