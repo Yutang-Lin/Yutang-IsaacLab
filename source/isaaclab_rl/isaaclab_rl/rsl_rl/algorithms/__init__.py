@@ -1,4 +1,4 @@
-from rsl_rl.algorithms import Distillation
+from .distillation import Distillation
 from .hrpo import HRPO  
 from .ppo import PPO
 from .ppo_kl import PPOKL

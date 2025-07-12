@@ -166,7 +166,6 @@ class ActorCriticMoE(ActorCritic):
         self.store_logits[0] = store_logits
     
     def act_inference(self, observations):
-        self.set_store_logits(False)
         actions_mean = self.actor(observations)
         return actions_mean
     

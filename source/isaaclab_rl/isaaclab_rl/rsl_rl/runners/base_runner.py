@@ -19,6 +19,7 @@ from isaaclab_rl.rsl_rl.algorithms import *
 from isaaclab_rl.rsl_rl.modules import *
 
 from collections import deque
+from copy import deepcopy
 
 class BaseRunner(OnPolicyRunner):
     """On-policy runner for training and evaluation."""
@@ -67,6 +68,9 @@ class BaseRunner(OnPolicyRunner):
         else:
             num_privileged_obs = num_obs
 
+        self.full_policy_cfg = deepcopy(self.policy_cfg)
+        self.full_policy_cfg["_args"] = [num_obs, num_privileged_obs, self.env.num_actions]
+
         # evaluate the policy class
         policy_class = eval(self.policy_cfg.pop("class_name"))
         policy: ActorCritic | ActorCriticRecurrent | StudentTeacher | StudentTeacherRecurrent = policy_class(
@@ -107,6 +111,17 @@ class BaseRunner(OnPolicyRunner):
         else:
             self.obs_normalizer = torch.nn.Identity().to(self.device)  # no normalization
             self.privileged_obs_normalizer = torch.nn.Identity().to(self.device)  # no normalization
+
+        if self.training_type == "distillation" and policy.obs_norm_state_dict is not None:
+            self.privileged_obs_normalizer = EmpiricalNormalization(shape=[num_privileged_obs], until=1.0e8)
+            self.privileged_obs_normalizer.load_state_dict(policy.obs_norm_state_dict)
+            self.privileged_obs_normalizer = self.privileged_obs_normalizer.to(self.device).eval()
+            policy.obs_norm_state_dict = None # type: ignore
+            print('[INFO]: Loaded teacher empirical normalizer')
+            
+        elif self.training_type == "distillation" and policy.obs_norm_state_dict is None:
+            self.privileged_obs_normalizer = torch.nn.Identity().to(self.device)
+            print('[INFO]: No teacher empirical normalizer loaded')
 
         # init storage and model
         self.alg.init_storage(
@@ -450,21 +465,16 @@ class BaseRunner(OnPolicyRunner):
     
     def save(self, path: str, infos=None):
         # -- Save model
-        if isinstance(self.alg, TD3):
-            saved_dict = {
-                "model_state_dict": self.alg.policy.state_dict(),
-                "actor_optimizer_state_dict": self.alg.actor_optimizer.state_dict(),
-                "critic_optimizer_state_dict": self.alg.critic_optimizer.state_dict(),
-                "iter": self.current_learning_iteration,
-                "infos": infos,
-            }
-        else:
-            saved_dict = {
-                "model_state_dict": self.alg.policy.state_dict(),
-                "optimizer_state_dict": self.alg.optimizer.state_dict(),
-                "iter": self.current_learning_iteration,
-                "infos": infos,
-            }
+        saved_dict = {
+            "policy_cfg": self.full_policy_cfg,
+            "model_state_dict": self.alg.policy.state_dict(),
+            "optimizer_state_dict": self.alg.optimizer.state_dict(),
+            "iter": self.current_learning_iteration,
+            "infos": infos,
+        }
+        if hasattr(self.alg, "critic_optimizer"):
+            saved_dict["critic_optimizer_state_dict"] = self.alg.critic_optimizer.state_dict() # type: ignore
+
         # -- Save RND model if used
         if self.alg.rnd:
             saved_dict["rnd_state_dict"] = self.alg.rnd.state_dict()
@@ -523,19 +533,16 @@ class BaseRunner(OnPolicyRunner):
         # -- load optimizer if used
         if self.amp_reward is not None and 'amp_optimizer_state_dict' in loaded_dict and amp_loaded:
             self.amp_reward.optimizer.load_state_dict(loaded_dict["amp_optimizer_state_dict"])
+        
+        # -- algorithm optimizer
+        self.alg.optimizer.load_state_dict(loaded_dict["optimizer_state_dict"])
+        # -- RND optimizer if used
+        if self.alg.rnd:
+            self.alg.rnd_optimizer.load_state_dict(loaded_dict["rnd_optimizer_state_dict"]) # type: ignore
 
-        if not isinstance(self.alg, TD3):
-            # -- algorithm optimizer
-            self.alg.optimizer.load_state_dict(loaded_dict["optimizer_state_dict"])
-            # -- RND optimizer if used
-            if self.alg.rnd:
-                self.alg.rnd_optimizer.load_state_dict(loaded_dict["rnd_optimizer_state_dict"]) # type: ignore
-            # -- AMP optimizer if used
-        else:
-            # -- actor optimizer
-            self.alg.actor_optimizer.load_state_dict(loaded_dict["actor_optimizer_state_dict"])
+        if hasattr(self.alg, "critic_optimizer") and 'critic_optimizer_state_dict' in loaded_dict:
             # -- critic optimizer
-            self.alg.critic_optimizer.load_state_dict(loaded_dict["critic_optimizer_state_dict"])
+            self.alg.critic_optimizer.load_state_dict(loaded_dict["critic_optimizer_state_dict"]) # type: ignore
                 
         # -- load current learning iteration
         # if resumed_training:

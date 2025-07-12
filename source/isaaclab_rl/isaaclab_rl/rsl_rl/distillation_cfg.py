@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 from dataclasses import MISSING
-from typing import Literal
+from typing import Literal, Any
 
 from isaaclab.utils import configclass
 
@@ -28,14 +28,11 @@ class RslRlDistillationStudentTeacherCfg:
     noise_std_type: Literal["scalar", "log"] = "scalar"
     """The type of noise standard deviation for the policy. Default is scalar."""
 
-    student_hidden_dims: list[int] = MISSING
-    """The hidden dimensions of the student network."""
+    student_policy_cfg: Any = MISSING
+    """The policy configuration for the student network."""
 
-    teacher_hidden_dims: list[int] = MISSING
-    """The hidden dimensions of the teacher network."""
-
-    activation: str = MISSING
-    """The activation function for the student and teacher networks."""
+    teacher_policy_ckpt: str = MISSING
+    """The checkpoint path for the teacher policy."""
 
 
 @configclass

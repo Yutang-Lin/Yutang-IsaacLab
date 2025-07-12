@@ -96,7 +96,7 @@ class TD3:
         self.policy = policy
         self.policy.to(self.device)
         # Create optimizer
-        self.actor_optimizer = optim.Adam(self.policy.actor.parameters(), lr=learning_rate)
+        self.optimizer = optim.Adam(self.policy.actor.parameters(), lr=learning_rate)
         self.critic_optimizer = optim.Adam(self.policy.critic.parameters(), lr=learning_rate)
 
         self.actor_target = deepcopy(self.policy.actor)
@@ -336,7 +336,7 @@ class TD3:
 
             # Compute the gradients
             # -- For TD3
-            self.actor_optimizer.zero_grad()
+            self.optimizer.zero_grad()
             actor_loss.backward()
             # -- For RND
             if self.rnd:
@@ -350,7 +350,7 @@ class TD3:
             # Apply the gradients
             # -- For TD3
             nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
-            self.actor_optimizer.step()
+            self.optimizer.step()
             # -- For RND
             if self.rnd_optimizer:
                 self.rnd_optimizer.step()
