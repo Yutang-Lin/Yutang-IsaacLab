@@ -183,6 +183,13 @@ class PPO(RslRlPPO):
                         elif kl_mean < self.desired_kl / 2.0 and kl_mean > 0.0:
                             self.learning_rate = min(1e-2, self.learning_rate * 1.5)
 
+                        if self.desired_clipping > 0.0:
+                            current_clipping_ratio = num_clipped_ratios / num_all_ratios if num_all_ratios > 0 else 0.0
+                            if current_clipping_ratio > self.desired_clipping * 2.0:
+                                self.learning_rate = max(1e-5, self.learning_rate / 2.)
+                            elif current_clipping_ratio < self.desired_clipping / 2.0 and current_clipping_ratio > 0.0:
+                                self.learning_rate = min(1e-2, self.learning_rate * 2.)
+
                     # Update the learning rate for all GPUs
                     if self.is_multi_gpu:
                         lr_tensor = torch.tensor(self.learning_rate, device=self.device)
@@ -324,24 +331,7 @@ class PPO(RslRlPPO):
         self.storage.clear()
         if hasattr(self.policy, "after_train"):
             self.policy.after_train()
-        
-        with torch.inference_mode():
-            if self.desired_clipping > 0.0:
-                if self.gpu_global_rank == 0:
-                    if mean_clipping_ratio > self.desired_clipping * 2.0:
-                        self.learning_rate = max(1e-5, self.learning_rate / 2.)
-                    elif mean_clipping_ratio < self.desired_clipping / 2.0 and mean_clipping_ratio > 0.0:
-                        self.learning_rate = min(1e-2, self.learning_rate * 2.)
-
-                # Update the learning rate for all GPUs
-                if self.is_multi_gpu:
-                    lr_tensor = torch.tensor(self.learning_rate, device=self.device)
-                    torch.distributed.broadcast(lr_tensor, src=0)
-                    self.learning_rate = lr_tensor.item()
-
-                # Update the learning rate for all parameter groups
-                for param_group in self.optimizer.param_groups:
-                    param_group["lr"] = self.learning_rate
+            
                     
         # construct the loss dictionary
         loss_dict = {
