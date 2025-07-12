@@ -29,6 +29,7 @@ class PPO(RslRlPPO):
             # Distributed training parameters
             multi_gpu_cfg=kwargs.pop("multi_gpu_cfg", None),
         )
+        self.desired_clipping = kwargs.pop("desired_clipping", 0.0)
         self.importance_sample_value = kwargs.pop("importance_sample_value", False)
         self.centralize_log_prob = kwargs.pop("centralize_log_prob", False)
 
@@ -310,6 +311,7 @@ class PPO(RslRlPPO):
         mean_value_loss /= num_updates
         mean_surrogate_loss /= num_updates
         mean_entropy /= num_updates
+        mean_clipping_ratio = (num_clipped_ratios / num_all_ratios) if num_all_ratios > 0 else 0
         for key, value in mean_extra_loss.items():
             mean_extra_loss[key] /= num_updates
         # -- For RND
@@ -322,13 +324,31 @@ class PPO(RslRlPPO):
         self.storage.clear()
         if hasattr(self.policy, "after_train"):
             self.policy.after_train()
+        
+        with torch.inference_mode():
+            if self.desired_clipping > 0.0:
+                if self.gpu_global_rank == 0:
+                    if mean_clipping_ratio > self.desired_clipping * 2.0:
+                        self.learning_rate = max(1e-5, self.learning_rate / 2.)
+                    elif mean_clipping_ratio < self.desired_clipping / 2.0 and mean_clipping_ratio > 0.0:
+                        self.learning_rate = min(1e-2, self.learning_rate * 2.)
 
+                # Update the learning rate for all GPUs
+                if self.is_multi_gpu:
+                    lr_tensor = torch.tensor(self.learning_rate, device=self.device)
+                    torch.distributed.broadcast(lr_tensor, src=0)
+                    self.learning_rate = lr_tensor.item()
+
+                # Update the learning rate for all parameter groups
+                for param_group in self.optimizer.param_groups:
+                    param_group["lr"] = self.learning_rate
+                    
         # construct the loss dictionary
         loss_dict = {
             "value_function": mean_value_loss,
             "surrogate": mean_surrogate_loss,
             "entropy": mean_entropy,
-            "clipping_ratio": (num_clipped_ratios / num_all_ratios) if num_all_ratios > 0 else 0,
+            "clipping_ratio": mean_clipping_ratio,
             **mean_extra_loss,
         }
         if self.rnd:

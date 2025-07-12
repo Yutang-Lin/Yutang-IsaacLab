@@ -203,6 +203,9 @@ class RslRlPpoAlgorithmCfg:
     desired_kl: float = MISSING
     """The desired KL divergence."""
 
+    desired_clipping: float = -1.0
+    """The desired clipping."""
+
     max_grad_norm: float = MISSING
     """The maximum gradient norm."""
 
