@@ -35,9 +35,14 @@ class StudentTeacher(nn.Module):
         super().__init__()
         self.loaded_teacher = False  # indicates if teacher has been loaded
 
+        if isinstance(num_student_obs, tuple):
+            num_student_obs, num_student_priv_obs = num_student_obs
+        else:
+            num_student_priv_obs = 1
+
         # student
         student_policy_class = eval(student_policy_cfg.pop("class_name"))
-        self.student: ActorCritic = student_policy_class(num_student_obs, 1, num_actions, **student_policy_cfg)
+        self.student: ActorCritic = student_policy_class(num_student_obs, num_student_priv_obs, num_actions, **student_policy_cfg)
 
         # teacher
         teacher_policy_ckpt = torch.load(teacher_policy_ckpt, map_location="cpu", weights_only=False)

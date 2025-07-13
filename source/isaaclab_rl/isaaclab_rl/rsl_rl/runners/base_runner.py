@@ -30,6 +30,7 @@ class BaseRunner(OnPolicyRunner):
         self.policy_cfg = train_cfg["policy"]
         self.device = device
         self.env = env
+        self.env_unwrapped = env.unwrapped # type: ignore
 
         # check if multi-gpu is enabled
         self._configure_multi_gpu()
@@ -68,6 +69,12 @@ class BaseRunner(OnPolicyRunner):
         else:
             num_privileged_obs = num_obs
 
+        if self.training_type == "distillation" and hasattr(self.env_unwrapped, "_get_main_observations"): 
+            obs = self.env_unwrapped._get_main_observations()
+            num_student_priv_obs = obs['critic'].shape[1]
+            num_obs = (num_obs, num_student_priv_obs)
+            print(f"[INFO]: Student privileged observations shape: (*, {num_student_priv_obs})")
+
         self.full_policy_cfg = deepcopy(self.policy_cfg)
         self.full_policy_cfg["_args"] = [num_obs, num_privileged_obs, self.env.num_actions]
 
@@ -88,7 +95,7 @@ class BaseRunner(OnPolicyRunner):
             # add rnd gated state to config
             self.alg_cfg["rnd_cfg"]["num_states"] = num_rnd_state
             # scale down the rnd weight with timestep (similar to how rewards are scaled down in legged_gym envs)
-            self.alg_cfg["rnd_cfg"]["weight"] *= env.unwrapped.step_dt # type: ignore
+            self.alg_cfg["rnd_cfg"]["weight"] *= self.env_unwrapped.step_dt
 
         # if using symmetry then pass the environment config object
         if "symmetry_cfg" in self.alg_cfg and self.alg_cfg["symmetry_cfg"] is not None:
@@ -118,7 +125,7 @@ class BaseRunner(OnPolicyRunner):
             self.privileged_obs_normalizer = self.privileged_obs_normalizer.to(self.device).eval()
             policy.obs_norm_state_dict = None # type: ignore
             print('[INFO]: Loaded teacher empirical normalizer')
-            
+
         elif self.training_type == "distillation" and policy.obs_norm_state_dict is None:
             self.privileged_obs_normalizer = torch.nn.Identity().to(self.device)
             print('[INFO]: No teacher empirical normalizer loaded')
@@ -317,6 +324,9 @@ class BaseRunner(OnPolicyRunner):
                 amp_loss = self.amp_reward.update()
                 loss_dict["amp"] = amp_loss
                 self.amp_reward.eval()
+
+            if hasattr(self.env_unwrapped, "sync_multi_gpu"):
+                self.env_unwrapped.sync_multi_gpu(self.multi_gpu_cfg)
 
             stop = time.time()
             learn_time = stop - start
