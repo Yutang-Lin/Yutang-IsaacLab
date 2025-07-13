@@ -84,6 +84,9 @@ class BaseRunner(OnPolicyRunner):
             num_obs, num_privileged_obs, self.env.num_actions, **self.policy_cfg
         ).to(self.device)
 
+        if isinstance(num_obs, tuple):
+            num_obs, _ = num_obs
+
         # resolve dimension of rnd gated state
         if "rnd_cfg" in self.alg_cfg and self.alg_cfg["rnd_cfg"] is not None:
             # check if rnd gated state is present
