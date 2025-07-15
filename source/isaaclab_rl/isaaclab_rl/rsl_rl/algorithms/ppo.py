@@ -61,7 +61,8 @@ class PPO(RslRlPPO):
         )
 
     def _compute_lipschitz_constraint(self, obs_batch: torch.Tensor, actions_log_prob_batch: torch.Tensor):
-        grad_log_prob = torch.autograd.grad(actions_log_prob_batch.sum(), obs_batch, create_graph=True)[0]
+        grad_log_prob = torch.autograd.grad(actions_log_prob_batch.sum(), obs_batch, create_graph=True,
+                                            allow_unused=True)[0]
         gradient_penalty_loss = torch.sum(torch.square(grad_log_prob), dim=-1).mean()
         return gradient_penalty_loss
 
@@ -147,10 +148,16 @@ class PPO(RslRlPPO):
                 advantages_batch = advantages_batch.repeat(num_aug, 1)
                 returns_batch = returns_batch.repeat(num_aug, 1)
 
+            if self.use_lipschitz_constraint:
+                actor_obs_batch = obs_batch.clone()
+                actor_obs_batch.requires_grad_()
+            else:
+                actor_obs_batch = obs_batch
+
             # Recompute actions log prob and entropy for current batch of transitions
             # Note: we need to do this because we updated the policy with the new parameters
             # -- actor
-            self.policy.act(obs_batch, masks=masks_batch, hidden_states=hid_states_batch[0])
+            self.policy.act(actor_obs_batch, masks=masks_batch, hidden_states=hid_states_batch[0])
             actions_log_prob_batch = self.policy.get_actions_log_prob(actions_batch)
             # -- critic
             value_batch = self.policy.evaluate(critic_obs_batch, masks=masks_batch, hidden_states=hid_states_batch[1])
@@ -238,9 +245,7 @@ class PPO(RslRlPPO):
                 value_loss = (returns_batch - value_batch).pow(2).mean()
 
             if self.use_lipschitz_constraint:
-                obs_batch_lc = obs_batch.clone()
-                obs_batch_lc.requires_grad_()
-                lipschitz_constraint_loss = self._compute_lipschitz_constraint(obs_batch_lc,
+                lipschitz_constraint_loss = self._compute_lipschitz_constraint(actor_obs_batch,
                                                                                actions_log_prob_batch)
                 mean_extra_loss["lipschitz_constraint"] += lipschitz_constraint_loss.item() * \
                                                              self.lipschitz_constraint_coef
