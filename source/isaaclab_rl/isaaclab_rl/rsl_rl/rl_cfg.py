@@ -245,6 +245,14 @@ class RslRlPpoAlgorithmCfg:
     beta_range: list[float, float] = [0.01, 1.0]
     """The range of beta for the PPOKL. Default is [0.01, 1.0]."""
 
+    use_lipschitz_constraint: bool = False
+    """Whether to use the lipschitz constraint. Default is False."""
+
+    lipschitz_constraint_coef: float = 2e-3
+    """The coefficient for the lipschitz constraint. Default is 1e-3."""
+    
+    
+
     
 
 @configclass

@@ -32,6 +32,8 @@ class PPO(RslRlPPO):
         self.desired_clipping = kwargs.pop("desired_clipping", 0.0)
         self.importance_sample_value = kwargs.pop("importance_sample_value", False)
         self.centralize_log_prob = kwargs.pop("centralize_log_prob", False)
+        self.use_lipschitz_constraint = kwargs.pop("use_lipschitz_constraint", False)
+        self.lipschitz_constraint_coef = kwargs.pop("lipschitz_constraint_coef", 2e-2)
 
     def act(self, obs, critic_obs):
         if self.policy.is_recurrent:
@@ -58,11 +60,20 @@ class PPO(RslRlPPO):
             last_values, self.gamma, self.lam, normalize_advantage=not self.normalize_advantage_per_mini_batch
         )
 
+    def _compute_lipschitz_constraint(self, obs_batch: torch.Tensor, actions_log_prob_batch: torch.Tensor):
+        grad_log_prob = torch.autograd.grad(actions_log_prob_batch.sum(), obs_batch, create_graph=True)[0]
+        gradient_penalty_loss = torch.sum(torch.square(grad_log_prob), dim=-1).mean()
+        return gradient_penalty_loss
+
     def update(self):  # noqa: C901
         mean_value_loss = 0
         mean_surrogate_loss = 0
         mean_entropy = 0
         mean_extra_loss = {}
+
+        # -- Lipschitz constraint loss
+        if self.use_lipschitz_constraint:
+            mean_extra_loss["lipschitz_constraint"] = 0
 
         # to track the ratio of clipped and unclipped ratios
         num_all_ratios = 0
@@ -226,7 +237,21 @@ class PPO(RslRlPPO):
             else:
                 value_loss = (returns_batch - value_batch).pow(2).mean()
 
-            loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy_batch.mean()
+            if self.use_lipschitz_constraint:
+                obs_batch_lc = obs_batch.clone()
+                obs_batch_lc.requires_grad_()
+                lipschitz_constraint_loss = self._compute_lipschitz_constraint(obs_batch_lc,
+                                                                               actions_log_prob_batch)
+                mean_extra_loss["lipschitz_constraint"] += lipschitz_constraint_loss.item() * \
+                                                             self.lipschitz_constraint_coef
+            else:
+                lipschitz_constraint_loss = 0.0
+
+            loss = surrogate_loss + \
+                self.value_loss_coef * value_loss - \
+                self.entropy_coef * entropy_batch.mean() + \
+                self.lipschitz_constraint_coef * lipschitz_constraint_loss
+            
             if hasattr(self.policy, "extra_loss"):
                 for key, value in extra_loss.items():
                     loss += value
