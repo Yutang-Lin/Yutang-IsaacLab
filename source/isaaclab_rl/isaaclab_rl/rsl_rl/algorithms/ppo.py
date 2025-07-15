@@ -60,8 +60,8 @@ class PPO(RslRlPPO):
             last_values, self.gamma, self.lam, normalize_advantage=not self.normalize_advantage_per_mini_batch
         )
 
-    def _compute_lipschitz_constraint(self, obs_batch: torch.Tensor, actions_log_prob_batch: torch.Tensor):
-        grad_log_prob = torch.autograd.grad(actions_log_prob_batch.sum(), obs_batch, create_graph=True,
+    def _compute_lipschitz_constraint(self, obs_batch: torch.Tensor, action_mean_batch: torch.Tensor):
+        grad_log_prob = torch.autograd.grad(action_mean_batch.sum(), obs_batch, create_graph=True,
                                             allow_unused=True)[0]
         gradient_penalty_loss = torch.sum(torch.square(grad_log_prob), dim=-1).mean()
         return gradient_penalty_loss
@@ -245,8 +245,9 @@ class PPO(RslRlPPO):
                 value_loss = (returns_batch - value_batch).pow(2).mean()
 
             if self.use_lipschitz_constraint:
+                action_mean_batch = self.policy.action_mean
                 lipschitz_constraint_loss = self._compute_lipschitz_constraint(actor_obs_batch,
-                                                                               actions_log_prob_batch)
+                                                                               action_mean_batch)
                 mean_extra_loss["lipschitz_constraint"] += lipschitz_constraint_loss.item() * \
                                                              self.lipschitz_constraint_coef
             else:
