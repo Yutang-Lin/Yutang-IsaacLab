@@ -56,7 +56,7 @@ class _TorchPolicyExporter(torch.nn.Module):
             if self.is_recurrent:
                 self.rnn = copy.deepcopy(policy.memory_a.rnn)
         elif hasattr(policy, "student"):
-            self.actor = copy.deepcopy(policy.student)
+            self.actor = copy.deepcopy(policy.student.actor)
             if self.is_recurrent:
                 self.rnn = copy.deepcopy(policy.memory_s.rnn)
         else:
@@ -114,7 +114,7 @@ class _OnnxPolicyExporter(torch.nn.Module):
             if self.is_recurrent:
                 self.rnn = copy.deepcopy(policy.memory_a.rnn)
         elif hasattr(policy, "student"):
-            self.actor = copy.deepcopy(policy.student)
+            self.actor = copy.deepcopy(policy.student.actor)
             if self.is_recurrent:
                 self.rnn = copy.deepcopy(policy.memory_s.rnn)
         else:
