@@ -251,7 +251,8 @@ class RslRlPpoAlgorithmCfg:
     lipschitz_constraint_coef: float = 2e-3
     """The coefficient for the lipschitz constraint. Default is 1e-3."""
     
-    
+    adjust_critic_lr: bool = True
+    """Whether to adjust the critic learning rate. Default is True."""
 
     
 
