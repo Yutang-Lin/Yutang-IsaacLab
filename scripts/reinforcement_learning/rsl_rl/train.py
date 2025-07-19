@@ -175,7 +175,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         runner.load(resume_path)
 
     # dump the configuration into log-directory
-    if app_launcher.local_rank == 0 and app_launcher.global_rank == 0:
+    if not hasattr(app_launcher, "local_rank") or \
+        (app_launcher.local_rank == 0 and app_launcher.global_rank == 0):
         dump_yaml(os.path.join(log_dir, "params", "env.yaml"), env_cfg)
         dump_yaml(os.path.join(log_dir, "params", "agent.yaml"), agent_cfg)
         dump_pickle(os.path.join(log_dir, "params", "env.pkl"), env_cfg)
