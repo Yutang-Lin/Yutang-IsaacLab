@@ -69,7 +69,7 @@ class AmpReward:
                 layers.append(nn.LayerNorm(hidden_dims[i + 1]))
             layers.append(deepcopy(self.activation))
         layers.append(nn.Linear(hidden_dims[-1], 1))
-        layers.append(nn.Sigmoid())
+        # layers.append(nn.Sigmoid()) # NOTE: no sigmoid for amp
         self.network = nn.Sequential(*layers)
         self.network.to(device)
 
@@ -88,10 +88,9 @@ class AmpReward:
 
     def _compute_gradient_penalty(self, real_samples, fake_samples):
         # Randomly interpolate between real and fake samples
-        alpha = torch.rand(real_samples.size(0), 1).to(self.device)  # Adjust dimensions as needed
-        interpolated = alpha * real_samples + (1 - alpha) * fake_samples
+        interpolated = real_samples.clone() # NOTE: real only
         interpolated.requires_grad_(True)
-
+        
         return self._compute_gradient_penalty_(interpolated)
 
     def _compute_gradient_penalty_(self, interpolated):
@@ -104,7 +103,7 @@ class AmpReward:
                                         create_graph=True, retain_graph=True)[0]
 
         # Compute the gradient penalty
-        gradient_penalty = (gradients.norm(2, dim=1) ** 2).mean() * self.w_grad_penalty
+        gradient_penalty = (gradients.norm(2, dim=1) ** 2).mean() * self.w_grad_penalty * 0.5
         return gradient_penalty
 
     def _optimize_amp(self, gen_batch, ref_batch) -> float:
@@ -148,7 +147,7 @@ class AmpReward:
         features = obs.view(self.num_envs, -1).clamp(-self.clip_obs_value, self.clip_obs_value)
         amp_score = self.network(features).view(self.num_envs)
 
-        return (1 - self.reward_factor * torch.square(amp_score - 1)) * self.reward_scale
+        return (1 - self.reward_factor * torch.square(amp_score - 1)).clamp(min=0) * self.reward_scale
     
     def reduce_parameters(self):
         """Collect gradients from all GPUs and average them.
