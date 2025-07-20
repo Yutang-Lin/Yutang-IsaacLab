@@ -92,7 +92,7 @@ class PPO(RslRlPPO):
             {"params": actor_params, "lr": learning_rate},
             {"params": critic_params, "lr": learning_rate},
             {"params": other_params, "lr": learning_rate}
-        ])
+        ], lr=learning_rate, eps=1e-5)
 
         # Create rollout storage
         self.storage: RolloutStorage = None  # type: ignore
