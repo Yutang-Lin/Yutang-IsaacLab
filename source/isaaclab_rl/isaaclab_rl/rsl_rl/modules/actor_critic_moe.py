@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 from torch.distributions import Normal
 from rsl_rl.utils import resolve_nn_activation
-from .actor_critic import ActorCritic
+from .actor_critic import ActorCritic, ResidualWrapper
 
 class MoELayer(nn.Module):
     def __init__(self, input_dim, output_dim, num_experts, top_k, store_logits: list[bool]):
@@ -59,6 +59,7 @@ class ActorCriticMoE(ActorCritic):
         noise_std_type: str = "scalar",
         layer_norm: bool = False,
         dropout_rate: float = 0.0,
+        residual: bool = False,
         **kwargs,
     ):
         if kwargs:
@@ -85,7 +86,13 @@ class ActorCriticMoE(ActorCritic):
         actor_layers.append(activation)
         for layer_index in range(len(actor_hidden_dims)):
             if layer_index == len(actor_hidden_dims) - 1:
-                actor_layers.append(nn.Linear(actor_hidden_dims[layer_index], num_actions))
+                if not residual:
+                    actor_layers.append(nn.Linear(actor_hidden_dims[layer_index], num_actions))
+                else:
+                    sequential_actor_layers = nn.Sequential(*actor_layers)
+                    residule_wrapper = ResidualWrapper(sequential_actor_layers, mlp_input_dim_a,
+                                                       actor_hidden_dims[layer_index])
+                    actor_layers = [residule_wrapper, nn.Linear(actor_hidden_dims[layer_index], num_actions)]
             else:
                 actor_layers.append(MoELayer(actor_hidden_dims[layer_index], actor_hidden_dims[layer_index + 1], num_experts, top_k, self.store_logits))
                 if layer_norm:
@@ -104,7 +111,13 @@ class ActorCriticMoE(ActorCritic):
         critic_layers.append(activation)
         for layer_index in range(len(critic_hidden_dims)):
             if layer_index == len(critic_hidden_dims) - 1:
-                critic_layers.append(nn.Linear(critic_hidden_dims[layer_index], 1))
+                if not residual:
+                    critic_layers.append(nn.Linear(critic_hidden_dims[layer_index], 1))
+                else:
+                    sequential_critic_layers = nn.Sequential(*critic_layers)
+                    residule_wrapper = ResidualWrapper(sequential_critic_layers, mlp_input_dim_c,
+                                                       critic_hidden_dims[layer_index])
+                    critic_layers = [residule_wrapper, nn.Linear(critic_hidden_dims[layer_index], 1)]
             else:
                 if self.moe_critic:
                     critic_layers.append(MoELayer(critic_hidden_dims[layer_index], critic_hidden_dims[layer_index + 1], num_experts, top_k, self.store_logits))
@@ -143,24 +156,30 @@ class ActorCriticMoE(ActorCritic):
 
         for layer in self.actor:
             if isinstance(layer, MoELayer):
-                assert layer.logits is not None
-                activation = torch.softmax(layer.logits, dim=-1).mean(dim=0)
-                balance_loss = (activation - upper_bound).clamp(min=0.0).sum(dim=-1) + \
-                            (lower_bound - activation).clamp(min=0.0).sum(dim=-1)
-                layer.logits = None
-                all_balance_loss += balance_loss
-
+                all_balance_loss += self._get_balance_loss(layer, upper_bound, lower_bound)
+            elif isinstance(layer, ResidualWrapper):
+                for sub_layer in layer.module:
+                    if isinstance(sub_layer, MoELayer):
+                        all_balance_loss += self._get_balance_loss(sub_layer, upper_bound, lower_bound)
+    
         if self.moe_critic:
             for layer in self.critic:
                 if isinstance(layer, MoELayer):
-                    assert layer.logits is not None
-                    activation = torch.softmax(layer.logits, dim=-1).mean(dim=0)
-                    balance_loss = (activation - upper_bound).clamp(min=0.0).sum(dim=-1) + \
-                                (lower_bound - activation).clamp(min=0.0).sum(dim=-1)
-                    layer.logits = None
-                    all_balance_loss += balance_loss
+                    all_balance_loss += self._get_balance_loss(layer, upper_bound, lower_bound)
+                elif isinstance(layer, ResidualWrapper):
+                    for sub_layer in layer.module:
+                        if isinstance(sub_layer, MoELayer):
+                            all_balance_loss += self._get_balance_loss(sub_layer, upper_bound, lower_bound)
 
         return {"moe_balance": all_balance_loss * self.balance_loss_weight}
+    
+    def _get_balance_loss(self, layer: MoELayer, upper_bound, lower_bound):
+        assert layer.logits is not None
+        activation = torch.softmax(layer.logits, dim=-1).mean(dim=0)
+        balance_loss = (activation - upper_bound).clamp(min=0.0).sum(dim=-1) + \
+                    (lower_bound - activation).clamp(min=0.0).sum(dim=-1)
+        layer.logits = None
+        return balance_loss
     
     def set_store_logits(self, store_logits):
         self.store_logits[0] = store_logits

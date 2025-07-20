@@ -4,6 +4,27 @@ import torch.nn as nn
 from torch.distributions import Normal
 from rsl_rl.utils import resolve_nn_activation
 
+class ResidualWrapper(nn.Module):
+    def __init__(self, module: nn.Module,
+                 input_dim: int,
+                 output_dim: int):
+        super(ResidualWrapper, self).__init__()
+        self.module = module
+        self.input_dim = input_dim
+        self.output_dim = output_dim
+
+        self.residual_layer = nn.Sequential(
+            nn.Linear(input_dim, output_dim),
+            nn.LeakyReLU(negative_slope=0.01),
+        )
+        for layer in self.residual_layer:   
+            if isinstance(layer, nn.Linear):
+                layer.weight.data.uniform_(-0.03, 0.03)
+                layer.bias.data.zero_()
+
+    def forward(self, x):
+        return self.residual_layer(x) + self.module(x)
+
 class ActorCritic(RslRlActorCritic):
     def __init__(
         self,
@@ -18,6 +39,7 @@ class ActorCritic(RslRlActorCritic):
         noise_std_type: str = "scalar",
         layer_norm: bool = False,
         dropout_rate: float = 0.0,
+        residual: bool = False,
         **kwargs,
     ):
         if kwargs:
@@ -38,7 +60,13 @@ class ActorCritic(RslRlActorCritic):
         actor_layers.append(activation)
         for layer_index in range(len(actor_hidden_dims)):
             if layer_index == len(actor_hidden_dims) - 1:
-                actor_layers.append(nn.Linear(actor_hidden_dims[layer_index], num_actions))
+                if not residual:
+                    actor_layers.append(nn.Linear(actor_hidden_dims[layer_index], num_actions))
+                else:
+                    sequential_actor_layers = nn.Sequential(*actor_layers)
+                    residule_wrapper = ResidualWrapper(sequential_actor_layers, mlp_input_dim_a,
+                                                       actor_hidden_dims[layer_index])
+                    actor_layers = [residule_wrapper, nn.Linear(actor_hidden_dims[layer_index], num_actions)]
             else:
                 actor_layers.append(nn.Linear(actor_hidden_dims[layer_index], actor_hidden_dims[layer_index + 1]))
                 if layer_norm:
@@ -54,7 +82,13 @@ class ActorCritic(RslRlActorCritic):
         critic_layers.append(activation)
         for layer_index in range(len(critic_hidden_dims)):
             if layer_index == len(critic_hidden_dims) - 1:
-                critic_layers.append(nn.Linear(critic_hidden_dims[layer_index], 1))
+                if not residual:
+                    critic_layers.append(nn.Linear(critic_hidden_dims[layer_index], 1))
+                else:
+                    sequential_critic_layers = nn.Sequential(*critic_layers)
+                    residule_wrapper = ResidualWrapper(sequential_critic_layers, mlp_input_dim_c,
+                                                       critic_hidden_dims[layer_index])
+                    critic_layers = [residule_wrapper, nn.Linear(critic_hidden_dims[layer_index], 1)]
             else:
                 critic_layers.append(nn.Linear(critic_hidden_dims[layer_index], critic_hidden_dims[layer_index + 1]))
                 if layer_norm:

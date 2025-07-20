@@ -51,6 +51,9 @@ class RslRlPpoActorCriticCfg:
     dropout_rate: float = 0.0
     """The dropout rate for the actor and critic networks."""
 
+    residual: bool = False
+    """Whether to use residual connections."""
+
 
 @configclass
 class RslRlPpoActorCriticMoECfg(RslRlPpoActorCriticCfg):
