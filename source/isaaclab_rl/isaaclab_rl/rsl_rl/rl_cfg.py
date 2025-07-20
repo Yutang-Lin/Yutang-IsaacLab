@@ -57,7 +57,7 @@ class RslRlPpoActorCriticCfg:
 
 @configclass
 class RslRlPpoActorCriticMoECfg(RslRlPpoActorCriticCfg):
-    """Configuration for the PPO actor-critic networks."""
+    """Configuration for the PPO actor-critic mixture of experts networks."""
 
     class_name: str = "ActorCriticMoE"
     """The policy class name. Default is ActorCriticMoE."""
@@ -76,6 +76,32 @@ class RslRlPpoActorCriticMoECfg(RslRlPpoActorCriticCfg):
 
     moe_critic: bool = False
     """Whether to use the MoE critic."""
+
+
+@configclass
+class RslRlPpoActorCriticMoPCfg(RslRlPpoActorCriticCfg):
+    """Configuration for the PPO actor-critic mixture of policies networks."""
+
+    class_name: str = "ActorCriticMoP"
+    """The policy class name. Default is ActorCriticMoP."""
+
+    num_policies: int = MISSING
+    """The number of policies."""
+
+    router_hidden_dims: list[int] = MISSING
+    """The hidden dimensions of the router network."""
+
+    balance_tolerance: float = MISSING
+    """The balance tolerance for the MoE."""
+
+    balance_loss_weight: float = MISSING
+    """The balance loss weight for the MoE."""
+
+    grad_penalty_weight: float = MISSING
+    """The gradient penalty weight for the MoP."""
+
+    mop_critic: bool = False
+    """Whether to use the MoP critic."""
 
 
 @configclass

@@ -115,7 +115,7 @@ class ActorCritic(RslRlActorCritic):
         # disable args validation for speedup
         Normal.set_default_validate_args(False)
     
-    def extra_loss(self):
+    def extra_loss(self, **kwargs):
         return {}
 
     def get_actions_log_prob(self, actions, **kwargs):

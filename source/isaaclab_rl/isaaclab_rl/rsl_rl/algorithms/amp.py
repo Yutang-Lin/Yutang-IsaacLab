@@ -90,7 +90,7 @@ class AmpReward:
         # Randomly interpolate between real and fake samples
         interpolated = real_samples.clone() # NOTE: real only
         interpolated.requires_grad_(True)
-        
+
         return self._compute_gradient_penalty_(interpolated)
 
     def _compute_gradient_penalty_(self, interpolated):
@@ -103,7 +103,7 @@ class AmpReward:
                                         create_graph=True, retain_graph=True)[0]
 
         # Compute the gradient penalty
-        gradient_penalty = (gradients.norm(2, dim=1) ** 2).mean() * self.w_grad_penalty * 0.5
+        gradient_penalty = gradients.square().sum(dim=-1).mean() * self.w_grad_penalty * 0.5
         return gradient_penalty
 
     def _optimize_amp(self, gen_batch, ref_batch) -> float:

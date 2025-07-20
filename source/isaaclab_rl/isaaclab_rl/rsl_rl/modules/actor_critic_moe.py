@@ -39,6 +39,7 @@ class MoELayer(nn.Module):
         return results
 
 class ActorCriticMoE(ActorCritic):
+    '''Actor Critic with Mixture of Experts'''
     def __init__(
         self,
         num_actor_obs,
@@ -148,7 +149,7 @@ class ActorCriticMoE(ActorCritic):
         # disable args validation for speedup
         Normal.set_default_validate_args(False)
 
-    def extra_loss(self):
+    def extra_loss(self, **kwargs):
         all_balance_loss = 0.0
         mean_prob = 1.0 / self.num_experts
         upper_bound = mean_prob * (1 + self.balance_tolerance)

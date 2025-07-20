@@ -253,7 +253,10 @@ class PPO(RslRlPPO):
             entropy_batch = self.policy.entropy[:original_batch_size]
 
             if hasattr(self.policy, "extra_loss"):
-                extra_loss = self.policy.extra_loss()
+                extra_loss = self.policy.extra_loss(
+                    obs_batch=obs_batch,
+                    critic_obs_batch=critic_obs_batch,
+                )
                 for key, value in extra_loss.items():
                     if key not in mean_extra_loss:
                         mean_extra_loss[key] = 0.0
