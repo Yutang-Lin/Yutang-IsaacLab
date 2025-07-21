@@ -14,6 +14,7 @@ class PPO(RslRlPPO):
 
     def __init__(self, policy,
         num_learning_epochs=1,
+        num_critic_extra_epochs=0,
         num_mini_batches=1,
         clip_param=0.2,
         gamma=0.998,
@@ -101,6 +102,7 @@ class PPO(RslRlPPO):
         # PPO parameters
         self.clip_param = clip_param
         self.num_learning_epochs = num_learning_epochs
+        self.num_critic_extra_epochs = num_critic_extra_epochs
         self.num_mini_batches = num_mini_batches
         self.value_loss_coef = value_loss_coef
         self.entropy_coef = entropy_coef
@@ -178,15 +180,15 @@ class PPO(RslRlPPO):
 
         # generator for mini batches
         if self.policy.is_recurrent:
-            generator = self.storage.recurrent_mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
+            generator = self.storage.recurrent_mini_batch_generator(self.num_mini_batches, self.num_learning_epochs + self.num_critic_extra_epochs)
         else:
-            generator = self.storage.mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
+            generator = self.storage.mini_batch_generator(self.num_mini_batches, self.num_learning_epochs + self.num_critic_extra_epochs)
 
         if hasattr(self.policy, "pre_train"):
             self.policy.pre_train()
 
         # iterate over batches
-        for (
+        for update_id, (
             obs_batch,
             critic_obs_batch,
             actions_batch,
@@ -199,7 +201,28 @@ class PPO(RslRlPPO):
             hid_states_batch,
             masks_batch,
             rnd_state_batch,
-        ) in generator:
+        ) in enumerate(generator):
+            if update_id // self.num_mini_batches > self.num_learning_epochs:
+                # critic extra epochs
+                value_batch = self.policy.evaluate(critic_obs_batch, masks=masks_batch, hidden_states=hid_states_batch[1])
+
+                # Value function loss
+                if self.use_clipped_value_loss:
+                    value_clipped = target_values_batch + (value_batch - target_values_batch).clamp(
+                        -self.clip_param, self.clip_param
+                    )
+                    value_losses = (value_batch - returns_batch).pow(2)
+                    value_losses_clipped = (value_clipped - returns_batch).pow(2)
+                    value_loss = torch.max(value_losses, value_losses_clipped).mean()
+                else:
+                    value_loss = (returns_batch - value_batch).pow(2).mean()
+
+                loss = self.value_loss_coef * value_loss
+                self.optimizer.zero_grad()
+                loss.backward()
+                nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
+                self.optimizer.step()
+                continue
 
             # number of augmentations per sample
             # we start with 1 and increase it if we use symmetry augmentation

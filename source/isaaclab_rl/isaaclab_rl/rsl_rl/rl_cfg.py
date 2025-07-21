@@ -199,6 +199,9 @@ class RslRlPpoAlgorithmCfg:
     num_learning_epochs: int = MISSING
     """The number of learning epochs per update."""
 
+    num_critic_extra_epochs: int = 0
+    """The number of extra critic epochs per update."""
+
     num_mini_batches: int = MISSING
     """The number of mini-batches per update."""
 
