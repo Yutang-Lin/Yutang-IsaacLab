@@ -17,6 +17,8 @@ class MoPModule(nn.Module):
         super(MoPModule, self).__init__()
         self.input_dim = input_dim
         self.output_dim = output_dim
+        self.in_features = input_dim
+        self.out_features = output_dim
         self.num_policies = num_policies
         self.hidden_dims = hidden_dims
         self.store_logits = store_logits
