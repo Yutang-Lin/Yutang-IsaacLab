@@ -131,9 +131,9 @@ class StudentTeacher(nn.Module):
         """
 
         # ignore teacher parameters
-        teacher_keys = [key for key in state_dict.keys() if "teacher" in key]
-        rest_params = {key: value for key, value in state_dict.items() if key not in teacher_keys}
-        super().load_state_dict(rest_params, strict=False)
+        student_keys = [key for key in state_dict.keys() if key.startswith('student')]
+        student_params = {key: value for key, value in state_dict.items() if key in student_keys}
+        super().load_state_dict(student_params, strict=False)
         return True
 
     def get_hidden_states(self):
