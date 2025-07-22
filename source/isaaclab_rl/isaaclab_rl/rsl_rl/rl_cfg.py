@@ -33,6 +33,9 @@ class RslRlPpoActorCriticCfg:
     load_noise_std: bool = True
     """Whether to load the noise std from the checkpoint. Default is True."""
 
+    learnable_noise_std: bool = True
+    """Whether to make the noise std learnable. Default is True."""
+
     noise_std_type: Literal["scalar", "log"] = "scalar"
     """The type of noise standard deviation for the policy. Default is scalar."""
 

@@ -28,6 +28,7 @@ class MoPModule(nn.Module):
         for i in range(len(hidden_dims)):
             if i == 0:
                 single_model.append(nn.Linear(input_dim, hidden_dims[i]))
+                single_model.append(activation)
             else:
                 single_model.append(nn.Linear(hidden_dims[i-1], hidden_dims[i]))
                 if layer_norm:
@@ -49,6 +50,7 @@ class MoPModule(nn.Module):
         for i in range(len(router_hidden_dims)):
             if i == 0:
                 router.append(nn.Linear(input_dim, router_hidden_dims[i]))
+                router.append(activation)
             else:
                 router.append(nn.Linear(router_hidden_dims[i-1], router_hidden_dims[i]))
                 if layer_norm:
@@ -97,6 +99,7 @@ class ActorCriticMoP(ActorCritic):
         activation="elu",
         init_noise_std=1.0,
         load_noise_std: bool = True,
+        learnable_noise_std: bool = True,
         noise_std_type: str = "scalar",
         layer_norm: bool = False,
         dropout_rate: float = 0.0,
@@ -118,6 +121,7 @@ class ActorCriticMoP(ActorCritic):
         self.num_policies = num_policies
         self.mop_critic = mop_critic
         self.load_noise_std = load_noise_std
+        self.learnable_noise_std = learnable_noise_std
 
         mlp_input_dim_a = num_actor_obs
         mlp_input_dim_c = num_critic_obs

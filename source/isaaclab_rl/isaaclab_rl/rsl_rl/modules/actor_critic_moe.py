@@ -57,6 +57,7 @@ class ActorCriticMoE(ActorCritic):
         activation="elu",
         init_noise_std=1.0,
         load_noise_std: bool = True,
+        learnable_noise_std: bool = True,
         noise_std_type: str = "scalar",
         layer_norm: bool = False,
         dropout_rate: float = 0.0,
@@ -78,6 +79,7 @@ class ActorCriticMoE(ActorCritic):
         self.top_k = top_k
         self.moe_critic = moe_critic
         self.load_noise_std = load_noise_std
+        self.learnable_noise_std = learnable_noise_std
 
         mlp_input_dim_a = num_actor_obs
         mlp_input_dim_c = num_critic_obs

@@ -36,6 +36,7 @@ class ActorCritic(RslRlActorCritic):
         activation="elu",
         init_noise_std=1.0,
         load_noise_std: bool = True,
+        learnable_noise_std: bool = True,
         noise_std_type: str = "scalar",
         layer_norm: bool = False,
         dropout_rate: float = 0.0,
@@ -51,6 +52,7 @@ class ActorCritic(RslRlActorCritic):
         activation = resolve_nn_activation(activation)
 
         self.load_noise_std = load_noise_std
+        self.learnable_noise_std = learnable_noise_std
 
         mlp_input_dim_a = num_actor_obs
         mlp_input_dim_c = num_critic_obs
@@ -131,6 +133,9 @@ class ActorCritic(RslRlActorCritic):
             std = torch.exp(self.log_std).expand_as(mean)
         else:
             raise ValueError(f"Unknown standard deviation type: {self.noise_std_type}. Should be 'scalar' or 'log'")
+        if not self.learnable_noise_std:
+            std = std.detach()
+        
         # create distribution
         self.distribution = Normal(mean, std + 1e-3) # add small epsilon to avoid log(0)
 
