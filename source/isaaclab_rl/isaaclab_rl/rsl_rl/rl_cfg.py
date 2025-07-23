@@ -106,6 +106,25 @@ class RslRlPpoActorCriticMoPCfg(RslRlPpoActorCriticCfg):
     mop_critic: bool = False
     """Whether to use the MoP critic."""
 
+@configclass
+class RslRlPpoActorCriticPNNCfg(RslRlPpoActorCriticCfg):
+    """Configuration for the PPO actor-critic progressive neural network."""
+
+    class_name: str = "ActorCriticPNN"
+    """The policy class name. Default is ActorCriticPNN."""
+
+    num_policies: int = MISSING
+    """The number of policies."""
+
+    pnn_critic: bool = False
+    """Whether to use the PNN critic."""
+
+    router_hidden_dims: list[int] = MISSING
+    """The hidden dimensions of the router network."""
+
+    grad_penalty_weight: float = MISSING
+    """The gradient penalty weight for the PNN."""
+
 
 @configclass
 class RslRlPpoActorCriticOUCfg(RslRlPpoActorCriticCfg):

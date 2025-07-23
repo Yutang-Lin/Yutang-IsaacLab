@@ -328,8 +328,21 @@ class BaseRunner(OnPolicyRunner):
                 loss_dict["amp"] = amp_loss
                 self.amp_reward.eval()
 
+            # schedule
+            doing_schedule = hasattr(self.env_unwrapped, "pre_schedule")
+            if doing_schedule:
+                self.env_unwrapped.pre_schedule()
+
             if hasattr(self.env_unwrapped, "sync_multi_gpu"):
                 self.env_unwrapped.sync_multi_gpu(self.multi_gpu_cfg)
+
+            if doing_schedule:
+                schedule = self.env_unwrapped.schedule()
+                if hasattr(self.alg.policy, "schedule"):
+                    feedback = self.alg.policy.schedule(**schedule)
+                else:
+                    feedback = {}
+                self.env_unwrapped.post_schedule(**feedback)
 
             stop = time.time()
             learn_time = stop - start
