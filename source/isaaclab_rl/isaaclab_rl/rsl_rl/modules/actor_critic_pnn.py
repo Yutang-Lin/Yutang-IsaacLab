@@ -162,6 +162,7 @@ class ActorCriticPNN(ActorCritic):
         num_policies=1,
         pnn_critic=False,
         weight_sharing=True,
+        start_by_id=0,
         router_hidden_dims=[128],
         grad_penalty_weight=0.0,
 
@@ -189,6 +190,7 @@ class ActorCriticPNN(ActorCritic):
         self.num_policies = num_policies
         self.pnn_critic = pnn_critic
         self.weight_sharing = weight_sharing
+        self.start_by_id = start_by_id
         self.load_noise_std = load_noise_std
         self.learnable_noise_std = learnable_noise_std
 
@@ -305,3 +307,22 @@ class ActorCriticPNN(ActorCritic):
         
         else:
             return dict()
+        
+    def load_state_dict(self, state_dict, strict=True):
+        """Load the parameters of the actor-critic model.
+
+        Args:
+            state_dict (dict): State dictionary of the model.
+            strict (bool): Whether to strictly enforce that the keys in state_dict match the keys returned by this
+                           module's state_dict() function.
+
+        Returns:
+            bool: Whether this training resumes a previous training. This flag is used by the `load()` function of
+                  `OnPolicyRunner` to determine how to load further parameters (relevant for, e.g., distillation).
+        """
+        super().load_state_dict(state_dict, strict=strict)
+        for _ in range(self.start_by_id):
+            self.actor.increase_policy_id()
+            if self.pnn_critic:
+                self.critic.increase_policy_id()
+        return True

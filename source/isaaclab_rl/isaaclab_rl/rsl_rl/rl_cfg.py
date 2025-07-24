@@ -122,6 +122,9 @@ class RslRlPpoActorCriticPNNCfg(RslRlPpoActorCriticCfg):
     weight_sharing: bool = True
     """Whether to share the weights of the PNN."""
 
+    start_by_id: int = 0
+    """The policy id to start the PNN."""
+
     router_hidden_dims: list[int] = MISSING
     """The hidden dimensions of the router network."""
 

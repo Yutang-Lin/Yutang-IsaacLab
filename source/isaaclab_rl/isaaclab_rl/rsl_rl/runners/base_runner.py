@@ -209,6 +209,8 @@ class BaseRunner(OnPolicyRunner):
         privileged_obs = extras["observations"].get(self.privileged_obs_type, obs)
         obs, privileged_obs = obs.to(self.device), privileged_obs.to(self.device)
         self.train_mode()  # switch to train mode (for dropout for example)
+        if self.training_type == "distillation":
+            self.privileged_obs_normalizer.eval() # no updates for teacher normalizer
 
         # Book keeping
         ep_infos = []
