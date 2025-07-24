@@ -34,7 +34,7 @@ class TransformerMemory(torch.nn.Module):
             if hidden_states is None:
                 raise ValueError("Hidden states not passed to memory module during policy update")
             input_tokens = self.projector(input).unsqueeze(0)
-            input_tokens = torch.cat([hidden_states, input_tokens], dim=1)
+            input_tokens = torch.cat([hidden_states, input_tokens], dim=0)
             out = self.transformer(input_tokens)
             out = unpad_trajectories(out, masks)
         else:
