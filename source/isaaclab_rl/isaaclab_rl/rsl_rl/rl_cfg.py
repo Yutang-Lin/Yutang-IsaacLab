@@ -119,6 +119,9 @@ class RslRlPpoActorCriticPNNCfg(RslRlPpoActorCriticCfg):
     pnn_critic: bool = False
     """Whether to use the PNN critic."""
 
+    weight_sharing: bool = True
+    """Whether to share the weights of the PNN."""
+
     router_hidden_dims: list[int] = MISSING
     """The hidden dimensions of the router network."""
 

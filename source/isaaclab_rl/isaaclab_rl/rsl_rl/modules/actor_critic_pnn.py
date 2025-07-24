@@ -87,7 +87,8 @@ class PNNModule(nn.Module):
                  activation,
                  current_policy_id=0,
                  layer_norm=False,
-                 dropout_rate=0.0):
+                 dropout_rate=0.0,
+                 weight_sharing=True):
         super(PNNModule, self).__init__()
         self.input_dim = input_dim
         self.output_dim = output_dim
@@ -95,6 +96,7 @@ class PNNModule(nn.Module):
         self.out_features = output_dim
         self.num_policies = num_policies
         self.current_policy_id = current_policy_id
+        self.weight_sharing = weight_sharing
         self.hidden_dims = hidden_dims
         
         self.policies = nn.ModuleList([Primitive(input_dim, hidden_dims, output_dim,
@@ -129,6 +131,14 @@ class PNNModule(nn.Module):
         if self.current_policy_id >= self.num_policies:
             self.current_policy_id = 0
             return False
+        elif self.weight_sharing:
+            last_policy_id = self.current_policy_id - 1
+            assert last_policy_id >= 0, "RuntimeError: current_policy_id is 0 but weight_sharing is True"
+            state_dict = self.policies[last_policy_id].state_dict()
+            model_dict = {k: v for k, v in state_dict.items() if k not in ['lateral_weights']}
+            # we only load main model parameters, not lateral weights
+            self.policies[self.current_policy_id].load_state_dict(model_dict, strict=False)
+            print(f'[INFO]: PNN next policy loaded with weight sharing: {self.current_policy_id}/{self.num_policies}', flush=True)
         return True
 
     def forward(self, x):
@@ -151,6 +161,7 @@ class ActorCriticPNN(ActorCritic):
 
         num_policies=1,
         pnn_critic=False,
+        weight_sharing=True,
         router_hidden_dims=[128],
         grad_penalty_weight=0.0,
 
@@ -177,6 +188,7 @@ class ActorCriticPNN(ActorCritic):
         self.grad_penalty_weight = grad_penalty_weight
         self.num_policies = num_policies
         self.pnn_critic = pnn_critic
+        self.weight_sharing = weight_sharing
         self.load_noise_std = load_noise_std
         self.learnable_noise_std = learnable_noise_std
 
@@ -193,6 +205,7 @@ class ActorCriticPNN(ActorCritic):
             0,
             layer_norm,
             dropout_rate,
+            weight_sharing,
         )
 
         # Value function
@@ -207,6 +220,7 @@ class ActorCriticPNN(ActorCritic):
                 0,
                 layer_norm,
                 dropout_rate,
+                weight_sharing,
             )
         else:
             critic = []
