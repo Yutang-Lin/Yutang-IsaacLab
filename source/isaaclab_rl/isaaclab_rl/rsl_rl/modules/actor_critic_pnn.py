@@ -292,7 +292,7 @@ class ActorCriticPNN(ActorCritic):
     
     def schedule(self, converged) -> dict:
         if converged:
-            rescheduled = self.actor.increase_policy_id()
+            rescheduled = not self.actor.increase_policy_id()
             if self.pnn_critic:
                 self.critic.increase_policy_id()
             if wandb.run is not None:
