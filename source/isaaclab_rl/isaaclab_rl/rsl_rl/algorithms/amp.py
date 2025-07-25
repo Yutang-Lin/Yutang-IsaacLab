@@ -143,11 +143,12 @@ class AmpReward:
         self.step = (self.step + 1) % self.num_steps_per_env
     
     @torch.inference_mode()
-    def compute_reward(self, obs: torch.Tensor):
+    def compute_reward(self, obs: torch.Tensor, scale: float = 1.0):
         features = obs.view(self.num_envs, -1).clamp(-self.clip_obs_value, self.clip_obs_value)
         amp_score = self.network(features).view(self.num_envs)
 
-        return (1 - self.reward_factor * torch.square(amp_score - 1)).clamp(min=0) * self.reward_scale
+        # if scale is low, reward will be high to make amp constraints less important
+        return (1 - scale * self.reward_factor * torch.square(amp_score - 1)).clamp(min=0) * self.reward_scale
     
     def reduce_parameters(self):
         """Collect gradients from all GPUs and average them.
