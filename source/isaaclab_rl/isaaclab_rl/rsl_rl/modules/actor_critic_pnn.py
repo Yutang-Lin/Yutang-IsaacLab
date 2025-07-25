@@ -138,7 +138,7 @@ class PNNModule(nn.Module):
             model_dict = {k: v for k, v in state_dict.items() if k not in ['lateral_weights']}
             # we only load main model parameters, not lateral weights
             self.policies[self.current_policy_id].load_state_dict(model_dict, strict=False)
-            print(f'[INFO]: PNN next policy loaded with weight sharing: {self.current_policy_id}/{self.num_policies}', flush=True)
+            print(f'[INFO]: PNN next policy loaded with weight sharing: {self.current_policy_id+1}/{self.num_policies}', flush=True)
         return True
 
     def forward(self, x):
@@ -301,12 +301,12 @@ class ActorCriticPNN(ActorCritic):
                 self.critic.increase_policy_id()
             if wandb.run is not None:
                 wandb.alert(title="PNN schedule alert", 
-                            text=f'Current PNN schedule: {self.actor.current_policy_id}/{self.num_policies}')
+                            text=f'Current PNN schedule: {self.actor.current_policy_id+1}/{self.num_policies}')
                 if rescheduled:
                     wandb.alert(title="PNN schedule alert", 
-                                text=f'PNN rescheduled: {self.actor.current_policy_id}/{self.num_policies}')
+                                text=f'PNN rescheduled: {self.actor.current_policy_id+1}/{self.num_policies}')
             
-            print(f'[INFO]: PNN schedule: {self.actor.current_policy_id}/{self.num_policies}', flush=True)
+            print(f'[INFO]: PNN schedule: {self.actor.current_policy_id+1}/{self.num_policies}', flush=True)
             return_dict['rescheduled'] = rescheduled
             return_dict['current_policy_id'] = self.actor.current_policy_id
         
