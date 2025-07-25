@@ -41,10 +41,11 @@ def resolve_module(checkpoint_path) -> tuple[torch.nn.Module, tuple, dict]:
         policy = policy.act_inference
     if 'obs_norm_state_dict' in checkpoint:
         emp_state_dict = checkpoint['obs_norm_state_dict']
-        emperical_normalizer = EmpiricalNormalization(shape=[policy_args[0]], until=1.0e8)
+        num_obs = policy_args[0] if isinstance(policy_args[0], int) else policy_args[0][0]
+        
+        emperical_normalizer = EmpiricalNormalization(shape=[num_obs], until=1.0e8)
         emperical_normalizer.load_state_dict(emp_state_dict)
-        emperical_normalizer.eval()
-        policy = _ModuleWrapper(policy, emperical_normalizer)
+        policy = _ModuleWrapper(policy, emperical_normalizer).eval()
 
     return policy, policy_args, policy_cfg
 
