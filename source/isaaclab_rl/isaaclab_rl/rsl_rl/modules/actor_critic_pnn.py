@@ -126,12 +126,12 @@ class PNNModule(nn.Module):
     def set_policy_id(self, policy_id):
         self.current_policy_id = policy_id
 
-    def increase_policy_id(self):
+    def increase_policy_id(self, share_weights=True):
         self.current_policy_id += 1
         if self.current_policy_id >= self.num_policies:
             self.current_policy_id = 0
             return False
-        elif self.weight_sharing:
+        elif self.weight_sharing and share_weights:
             last_policy_id = self.current_policy_id - 1
             assert last_policy_id >= 0, "RuntimeError: current_policy_id is 0 but weight_sharing is True"
             state_dict = self.policies[last_policy_id].state_dict()
@@ -291,6 +291,10 @@ class ActorCriticPNN(ActorCritic):
         return actions_mean
     
     def schedule(self, converged) -> dict:
+        return_dict = dict(
+            num_policies=self.num_policies,
+            current_policy_id=self.actor.current_policy_id,
+            rescheduled=False)
         if converged:
             rescheduled = not self.actor.increase_policy_id()
             if self.pnn_critic:
@@ -303,10 +307,10 @@ class ActorCriticPNN(ActorCritic):
                                 text=f'PNN rescheduled: {self.actor.current_policy_id}/{self.num_policies}')
             
             print(f'[INFO]: PNN schedule: {self.actor.current_policy_id}/{self.num_policies}', flush=True)
-            return dict(rescheduled=rescheduled)
+            return_dict['rescheduled'] = rescheduled
+            return_dict['current_policy_id'] = self.actor.current_policy_id
         
-        else:
-            return dict()
+        return return_dict
         
     def load_state_dict(self, state_dict, strict=True):
         """Load the parameters of the actor-critic model.
@@ -320,9 +324,19 @@ class ActorCriticPNN(ActorCritic):
             bool: Whether this training resumes a previous training. This flag is used by the `load()` function of
                   `OnPolicyRunner` to determine how to load further parameters (relevant for, e.g., distillation).
         """
-        super().load_state_dict(state_dict, strict=strict)
+
+        # pnn load unstrictly to support changing the number of policies
+        try:
+            super().load_state_dict(state_dict, strict=False)
+        except Exception as e:
+            # this due to mismatch of the number of policies
+            # thus delete router from state_dict
+            state_dict = {k: v for k, v in state_dict.items() if 'router' not in k}
+            super().load_state_dict(state_dict, strict=False)
+            print(f'[WARNING]: PNN load state_dict with mismatch number of policies, initializing new router.', flush=True)
+
         for _ in range(self.start_by_id):
-            self.actor.increase_policy_id()
+            self.actor.increase_policy_id(share_weights=False)
             if self.pnn_critic:
-                self.critic.increase_policy_id()
+                self.critic.increase_policy_id(share_weights=False)
         return True

@@ -94,11 +94,14 @@ class _TorchPolicyExporter(torch.nn.Module):
         self.cell_state[:] = 0.0
 
     def export(self, path, filename):
-        os.makedirs(path, exist_ok=True)
-        path = os.path.join(path, filename)
-        self.to("cpu")
-        traced_script_module = torch.jit.script(self)
-        traced_script_module.save(path)
+        try:
+            os.makedirs(path, exist_ok=True)
+            path = os.path.join(path, filename)
+            self.to("cpu")
+            traced_script_module = torch.jit.script(self)
+            traced_script_module.save(path)
+        except Exception as e:
+            print(f"[WARNING]: Error exporting policy: {e}", flush=True)
 
 
 class _OnnxPolicyExporter(torch.nn.Module):

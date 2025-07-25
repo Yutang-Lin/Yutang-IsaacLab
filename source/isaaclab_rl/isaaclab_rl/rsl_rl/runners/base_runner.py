@@ -563,7 +563,11 @@ class BaseRunner(OnPolicyRunner):
             self.amp_reward.optimizer.load_state_dict(loaded_dict["amp_optimizer_state_dict"])
         
         # -- algorithm optimizer
-        self.alg.optimizer.load_state_dict(loaded_dict["optimizer_state_dict"])
+        try:
+            self.alg.optimizer.load_state_dict(loaded_dict["optimizer_state_dict"])
+        except Exception as e:
+            print(f"[WARNING]: Failed to load optimizer. Error: {e}. Reinitializing optimizer.")
+
         # -- RND optimizer if used
         if self.alg.rnd:
             self.alg.rnd_optimizer.load_state_dict(loaded_dict["rnd_optimizer_state_dict"]) # type: ignore

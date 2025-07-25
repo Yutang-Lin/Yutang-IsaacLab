@@ -13,7 +13,18 @@ from .actor_critic_pnn import ActorCriticPNN
 from .student_teacher import StudentTeacher
 
 import torch
-def resolve_module(checkpoint_path) -> tuple[ActorCritic, tuple, dict]:
+class _ModuleWrapper(torch.nn.Module):
+    def __init__(self, module, normalizer=None):
+        super().__init__()
+        self.module = module
+        self.normalizer = normalizer
+
+    def forward(self, x):
+        if self.normalizer is not None:
+            x = self.normalizer(x)
+        return self.module(x)
+
+def resolve_module(checkpoint_path) -> tuple[torch.nn.Module, tuple, dict]:
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     policy_cfg = checkpoint["policy_cfg"]
     policy_class = eval(policy_cfg.pop("class_name"))
@@ -28,6 +39,13 @@ def resolve_module(checkpoint_path) -> tuple[ActorCritic, tuple, dict]:
         policy = policy.actor
     if hasattr(policy, "act_inference"):
         policy = policy.act_inference
+    if 'obs_norm_state_dict' in checkpoint:
+        emp_state_dict = checkpoint['obs_norm_state_dict']
+        emperical_normalizer = EmpiricalNormalization(shape=[policy_args[0]], until=1.0e8)
+        emperical_normalizer.load_state_dict(emp_state_dict)
+        emperical_normalizer.eval()
+        policy = _ModuleWrapper(policy, emperical_normalizer)
+
     return policy, policy_args, policy_cfg
 
 __all__ = ["ActorCritic", "ActorCriticRecurrent", "EmpiricalNormalization", "StudentTeacher", "StudentTeacherRecurrent", "TwinDelayed", "ActorCriticOU", "ActorDoubleCritic", "ActorCriticMoE", "ActorCriticMoP", "ActorCriticPNN"]
