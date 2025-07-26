@@ -311,8 +311,8 @@ class PPO(RslRlPPO):
                     # Perform this adaptation only on the main process
                     # TODO: Is this needed? If KL-divergence is the "same" across all GPUs,
                     #       then the learning rate should be the same across all GPUs.
+                    # NOTE: using stablebaseline3 implementation
                     if self.desired_clipping < 1e-3:
-                        # NOTE: using stablebaseline3 implementation
                         if self.gpu_global_rank == 0:
                             if kl_mean > self.desired_kl * 2.0:
                                 self.learning_rate = max(1e-5, self.learning_rate / 1.5)
@@ -333,7 +333,7 @@ class PPO(RslRlPPO):
                         self.optimizer.param_groups[2]["lr"] = self.learning_rate
 
                     # NOTE: using stablebaseline3 implementation
-                    if kl_mean > self.desired_kl * 2.0:
+                    if kl_mean > self.desired_kl * 5.0:
                         break # stop training if KL-divergence is too high
 
             if hasattr(self.policy, "extra_loss"):
