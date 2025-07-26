@@ -291,15 +291,14 @@ class PPO(RslRlPPO):
             if self.desired_kl is not None and self.schedule == "adaptive":
                 with torch.inference_mode():
                     # NOTE: using stablebaseline3 implementation
-                    # kl = torch.sum(
-                    #     torch.log(sigma_batch / old_sigma_batch + 1.0e-5)
-                    #     + (torch.square(old_sigma_batch) + torch.square(old_mu_batch - mu_batch)) # type: ignore
-                    #     / (2.0 * torch.square(sigma_batch))
-                    #     - 0.5,
-                    #     axis=-1,
-                    # ) # type: ignore
-                    # kl_mean = torch.mean(kl)
-                    kl_mean = torch.mean(torch.exp(log_ratio) - 1.0 - log_ratio)
+                    kl = torch.sum(
+                        torch.log(sigma_batch / old_sigma_batch + 1.0e-5)
+                        + (torch.square(old_sigma_batch) + torch.square(old_mu_batch - mu_batch)) # type: ignore
+                        / (2.0 * torch.square(sigma_batch))
+                        - 0.5,
+                        axis=-1,
+                    ) # type: ignore
+                    kl_mean = torch.mean(kl)
 
                     # Reduce the KL divergence across all GPUs
                     if self.is_multi_gpu:
@@ -314,28 +313,28 @@ class PPO(RslRlPPO):
                     #       then the learning rate should be the same across all GPUs.
                     if self.desired_clipping < 1e-3:
                         # NOTE: using stablebaseline3 implementation
-                        # if self.gpu_global_rank == 0:
-                        #     if kl_mean > self.desired_kl * 2.0:
-                        #         self.learning_rate = max(1e-5, self.learning_rate / 1.5)
-                        #     elif kl_mean < self.desired_kl / 2.0 and kl_mean > 0.0:
-                        #         self.learning_rate = min(1e-2, self.learning_rate * 1.5)
+                        if self.gpu_global_rank == 0:
+                            if kl_mean > self.desired_kl * 2.0:
+                                self.learning_rate = max(1e-5, self.learning_rate / 1.5)
+                            elif kl_mean < self.desired_kl / 2.0 and kl_mean > 0.0:
+                                self.learning_rate = min(1e-2, self.learning_rate * 1.5)
 
-                        # # Update the learning rate for all GPUs
-                        # if self.is_multi_gpu:
-                        #     lr_tensor = torch.tensor(self.learning_rate, device=self.device)
-                        #     torch.distributed.broadcast(lr_tensor, src=0)
-                        #     self.learning_rate = lr_tensor.item()
+                        # Update the learning rate for all GPUs
+                        if self.is_multi_gpu:
+                            lr_tensor = torch.tensor(self.learning_rate, device=self.device)
+                            torch.distributed.broadcast(lr_tensor, src=0)
+                            self.learning_rate = lr_tensor.item()
 
-                        # # Update the learning rate for all parameter groups
-                        # # NOTE: 0 is actor, 1 is critic, 2 is other
-                        # self.optimizer.param_groups[0]["lr"] = self.learning_rate
-                        # if self.adjust_critic_lr:
-                        #     self.optimizer.param_groups[1]["lr"] = self.learning_rate
-                        # self.optimizer.param_groups[2]["lr"] = self.learning_rate
+                        # Update the learning rate for all parameter groups
+                        # NOTE: 0 is actor, 1 is critic, 2 is other
+                        self.optimizer.param_groups[0]["lr"] = self.learning_rate
+                        if self.adjust_critic_lr:
+                            self.optimizer.param_groups[1]["lr"] = self.learning_rate
+                        self.optimizer.param_groups[2]["lr"] = self.learning_rate
 
-                        # NOTE: using stablebaseline3 implementation
-                        if kl_mean > self.desired_kl * 1.5:
-                            break # stop training if KL-divergence is too high
+                    # NOTE: using stablebaseline3 implementation
+                    if kl_mean > self.desired_kl * 2.0:
+                        break # stop training if KL-divergence is too high
 
             if hasattr(self.policy, "extra_loss"):
                 extra_loss = self.policy.extra_loss(
