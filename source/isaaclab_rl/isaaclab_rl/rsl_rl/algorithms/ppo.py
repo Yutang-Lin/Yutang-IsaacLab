@@ -122,7 +122,7 @@ class PPO(RslRlPPO):
         self.lipschitz_constraint_coef = kwargs.pop("lipschitz_constraint_coef", 2e-2)
         self.adjust_critic_lr = kwargs.pop("adjust_critic_lr", True)
 
-    def act(self, obs, critic_obs):
+    def act(self, obs, critic_obs, **kwargs):
         if self.policy.is_recurrent:
             self.transition.hidden_states = self.policy.get_hidden_states()
         # compute the actions and values

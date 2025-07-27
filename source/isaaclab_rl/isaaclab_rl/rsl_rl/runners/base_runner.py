@@ -237,6 +237,9 @@ class BaseRunner(OnPolicyRunner):
             amp_reward_storage = torch.zeros(self.env.num_envs, device=self.device)
             self.amp_reward.reset_storage()
 
+        # initialize infos
+        infos = None
+
         # Start training
         start_iter = self.current_learning_iteration
         tot_iter = start_iter + num_learning_iterations
@@ -249,7 +252,7 @@ class BaseRunner(OnPolicyRunner):
 
                 for _ in range(self.num_steps_per_env):
                     # Sample actions
-                    actions = self.alg.act(obs, privileged_obs)
+                    actions = self.alg.act(obs, privileged_obs, infos=infos)
                     # Step the environment
                     obs, rewards, dones, infos = self.env.step(actions.to(self.env.device)) # type: ignore
                     # Move to device
