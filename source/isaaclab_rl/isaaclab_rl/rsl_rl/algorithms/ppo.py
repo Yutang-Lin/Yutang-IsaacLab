@@ -333,9 +333,9 @@ class PPO(RslRlPPO):
                         self.optimizer.param_groups[2]["lr"] = self.learning_rate
 
                     # NOTE: using stablebaseline3 implementation
-                    if kl_mean > self.desired_kl * 5.0:
-                        self.learning_rate = max(1e-5, self.learning_rate / 4.0)
-                        break # stop training if KL-divergence is too high
+                    # if kl_mean > self.desired_kl * 5.0:
+                    #     self.learning_rate = max(1e-5, self.learning_rate / 4.0)
+                    #     break # stop training if KL-divergence is too high
 
             if hasattr(self.policy, "extra_loss"):
                 extra_loss = self.policy.extra_loss(
