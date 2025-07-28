@@ -59,6 +59,47 @@ class RslRlPpoActorCriticCfg:
 
 
 @configclass
+class RslRlPpoActorCriticDPCfg(RslRlPpoActorCriticCfg):
+    """Configuration for the PPO actor-critic networks with diffusion process."""
+
+    class_name: str = "ActorCriticDP"
+    """The policy class name. Default is ActorCriticDP."""
+    
+    condition_hidden_dim: int = 256
+    """The hidden dimension of the condition."""
+
+    timestep_hidden_dim: int = 256
+    """The hidden dimension of the timestep."""
+
+    max_timesteps: int = 1000
+    """The maximum number of timesteps."""
+
+    action_timestep: int = 50
+    """The action timestep."""
+
+    action_step_num: int = 10
+    """The number of action steps."""
+
+    reference_gradient: bool = False
+    """Whether to use the reference gradient."""
+
+    alphas: any = None
+    """The alphas for the diffusion process."""
+
+    sigmas: any = None
+    """The sigmas for the diffusion process."""
+
+    ddim_eta: float = 0.0
+    """The eta for the diffusion process."""
+
+    lernable_sigmas: bool = False
+    """Whether to make the sigmas learnable."""
+
+    learn_residual: bool = False
+    """Whether to make the residual learnable."""
+
+
+@configclass
 class RslRlPpoActorCriticMoECfg(RslRlPpoActorCriticCfg):
     """Configuration for the PPO actor-critic mixture of experts networks."""
 
