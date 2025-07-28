@@ -12,7 +12,7 @@ class DDIMScheduler(nn.Module):
         super().__init__()
         max_timesteps = max_timesteps + 1
 
-        self.model: nn.Module = None # type: ignore
+        self.model: list[nn.Module] = None # type: ignore
         self.max_timesteps = max_timesteps
         self.time_embed = nn.Embedding(max_timesteps, timestep_hidden_dim)
 
@@ -103,11 +103,12 @@ class DDIMScheduler(nn.Module):
             self.sigmas: torch.Tensor
 
     def set_model(self, model):
-        self.model = model
+        self.model = []
+        self.model.append(model)
 
     def forward(self, x, condition, timestep):
         timestep_embed = self.time_embed(timestep)
-        return self.model(x, condition, timestep_embed)
+        return self.model[0](x, condition, timestep_embed)
     
     def apply_noise(self, x, timestep):
         return self.sqrt_alpha_bar[timestep, None] * x + self.sqrt_one_minus_alpha_bar[timestep, None] * torch.randn_like(x)
@@ -196,8 +197,11 @@ class DDIMScheduler(nn.Module):
         return loss
     
     def state_dict(self, *args, **kwargs):
-        model = self.model
-        self.set_model(None)
-        state_dict = super().state_dict(*args, **kwargs)
-        self.set_model(model)
-        return state_dict
+        if self.model is not None and len(self.model) > 0:
+            model = self.model[0]
+            self.set_model(None)
+            state_dict = super().state_dict(*args, **kwargs)
+            self.set_model(model)
+            return state_dict
+        else:
+            return super().state_dict(*args, **kwargs)
