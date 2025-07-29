@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import numpy as np
 
 class DDIMScheduler(nn.Module):
     def __init__(self, timestep_hidden_dim,
@@ -173,9 +174,21 @@ class DDIMScheduler(nn.Module):
                             from_timestep: int, # must solve with batched of same timestep
                             to_timestep: int,
                             num_steps: int,
+                            randomize_num_steps: bool = False,
                             sigma_coeff: torch.Tensor | float = 1.0,
                             return_distribution: bool = False) -> torch.Tensor | torch.distributions.Normal:
         timesteps = torch.linspace(from_timestep, to_timestep, num_steps).long().tolist()
+        if randomize_num_steps:
+            new_timesteps = []
+            new_timesteps.append(torch.ones(condition.shape[0], device=condition.device, dtype=torch.long) * \
+                                            timesteps[0])
+            for cur_step, nxt_step in zip(timesteps[:-1], timesteps[1:]):
+                new_timesteps.append((torch.rand(condition.shape[0], device=condition.device) * \
+                                       (nxt_step - cur_step) + cur_step).clamp(max=nxt_step - 0.5).long())
+            new_timesteps.append(torch.ones(condition.shape[0], device=condition.device, dtype=torch.long) * \
+                                            timesteps[-1])
+            timesteps = new_timesteps
+
         for cur_step, nxt_step in zip(timesteps[:-1], timesteps[1:]):
             # sampling
             x = self.sample(x, condition,

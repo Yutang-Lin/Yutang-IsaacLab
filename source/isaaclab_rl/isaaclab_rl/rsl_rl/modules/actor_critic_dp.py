@@ -71,6 +71,7 @@ class ActorCriticDP(ActorCritic):
             learnable_sigmas=lernable_sigmas,
             learn_residual=learn_residual,
         )
+        self.scheduler.sigmas[self.action_timestep + 1:] = 0.0
         self.scheduler.set_model(self.actor)
 
         # Value function
@@ -119,11 +120,15 @@ class ActorCriticDP(ActorCritic):
         current_actions = self.distribution.sample()
         if not self.reference_gradient:
             current_actions = current_actions.detach()
+        zero_condition = torch.zeros_like(obs_batch)
         _, pred_reference = self.scheduler.compute_noise_and_x_0_pred(current_actions,
-                                                                   obs_batch,
+                                                                   zero_condition,
                                                                    timestep=self.action_timestep)
         reference_loss = (pred_reference - reference_actions_batch).square().mean()
-        return {'reference_loss': reference_loss}
+
+        diffusion_loss = self.scheduler.loss(reference_actions_batch,
+                                             zero_condition)
+        return {'reference_loss': reference_loss, 'diffusion_loss': diffusion_loss}
     
     def generate_noise(self, num_samples, device):
         return torch.randn(num_samples, self.num_actions, device=device)
@@ -137,8 +142,9 @@ class ActorCriticDP(ActorCritic):
             noise = torch.randn(observations.shape[0], self.num_actions, device=observations.device)
         action_prev: torch.Tensor = self.scheduler.solve_grouped(noise, observations, deterministic=True,
                                                     from_timestep=self.max_timesteps - 1,
-                                                    to_timestep=self.action_timestep + 1,
-                                                    num_steps=self.action_step_num) # type: ignore
+                                                    to_timestep=self.action_timestep,
+                                                    num_steps=self.action_step_num,
+                                                    randomize_num_steps=True) # type: ignore
         
         # compute standard deviation
         if self.noise_std_type == "scalar":
@@ -152,7 +158,7 @@ class ActorCriticDP(ActorCritic):
         
         # create distribution
         self.distribution: torch.distributions.Normal = self.scheduler.sample(action_prev, observations,
-                                                                    from_timestep=self.action_timestep + 1,
+                                                                    from_timestep=self.action_timestep,
                                                                     return_distribution=True,
                                                                     apply_noise=True,
                                                                     sigma_coeff=std) # type: ignore
@@ -166,8 +172,9 @@ class ActorCriticDP(ActorCritic):
             noise = torch.randn(observations.shape[0], self.num_actions, device=observations.device)
         actions_mean: torch.Tensor = self.scheduler.solve_grouped(noise, observations, deterministic=True,
                                                                 from_timestep=self.max_timesteps - 1,
-                                                                to_timestep=self.action_timestep,
-                                                                num_steps=self.action_step_num) # type: ignore
+                                                                to_timestep=self.action_timestep - 1,
+                                                                num_steps=self.action_step_num,
+                                                                randomize_num_steps=True) # type: ignore
         return actions_mean
 
     def pre_train(self):

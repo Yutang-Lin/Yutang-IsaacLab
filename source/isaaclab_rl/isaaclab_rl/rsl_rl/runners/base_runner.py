@@ -247,6 +247,7 @@ class BaseRunner(OnPolicyRunner):
             start = time.time()
             # Rollout
             with torch.inference_mode():
+                self.alg.policy.eval()
                 if getattr(self.alg, "collect_reset", False):
                     self.alg.policy.reset() # type: ignore
 
@@ -329,6 +330,9 @@ class BaseRunner(OnPolicyRunner):
                 if self.training_type == "rl":
                     self.alg.compute_returns(privileged_obs, actions=actions) # type: ignore
 
+            # train policy
+            self.alg.policy.train()
+            # update policy
             loss_dict = self.alg.update()
             # update policy
             if self.amp_reward is not None:

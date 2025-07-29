@@ -15,6 +15,7 @@ class DiffusionMLP(nn.Module):
                 nn.Linear(condition_dim, condition_hidden_dim),
                 activation,
                 nn.Linear(condition_hidden_dim, condition_hidden_dim),
+                nn.LayerNorm(condition_hidden_dim),
             )
         else:
             self.condition_proj = None
