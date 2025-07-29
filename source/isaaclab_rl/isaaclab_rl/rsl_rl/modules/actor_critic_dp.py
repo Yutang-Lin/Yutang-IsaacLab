@@ -19,6 +19,8 @@ class ActorCriticDP(ActorCritic):
         max_timesteps=1000,
         action_timestep=50,
         action_step_num=5,
+        diffusion_loss_step_num=2,
+        reference_loss_step_num=1,
         reference_gradient=False,
         alphas=None,
         sigmas=None,
@@ -52,6 +54,8 @@ class ActorCriticDP(ActorCritic):
         self.reference_gradient = reference_gradient
         self.num_actions = num_actions
         self.ddim_lambda = ddim_lambda
+        self.diffusion_loss_step_num = diffusion_loss_step_num
+        self.reference_loss_step_num = reference_loss_step_num
 
         mlp_input_dim_a = num_actor_obs
         mlp_input_dim_c = num_critic_obs
@@ -124,15 +128,23 @@ class ActorCriticDP(ActorCritic):
         if not self.reference_gradient:
             current_actions = current_actions.detach()
         zero_condition = torch.zeros_like(obs_batch)
-        _, pred_reference = self.scheduler.compute_noise_and_x_0_pred(current_actions,
-                                                                   obs_batch,
-                                                                   timestep=self.action_timestep,
-                                                                   condition_lambda=self.ddim_lambda,
-                                                                   condition_empty=True)
-        reference_loss = (pred_reference - reference_actions_batch).square().mean()
 
-        diffusion_loss = self.scheduler.loss(reference_actions_batch,
-                                             zero_condition)
+        reference_loss = 0.
+        for _ in range(self.reference_loss_step_num):
+            _, pred_reference = self.scheduler.compute_noise_and_x_0_pred(current_actions,
+                                                                       obs_batch,
+                                                                       timestep=self.action_timestep,
+                                                                       condition_lambda=self.ddim_lambda,
+                                                                       condition_empty=True)
+            reference_loss += (pred_reference - reference_actions_batch).square().mean()
+        reference_loss /= self.reference_loss_step_num
+
+        diffusion_loss = 0.
+        for _ in range(self.diffusion_loss_step_num):
+            diffusion_loss += self.scheduler.loss(reference_actions_batch,
+                                                  zero_condition,
+                                                  condition_lambda=self.ddim_lambda)
+        diffusion_loss /= self.diffusion_loss_step_num
         return {'reference_loss': reference_loss, 'diffusion_loss': diffusion_loss}
     
     def generate_noise(self, num_samples, device):

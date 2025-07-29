@@ -80,6 +80,12 @@ class RslRlPpoActorCriticDPCfg(RslRlPpoActorCriticCfg):
     action_step_num: int = 10
     """The number of action steps."""
 
+    diffusion_loss_step_num: int = 2
+    """The number of diffusion loss iterations."""
+
+    reference_loss_step_num: int = 1
+    """The number of reference loss iterations."""
+
     reference_gradient: bool = False
     """Whether to use the reference gradient."""
 

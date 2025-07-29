@@ -26,6 +26,7 @@ class DiffusionMLP(nn.Module):
         layers = []
         for i in range(len(hidden_dims) - 1):
             layers.append(nn.Linear(hidden_dims[i], hidden_dims[i+1]))
+            layers.append(nn.LayerNorm(hidden_dims[i+1]))
             layers.append(activation)
         layers.append(nn.Linear(hidden_dims[-1], action_dim))
         self.mlp = nn.Sequential(*layers)
