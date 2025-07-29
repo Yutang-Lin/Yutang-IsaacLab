@@ -1,13 +1,15 @@
 import torch
 import torch.nn as nn
 
-class DiffusionMLP(nn.Module):
+class DiffusionTransformer(nn.Module):
     def __init__(self, action_dim, 
                  condition_dim,
                  hidden_dims, 
                  condition_hidden_dim,
                  timestep_hidden_dim,
                  activation: nn.Module,
+                 num_heads: int = 4,
+                 dropout_rate: float = 0.1,
                  **kwargs):
         super().__init__()
         self.condition_dim = condition_dim

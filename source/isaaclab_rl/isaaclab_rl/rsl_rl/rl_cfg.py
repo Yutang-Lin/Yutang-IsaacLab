@@ -107,6 +107,9 @@ class RslRlPpoActorCriticDPCfg(RslRlPpoActorCriticCfg):
     learn_residual: bool = False
     """Whether to make the residual learnable."""
 
+    extra_actor_params: dict = {}
+    """Extra parameters for the actor."""
+
 
 @configclass
 class RslRlPpoActorCriticMoECfg(RslRlPpoActorCriticCfg):

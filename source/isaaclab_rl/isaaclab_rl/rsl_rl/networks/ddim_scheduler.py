@@ -130,7 +130,7 @@ class DDIMScheduler(nn.Module):
             condition = torch.cat([condition, zero_condition], dim=0)
             timesteps = torch.cat([timesteps, timesteps], dim=0)
         elif condition_lambda < 1.0 and condition_empty:
-            zero_mask = torch.rand(condition.shape[0], 1, device=condition.device) < (1 - condition_lambda)
+            zero_mask = torch.rand(condition.shape[0], 1, device=condition.device) < condition_lambda
             condition = condition * zero_mask
 
         noise_pred = self.forward(inputs, condition, timesteps)
