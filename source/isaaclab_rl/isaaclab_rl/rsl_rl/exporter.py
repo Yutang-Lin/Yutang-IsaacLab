@@ -125,7 +125,7 @@ class _OnnxPolicyExporter(torch.nn.Module):
         # set up recurrent network
         if self.is_recurrent:
             self.rnn.cpu()
-            self.forward = self.forward_lstm
+            self.forward = self.forward_lstm # type: ignore
         # copy normalizer if exists
         if normalizer:
             self.normalizer = copy.deepcopy(normalizer)
@@ -142,36 +142,39 @@ class _OnnxPolicyExporter(torch.nn.Module):
         return self.actor(self.normalizer(x))
 
     def export(self, path, filename):
-        self.to("cpu")
-        if self.is_recurrent:
-            obs = torch.zeros(1, self.rnn.input_size)
-            h_in = torch.zeros(self.rnn.num_layers, 1, self.rnn.hidden_size)
-            c_in = torch.zeros(self.rnn.num_layers, 1, self.rnn.hidden_size)
-            actions, h_out, c_out = self(obs, h_in, c_in)
-            torch.onnx.export(
-                self,
-                (obs, h_in, c_in),
-                os.path.join(path, filename),
-                export_params=True,
-                opset_version=11,
-                verbose=self.verbose,
-                input_names=["obs", "h_in", "c_in"],
-                output_names=["actions", "h_out", "c_out"],
-                dynamic_axes={},
-            )
-        else:
-            try:
-                obs = torch.zeros(1, self.actor[0].in_features)
-            except:
-                obs = torch.zeros(1, self.actor.in_features)
-            torch.onnx.export(
-                self,
-                obs,
-                os.path.join(path, filename),
-                export_params=True,
-                opset_version=11,
-                verbose=self.verbose,
-                input_names=["obs"],
-                output_names=["actions"],
-                dynamic_axes={},
-            )
+        try:
+            self.to("cpu")
+            if self.is_recurrent:
+                obs = torch.zeros(1, self.rnn.input_size)
+                h_in = torch.zeros(self.rnn.num_layers, 1, self.rnn.hidden_size)
+                c_in = torch.zeros(self.rnn.num_layers, 1, self.rnn.hidden_size)
+                actions, h_out, c_out = self(obs, h_in, c_in)
+                torch.onnx.export(
+                    self,
+                    (obs, h_in, c_in),
+                    os.path.join(path, filename),
+                    export_params=True,
+                    opset_version=11,
+                    verbose=self.verbose,
+                    input_names=["obs", "h_in", "c_in"],
+                    output_names=["actions", "h_out", "c_out"],
+                    dynamic_axes={},
+                )
+            else:
+                try:
+                    obs = torch.zeros(1, self.actor[0].in_features)
+                except:
+                    obs = torch.zeros(1, self.actor.in_features)
+                torch.onnx.export(
+                    self,
+                    obs,
+                    os.path.join(path, filename),
+                    export_params=True,
+                    opset_version=11,
+                    verbose=self.verbose,
+                    input_names=["obs"],
+                    output_names=["actions"],
+                    dynamic_axes={},
+                )
+        except Exception as e:
+            print(f"[WARNING]: Error exporting policy: {e}", flush=True)

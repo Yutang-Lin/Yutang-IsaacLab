@@ -22,6 +22,7 @@ class ActorCriticDP(ActorCritic):
         reference_gradient=False,
         alphas=None,
         sigmas=None,
+        ddim_lambda=1.0,
         ddim_eta=0.0,
         lernable_sigmas=False,
         learn_residual=False,
@@ -50,6 +51,7 @@ class ActorCriticDP(ActorCritic):
         self.action_step_num = action_step_num
         self.reference_gradient = reference_gradient
         self.num_actions = num_actions
+        self.ddim_lambda = ddim_lambda
 
         mlp_input_dim_a = num_actor_obs
         mlp_input_dim_c = num_critic_obs
@@ -115,6 +117,7 @@ class ActorCriticDP(ActorCritic):
     
     def extra_loss(self, 
                    obs_batch,
+                   initial_noise_batch,
                    reference_actions_batch,
                    **kwargs):
         current_actions = self.distribution.sample()
@@ -122,8 +125,10 @@ class ActorCriticDP(ActorCritic):
             current_actions = current_actions.detach()
         zero_condition = torch.zeros_like(obs_batch)
         _, pred_reference = self.scheduler.compute_noise_and_x_0_pred(current_actions,
-                                                                   zero_condition,
-                                                                   timestep=self.action_timestep)
+                                                                   obs_batch,
+                                                                   timestep=self.action_timestep,
+                                                                   condition_lambda=self.ddim_lambda,
+                                                                   condition_empty=True)
         reference_loss = (pred_reference - reference_actions_batch).square().mean()
 
         diffusion_loss = self.scheduler.loss(reference_actions_batch,
@@ -144,7 +149,8 @@ class ActorCriticDP(ActorCritic):
                                                     from_timestep=self.max_timesteps - 1,
                                                     to_timestep=self.action_timestep,
                                                     num_steps=self.action_step_num,
-                                                    randomize_num_steps=True) # type: ignore
+                                                    randomize_num_steps=True,
+                                                    condition_lambda=self.ddim_lambda) # type: ignore
         
         # compute standard deviation
         if self.noise_std_type == "scalar":
@@ -159,6 +165,7 @@ class ActorCriticDP(ActorCritic):
         # create distribution
         self.distribution: torch.distributions.Normal = self.scheduler.sample(action_prev, observations,
                                                                     from_timestep=self.action_timestep,
+                                                                    condition_lambda=self.ddim_lambda,
                                                                     return_distribution=True,
                                                                     apply_noise=True,
                                                                     sigma_coeff=std) # type: ignore
@@ -169,12 +176,13 @@ class ActorCriticDP(ActorCritic):
 
     def act_inference(self, observations, noise=None):
         if noise is None:
-            noise = torch.randn(observations.shape[0], self.num_actions, device=observations.device)
+            noise = torch.zeros(observations.shape[0], self.num_actions, device=observations.device)
         actions_mean: torch.Tensor = self.scheduler.solve_grouped(noise, observations, deterministic=True,
                                                                 from_timestep=self.max_timesteps - 1,
                                                                 to_timestep=self.action_timestep - 1,
-                                                                num_steps=self.action_step_num,
-                                                                randomize_num_steps=True) # type: ignore
+                                                                num_steps=self.action_step_num + 1,
+                                                                randomize_num_steps=False,
+                                                                condition_lambda=self.ddim_lambda) # type: ignore
         return actions_mean
 
     def pre_train(self):

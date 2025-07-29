@@ -114,18 +114,38 @@ class DDIMScheduler(nn.Module):
     def apply_noise(self, x, timestep):
         return self.sqrt_alpha_bar[timestep, None] * x + self.sqrt_one_minus_alpha_bar[timestep, None] * torch.randn_like(x)
     
-    def compute_noise_and_x_0_pred(self, x, condition, timestep):
+    def compute_noise_and_x_0_pred(self, x: torch.Tensor,
+                                   condition: torch.Tensor,
+                                   timestep: torch.Tensor | int,
+                                   condition_lambda: float = 1.0,
+                                   condition_empty: bool = False):
         if isinstance(timestep, int):
             timestep = torch.ones(x.shape[0], device=x.device, dtype=torch.long) * timestep
-        noise_pred = self.forward(x, condition, timestep)
-        if self.learn_residual:
-            x_0_pred = (x - self.sqrt_one_minus_alpha_bar[timestep, None] * noise_pred) / self.sqrt_alpha_bar[timestep, None]
-        else:
-            x_0_pred = noise_pred
-            noise_pred = (1 / self.sqrt_one_minus_alpha_bar[timestep, None]) * (x - self.sqrt_alpha_bar[timestep, None] * x_0_pred)
+
+        inputs = x
+        timesteps = timestep
+        if condition_lambda < 1.0 and not condition_empty:
+            zero_condition = torch.zeros_like(condition)
+            inputs = torch.cat([x, x], dim=0)
+            condition = torch.cat([condition, zero_condition], dim=0)
+            timesteps = torch.cat([timesteps, timesteps], dim=0)
+        elif condition_lambda < 1.0 and condition_empty:
+            zero_mask = torch.rand(condition.shape[0], 1, device=condition.device) < (1 - condition_lambda)
+            condition = condition * zero_mask
+
+        noise_pred = self.forward(inputs, condition, timesteps)
+        if not self.learn_residual:
+            noise_pred = (1 / self.sqrt_one_minus_alpha_bar[timesteps, None]) * (inputs - self.sqrt_alpha_bar[timesteps, None] * noise_pred)
+
+        if condition_lambda < 1.0 and not condition_empty:
+            noise_pred_cond, noise_pred_uncond = noise_pred.chunk(2, dim=0)
+            noise_pred = condition_lambda * noise_pred_cond + (1 - condition_lambda) * noise_pred_uncond
+        
+        x_0_pred = (x - self.sqrt_one_minus_alpha_bar[timestep, None] * noise_pred) / self.sqrt_alpha_bar[timestep, None]
         return noise_pred, x_0_pred
     
     def sample(self, x, condition, from_timestep, to_timestep=None,
+               condition_lambda: float = 1.0,
                apply_noise: bool = True, sigma_coeff: torch.Tensor | float = 1.0,
                return_distribution: bool = False) -> torch.Tensor | torch.distributions.Normal:
         if isinstance(x, torch.distributions.Normal):
@@ -134,7 +154,8 @@ class DDIMScheduler(nn.Module):
             from_timestep = torch.ones(x.shape[0], device=x.device, dtype=torch.long) * from_timestep
         
         # Predict noise and x_0 prediction
-        noise_pred, x_0_pred = self.compute_noise_and_x_0_pred(x, condition, from_timestep)
+        noise_pred, x_0_pred = self.compute_noise_and_x_0_pred(x, condition, from_timestep, condition_lambda,
+                                                               condition_empty=False)
 
         # If to_timestep is not provided, use the previous timestep
         if to_timestep is None:
@@ -175,6 +196,7 @@ class DDIMScheduler(nn.Module):
                             to_timestep: int,
                             num_steps: int,
                             randomize_num_steps: bool = False,
+                            condition_lambda: float = 1.0,
                             sigma_coeff: torch.Tensor | float = 1.0,
                             return_distribution: bool = False) -> torch.Tensor | torch.distributions.Normal:
         timesteps = torch.linspace(from_timestep, to_timestep, num_steps).long().tolist()
@@ -193,18 +215,21 @@ class DDIMScheduler(nn.Module):
             # sampling
             x = self.sample(x, condition,
                             cur_step, nxt_step, 
+                            condition_lambda=condition_lambda,
                             apply_noise=not deterministic, 
                             sigma_coeff=sigma_coeff, 
                             return_distribution=return_distribution)
         return x
     
-    def loss(self, x, condition):
+    def loss(self, x, condition, condition_lambda: float = 1.0):
         # Randomly sample timesteps for each data point in the batch (excluding t=0)
         timestep = torch.randint(1, self.max_timesteps, (x.shape[0],), device=x.device)
         # Add noise to the input data at the chosen timesteps
         x_t = self.apply_noise(x, timestep)
         # Denoise the noised data by sampling from the model (without adding noise)
-        _, x_0_pred = self.compute_noise_and_x_0_pred(x_t, condition, timestep)
+        _, x_0_pred = self.compute_noise_and_x_0_pred(x_t, condition, timestep, 
+                                                      condition_lambda=condition_lambda,
+                                                      condition_empty=True)
         # Compute mean squared error loss between the denoised prediction and the original data
         loss = torch.nn.functional.mse_loss(x_0_pred, x)
         return loss

@@ -89,6 +89,9 @@ class RslRlPpoActorCriticDPCfg(RslRlPpoActorCriticCfg):
     sigmas: any = None
     """The sigmas for the diffusion process."""
 
+    ddim_lambda: float = 1.0
+    """The lambda for the classifier-free diffusion process."""
+
     ddim_eta: float = 0.0
     """The eta for the diffusion process."""
 
