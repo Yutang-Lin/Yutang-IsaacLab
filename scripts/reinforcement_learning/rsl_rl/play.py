@@ -156,6 +156,17 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         policy_nn, normalizer=ppo_runner.obs_normalizer, path=export_model_dir, filename="policy.onnx"
     )
 
+    # export observation to jit
+    if hasattr(env.unwrapped, "observation_jit"):
+        import json
+        from typing import Any
+
+        jit_trace: torch.jit.TracedModule = env.unwrapped.observation_jit # type: ignore
+        jit_trace.save(os.path.join(export_model_dir, "observation.pt"))
+        jit_hints: dict[str, Any] = env.unwrapped.jit_hints # type: ignore
+        with open(os.path.join(export_model_dir, "observation.json"), "w") as f:
+            json.dump(jit_hints, f)
+
     dt = env.unwrapped.step_dt
 
     # reset environment
