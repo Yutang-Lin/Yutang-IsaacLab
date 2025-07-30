@@ -540,7 +540,7 @@ class BaseRunner(OnPolicyRunner):
             files_number = [int(file.split("_")[-1].split(".")[0]) for file in files]
             if len(files_number) > self.max_checkpoint_num:
                 files_number.sort()
-                for file in files[:-self.max_checkpoint_num]:
+                for file in files_number[:-self.max_checkpoint_num]:
                     path = os.path.join(self.log_dir, f"model_{file}.pt") # type: ignore
                     os.remove(path)
 
