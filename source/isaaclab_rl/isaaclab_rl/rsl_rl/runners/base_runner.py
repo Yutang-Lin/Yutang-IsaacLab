@@ -38,6 +38,9 @@ class BaseRunner(OnPolicyRunner):
         # check if checkpoint should be uploaded
         self.upload_checkpoint = self.cfg.get("upload_checkpoint", True)
 
+        # max checkpoint number
+        self.max_checkpoint_num = self.cfg.get("max_checkpoint_num", 10)
+
         # resolve training type depending on the algorithm
         if self.alg_cfg["class_name"] == "PPO":
             self.training_type = "rl"
@@ -529,6 +532,17 @@ class BaseRunner(OnPolicyRunner):
 
         # save model
         torch.save(saved_dict, path)
+
+        # clear extra checkpoints
+        if self.max_checkpoint_num is not None:
+            files = os.listdir(self.log_dir)
+            files = [file for file in files if file.endswith(".pt") and "model" in file]
+            files_number = [int(file.split("_")[-1].split(".")[0]) for file in files]
+            if len(files_number) > self.max_checkpoint_num:
+                files_number.sort()
+                for file in files[:-self.max_checkpoint_num]:
+                    path = os.path.join(self.log_dir, f"model_{file}.pt") # type: ignore
+                    os.remove(path)
 
         # upload model to external logging service
         if self.logger_type in ["neptune", "wandb"] and not self.disable_logs and self.upload_checkpoint:

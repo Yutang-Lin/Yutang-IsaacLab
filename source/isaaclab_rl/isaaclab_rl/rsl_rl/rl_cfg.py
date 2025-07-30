@@ -451,6 +451,9 @@ class RslRlOnPolicyRunnerCfg:
     max_iterations: int = MISSING
     """The maximum number of iterations."""
 
+    max_checkpoint_num: int = 10
+    """The maximum number of checkpoints to save."""
+
     empirical_normalization: bool = MISSING
     """Whether to use empirical normalization."""
 
