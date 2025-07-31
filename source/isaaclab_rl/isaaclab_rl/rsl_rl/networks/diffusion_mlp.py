@@ -14,8 +14,11 @@ class DiffusionMLP(nn.Module):
         if condition_dim > 0:
             self.condition_proj = nn.Sequential(
                 nn.Linear(condition_dim, condition_hidden_dim),
+                nn.LayerNorm(condition_hidden_dim),
                 activation,
                 nn.Linear(condition_hidden_dim, condition_hidden_dim),
+                nn.LayerNorm(condition_hidden_dim),
+                activation,
             )
         else:
             self.condition_proj = None
@@ -26,6 +29,7 @@ class DiffusionMLP(nn.Module):
         layers = []
         for i in range(len(hidden_dims) - 1):
             layers.append(nn.Linear(hidden_dims[i], hidden_dims[i+1]))
+            layers.append(nn.LayerNorm(hidden_dims[i+1]))
             layers.append(activation)
         layers.append(nn.Linear(hidden_dims[-1], action_dim))
         self.mlp = nn.Sequential(*layers)
