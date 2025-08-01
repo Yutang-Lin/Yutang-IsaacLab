@@ -4,7 +4,6 @@ from torch.distributions import Normal
 from rsl_rl.utils import resolve_nn_activation
 from isaaclab_rl.rsl_rl.modules.actor_critic import ActorCritic, ResidualWrapper
 from isaaclab_rl.rsl_rl.networks.diffusion_mlp import DiffusionMLP
-from isaaclab_rl.rsl_rl.networks.diffusion_transformer import DiffusionTransformer
 from isaaclab_rl.rsl_rl.networks.ddim_scheduler import DDIMScheduler
 
 class ActorCriticDP(ActorCritic):
@@ -37,7 +36,6 @@ class ActorCriticDP(ActorCritic):
         layer_norm: bool = False,
         dropout_rate: float = 0.0,
         residual: bool = False,
-        extra_actor_params: dict = {},
         **kwargs,
     ):
         if kwargs:
@@ -58,20 +56,17 @@ class ActorCriticDP(ActorCritic):
         self.ddim_lambda = ddim_lambda
         self.diffusion_loss_step_num = diffusion_loss_step_num
         self.reference_loss_step_num = reference_loss_step_num
-        self.extra_actor_params = extra_actor_params
 
         mlp_input_dim_a = num_actor_obs
         mlp_input_dim_c = num_critic_obs
         # Policy
-        actor_class = eval(extra_actor_params.pop('class_name', 'DiffusionMLP'))
-        self.actor: DiffusionMLP | DiffusionTransformer = actor_class(
+        self.actor = DiffusionMLP(
             action_dim=num_actions,
             condition_dim=mlp_input_dim_a,
             hidden_dims=actor_hidden_dims,
             condition_hidden_dim=condition_hidden_dim,
             timestep_hidden_dim=timestep_hidden_dim,
             activation=activation,
-            **extra_actor_params,
         )
         self.scheduler = DDIMScheduler(
             timestep_hidden_dim=timestep_hidden_dim,

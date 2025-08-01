@@ -13,6 +13,7 @@ from .actor_critic_pnn import ActorCriticPNN
 from .actor_critic_dp import ActorCriticDP
 from .actor_critic_transformer import ActorCriticTransformer
 from .student_teacher import StudentTeacher
+from .actor_critic_dp_transformer import ActorCriticDPTransformer
 
 import torch
 class _ModuleWrapper(torch.nn.Module):
@@ -51,4 +52,20 @@ def resolve_module(checkpoint_path) -> tuple[torch.nn.Module, tuple, dict]:
 
     return policy, policy_args, policy_cfg
 
-__all__ = ["ActorCritic", "ActorCriticRecurrent", "EmpiricalNormalization", "StudentTeacher", "StudentTeacherRecurrent", "TwinDelayed", "ActorCriticOU", "ActorDoubleCritic", "ActorCriticMoE", "ActorCriticMoP", "ActorCriticPNN", "ActorCriticDP", "ActorCriticTransformer"]
+__all__ = [
+    "ActorCritic",
+    "ActorCriticOU",
+    "ActorCriticDP",
+    "ActorCriticDPTransformer",
+    "ActorCriticTransformer",
+    "ActorCriticMoE",
+    "ActorCriticMoP",
+    "ActorCriticPNN",
+    "ActorCriticRecurrent",
+    "ActorCriticTransformer",
+    "EmpiricalNormalization",
+    "StudentTeacher",
+    "StudentTeacherRecurrent",
+    "TwinDelayed",
+    "ActorDoubleCritic",
+]

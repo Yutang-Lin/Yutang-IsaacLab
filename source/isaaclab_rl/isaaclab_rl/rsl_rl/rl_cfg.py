@@ -107,8 +107,71 @@ class RslRlPpoActorCriticDPCfg(RslRlPpoActorCriticCfg):
     learn_residual: bool = False
     """Whether to make the residual learnable."""
 
-    extra_actor_params: dict = {}
-    """Extra parameters for the actor."""
+
+@configclass
+class RslRlPpoActorCriticDPTransformerCfg(RslRlPpoActorCriticCfg):
+    """Configuration for the PPO actor-critic networks with diffusion process."""
+
+    class_name: str = "ActorCriticDPTransformer"
+    """The policy class name. Default is ActorCriticDPTransformer."""
+
+    tf_d_model: int = MISSING
+    """The dimension of the transformer model."""
+
+    tf_num_heads: int = MISSING
+    """The number of transformer heads."""
+
+    tf_hidden_dim: int = MISSING
+    """The dimension of the transformer hidden layers."""
+
+    tf_num_layers: int = MISSING
+    """The number of transformer layers."""
+
+    tf_condition_tokens: int = MISSING
+    """The number of condition tokens."""
+
+    timestep_hidden_dim: int = 256
+    """The hidden dimension of the timestep."""
+
+    max_timesteps: int = 1000
+    """The maximum number of timesteps."""
+
+    action_timestep: int = 50
+    """The action timestep."""
+
+    action_step_num: int = 10
+    """The number of action steps."""
+
+    diffusion_loss_step_num: int = 2
+    """The number of diffusion loss iterations."""
+
+    reference_loss_step_num: int = 1
+    """The number of reference loss iterations."""
+
+    reference_gradient: bool = False
+    """Whether to use the reference gradient."""
+
+    alphas: any = None
+    """The alphas for the diffusion process."""
+
+    sigmas: any = None
+    """The sigmas for the diffusion process."""
+
+    ddim_lambda: float = 1.0
+    """The lambda for the classifier-free diffusion process."""
+
+    ddim_eta: float = 0.0
+    """The eta for the diffusion process."""
+
+    lernable_sigmas: bool = False
+    """Whether to make the sigmas learnable."""
+
+    learn_residual: bool = False
+    """Whether to make the residual learnable."""
+
+    # Deprecated
+    actor_hidden_dims: list[int] = []
+    """The hidden dimensions of the actor network."""
 
 
 @configclass
