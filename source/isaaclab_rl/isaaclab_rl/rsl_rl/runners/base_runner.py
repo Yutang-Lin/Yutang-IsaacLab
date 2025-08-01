@@ -243,6 +243,9 @@ class BaseRunner(OnPolicyRunner):
         # initialize infos
         infos = None
 
+        # initialize best reward
+        best_reward = -float("inf")
+
         # Start training
         start_iter = self.current_learning_iteration
         tot_iter = start_iter + num_learning_iterations
@@ -370,6 +373,10 @@ class BaseRunner(OnPolicyRunner):
                 self.log(locals())
                 # Save model
                 if it % self.save_interval == 0:
+                    current_reward = statistics.mean(rewbuffer)
+                    if current_reward > best_reward:
+                        best_reward = current_reward
+                        self.save(os.path.join(self.log_dir, f"model_best.pt"), remove_extras=False)
                     self.save(os.path.join(self.log_dir, f"model_{it}.pt"))
 
             # Clear episode infos
@@ -506,7 +513,7 @@ class BaseRunner(OnPolicyRunner):
         print(log_string)
 
     
-    def save(self, path: str, infos=None):
+    def save(self, path: str, infos=None, remove_extras=True):
         # -- Save model
         saved_dict = {
             "policy_cfg": self.full_policy_cfg,
@@ -535,10 +542,11 @@ class BaseRunner(OnPolicyRunner):
         torch.save(saved_dict, path)
 
         # clear extra checkpoints
-        if self.max_checkpoint_num is not None:
+        if self.max_checkpoint_num is not None and remove_extras:
             files = os.listdir(self.log_dir)
             files = [file for file in files if file.endswith(".pt") and "model" in file]
-            files_number = [int(file.split("_")[-1].split(".")[0]) for file in files]
+            files_number = [int(file.split("_")[-1].split(".")[0]) for file in files if 'best' not in file]
+
             if len(files_number) > self.max_checkpoint_num:
                 files_number.sort()
                 for file in files_number[:-self.max_checkpoint_num]:
