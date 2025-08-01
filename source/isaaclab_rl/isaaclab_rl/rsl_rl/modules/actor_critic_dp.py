@@ -129,7 +129,7 @@ class ActorCriticDP(ActorCritic):
             current_actions = current_actions.detach()
         zero_condition = torch.zeros_like(obs_batch)
 
-        reference_loss = 0.
+        reference_loss = torch.tensor(0.0, device=obs_batch.device)
         for _ in range(self.reference_loss_step_num):
             _, pred_reference = self.scheduler.compute_noise_and_x_0_pred(current_actions,
                                                                        obs_batch,
@@ -139,7 +139,7 @@ class ActorCriticDP(ActorCritic):
             reference_loss += (pred_reference - reference_actions_batch).square().mean()
         reference_loss /= self.reference_loss_step_num
 
-        diffusion_loss = 0.
+        diffusion_loss = torch.tensor(0.0, device=obs_batch.device)
         for _ in range(self.diffusion_loss_step_num):
             diffusion_loss += self.scheduler.loss(reference_actions_batch,
                                                   zero_condition,
