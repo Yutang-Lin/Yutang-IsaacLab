@@ -32,8 +32,9 @@ class RNNStyleTransformer(nn.Module):
         self.dropout = dropout
         self.activation = activation
         self.history_length = history_length
+
         self.hidden_history = hidden_history
-        self.history_size = self.input_size if not hidden_history else self.d_model
+        self.hidden_size = self.input_size if not hidden_history else self.d_model
 
         self.input_proj = nn.Linear(input_size, d_model)
         self.model = TransformerEncoder(d_model, 
@@ -47,7 +48,7 @@ class RNNStyleTransformer(nn.Module):
     def forward(self, input, hidden_states, attn_mask=None):
         transpose_input = input.transpose(0, 1).contiguous()
         if hidden_states is None:
-            transpose_hidden_states = torch.zeros(transpose_input.shape[0], self.history_length, self.history_size, device=input.device)
+            transpose_hidden_states = torch.zeros(transpose_input.shape[0], self.history_length, self.hidden_size, device=input.device)
         else:
             transpose_hidden_states = hidden_states.transpose(0, 1).contiguous()
 

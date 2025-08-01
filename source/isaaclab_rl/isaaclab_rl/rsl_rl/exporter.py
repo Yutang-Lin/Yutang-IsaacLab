@@ -73,6 +73,9 @@ class _TorchPolicyExporter(torch.nn.Module):
             elif self.rnn_type == "gru":
                 self.forward = self.forward_gru
                 self.reset = self.reset_memory
+            elif self.rnn_type == "rnnstyletransformer":
+                self.forward = self.forward_transformer
+                self.reset = self.reset_memory
             else:
                 raise NotImplementedError(f"Unsupported RNN type: {self.rnn_type}")
         # copy normalizer if exists
@@ -90,6 +93,13 @@ class _TorchPolicyExporter(torch.nn.Module):
         return self.actor(x)
 
     def forward_gru(self, x):
+        x = self.normalizer(x)
+        x, h = self.rnn(x.unsqueeze(0), self.hidden_state)
+        self.hidden_state[:] = h
+        x = x.squeeze(0)
+        return self.actor(x)
+    
+    def forward_transformer(self, x):
         x = self.normalizer(x)
         x, h = self.rnn(x.unsqueeze(0), self.hidden_state)
         self.hidden_state[:] = h
@@ -145,6 +155,8 @@ class _OnnxPolicyExporter(torch.nn.Module):
                 self.forward = self.forward_lstm
             elif self.rnn_type == "gru":
                 self.forward = self.forward_gru
+            elif self.rnn_type == "rnnstyletransformer":
+                self.forward = self.forward_transformer
             else:
                 raise NotImplementedError(f"Unsupported RNN type: {self.rnn_type}")
         # copy normalizer if exists
@@ -160,6 +172,12 @@ class _OnnxPolicyExporter(torch.nn.Module):
         return self.actor(x), h, c
 
     def forward_gru(self, x_in, h_in):
+        x_in = self.normalizer(x_in)
+        x, h = self.rnn(x_in.unsqueeze(0), h_in)
+        x = x.squeeze(0)
+        return self.actor(x), h
+    
+    def forward_transformer(self, x_in, h_in):
         x_in = self.normalizer(x_in)
         x, h = self.rnn(x_in.unsqueeze(0), h_in)
         x = x.squeeze(0)
