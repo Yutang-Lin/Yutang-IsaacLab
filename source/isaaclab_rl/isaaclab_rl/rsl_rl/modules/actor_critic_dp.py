@@ -196,10 +196,16 @@ class ActorCriticDP(ActorCritic):
             noise = torch.zeros(observations.shape[0], self.num_actions, device=observations.device)
         actions_mean: torch.Tensor = self.scheduler.solve_grouped(noise, observations, deterministic=True,
                                                                 from_timestep=self.max_timesteps - 1,
-                                                                to_timestep=self.action_timestep - 1,
-                                                                num_steps=self.action_step_num + 1,
+                                                                to_timestep=self.action_timestep,
+                                                                num_steps=self.action_step_num,
                                                                 randomize_num_steps=False,
                                                                 condition_lambda=self.ddim_lambda) # type: ignore
+        
+        actions_mean: torch.Tensor = self.scheduler.sample(actions_mean, observations,
+                                                            from_timestep=self.action_timestep,
+                                                            condition_lambda=self.ddim_lambda,
+                                                            return_distribution=False,
+                                                            apply_noise=False) # type: ignore
         return actions_mean
 
     def pre_train(self):

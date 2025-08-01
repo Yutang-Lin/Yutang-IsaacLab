@@ -249,6 +249,38 @@ class RslRlPpoActorCriticRecurrentCfg(RslRlPpoActorCriticCfg):
 
 
 @configclass
+class RslRlPpoActorCriticTransformerCfg(RslRlPpoActorCriticCfg):
+    """Configuration for the PPO actor-critic networks with transformer layers."""
+
+    class_name: str = "ActorCriticTransformer"
+    """The policy class name. Default is ActorCriticTransformer."""
+
+    tf_d_model: int = MISSING
+    """The dimension of the transformer model."""
+
+    tf_history_length: int = MISSING
+    """The history length for the transformer."""
+
+    tf_hidden_history: bool = True
+    """Whether to use the hidden state as the history for the transformer."""
+
+    tf_num_heads: int = MISSING
+    """The number of transformer heads."""
+
+    tf_num_layers: int = MISSING
+    """The number of transformer layers."""
+
+    tf_hidden_dim: int = MISSING
+    """The dimension of the transformer hidden layers."""
+
+    tf_dropout: float = 0.0
+    """The dropout rate for the transformer."""
+
+    tf_activation: str = "gelu"
+    """The activation function for the transformer."""
+    
+
+@configclass
 class RslRlTd3ActorCriticCfg:
     """Configuration for the TD3 actor-critic networks."""
 

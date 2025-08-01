@@ -9,7 +9,7 @@ import torch
 import torch.nn as nn
 
 from rsl_rl.utils import unpad_trajectories
-
+    
 
 class Memory(torch.nn.Module):
     def __init__(self, input_size, type="lstm", num_layers=1, hidden_size=256):

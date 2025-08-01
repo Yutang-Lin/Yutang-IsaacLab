@@ -275,6 +275,7 @@ class BaseRunner(OnPolicyRunner):
                         self.alg.policy.reset(resets) # type: ignore
 
                     if self.amp_reward is not None:
+                        reward_scale = infos.get("overall_reward_scale", 1.0)
                         gen_obs = infos["observations"]["amp_policy"].to(self.device)
                         ref_obs = infos["observations"]["amp_motion"].to(self.device)
                         self.amp_reward.update_storage(gen_obs, ref_obs)
@@ -282,7 +283,7 @@ class BaseRunner(OnPolicyRunner):
                         amp_reward_scale = 1.0
                         if 'reward_scales' in infos and 'amp' in infos['reward_scales']:
                             amp_reward_scale = infos['reward_scales']['amp']
-                        amp_rewards = self.amp_reward.compute_reward(gen_obs, amp_reward_scale)
+                        amp_rewards = self.amp_reward.compute_reward(gen_obs, amp_reward_scale) * reward_scale
                         
                         amp_reward_storage += amp_rewards
                         rewards += amp_rewards

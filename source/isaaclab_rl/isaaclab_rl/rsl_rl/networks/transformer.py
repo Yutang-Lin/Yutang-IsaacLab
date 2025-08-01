@@ -76,10 +76,10 @@ class MultiHeadAttention(nn.Module):
         if self.is_causal and attn_mask is not None:
             is_causal = False
 
-        with sdpa_kernel(backends=[SDPBackend.FLASH_ATTENTION]):
-            out = scaled_dot_product_attention(q, k, v, dropout_p=self.dropout,
-                                               attn_mask=attn_mask,
-                                               is_causal=is_causal)
+        # let torch decide the best backend
+        out = scaled_dot_product_attention(q, k, v, dropout_p=self.dropout,
+                                            attn_mask=attn_mask,
+                                            is_causal=is_causal)
 
         out = out.transpose(-2, -3).contiguous().view(out.size(0), *q_shape[1:-1], self.d_model)
         return self.out_proj(out)
@@ -89,13 +89,14 @@ class TransformerDecoderLayer(nn.Module):
                  num_heads, 
                  hidden_dim,
                  dropout=0.0, 
+                 is_causal=True,
                  activation: nn.Module | None = None,
                  **kwargs):
         super().__init__()
         if activation is None:
             activation = nn.GELU(approximate="tanh")
 
-        self.self_attn = MultiHeadAttention(d_model, num_heads, dropout, is_causal=True)
+        self.self_attn = MultiHeadAttention(d_model, num_heads, dropout, is_causal=is_causal)
         self.cross_attn = MultiHeadAttention(d_model, num_heads, dropout)
         self.norm1 = nn.LayerNorm(d_model)
         self.norm2 = nn.LayerNorm(d_model)
@@ -114,12 +115,14 @@ class TransformerDecoderLayer(nn.Module):
         return out
     
 class TransformerEncoderLayer(nn.Module):
-    def __init__(self, d_model, num_heads, hidden_dim, dropout=0.0, activation: nn.Module | None = None):
+    def __init__(self, d_model, num_heads, hidden_dim, dropout=0.0, 
+                 is_causal=False,
+                 activation: nn.Module | None = None):
         super().__init__()
         if activation is None:
             activation = nn.GELU(approximate="tanh")
 
-        self.self_attn = MultiHeadAttention(d_model, num_heads, dropout, is_causal=True)
+        self.self_attn = MultiHeadAttention(d_model, num_heads, dropout, is_causal=is_causal)
         self.norm1 = nn.LayerNorm(d_model)
         self.norm2 = nn.LayerNorm(d_model)
         self.mlp = nn.Sequential(
@@ -139,10 +142,11 @@ class TransformerDecoder(nn.Module):
                  hidden_dim, 
                  num_layers, 
                  dropout=0.0, 
+                 is_causal=True,
                  activation: nn.Module | None = None):
         super().__init__()
         self.layers = nn.ModuleList([
-            TransformerDecoderLayer(d_model, num_heads, hidden_dim, dropout, activation)
+            TransformerDecoderLayer(d_model, num_heads, hidden_dim, dropout, is_causal, activation)
             for _ in range(num_layers)
         ])
 
@@ -152,10 +156,12 @@ class TransformerDecoder(nn.Module):
         return feature
     
 class TransformerEncoder(nn.Module):
-    def __init__(self, d_model, num_heads, hidden_dim, num_layers, dropout=0.0, activation: nn.Module | None = None):
+    def __init__(self, d_model, num_heads, hidden_dim, num_layers, dropout=0.0, 
+                 is_causal=False,
+                 activation: nn.Module | None = None):
         super().__init__()
         self.layers = nn.ModuleList([
-            TransformerEncoderLayer(d_model, num_heads, hidden_dim, dropout, activation)
+            TransformerEncoderLayer(d_model, num_heads, hidden_dim, dropout, is_causal, activation)
             for _ in range(num_layers)
         ])
 
