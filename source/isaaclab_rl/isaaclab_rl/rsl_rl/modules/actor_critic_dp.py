@@ -157,7 +157,7 @@ class ActorCriticDP(ActorCritic):
     def update_distribution(self, observations, noise=None):
         # compute mean
         if noise is None:
-            noise = torch.randn(observations.shape[0], self.num_actions, device=observations.device)
+            noise = torch.zeros(observations.shape[0], self.num_actions, device=observations.device)
         action_prev: torch.Tensor = self.scheduler.solve_grouped(noise, observations, deterministic=True,
                                                     from_timestep=self.max_timesteps - 1,
                                                     to_timestep=self.action_timestep,
