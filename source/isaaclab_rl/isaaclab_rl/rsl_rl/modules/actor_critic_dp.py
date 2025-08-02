@@ -148,7 +148,8 @@ class ActorCriticDP(ActorCritic):
         return {'reference_loss': reference_loss, 'diffusion_loss': diffusion_loss}
     
     def generate_noise(self, num_samples, device):
-        return torch.randn(num_samples, self.num_actions, device=device)
+        # no noise is need due to ODE process
+        return torch.zeros(num_samples, self.num_actions, device=device)
 
     def get_actions_log_prob(self, actions, **kwargs):
         return self.distribution.log_prob(actions).sum(dim=-1) # type: ignore
