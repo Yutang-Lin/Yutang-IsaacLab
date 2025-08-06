@@ -41,6 +41,8 @@ class ActorCritic(RslRlActorCritic):
         layer_norm: bool = False,
         dropout_rate: float = 0.0,
         residual: bool = False,
+        actor_obs_meta: dict = None,
+        critic_obs_meta: dict = None,
         **kwargs,
     ):
         if kwargs:
@@ -53,6 +55,8 @@ class ActorCritic(RslRlActorCritic):
 
         self.load_noise_std = load_noise_std
         self.learnable_noise_std = learnable_noise_std
+        self.actor_obs_meta = actor_obs_meta
+        self.critic_obs_meta = critic_obs_meta
 
         mlp_input_dim_a = num_actor_obs
         mlp_input_dim_c = num_critic_obs

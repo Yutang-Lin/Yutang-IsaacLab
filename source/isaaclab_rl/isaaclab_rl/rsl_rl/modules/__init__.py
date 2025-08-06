@@ -12,8 +12,9 @@ from .actor_critic_mop import ActorCriticMoP
 from .actor_critic_pnn import ActorCriticPNN
 from .actor_critic_dp import ActorCriticDP
 from .actor_critic_transformer import ActorCriticTransformer
-from .student_teacher import StudentTeacher
+from .actor_critic_ml_transformer import ActorCriticMLTransformer
 from .actor_critic_dp_transformer import ActorCriticDPTransformer
+from .student_teacher import StudentTeacher
 
 import torch
 class _ModuleWrapper(torch.nn.Module):
@@ -63,6 +64,7 @@ __all__ = [
     "ActorCriticPNN",
     "ActorCriticRecurrent",
     "ActorCriticTransformer",
+    "ActorCriticMLTransformer",
     "EmpiricalNormalization",
     "StudentTeacher",
     "StudentTeacherRecurrent",

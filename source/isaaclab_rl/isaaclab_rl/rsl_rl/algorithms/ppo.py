@@ -122,7 +122,7 @@ class PPO(RslRlPPO):
         self.lipschitz_constraint_coef = kwargs.pop("lipschitz_constraint_coef", 2e-2)
         self.adjust_critic_lr = kwargs.pop("adjust_critic_lr", True)
 
-    def act(self, obs, critic_obs, **kwargs):
+    def act(self, obs, critic_obs, infos, **kwargs):
         if self.policy.is_recurrent:
             self.transition.hidden_states = self.policy.get_hidden_states()
         # compute the actions and values
@@ -333,8 +333,9 @@ class PPO(RslRlPPO):
                         self.optimizer.param_groups[2]["lr"] = self.learning_rate
 
                     # NOTE: using stablebaseline3 implementation
-                    if kl_mean > self.desired_kl * 50.0:
+                    if kl_mean > 10.0:
                         self.learning_rate = max(1e-5, self.learning_rate / 5.0)
+                        num_updates += 1 # avoid division by zero
                         break # stop training if KL-divergence is too high
 
             if hasattr(self.policy, "extra_loss"):

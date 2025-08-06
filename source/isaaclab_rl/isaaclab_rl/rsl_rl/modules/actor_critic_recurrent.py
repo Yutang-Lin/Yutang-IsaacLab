@@ -33,6 +33,8 @@ class ActorCriticRecurrent(ActorCritic):
         layer_norm: bool = False,
         dropout_rate: float = 0.0,
         residual: bool = False,
+        actor_obs_meta: dict = None,
+        critic_obs_meta: dict = None,
         **kwargs,
     ):
         if "rnn_hidden_size" in kwargs:
@@ -62,8 +64,9 @@ class ActorCriticRecurrent(ActorCritic):
             layer_norm=layer_norm,
             dropout_rate=dropout_rate,
             residual=residual,
+            actor_obs_meta=actor_obs_meta,
+            critic_obs_meta=critic_obs_meta,
         )
-
         activation = resolve_nn_activation(activation)
 
         self.memory_a = Memory(num_actor_obs, type=rnn_type, num_layers=rnn_num_layers, hidden_size=rnn_hidden_dim)

@@ -51,24 +51,32 @@ class BaseRunner(OnPolicyRunner):
             self.training_type = "rl"
 
         # resolve dimensions of observations
-        obs, extras = self.env.get_observations()
-        num_obs = obs.shape[1]
+        obs_dict = self.env.unwrapped._get_observations(compute_meta=True)
+        num_obs = obs_dict['policy'].shape[1]
 
         # resolve type of privileged observations
         if self.training_type == "rl":
-            if "critic" in extras["observations"]:
+            if "critic" in obs_dict:
                 self.privileged_obs_type = "critic"  # actor-critic reinforcement learnig, e.g., PPO
             else:
                 self.privileged_obs_type = None
+            meta_dict = dict(
+                actor_obs_meta=obs_dict['policy_meta'],
+                critic_obs_meta=obs_dict['critic_meta'],
+            )
         if self.training_type == "distillation":
-            if "teacher" in extras["observations"]:
+            if "teacher" in obs_dict:
                 self.privileged_obs_type = "teacher"  # policy distillation
             else:
                 self.privileged_obs_type = None
+            meta_dict = dict(
+                student_obs_meta=obs_dict['policy_meta'],
+                teacher_obs_meta=obs_dict['teacher_meta'],
+            )
 
         # resolve dimensions of privileged observations
         if self.privileged_obs_type is not None:
-            num_privileged_obs = extras["observations"][self.privileged_obs_type].shape[1]
+            num_privileged_obs = obs_dict[self.privileged_obs_type].shape[1]
         else:
             num_privileged_obs = num_obs
 
@@ -84,7 +92,7 @@ class BaseRunner(OnPolicyRunner):
         # evaluate the policy class
         policy_class = eval(self.policy_cfg.pop("class_name"))
         policy: ActorCritic | ActorCriticRecurrent | StudentTeacher | StudentTeacherRecurrent = policy_class(
-            num_obs, num_privileged_obs, self.env.num_actions, **self.policy_cfg
+            num_obs, num_privileged_obs, self.env.num_actions, **self.policy_cfg, **meta_dict
         ).to(self.device)
 
         if isinstance(num_obs, tuple):
@@ -93,7 +101,7 @@ class BaseRunner(OnPolicyRunner):
         # resolve dimension of rnd gated state
         if "rnd_cfg" in self.alg_cfg and self.alg_cfg["rnd_cfg"] is not None:
             # check if rnd gated state is present
-            rnd_state = extras["observations"].get("rnd_state")
+            rnd_state = obs_dict.get("rnd_state")
             if rnd_state is None:
                 raise ValueError("Observations for the key 'rnd_state' not found in infos['observations'].")
             # get dimension of rnd gated state
@@ -149,7 +157,7 @@ class BaseRunner(OnPolicyRunner):
         # init AMP reward
         if "amp_cfg" in self.cfg and self.cfg["amp_cfg"] is not None:
             # add AMP to observation space
-            amp_obs = extras["observations"]["amp_policy"]
+            amp_obs = obs_dict["amp_policy"]
             num_amp_obs = amp_obs.shape[1]
 
             self.cfg["amp_cfg"].pop("input_dim")

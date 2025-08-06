@@ -19,17 +19,17 @@ class Memory(torch.nn.Module):
         self.rnn = rnn_cls(input_size=input_size, hidden_size=hidden_size, num_layers=num_layers)
         self.hidden_states = None
 
-    def forward(self, input, masks=None, hidden_states=None):
+    def forward(self, input, masks=None, hidden_states=None, *args, **kwargs):
         batch_mode = masks is not None
         if batch_mode:
             # batch mode: needs saved hidden states
             if hidden_states is None:
                 raise ValueError("Hidden states not passed to memory module during policy update")
-            out, _ = self.rnn(input, hidden_states)
+            out, _ = self.rnn(input, hidden_states, *args, **kwargs)
             out = unpad_trajectories(out, masks)
         else:
             # inference/distillation mode: uses hidden states of last step
-            out, self.hidden_states = self.rnn(input.unsqueeze(0), self.hidden_states)
+            out, self.hidden_states = self.rnn(input.unsqueeze(0), self.hidden_states, *args, **kwargs)
         return out
 
     def reset(self, dones=None, hidden_states=None):
