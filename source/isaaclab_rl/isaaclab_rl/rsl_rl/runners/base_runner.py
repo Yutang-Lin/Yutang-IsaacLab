@@ -382,10 +382,11 @@ class BaseRunner(OnPolicyRunner):
                 self.log(locals())
                 # Save model
                 if it % self.save_interval == 0:
-                    current_reward = statistics.mean(rewbuffer)
-                    if current_reward > best_reward:
-                        best_reward = current_reward
-                        self.save(os.path.join(self.log_dir, f"model_best.pt"), remove_extras=False)
+                    if len(rewbuffer) > 0:
+                        current_reward = statistics.mean(rewbuffer)
+                        if current_reward > best_reward:
+                            best_reward = current_reward
+                            self.save(os.path.join(self.log_dir, f"model_best.pt"), remove_extras=False)
                     self.save(os.path.join(self.log_dir, f"model_{it}.pt"))
 
             # Clear episode infos
