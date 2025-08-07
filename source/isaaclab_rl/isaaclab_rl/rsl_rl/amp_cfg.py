@@ -24,9 +24,7 @@ class RslRlAmpCfg:
     """The number of learning epochs for the AMP module. Default is 4."""
 
     hidden_dims: list[int] = [256, 256, 256]
-    """The hidden dimensions for the AMP discriminator network. Default is [256, 256, 256].
-
-    """
+    """The hidden dimensions for the AMP discriminator network. Default is [256, 256, 256]."""
 
     activation: str = "relu"
     """The activation function for the AMP discriminator network. Default is "relu"."""

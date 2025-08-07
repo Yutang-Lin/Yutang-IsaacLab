@@ -165,7 +165,14 @@ class TransformerEncoder(nn.Module):
             for _ in range(num_layers)
         ])
 
-    def forward(self, feature, attn_mask=None):
+    def forward(self, feature, attn_mask=None, return_all_layers=False):
+        if return_all_layers:
+            features = []
         for layer in self.layers:
             feature = layer(feature, attn_mask)
-        return feature
+            if return_all_layers:
+                features.append(feature)
+        if return_all_layers:
+            return features
+        else:
+            return feature

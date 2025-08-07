@@ -300,6 +300,7 @@ class BaseRunner(OnPolicyRunner):
                         rewards += amp_rewards
 
                         infos["episode"]["rew_amp"] = amp_reward_storage.mean().item()
+                        infos["episode"]["Perstep/rew_amp"] = amp_reward_storage / infos["episode_length"].to(self.device)
                         amp_reward_storage[resets] = 0.
 
                     # process the step

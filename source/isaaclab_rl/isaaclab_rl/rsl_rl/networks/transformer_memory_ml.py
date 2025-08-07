@@ -129,18 +129,21 @@ class LNNStyleTransformerML(nn.Module):
                                     step_proprio, 
                                     step_task, 
                                     self.initial_cls_token.unsqueeze(0).repeat(step_proprio.shape[0], 1, 1)], dim=1)
-            output = self.model(step_input, attn_mask)
+            output = self.model(step_input, attn_mask, return_all_layers=True)
+            last_output = output[-1]
             if compute_align_loss:
-                motion_output, text_output = output.chunk(2, dim=0)
-                task_token_start = self.num_history_tokens + self.num_proprio_tokens
-                hidden_align = F.mse_loss(text_output[:, -1], motion_output[:, -1])
-                task_align = F.mse_loss(text_output[:, task_token_start:task_token_start+self.num_task_tokens], 
-                                        motion_output[:, task_token_start:task_token_start+self.num_task_tokens])
+                hidden_align, task_align = 0.0, 0.0
+                for layer_output in output:
+                    motion_output, text_output = layer_output.chunk(2, dim=0)
+                    task_token_start = self.num_history_tokens + self.num_proprio_tokens
+                    hidden_align += F.mse_loss(text_output[:, -1], motion_output[:, -1])
+                    task_align += F.mse_loss(text_output[:, task_token_start:task_token_start+self.num_task_tokens], 
+                                            motion_output[:, task_token_start:task_token_start+self.num_task_tokens])
                 self._save_dict['hidden_align'] += hidden_align / seq_length
                 self._save_dict['task_align'] += task_align / seq_length
 
-            transpose_hidden_states = self._lnn_update(transpose_hidden_states, output[:, :self.num_history_tokens])
-            all_outpus.append(output[:, -1])
+            transpose_hidden_states = self._lnn_update(transpose_hidden_states, last_output[:, :self.num_history_tokens])
+            all_outpus.append(last_output[:, -1])
 
         all_outputs = torch.stack(all_outpus, dim=1)
         if compute_align_loss:
