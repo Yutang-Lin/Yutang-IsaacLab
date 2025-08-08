@@ -20,8 +20,8 @@ class RslRlAmpCfg:
     learning_rate: float = 1e-3
     """The learning rate for the AMP module. Default is 1e-3."""
 
-    num_learning_epochs: int = 4
-    """The number of learning epochs for the AMP module. Default is 4."""
+    num_learning_epochs: int = 1
+    """The number of learning epochs for the AMP module. Default is 1."""
 
     hidden_dims: list[int] = [256, 256, 256]
     """The hidden dimensions for the AMP discriminator network. Default is [256, 256, 256]."""
