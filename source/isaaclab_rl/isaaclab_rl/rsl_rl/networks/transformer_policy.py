@@ -42,23 +42,17 @@ class TransformerPolicy(nn.Module):
                                        hidden_dim, 
                                        num_layers, 
                                        dropout, 
-                                       is_causal=False, 
+                                       is_causal=True, 
                                        activation=activation)
-        out_proj_layers = [nn.Linear(d_model, mlp_hidden_dims[0]), mlp_activation]
+        out_proj_layers = [nn.Linear(num_input_tokens * d_model, mlp_hidden_dims[0]), mlp_activation]
         for i in range(1, len(mlp_hidden_dims)):
             out_proj_layers.append(nn.Linear(mlp_hidden_dims[i-1], mlp_hidden_dims[i]))
             out_proj_layers.append(mlp_activation)
         out_proj_layers.append(nn.Linear(mlp_hidden_dims[-1], output_size))
         self.output_proj = nn.Sequential(*out_proj_layers)
-        self.initial_cls_token = nn.Parameter(torch.randn(1, d_model))
-        self.input_tokens_embeddings = nn.Parameter(torch.randn(1, d_model))
 
     def forward(self, input: torch.Tensor):
         batch_size = input.shape[0]
-
-        input = self.input_proj(input)
-        input = input.view(batch_size, self.num_input_tokens, self.d_model)
-        input = torch.cat([input + self.input_tokens_embeddings.unsqueeze(0),
-                          self.initial_cls_token.unsqueeze(0).repeat(batch_size, 1, 1)], dim=1)
+        input = self.input_proj(input).view(batch_size, self.num_input_tokens, self.d_model)
         input = self.model(input)
-        return self.output_proj(input[:, -1])
+        return self.output_proj(input.flatten(start_dim=1))
