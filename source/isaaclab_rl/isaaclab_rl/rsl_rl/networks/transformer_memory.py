@@ -52,10 +52,13 @@ class LNNStyleTransformer(nn.Module):
                                        dropout, 
                                        is_causal=False, 
                                        activation=activation)
-        self.initial_cls_token = nn.Parameter(torch.randn(1, d_model))
         self.initial_history_tokens = nn.Parameter(torch.zeros(num_history_tokens, d_model))
         self.history_tokens_embeddings = nn.Parameter(torch.randn(1, d_model))
         self.input_tokens_embeddings = nn.Parameter(torch.randn(1, d_model))
+        self.out_proj = nn.Sequential(
+            nn.Linear(num_input_tokens * d_model, d_model),
+            activation,
+        )
     
     def _lnn_update(self, hidden_states: torch.Tensor, hidden_states_vel: torch.Tensor):
         velocity = - (self.lnn_tau_inv + hidden_states_vel) * hidden_states + hidden_states_vel * self.lnn_bias.unsqueeze(0)
@@ -80,11 +83,10 @@ class LNNStyleTransformer(nn.Module):
             transpose_hidden_states = transpose_hidden_states + self.history_tokens_embeddings.unsqueeze(0)
 
             step_input = torch.cat([transpose_hidden_states, 
-                                    step_input, 
-                                    self.initial_cls_token.unsqueeze(0).repeat(step_input.shape[0], 1, 1)], dim=1)
+                                    step_input], dim=1)
             output = self.model(step_input, attn_mask)
             transpose_hidden_states = self._lnn_update(transpose_hidden_states, output[:, :self.num_history_tokens])
-            all_outpus.append(output[:, -1])
+            all_outpus.append(self.out_proj(output[:, -self.num_input_tokens:].flatten(start_dim=1)))
 
         all_outputs = torch.stack(all_outpus, dim=1)
         return all_outputs.transpose(0, 1).contiguous(), transpose_hidden_states.transpose(0, 1).contiguous()

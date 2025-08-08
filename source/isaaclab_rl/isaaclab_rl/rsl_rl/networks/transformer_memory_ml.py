@@ -62,11 +62,14 @@ class LNNStyleTransformerML(nn.Module):
                                        dropout, 
                                        is_causal=False, 
                                        activation=activation)
-        self.initial_cls_token = nn.Parameter(torch.randn(1, d_model))
         self.initial_history_tokens = nn.Parameter(torch.zeros(num_history_tokens, d_model))
         self.history_tokens_embeddings = nn.Parameter(torch.randn(1, d_model))
         self.task_tokens_embeddings = nn.Parameter(torch.randn(1, d_model))
         self.proprio_tokens_embeddings = nn.Parameter(torch.randn(1, d_model))
+        self.out_proj = nn.Sequential(
+            nn.Linear(num_task_tokens * d_model, d_model),
+            activation,
+        )
 
         self._save_dict = dict()
 
@@ -128,8 +131,7 @@ class LNNStyleTransformerML(nn.Module):
 
             step_input = torch.cat([transpose_hidden_states, 
                                     step_proprio, 
-                                    step_task, 
-                                    self.initial_cls_token.unsqueeze(0).repeat(step_proprio.shape[0], 1, 1)], dim=1)
+                                    step_task], dim=1)
             output = self.model(step_input, attn_mask, return_all_layers=True)
             last_output = output[-1]
             if compute_align_loss:
@@ -144,7 +146,7 @@ class LNNStyleTransformerML(nn.Module):
                 self._save_dict['task_align'] += task_align / seq_length
 
             transpose_hidden_states = self._lnn_update(transpose_hidden_states, last_output[:, :self.num_history_tokens])
-            all_outpus.append(last_output[:, -1])
+            all_outpus.append(self.out_proj(last_output[:, -self.num_task_tokens:].flatten(start_dim=1)))
 
         all_outputs = torch.stack(all_outpus, dim=1)
         if compute_align_loss:
