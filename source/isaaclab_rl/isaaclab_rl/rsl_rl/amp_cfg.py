@@ -23,6 +23,12 @@ class RslRlAmpCfg:
     num_learning_epochs: int = 3
     """The number of learning epochs for the AMP module. Default is 1."""
 
+    max_buffer_size: int = 49152
+    """The maximum size of the buffer. Default is 49152."""
+    
+    sample_k: int = 2048
+    """The number of samples to sample from the buffer. Default is 2048."""
+
     hidden_dims: list[int] = [256, 256, 256]
     """The hidden dimensions for the AMP discriminator network. Default is [256, 256, 256]."""
 

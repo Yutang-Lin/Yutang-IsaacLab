@@ -161,11 +161,10 @@ class BaseRunner(OnPolicyRunner):
             num_amp_obs = amp_obs.shape[1]
 
             self.cfg["amp_cfg"].pop("input_dim")
-            self.amp_obs_normalizer = EmpiricalNormalization(shape=[num_amp_obs], until=1.0e8).to(self.device)
             self.amp_reward = AmpReward(num_amp_obs, training=True, 
                                         num_envs=self.env.num_envs,
-                                        num_steps_per_env=self.num_steps_per_env,
                                         device=self.device, 
+                                        store_interval=self.num_steps_per_env,
                                         multi_gpu_cfg=self.multi_gpu_cfg,
                                         **self.cfg["amp_cfg"])
         else:
@@ -288,13 +287,15 @@ class BaseRunner(OnPolicyRunner):
 
                     if self.amp_reward is not None:
                         reward_scale = infos.get("overall_reward_scale", 1.0)
-                        gen_obs = self.amp_obs_normalizer(infos["observations"]["amp_policy"].to(self.device))
-                        ref_obs = self.amp_obs_normalizer(infos["observations"]["amp_motion"].to(self.device))
+                        gen_obs = infos["observations"]["amp_policy"].to(self.device)
+                        ref_obs = infos["observations"]["amp_motion"].to(self.device)
                         self.amp_reward.update_storage(gen_obs, ref_obs)
 
                         amp_reward_scale = 1.0
                         if 'reward_scales' in infos and 'amp' in infos['reward_scales']:
                             amp_reward_scale = infos['reward_scales']['amp']
+                            if isinstance(amp_reward_scale, torch.Tensor):
+                                amp_reward_scale = amp_reward_scale.to(self.device)
                         amp_rewards = self.amp_reward.compute_reward(gen_obs, amp_reward_scale) * reward_scale
                         
                         amp_reward_storage += amp_rewards
@@ -545,7 +546,6 @@ class BaseRunner(OnPolicyRunner):
         # -- Save AMP model if used
         if self.amp_reward is not None:
             saved_dict["amp_state_dict"] = self.amp_reward.network.state_dict()
-            saved_dict["amp_obs_norm_state_dict"] = self.amp_obs_normalizer.state_dict()
             saved_dict["amp_optimizer_state_dict"] = self.amp_reward.optimizer.state_dict()
         # -- Save observation normalizer if used
         if self.empirical_normalization:
@@ -585,10 +585,6 @@ class BaseRunner(OnPolicyRunner):
             if 'amp_state_dict' in loaded_dict:
                 try:
                     self.amp_reward.network.load_state_dict(loaded_dict["amp_state_dict"])
-                    try:
-                        self.amp_obs_normalizer.load_state_dict(loaded_dict["amp_obs_norm_state_dict"])
-                    except Exception as e:
-                        print(f"[WARNING]: Failed to load AMP observation normalizer. Error: {e}. Initializing new AMP observation normalizer.")
                     amp_loaded = True
                 except Exception as e:
                     print(f"[WARNING]: Failed to load AMP model. Error: {e}. Initializing new AMP model.")
@@ -643,8 +639,6 @@ class BaseRunner(OnPolicyRunner):
         if self.empirical_normalization:
             self.obs_normalizer.train()
             self.privileged_obs_normalizer.train()
-        if self.amp_reward is not None:
-            self.amp_obs_normalizer.train()
 
     def eval_mode(self):
         # -- PPO
@@ -656,5 +650,3 @@ class BaseRunner(OnPolicyRunner):
         if self.empirical_normalization:
             self.obs_normalizer.eval()
             self.privileged_obs_normalizer.eval()
-        if self.amp_reward is not None:
-            self.amp_obs_normalizer.eval()

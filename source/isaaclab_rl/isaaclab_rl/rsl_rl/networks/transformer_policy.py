@@ -52,7 +52,5 @@ class TransformerPolicy(nn.Module):
         self.output_proj = nn.Sequential(*out_proj_layers)
 
     def forward(self, input: torch.Tensor):
-        batch_size = input.shape[0]
-        input = self.input_proj(input).view(batch_size, self.num_input_tokens, self.d_model)
-        input = self.model(input)
+        input = self.model(self.input_proj(input).view(input.shape[0], self.num_input_tokens, self.d_model))
         return self.output_proj(input.flatten(start_dim=1))

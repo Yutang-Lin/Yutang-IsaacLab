@@ -7,6 +7,9 @@ class AmpReward:
     def __init__(self, input_dim: int,
                  learning_rate: float = 1e-4,
                  num_learning_epochs: int = 3,
+                 store_interval: int = 8,
+                 max_buffer_size: int = 100000,
+                 sample_k: int = 1024,
                  hidden_dims: list[int] = [128, 128],
                  activation: str = "relu",
                  layer_norm: bool = False,
@@ -18,7 +21,6 @@ class AmpReward:
 
                  training: bool = True,
                  num_envs: int = 1,
-                 num_steps_per_env: int = 1,
                  device: str = "cpu",
                  multi_gpu_cfg: dict | None = None,):
         super().__init__()
@@ -31,12 +33,18 @@ class AmpReward:
         self.num_learning_epochs = num_learning_epochs
 
         self.num_envs = num_envs
-        self.num_steps_per_env = num_steps_per_env
         self.clip_obs_value = clip_obs_value
         self.reward_scale = reward_scale
         self.reward_factor = reward_factor
         self.w_grad_penalty = w_grad_penalty
         self.max_grad_norm = max_grad_norm
+
+        self.store_interval = store_interval
+        max_buffer_size = max_buffer_size - max_buffer_size % num_envs
+        assert max_buffer_size > 0, "max_buffer_size must be greater than 0 after mod num_envs"
+        self.max_buffer_size = max_buffer_size
+        self.max_buffer_step = max_buffer_size // num_envs
+        self.sample_k = sample_k
 
         self.is_multi_gpu = multi_gpu_cfg is not None
         # Multi-GPU parameters
@@ -75,14 +83,14 @@ class AmpReward:
 
         self.training = training
         if training:
-            self.step = 0
-            self.gen_storage = torch.zeros(num_envs, num_steps_per_env, input_dim, device=device)
-            self.ref_storage = torch.zeros(num_envs, num_steps_per_env, input_dim, device=device)
+            self.step_counter = 0
+            self.gen_storage = torch.zeros(max_buffer_size, input_dim, device=device)
+            self.ref_storage = torch.zeros(max_buffer_size, input_dim, device=device)
             self.optimizer = torch.optim.AdamW(self.network.parameters(), lr=learning_rate)
 
     def reset_storage(self):
         if self.training:
-            self.step = 0
+            self.step_counter = 0
             self.gen_storage[:] = 0.
             self.ref_storage[:] = 0.
 
@@ -99,7 +107,7 @@ class AmpReward:
 
         # Compute gradients
         gradients = torch.autograd.grad(outputs=d_interpolated, inputs=interpolated,
-                                        grad_outputs=torch.ones(d_interpolated.size()).to(self.device),
+                                        grad_outputs=torch.ones_like(d_interpolated),
                                         create_graph=True, retain_graph=True)[0]
 
         # Compute the gradient penalty
@@ -130,18 +138,28 @@ class AmpReward:
         if not self.training:
             raise ValueError("AMP is not trained, call training=True")
         
-        gen_batch = self.gen_storage.clone().flatten(0, 1)
-        ref_batch = self.ref_storage.clone().flatten(0, 1)
-        for _ in range(self.num_learning_epochs):
+        gen_storage = self.gen_storage.clone()
+        ref_storage = self.ref_storage.clone()
+        batch_ids = torch.randperm(self.max_buffer_size, device=self.device)
+        for i in range(self.num_learning_epochs):
+            start_idx = i * self.sample_k
+            end_idx = min(start_idx + self.sample_k, self.max_buffer_size)
+            if start_idx >= end_idx:
+                break
+            gen_batch = gen_storage[batch_ids[start_idx:end_idx]]
+            ref_batch = ref_storage[batch_ids[start_idx:end_idx]]
             loss = self._optimize_amp(gen_batch, ref_batch)
         return loss
 
     @torch.inference_mode()
     def update_storage(self, gen_obs: torch.Tensor, ref_obs: torch.Tensor):
-        self.gen_storage[:, self.step, :] = gen_obs.view(self.num_envs, -1).clamp(-self.clip_obs_value, self.clip_obs_value)
-        self.ref_storage[:, self.step, :] = ref_obs.view(self.num_envs, -1).clamp(-self.clip_obs_value, self.clip_obs_value)
-        self.step = (self.step + 1) % self.num_steps_per_env
-    
+        if self.step_counter % self.store_interval == 0:
+            start_idx = ((self.step_counter // self.store_interval) % self.max_buffer_step) * self.num_envs
+            end_idx = start_idx + self.num_envs
+            self.gen_storage[start_idx:end_idx, :] = gen_obs.view(self.num_envs, -1).clamp(-self.clip_obs_value, self.clip_obs_value)
+            self.ref_storage[start_idx:end_idx, :] = ref_obs.view(self.num_envs, -1).clamp(-self.clip_obs_value, self.clip_obs_value)
+        self.step_counter += 1
+
     @torch.inference_mode()
     def compute_reward(self, obs: torch.Tensor, scale: float = 1.0):
         features = obs.view(self.num_envs, -1).clamp(-self.clip_obs_value, self.clip_obs_value)
