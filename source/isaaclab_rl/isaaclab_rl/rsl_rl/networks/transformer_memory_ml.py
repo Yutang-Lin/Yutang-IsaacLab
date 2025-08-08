@@ -39,6 +39,7 @@ class LNNStyleTransformerML(nn.Module):
         self.num_layers = num_layers
         self.num_heads = num_heads
         self.hidden_dim = hidden_dim
+        self.hidden_size = d_model
         self.dropout = dropout
         self.activation = activation
 

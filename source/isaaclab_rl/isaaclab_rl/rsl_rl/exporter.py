@@ -76,6 +76,12 @@ class _TorchPolicyExporter(torch.nn.Module):
             elif self.rnn_type == "rnnstyletransformer":
                 self.forward = self.forward_transformer
                 self.reset = self.reset_memory
+            elif self.rnn_type == "lnnstyletransformer":
+                self.forward = self.forward_transformer
+                self.reset = self.reset_memory
+            elif self.rnn_type == "lnnstyletransformerml":
+                self.forward = self.forward_transformer
+                self.reset = self.reset_memory
             else:
                 raise NotImplementedError(f"Unsupported RNN type: {self.rnn_type}")
         # copy normalizer if exists
@@ -156,6 +162,10 @@ class _OnnxPolicyExporter(torch.nn.Module):
             elif self.rnn_type == "gru":
                 self.forward = self.forward_gru
             elif self.rnn_type == "rnnstyletransformer":
+                self.forward = self.forward_transformer
+            elif self.rnn_type == "lnnstyletransformer":
+                self.forward = self.forward_transformer
+            elif self.rnn_type == "lnnstyletransformerml":
                 self.forward = self.forward_transformer
             else:
                 raise NotImplementedError(f"Unsupported RNN type: {self.rnn_type}")
