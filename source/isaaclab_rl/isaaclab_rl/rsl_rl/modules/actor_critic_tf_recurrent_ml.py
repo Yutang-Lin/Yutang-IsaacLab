@@ -13,7 +13,7 @@ from isaaclab_rl.rsl_rl.networks import TransformerMemoryML
 from isaaclab_rl.rsl_rl.utils import resolve_nn_activation, TensorDict
 
 
-class ActorCriticMLTransformer(ActorCritic):
+class ActorCriticTFRecurrentML(ActorCritic):
     """Motion-language version of ActorCriticTransformer, with text and ref motion modalities"""
     is_recurrent = True
 
@@ -49,7 +49,7 @@ class ActorCriticMLTransformer(ActorCritic):
     ):
         if kwargs:
             print(
-                "ActorCriticMLTransformer.__init__ got unexpected arguments, which will be ignored: " + str(kwargs.keys()),
+                "ActorCriticTFRecurrentML.__init__ got unexpected arguments, which will be ignored: " + str(kwargs.keys()),
             )
 
         super().__init__(

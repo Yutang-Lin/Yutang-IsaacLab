@@ -12,7 +12,8 @@ from .actor_critic_mop import ActorCriticMoP
 from .actor_critic_pnn import ActorCriticPNN
 from .actor_critic_dp import ActorCriticDP
 from .actor_critic_transformer import ActorCriticTransformer
-from .actor_critic_ml_transformer import ActorCriticMLTransformer
+from .actor_critic_tf_recurrent import ActorCriticTFRecurrent
+from .actor_critic_tf_recurrent_ml import ActorCriticTFRecurrentML
 from .actor_critic_dp_transformer import ActorCriticDPTransformer
 from .student_teacher import StudentTeacher
 
@@ -58,16 +59,16 @@ __all__ = [
     "ActorCriticOU",
     "ActorCriticDP",
     "ActorCriticDPTransformer",
-    "ActorCriticTransformer",
+    "ActorCriticTFRecurrent",
+    "ActorCriticTFRecurrentML",
     "ActorCriticMoE",
     "ActorCriticMoP",
     "ActorCriticPNN",
     "ActorCriticRecurrent",
-    "ActorCriticTransformer",
-    "ActorCriticMLTransformer",
     "EmpiricalNormalization",
     "StudentTeacher",
     "StudentTeacherRecurrent",
     "TwinDelayed",
     "ActorDoubleCritic",
+    "ActorCriticTransformer",
 ]

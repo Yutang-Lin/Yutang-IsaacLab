@@ -310,13 +310,40 @@ class RslRlPpoActorCriticRecurrentCfg(RslRlPpoActorCriticCfg):
     rnn_num_layers: int = MISSING
     """The number of RNN layers."""
 
-
 @configclass
 class RslRlPpoActorCriticTransformerCfg(RslRlPpoActorCriticCfg):
     """Configuration for the PPO actor-critic networks with transformer layers."""
 
     class_name: str = "ActorCriticTransformer"
     """The policy class name. Default is ActorCriticTransformer."""
+
+    tf_d_model: int = MISSING
+    """The dimension of the transformer model."""
+
+    tf_num_input_tokens: int = MISSING
+    """The number of input tokens."""
+
+    tf_num_heads: int = MISSING
+    """The number of transformer heads."""
+
+    tf_num_layers: int = MISSING
+    """The number of transformer layers."""
+
+    tf_hidden_dim: int = MISSING
+    """The dimension of the transformer hidden layers."""
+
+    tf_dropout: float = 0.0
+    """The dropout rate for the transformer."""
+
+    tf_activation: str = "gelu"
+    """The activation function for the transformer."""
+
+@configclass
+class RslRlPpoActorCriticTFRecurrentCfg(RslRlPpoActorCriticCfg):
+    """Configuration for the PPO actor-critic networks with transformer layers."""
+
+    class_name: str = "ActorCriticTFRecurrent"
+    """The policy class name. Default is ActorCriticTFRecurrent."""
 
     tf_d_model: int = MISSING
     """The dimension of the transformer model."""
@@ -349,14 +376,14 @@ class RslRlPpoActorCriticTransformerCfg(RslRlPpoActorCriticCfg):
     """The activation function for the transformer."""
 
 @configclass
-class RslRlPpoActorCriticMLTransformerCfg(RslRlPpoActorCriticTransformerCfg):
+class RslRlPpoActorCriticTFRecurrentMLCfg(RslRlPpoActorCriticTFRecurrentCfg):
     """Configuration for the PPO actor-critic networks with transformer layers."""
 
     tf_num_task_tokens: int = MISSING
     """The number of task tokens."""
 
-    class_name: str = "ActorCriticMLTransformer"
-    """The policy class name. Default is ActorCriticMLTransformer."""
+    class_name: str = "ActorCriticTFRecurrentML"
+    """The policy class name. Default is ActorCriticTFRecurrentML."""
 
 @configclass
 class RslRlTd3ActorCriticCfg:
