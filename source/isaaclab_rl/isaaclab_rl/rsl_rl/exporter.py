@@ -73,9 +73,6 @@ class _TorchPolicyExporter(torch.nn.Module):
             elif self.rnn_type == "gru":
                 self.forward = self.forward_gru
                 self.reset = self.reset_memory
-            elif self.rnn_type == "rnnstyletransformer":
-                self.forward = self.forward_transformer
-                self.reset = self.reset_memory
             elif self.rnn_type == "lnnstyletransformer":
                 self.forward = self.forward_transformer
                 self.reset = self.reset_memory

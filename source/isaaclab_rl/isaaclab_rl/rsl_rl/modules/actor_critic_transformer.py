@@ -24,13 +24,15 @@ class ActorCriticTransformer(ActorCritic):
         critic_hidden_dims=[256, 256, 256],
         activation="elu",
         tf_d_model=256,
-        tf_history_length=8,
-        tf_hidden_history=True,
+        tf_num_input_tokens=4,
+        tf_num_history_tokens=4,
         tf_num_layers=1,
         tf_num_heads=4,
         tf_hidden_dim=256,
         tf_dropout=0.05,
         tf_activation="gelu",
+        tf_lnn_dt=0.02,
+        tf_lnn_tau=0.5,
         init_noise_std=1.0,
         load_noise_std: bool = True,
         learnable_noise_std: bool = True,
@@ -67,23 +69,27 @@ class ActorCriticTransformer(ActorCritic):
 
         tf_activation = resolve_nn_activation(tf_activation)
         self.memory_a = TransformerMemory(num_actor_obs, 
-                                         history_length=tf_history_length,
-                                         hidden_history=tf_hidden_history,
+                                         num_input_tokens=tf_num_input_tokens,
+                                         num_history_tokens=tf_num_history_tokens,
                                          num_layers=tf_num_layers, 
                                          d_model=tf_d_model, 
                                          hidden_dim=tf_hidden_dim, 
                                          num_heads=tf_num_heads, 
                                          dropout=tf_dropout, 
-                                         activation=tf_activation)
+                                         activation=tf_activation,
+                                         lnn_dt=tf_lnn_dt,
+                                         lnn_tau=tf_lnn_tau)
         self.memory_c = TransformerMemory(num_critic_obs, 
-                                         history_length=tf_history_length,
-                                         hidden_history=tf_hidden_history,
+                                         num_input_tokens=tf_num_input_tokens,
+                                         num_history_tokens=tf_num_history_tokens,
                                          num_layers=tf_num_layers, 
                                          d_model=tf_d_model, 
                                          hidden_dim=tf_hidden_dim, 
                                          num_heads=tf_num_heads, 
                                          dropout=tf_dropout, 
-                                         activation=tf_activation)
+                                         activation=tf_activation,
+                                         lnn_dt=tf_lnn_dt,
+                                         lnn_tau=tf_lnn_tau)
 
         print(f"Actor Transformer: {self.memory_a}")
         print(f"Critic Transformer: {self.memory_c}")

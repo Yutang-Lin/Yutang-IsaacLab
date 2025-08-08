@@ -20,7 +20,7 @@ class LNNStyleTransformerML(nn.Module):
                  proprio_dim,
                  text_dim,
                  motion_dim,
-                 num_proprio_tokens,
+                 num_input_tokens,
                  num_task_tokens,
                  num_history_tokens,
                  num_layers,
@@ -43,7 +43,7 @@ class LNNStyleTransformerML(nn.Module):
         self.dropout = dropout
         self.activation = activation
 
-        self.num_proprio_tokens = num_proprio_tokens
+        self.num_proprio_tokens = num_input_tokens
         self.num_task_tokens = num_task_tokens
         self.num_history_tokens = num_history_tokens
 
@@ -52,7 +52,7 @@ class LNNStyleTransformerML(nn.Module):
         self.lnn_tau_inv = 1 / lnn_tau
         self.lnn_bias = nn.Parameter(torch.zeros(1, d_model))
 
-        self.proprio_proj = nn.Linear(proprio_dim, num_proprio_tokens * d_model)
+        self.proprio_proj = nn.Linear(proprio_dim, num_input_tokens * d_model)
         self.text_proj = nn.Linear(text_dim, num_task_tokens * d_model)
         self.motion_proj = nn.Linear(motion_dim, num_task_tokens * d_model)
         self.model = TransformerEncoder(d_model, 
@@ -163,7 +163,7 @@ class TransformerMemoryML(Memory):
     def __init__(self, proprio_dim, 
                  text_dim, 
                  motion_dim,
-                 num_proprio_tokens,
+                 num_input_tokens,
                  num_task_tokens,
                  num_history_tokens,
                  num_layers=1, 
@@ -179,7 +179,7 @@ class TransformerMemoryML(Memory):
                                        proprio_dim, 
                                        text_dim,
                                        motion_dim,
-                                       num_proprio_tokens,
+                                       num_input_tokens,
                                        num_task_tokens,
                                        num_history_tokens,
                                        num_layers, 

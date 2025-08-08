@@ -321,42 +321,8 @@ class RslRlPpoActorCriticTransformerCfg(RslRlPpoActorCriticCfg):
     tf_d_model: int = MISSING
     """The dimension of the transformer model."""
 
-    tf_history_length: int = MISSING
-    """The history length for the transformer."""
-
-    tf_hidden_history: bool = True
-    """Whether to use the hidden state as the history for the transformer."""
-
-    tf_num_heads: int = MISSING
-    """The number of transformer heads."""
-
-    tf_num_layers: int = MISSING
-    """The number of transformer layers."""
-
-    tf_hidden_dim: int = MISSING
-    """The dimension of the transformer hidden layers."""
-
-    tf_dropout: float = 0.0
-    """The dropout rate for the transformer."""
-
-    tf_activation: str = "gelu"
-    """The activation function for the transformer."""
-
-@configclass
-class RslRlPpoActorCriticMLTransformerCfg(RslRlPpoActorCriticCfg):
-    """Configuration for the PPO actor-critic networks with transformer layers."""
-
-    class_name: str = "ActorCriticMLTransformer"
-    """The policy class name. Default is ActorCriticMLTransformer."""
-
-    tf_d_model: int = MISSING
-    """The dimension of the transformer model."""
-
-    tf_num_proprio_tokens: int = MISSING
-    """The number of proprio tokens."""
-
-    tf_num_task_tokens: int = MISSING
-    """The number of task tokens."""
+    tf_num_input_tokens: int = MISSING
+    """The number of input tokens."""
 
     tf_num_history_tokens: int = MISSING
     """The number of history tokens."""
@@ -381,8 +347,16 @@ class RslRlPpoActorCriticMLTransformerCfg(RslRlPpoActorCriticCfg):
 
     tf_activation: str = "gelu"
     """The activation function for the transformer."""
-    
-    
+
+@configclass
+class RslRlPpoActorCriticMLTransformerCfg(RslRlPpoActorCriticTransformerCfg):
+    """Configuration for the PPO actor-critic networks with transformer layers."""
+
+    tf_num_task_tokens: int = MISSING
+    """The number of task tokens."""
+
+    class_name: str = "ActorCriticMLTransformer"
+    """The policy class name. Default is ActorCriticMLTransformer."""
 
 @configclass
 class RslRlTd3ActorCriticCfg:
