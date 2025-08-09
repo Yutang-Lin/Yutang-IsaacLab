@@ -192,7 +192,7 @@ class AmpReward:
             if self.offload_buffer:
                 gen_obs = gen_obs.to("cpu")
                 ref_obs = ref_obs.to("cpu")
-            self.num_storage = max(self.max_buffer_size, self.num_storage + self.num_envs)
+            self.num_storage = min(self.max_buffer_size, self.num_storage + self.num_envs)
             self.gen_storage[start_idx:end_idx, :] = gen_obs.view(self.num_envs, -1).clamp(-self.clip_obs_value, self.clip_obs_value)
             self.ref_storage[start_idx:end_idx, :] = ref_obs.view(self.num_envs, -1).clamp(-self.clip_obs_value, self.clip_obs_value)
         self.step_counter += 1
