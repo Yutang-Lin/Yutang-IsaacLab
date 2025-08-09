@@ -52,6 +52,11 @@ class BaseRunner(OnPolicyRunner):
 
         # resolve dimensions of observations
         obs_dict = self.env.unwrapped._get_observations(compute_meta=True)
+        meta_tensors = self.env.unwrapped._get_meta_tensors()
+        if len(meta_tensors) == 0:
+            meta_tensors = None
+        else:
+            print(f"[INFO]: Meta tensors are used, keys: {meta_tensors.keys()}")
         num_obs = obs_dict['policy'].shape[1]
 
         # resolve type of privileged observations
@@ -152,6 +157,7 @@ class BaseRunner(OnPolicyRunner):
             [num_obs],
             [num_privileged_obs],
             [self.env.num_actions],
+            meta_tensors=meta_tensors
         )
 
         # init AMP reward
@@ -249,7 +255,7 @@ class BaseRunner(OnPolicyRunner):
             self.amp_reward.reset_storage()
 
         # initialize infos
-        infos = None
+        infos = dict(meta_tensors={})
 
         # initialize best reward
         best_reward = -float("inf")
@@ -348,7 +354,8 @@ class BaseRunner(OnPolicyRunner):
 
                 # compute returns
                 if self.training_type == "rl":
-                    self.alg.compute_returns(privileged_obs, actions=actions) # type: ignore
+                    self.alg.compute_returns(privileged_obs, actions=actions,
+                                             infos=infos) # type: ignore
 
             # train policy
             self.alg.policy.train()

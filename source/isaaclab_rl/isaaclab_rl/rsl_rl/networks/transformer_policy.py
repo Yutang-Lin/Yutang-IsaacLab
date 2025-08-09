@@ -21,7 +21,8 @@ class TransformerPolicy(nn.Module):
                  num_heads, 
                  hidden_dim, 
                  dropout, 
-                 activation):
+                 activation,
+                 enable_sdpa: bool = True):
         super().__init__()
         self.d_model = d_model
         self.input_size = input_size
@@ -43,7 +44,8 @@ class TransformerPolicy(nn.Module):
                                        num_layers, 
                                        dropout, 
                                        is_causal=True, 
-                                       activation=activation)
+                                       activation=activation,
+                                       enable_sdpa=enable_sdpa)
         out_proj_layers = [nn.Linear(num_input_tokens * d_model, mlp_hidden_dims[0]), mlp_activation]
         for i in range(1, len(mlp_hidden_dims)):
             out_proj_layers.append(nn.Linear(mlp_hidden_dims[i-1], mlp_hidden_dims[i]))

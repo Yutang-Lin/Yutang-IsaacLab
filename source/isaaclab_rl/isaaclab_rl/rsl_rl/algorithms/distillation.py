@@ -99,7 +99,8 @@ class Distillation:
         self.transition.rewards = rewards
         self.transition.dones = dones
         # record the transition
-        self.storage.add_transitions(self.transition)
+        self.storage.add_transitions(self.transition, 
+                                     meta_tensors=infos.get('meta_tensors', None))
         self.transition.clear()
         self.policy.reset(dones)
 

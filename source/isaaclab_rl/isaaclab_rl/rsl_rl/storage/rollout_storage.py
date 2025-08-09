@@ -40,6 +40,7 @@ class RolloutStorage:
         rnd_state_shape=None,
         device="cpu",
         deterministic=False,
+        meta_tensors=None,
     ):
         # store inputs
         self.training_type = training_type
@@ -78,6 +79,12 @@ class RolloutStorage:
             self.returns = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
             self.advantages = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
 
+        if meta_tensors is not None:
+            self.have_meta_tensors = True
+            self.create_meta_tensors_storage(meta_tensors)
+        else:
+            self.have_meta_tensors = False
+
         # For RND
         if rnd_state_shape is not None:
             self.rnd_state = torch.zeros(num_transitions_per_env, num_envs, *rnd_state_shape, device=self.device)
@@ -89,7 +96,37 @@ class RolloutStorage:
         # counter for the number of transitions stored
         self.step = 0
 
-    def add_transitions(self, transition: Transition):
+    def create_meta_tensors_storage(self, meta_tensors: dict[str, torch.Tensor]):
+        meta_tensors_list = []
+        self._meta_tensors = []
+
+        last_idx = 0
+        for k, v in meta_tensors.items():
+            assert v.shape[0] == self.num_envs
+            num_obs = 1
+            for dim in v.shape[1:]:
+                num_obs *= dim
+            self._meta_tensors.append((k, v.shape[1:], num_obs, last_idx))
+            meta_tensors_list.append(torch.zeros(self.num_transitions_per_env, self.num_envs, num_obs, device=self.device))
+            last_idx += num_obs
+        self.meta_tensors = torch.cat(meta_tensors_list, dim=-1)
+
+    def _assemble_meta_tensors(self, meta_tensors: dict[str, torch.Tensor]):
+        for i, (k, v) in enumerate(meta_tensors.items()):
+            assert k == self._meta_tensors[i][0], "Meta tensor key mismatch"
+            start_idx = self._meta_tensors[i][3]
+            end_idx = start_idx + self._meta_tensors[i][2]
+            self.meta_tensors[self.step, :, start_idx:end_idx] = v.view(self.num_envs, -1).to(self.device)
+
+    def _disassemble_meta_tensors(self):
+        meta_tensors = {}
+        for (k, s, n, i) in self._meta_tensors:
+            meta_tensors[k] = self.meta_tensors[:, :, i:i+n].view(
+                self.num_transitions_per_env, self.num_envs, *s
+            )
+        return meta_tensors
+
+    def add_transitions(self, transition: Transition, meta_tensors: dict[str, torch.Tensor] = None):
         # check if the transition is valid
         if self.step >= self.num_transitions_per_env:
             raise OverflowError("Rollout buffer overflow! You should call clear() before adding new transitions.")
@@ -120,6 +157,10 @@ class RolloutStorage:
 
         # For RNN networks
         self._save_hidden_states(transition.hidden_states)
+
+        # For meta observations
+        if self.have_meta_tensors:
+            self._assemble_meta_tensors(meta_tensors)
 
         # increment the counter
         self.step += 1
@@ -225,6 +266,12 @@ class RolloutStorage:
         if self.rnd_state_shape is not None:
             rnd_state = self.rnd_state.flatten(0, 1)
 
+        # For meta observations
+        if self.have_meta_tensors:
+            meta_tensors = self._disassemble_meta_tensors()
+            for k, v in meta_tensors.items():
+                meta_tensors[k] = v.flatten(0, 1)
+
         for epoch in range(num_epochs):
             for i in range(num_mini_batches):
                 # Select the indices for the mini-batch
@@ -251,6 +298,14 @@ class RolloutStorage:
                     old_mu_batch = None
                     old_sigma_batch = None
 
+                # -- For meta observations
+                if self.have_meta_tensors:
+                    meta_tensors_batch = {}
+                    for k, v in meta_tensors.items():
+                        meta_tensors_batch[k] = v[batch_idx]
+                else:
+                    meta_tensors_batch = None
+
                 # -- For RND
                 if self.rnd_state_shape is not None:
                     rnd_state_batch = rnd_state[batch_idx]
@@ -261,7 +316,7 @@ class RolloutStorage:
                 yield obs_batch, privileged_observations_batch, actions_batch, target_values_batch, advantages_batch, returns_batch, old_actions_log_prob_batch, old_mu_batch, old_sigma_batch, (
                     None,
                     None,
-                ), None, rnd_state_batch
+                ), None, rnd_state_batch, meta_tensors_batch
 
     # for reinfrocement learning with recurrent networks
     def recurrent_mini_batch_generator(self, num_mini_batches, num_epochs=8):
@@ -277,6 +332,12 @@ class RolloutStorage:
             padded_rnd_state_trajectories, _ = split_and_pad_trajectories(self.rnd_state, self.dones)
         else:
             padded_rnd_state_trajectories = None
+
+        # For meta observations
+        if self.have_meta_tensors:
+            padded_meta_tensors_trajectories = self._disassemble_meta_tensors()
+            for k, v in padded_meta_tensors_trajectories.items():
+                padded_meta_tensors_trajectories[k], _ = split_and_pad_trajectories(v, self.dones)
 
         mini_batch_size = self.num_envs // num_mini_batches
         for ep in range(num_epochs):
@@ -316,6 +377,14 @@ class RolloutStorage:
                 else:
                     old_actions_log_prob_batch = None
 
+                # For meta observations
+                if self.have_meta_tensors:
+                    meta_tensors_batch = {}
+                    for k, v in padded_meta_tensors_trajectories.items():
+                        meta_tensors_batch[k] = v[:, first_traj:last_traj]
+                else:
+                    meta_tensors_batch = None
+
                 # reshape to [num_envs, time, num layers, hidden dim] (original shape: [time, num_layers, num_envs, hidden_dim])
                 # then take only time steps after dones (flattens num envs and time dimensions),
                 # take a batch of trajectories and finally reshape back to [num_layers, batch, hidden_dim]
@@ -339,6 +408,6 @@ class RolloutStorage:
                 yield obs_batch, privileged_obs_batch, actions_batch, values_batch, advantages_batch, returns_batch, old_actions_log_prob_batch, old_mu_batch, old_sigma_batch, (
                     hid_a_batch,
                     hid_c_batch,
-                ), masks_batch, rnd_state_batch
+                ), masks_batch, rnd_state_batch, meta_tensors_batch
 
                 first_traj = last_traj

@@ -46,13 +46,13 @@ class MultiHeadAttention(nn.Module):
     """Flash Attention enhanced MHA"""
     def __init__(self, d_model, num_heads, dropout=0.0, 
                  is_causal=False,
-                 scale=None):
+                 enable_sdpa: bool = True):
         super().__init__()
         self.d_model = d_model
         self.num_heads = num_heads
         self.dropout = dropout
         self.is_causal = is_causal
-        self.scale = scale if scale is not None else 1.0 / math.sqrt(d_model)
+        self.enable_sdpa = enable_sdpa
 
         self.head_dim = d_model // num_heads
         self.q_proj = nn.Linear(d_model, d_model)
@@ -61,9 +61,13 @@ class MultiHeadAttention(nn.Module):
         self.out_proj = nn.Linear(d_model, d_model)
 
     def forward(self, feature, other, attn_mask=None):
+        is_causal = self.is_causal
+        if is_causal and attn_mask is not None:
+            is_causal = False
+
         q_shape = feature.shape
         v_shape = other.shape
-        
+            
         q = self.q_proj(feature)
         k = self.k_proj(other)
         v = self.v_proj(other)
@@ -72,14 +76,22 @@ class MultiHeadAttention(nn.Module):
         k = k.view(*v_shape[:-1], self.num_heads, self.head_dim).transpose(-2, -3)
         v = v.view(*v_shape[:-1], self.num_heads, self.head_dim).transpose(-2, -3)
 
-        is_causal = self.is_causal
-        if self.is_causal and attn_mask is not None:
-            is_causal = False
+        if not self.enable_sdpa:
+            q = q.reshape(-1, q.shape[-2], q.shape[-1])
+            k = k.reshape(-1, k.shape[-2], k.shape[-1])
+            v = v.reshape(-1, v.shape[-2], v.shape[-1])
+            attn_score = torch.bmm(q, k.transpose(-2, -1))
+            if attn_mask is not None:
+                attn_mask = - torch.inf * attn_mask.reshape(-1, q.shape[-2], k.shape[-2])
+                attn_score = attn_score + attn_mask
+            attn_score = F.softmax(attn_score / math.sqrt(self.head_dim), dim=-1)
+            out = torch.bmm(attn_score, v).reshape(*q_shape[:-2], self.num_heads, -1, self.head_dim)
 
-        # let torch decide the best backend
-        out = scaled_dot_product_attention(q, k, v, dropout_p=self.dropout,
-                                            attn_mask=attn_mask,
-                                            is_causal=is_causal)
+        else:
+            # let torch decide the best backend
+            out = scaled_dot_product_attention(q, k, v, dropout_p=self.dropout,
+                                                attn_mask=attn_mask,
+                                                is_causal=is_causal)
 
         out = out.transpose(-2, -3).contiguous().view(out.size(0), *q_shape[1:-1], self.d_model)
         return self.out_proj(out)
@@ -117,12 +129,13 @@ class TransformerDecoderLayer(nn.Module):
 class TransformerEncoderLayer(nn.Module):
     def __init__(self, d_model, num_heads, hidden_dim, dropout=0.0, 
                  is_causal=False,
-                 activation: nn.Module | None = None):
+                 activation: nn.Module | None = None,
+                 enable_sdpa: bool = True):
         super().__init__()
         if activation is None:
             activation = nn.GELU(approximate="tanh")
-
-        self.self_attn = MultiHeadAttention(d_model, num_heads, dropout, is_causal=is_causal)
+        
+        self.self_attn = MultiHeadAttention(d_model, num_heads, dropout, is_causal=is_causal, enable_sdpa=enable_sdpa)
         self.norm1 = nn.LayerNorm(d_model)
         self.norm2 = nn.LayerNorm(d_model)
         self.mlp = nn.Sequential(
@@ -158,10 +171,11 @@ class TransformerDecoder(nn.Module):
 class TransformerEncoder(nn.Module):
     def __init__(self, d_model, num_heads, hidden_dim, num_layers, dropout=0.0, 
                  is_causal=False,
-                 activation: nn.Module | None = None):
+                 activation: nn.Module | None = None,
+                 enable_sdpa: bool = True):
         super().__init__()
         self.layers = nn.ModuleList([
-            TransformerEncoderLayer(d_model, num_heads, hidden_dim, dropout, is_causal, activation)
+            TransformerEncoderLayer(d_model, num_heads, hidden_dim, dropout, is_causal, activation, enable_sdpa)
             for _ in range(num_layers)
         ])
 

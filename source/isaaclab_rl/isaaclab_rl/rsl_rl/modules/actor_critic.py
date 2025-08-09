@@ -126,6 +126,18 @@ class ActorCritic(RslRlActorCritic):
 
     def get_actions_log_prob(self, actions, **kwargs):
         return self.distribution.log_prob(actions).sum(dim=-1) # type: ignore
+    
+    def act(self, observations, **kwargs):
+        self.update_distribution(observations)
+        return self.distribution.sample()
+
+    def act_inference(self, observations, **kwargs):
+        actions_mean = self.actor(observations)
+        return actions_mean
+
+    def evaluate(self, critic_observations, **kwargs):
+        value = self.critic(critic_observations)
+        return value
 
     def update_distribution(self, observations):
         # compute mean

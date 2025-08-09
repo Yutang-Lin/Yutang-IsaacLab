@@ -12,6 +12,9 @@ from torch.distributions import Normal
 from rsl_rl.utils import resolve_nn_activation
 from .actor_critic import ActorCritic
 from .actor_critic_moe import ActorCriticMoE
+from .actor_critic_transformer import ActorCriticTransformer
+from .actor_critic_tf_recurrent import ActorCriticTFRecurrent
+from .actor_critic_tf_recurrent_ml import ActorCriticTFRecurrentML
 
 
 class StudentTeacher(nn.Module):

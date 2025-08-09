@@ -73,11 +73,10 @@ class ActorCriticTFRecurrentML(ActorCritic):
         self.critic_obs_meta = critic_obs_meta
         assert 'text_embeddings' in actor_obs_meta, "text_embeddings must be provided in actor_obs_meta"
         assert 'motion_reference' in actor_obs_meta, "motion_reference must be provided in actor_obs_meta"
-        assert 'task_blend_mask' in actor_obs_meta, "task_blend_mask must be provided in actor_obs_meta"
 
         # resolve obs meta
-        self.actor_proprio_ids, self.actor_text_ids, self.actor_motion_ids, self.actor_blend_mask_ids = self._resolve_obs_meta(num_actor_obs, actor_obs_meta)
-        self.critic_proprio_ids, self.critic_text_ids, self.critic_motion_ids, self.critic_blend_mask_ids = self._resolve_obs_meta(num_critic_obs, critic_obs_meta)
+        self.actor_proprio_ids, self.actor_text_ids, self.actor_motion_ids = self._resolve_obs_meta(num_actor_obs, actor_obs_meta)
+        self.critic_proprio_ids, self.critic_text_ids, self.critic_motion_ids = self._resolve_obs_meta(num_critic_obs, critic_obs_meta)
 
         tf_activation = resolve_nn_activation(tf_activation)
         self.memory_a = TransformerMemoryML(self.actor_proprio_ids.shape[0], 
@@ -130,7 +129,6 @@ class ActorCriticTFRecurrentML(ActorCritic):
         proprio_obs = torch.ones(num_obs, dtype=torch.bool)
         text_obs = []
         motion_obs = []
-        blend_mask_obs = []
         for seg in obs_meta['text_embeddings']:
             text_obs.append(all_obs[seg['start']:seg['end']].clone())
             proprio_obs[seg['start']:seg['end']] = False
@@ -138,53 +136,58 @@ class ActorCriticTFRecurrentML(ActorCritic):
         for seg in obs_meta['motion_reference']:
             motion_obs.append(all_obs[seg['start']:seg['end']].clone())
             proprio_obs[seg['start']:seg['end']] = False
-        
-        for seg in obs_meta['task_blend_mask']:
-            blend_mask_obs.append(all_obs[seg['start']:seg['end']].clone())
-            proprio_obs[seg['start']:seg['end']] = False
 
         proprio_obs = all_obs[proprio_obs].clone().contiguous()
         text_obs = torch.cat(text_obs).contiguous()
         motion_obs = torch.cat(motion_obs).contiguous()
-        blend_mask_obs = torch.cat(blend_mask_obs).contiguous()
-        return proprio_obs, text_obs, motion_obs, blend_mask_obs
+        return proprio_obs, text_obs, motion_obs
     
     def _split_observations(self, observations: torch.Tensor):
         proprio_obs = observations[..., self.actor_proprio_ids].contiguous()
         text_obs = observations[..., self.actor_text_ids].contiguous()
         motion_obs = observations[..., self.actor_motion_ids].contiguous()
-        blend_mask_obs = observations[..., self.actor_blend_mask_ids].contiguous()
-        return TensorDict(proprio=proprio_obs, text=text_obs, motion=motion_obs, blend_mask=blend_mask_obs)
+        return TensorDict(proprio=proprio_obs, text=text_obs, motion=motion_obs)
     
     def _split_critic_observations(self, observations: torch.Tensor):
         proprio_obs = observations[..., self.critic_proprio_ids].contiguous()
         text_obs = observations[..., self.critic_text_ids].contiguous()
         motion_obs = observations[..., self.critic_motion_ids].contiguous()
-        blend_mask_obs = observations[..., self.critic_blend_mask_ids].contiguous()
-        return TensorDict(proprio=proprio_obs, text=text_obs, motion=motion_obs, blend_mask=blend_mask_obs)
+        return TensorDict(proprio=proprio_obs, text=text_obs, motion=motion_obs)
 
     def reset(self, dones=None):
         self.memory_a.reset(dones)
         self.memory_c.reset(dones)
 
-    def act(self, observations, masks=None, hidden_states=None):
-        input_a = self.memory_a(self._split_observations(observations), masks, hidden_states, compute_align_loss=self.compute_align_loss)
+    def act(self, observations, masks=None, hidden_states=None,
+            meta_tensors=None, **kwargs):
+        tensor_dict = self._split_observations(observations)
+        ml_blend_mask = meta_tensors.get('ml_blend_mask', None)
+        if ml_blend_mask is not None:
+            tensor_dict['blend_mask'] = ml_blend_mask
+        else:
+            print("[WARNING]: No ml_blend_mask provided")
+        input_a = self.memory_a(tensor_dict, masks, hidden_states, compute_align_loss=self.compute_align_loss)
         return super().act(input_a.squeeze(0))
 
     def act_inference(self, observations=None,
                       proprio=None,
                       text=None,
                       motion=None,
-                      blend_mask=None):
+                      **kwargs):
         if observations is not None:
             obs_dict = self._split_observations(observations)
         else:
-            obs_dict = TensorDict(proprio=proprio, text=text, motion=motion, blend_mask=blend_mask)
+            obs_dict = TensorDict(proprio=proprio, text=text, motion=motion)
         input_a = self.memory_a(obs_dict, compute_align_loss=self.compute_align_loss)
         return super().act_inference(input_a.squeeze(0))
 
-    def evaluate(self, critic_observations, masks=None, hidden_states=None):
-        input_c = self.memory_c(self._split_critic_observations(critic_observations), masks, hidden_states,
+    def evaluate(self, critic_observations, masks=None, hidden_states=None,
+                 meta_tensors=None):
+        tensor_dict = self._split_critic_observations(critic_observations)
+        ml_blend_mask = meta_tensors.get('ml_blend_mask', None)
+        if ml_blend_mask is not None:
+            tensor_dict['blend_mask'] = ml_blend_mask
+        input_c = self.memory_c(tensor_dict, masks, hidden_states,
                                 use_all_task_tokens=True)
         return super().evaluate(input_c.squeeze(0))
 

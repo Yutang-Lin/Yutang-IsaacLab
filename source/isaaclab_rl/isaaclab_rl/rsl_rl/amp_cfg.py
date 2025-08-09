@@ -10,9 +10,7 @@ from isaaclab.utils import configclass
 
 @configclass
 class RslRlAmpCfg:
-    """Configuration for the Adversarial Motion Prior (AMP) module.
-
-    """
+    """Configuration for the Adversarial Motion Prior (AMP) module."""
 
     input_dim: int = 1
     """The input dimension for the AMP module. Default is 1."""
@@ -34,6 +32,33 @@ class RslRlAmpCfg:
 
     activation: str = "relu"
     """The activation function for the AMP discriminator network. Default is "relu"."""
+
+    use_transformer: bool = False
+    """Whether to use a transformer for the AMP discriminator network. Default is False."""
+
+    tf_d_model: int = 256
+    """The dimension of the transformer for the AMP discriminator network. Default is 256."""
+
+    tf_hidden_dim: int = 512
+    """The hidden dimension for the transformer for the AMP discriminator network. Default is 256."""
+
+    tf_num_layers: int = 2
+    """The number of layers for the transformer for the AMP discriminator network. Default is 3."""
+
+    tf_num_heads: int = 4
+    """The number of heads for the transformer for the AMP discriminator network. Default is 4."""
+
+    tf_dropout: float = 0.1
+    """The dropout for the transformer for the AMP discriminator network. Default is 0.1."""
+
+    tf_num_input_tokens: int = 4
+    """The number of input tokens for the transformer for the AMP discriminator network. Default is 1."""
+
+    tf_activation: str = "gelu"
+    """The activation function for the transformer for the AMP discriminator network. Default is "gelu"."""
+
+    offload_buffer: bool = False
+    """Whether to offload the buffer for the AMP buffer to CPU. Default is False."""
 
     layer_norm: bool = False
     """Whether to use layer normalization for the AMP discriminator network. Default is False."""

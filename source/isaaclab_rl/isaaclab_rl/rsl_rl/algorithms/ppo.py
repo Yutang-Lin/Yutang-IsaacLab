@@ -122,12 +122,35 @@ class PPO(RslRlPPO):
         self.lipschitz_constraint_coef = kwargs.pop("lipschitz_constraint_coef", 2e-2)
         self.adjust_critic_lr = kwargs.pop("adjust_critic_lr", True)
 
+    def init_storage(
+        self, training_type, num_envs, num_transitions_per_env, actor_obs_shape, critic_obs_shape, actions_shape,
+        meta_tensors=None
+    ):
+        # create memory for RND as well :)
+        if self.rnd:
+            rnd_state_shape = [self.rnd.num_states]
+        else:
+            rnd_state_shape = None
+        # create rollout storage
+        self.storage = RolloutStorage(
+            training_type,
+            num_envs,
+            num_transitions_per_env,
+            actor_obs_shape,
+            critic_obs_shape,
+            actions_shape,
+            rnd_state_shape,
+            self.device,
+            meta_tensors=meta_tensors
+        )
+
     def act(self, obs, critic_obs, infos, **kwargs):
         if self.policy.is_recurrent:
             self.transition.hidden_states = self.policy.get_hidden_states()
+        meta_tensors = infos.get('meta_tensors', {})
         # compute the actions and values
-        self.transition.actions = self.policy.act(obs).detach() # type: ignore
-        self.transition.values = self.policy.evaluate(critic_obs).detach()
+        self.transition.actions = self.policy.act(obs, meta_tensors=meta_tensors).detach() # type: ignore
+        self.transition.values = self.policy.evaluate(critic_obs, meta_tensors=meta_tensors).detach()
         self.transition.actions_log_prob = self.policy.get_actions_log_prob(
             self.transition.actions,
             collecting=True
@@ -139,10 +162,41 @@ class PPO(RslRlPPO):
         self.transition.observations = obs
         self.transition.privileged_observations = critic_obs
         return self.transition.actions
+    
+    def process_env_step(self, rewards, dones, infos):
+        # Record the rewards and dones
+        # Note: we clone here because later on we bootstrap the rewards based on timeouts
+        self.transition.rewards = rewards.clone()
+        self.transition.dones = dones
 
-    def compute_returns(self, last_critic_obs, **kwargs):
+        # Compute the intrinsic rewards and add to extrinsic rewards
+        if self.rnd:
+            # Obtain curiosity gates / observations from infos
+            rnd_state = infos["observations"]["rnd_state"]
+            # Compute the intrinsic rewards
+            # note: rnd_state is the gated_state after normalization if normalization is used
+            self.intrinsic_rewards, rnd_state = self.rnd.get_intrinsic_reward(rnd_state)
+            # Add intrinsic rewards to extrinsic rewards
+            self.transition.rewards += self.intrinsic_rewards
+            # Record the curiosity gates
+            self.transition.rnd_state = rnd_state.clone()
+
+        # Bootstrapping on time outs
+        if "time_outs" in infos:
+            self.transition.rewards += self.gamma * torch.squeeze(
+                self.transition.values * infos["time_outs"].unsqueeze(1).to(self.device), 1
+            )
+
+        # record the transition
+        self.storage.add_transitions(self.transition,
+                                     meta_tensors=infos.get('meta_tensors', None))
+        self.transition.clear()
+        self.policy.reset(dones)
+
+    def compute_returns(self, last_critic_obs, infos, **kwargs):
         # compute value for the last step
-        last_values = self.policy.evaluate(last_critic_obs).detach()
+        meta_tensors = infos.get('meta_tensors', {})
+        last_values = self.policy.evaluate(last_critic_obs, meta_tensors=meta_tensors).detach()
         self.storage.compute_returns(
             last_values, self.gamma, self.lam, normalize_advantage=not self.normalize_advantage_per_mini_batch
         )
@@ -203,6 +257,7 @@ class PPO(RslRlPPO):
             hid_states_batch,
             masks_batch,
             rnd_state_batch,
+            meta_tensors_batch,
         ) in enumerate(generator):
             if update_id // self.num_mini_batches > self.num_learning_epochs:
                 # critic extra epochs
@@ -267,10 +322,12 @@ class PPO(RslRlPPO):
             # Recompute actions log prob and entropy for current batch of transitions
             # Note: we need to do this because we updated the policy with the new parameters
             # -- actor
-            self.policy.act(actor_obs_batch, masks=masks_batch, hidden_states=hid_states_batch[0])
+            self.policy.act(actor_obs_batch, masks=masks_batch, hidden_states=hid_states_batch[0],
+                            meta_tensors=meta_tensors_batch)
             actions_log_prob_batch = self.policy.get_actions_log_prob(actions_batch)
             # -- critic
-            value_batch = self.policy.evaluate(critic_obs_batch, masks=masks_batch, hidden_states=hid_states_batch[1])
+            value_batch = self.policy.evaluate(critic_obs_batch, masks=masks_batch, hidden_states=hid_states_batch[1],
+                                               meta_tensors=meta_tensors_batch)
             # -- entropy
             # we only keep the entropy of the first augmentation (the original one)
             mu_batch = self.policy.action_mean[:original_batch_size]
@@ -404,7 +461,8 @@ class PPO(RslRlPPO):
                     num_aug = int(obs_batch.shape[0] / original_batch_size)
 
                 # actions predicted by the actor for symmetrically-augmented observations
-                mean_actions_batch = self.policy.act_inference(obs_batch.detach().clone())
+                mean_actions_batch = self.policy.act_inference(obs_batch.detach().clone(),
+                                                                meta_tensors=meta_tensors_batch)
 
                 # compute the symmetrically augmented actions
                 # note: we are assuming the first augmentation is the original one.

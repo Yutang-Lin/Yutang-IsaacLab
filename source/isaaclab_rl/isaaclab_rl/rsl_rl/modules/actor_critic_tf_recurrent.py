@@ -98,15 +98,17 @@ class ActorCriticTFRecurrent(ActorCritic):
         self.memory_a.reset(dones)
         self.memory_c.reset(dones)
 
-    def act(self, observations, masks=None, hidden_states=None):
+    def act(self, observations, masks=None, hidden_states=None,
+            **kwargs):
         input_a = self.memory_a(observations, masks, hidden_states)
         return super().act(input_a.squeeze(0))
 
-    def act_inference(self, observations):
+    def act_inference(self, observations, **kwargs):
         input_a = self.memory_a(observations)
         return super().act_inference(input_a.squeeze(0))
 
-    def evaluate(self, critic_observations, masks=None, hidden_states=None):
+    def evaluate(self, critic_observations, masks=None, hidden_states=None,
+                 **kwargs):
         input_c = self.memory_c(critic_observations, masks, hidden_states)
         return super().evaluate(input_c.squeeze(0))
 

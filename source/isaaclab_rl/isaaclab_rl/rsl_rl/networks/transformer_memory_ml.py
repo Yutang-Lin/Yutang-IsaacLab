@@ -63,9 +63,9 @@ class LNNStyleTransformerML(nn.Module):
                                        is_causal=False, 
                                        activation=activation)
         self.initial_history_tokens = nn.Parameter(torch.zeros(num_history_tokens, d_model))
-        self.history_tokens_embeddings = nn.Parameter(torch.randn(1, d_model))
-        self.task_tokens_embeddings = nn.Parameter(torch.randn(1, d_model))
-        self.proprio_tokens_embeddings = nn.Parameter(torch.randn(1, d_model))
+        self.history_tokens_embeddings = nn.Parameter(torch.randn(num_history_tokens, d_model))
+        self.task_tokens_embeddings = nn.Parameter(torch.randn(num_task_tokens, d_model))
+        self.proprio_tokens_embeddings = nn.Parameter(torch.randn(num_input_tokens, d_model))
         self.out_proj = nn.Sequential(
             nn.Linear(num_task_tokens * d_model, d_model),
             activation,
@@ -79,6 +79,8 @@ class LNNStyleTransformerML(nn.Module):
             text = self.text_proj(text)
         if motion is not None:
             motion = self.motion_proj(motion)
+        if blend_mask is None:
+            blend_mask = torch.zeros(proprio.shape[0], proprio.shape[1], device=proprio.device)
         return proprio, text, motion, blend_mask
     
     def _lnn_update(self, hidden_states: torch.Tensor, hidden_states_vel: torch.Tensor):
@@ -100,9 +102,9 @@ class LNNStyleTransformerML(nn.Module):
         text = text.view(batch_size, seq_length, self.num_task_tokens, self.d_model)
         motion = motion.view(batch_size, seq_length, self.num_task_tokens, self.d_model)
 
-        blend_mask = (blend_mask.view(batch_size, seq_length, 1, 1) + 1e-3).long()
-        motion_mask = blend_mask == 0
-        text_mask = blend_mask == 1
+        blend_mask = (blend_mask.view(batch_size, seq_length, 1, 1).float() + 1e-3).long()
+        text_mask = blend_mask == 0
+        motion_mask = blend_mask == 1
 
         if compute_align_loss:
             # duplicate batch
@@ -121,12 +123,17 @@ class LNNStyleTransformerML(nn.Module):
         else:
             task_tokens = torch.cat([text, motion], dim=2)
 
+        # add positional embeddings
+        proprio = proprio + self.proprio_tokens_embeddings.unsqueeze(0).unsqueeze(0)
+        if not use_all_task_tokens:
+            task_tokens = task_tokens + self.task_tokens_embeddings.unsqueeze(0).unsqueeze(0)
+        else:
+            task_tokens = task_tokens + self.task_tokens_embeddings.unsqueeze(0).unsqueeze(0).repeat(1, 1, 2, 1)
+
         all_outpus = []
         for s in range(seq_length):
             step_proprio = proprio[:, s]
             step_task = task_tokens[:, s]
-            step_proprio = step_proprio + self.proprio_tokens_embeddings.unsqueeze(0)
-            step_task = step_task + self.task_tokens_embeddings.unsqueeze(0)
             transpose_hidden_states = transpose_hidden_states + self.history_tokens_embeddings.unsqueeze(0)
 
             step_input = torch.cat([transpose_hidden_states, 
@@ -134,6 +141,7 @@ class LNNStyleTransformerML(nn.Module):
                                     step_task], dim=1)
             output = self.model(step_input, attn_mask, return_all_layers=True)
             last_output = output[-1]
+
             if compute_align_loss:
                 hidden_align, task_align = 0.0, 0.0
                 for layer_output in output:

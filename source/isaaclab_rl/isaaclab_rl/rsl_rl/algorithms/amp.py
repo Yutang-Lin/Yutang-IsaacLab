@@ -2,6 +2,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from copy import deepcopy
+from isaaclab_rl.rsl_rl.utils import resolve_nn_activation
+from isaaclab_rl.rsl_rl.networks.transformer_policy import TransformerPolicy
 
 class AmpReward:
     def __init__(self, input_dim: int,
@@ -19,9 +21,19 @@ class AmpReward:
                  reward_scale: float = 1.0,
                  reward_factor: float = 0.0,
 
+                 use_transformer: bool = False,
+                 tf_d_model: int = 256,
+                 tf_hidden_dim: int = 512,
+                 tf_num_layers: int = 3,
+                 tf_num_heads: int = 4,
+                 tf_dropout: float = 0.1,
+                 tf_num_input_tokens: int = 4,
+                 tf_activation: str = "gelu",
+
                  training: bool = True,
                  num_envs: int = 1,
                  device: str = "cpu",
+                 offload_buffer: bool = False,
                  multi_gpu_cfg: dict | None = None,):
         super().__init__()
 
@@ -46,6 +58,15 @@ class AmpReward:
         self.max_buffer_step = max_buffer_size // num_envs
         self.sample_k = sample_k
 
+        self.use_transformer = use_transformer
+        self.tf_d_model = tf_d_model
+        self.tf_hidden_dim = tf_hidden_dim
+        self.tf_num_layers = tf_num_layers
+        self.tf_num_heads = tf_num_heads
+        self.tf_dropout = tf_dropout
+        self.tf_num_input_tokens = tf_num_input_tokens
+
+        self.offload_buffer = offload_buffer
         self.is_multi_gpu = multi_gpu_cfg is not None
         # Multi-GPU parameters
         if multi_gpu_cfg is not None:
@@ -56,36 +77,45 @@ class AmpReward:
             self.gpu_world_size = 1
             
 
-        if activation == "relu":
-            self.activation = nn.ReLU()
-        elif activation == "tanh":
-            self.activation = nn.Tanh()
-        elif activation == "elu":
-            self.activation = nn.ELU()
-        elif activation == "gelu":
-            self.activation = nn.GELU()
-        else:
-            raise ValueError(f"Activation function {activation} not supported")
-        
+        activation = resolve_nn_activation(activation)
         # create the network
-        layers = []
-        layers.append(nn.Linear(input_dim, hidden_dims[0]))
-        layers.append(deepcopy(self.activation))
-        for i in range(len(hidden_dims) - 1):
-            layers.append(nn.Linear(hidden_dims[i], hidden_dims[i + 1]))
-            if layer_norm:
-                layers.append(nn.LayerNorm(hidden_dims[i + 1]))
-            layers.append(deepcopy(self.activation))
-        layers.append(nn.Linear(hidden_dims[-1], 1))
-        # layers.append(nn.Sigmoid()) # NOTE: no sigmoid for amp
-        self.network = nn.Sequential(*layers)
-        self.network.to(device)
+        if not use_transformer:
+            layers = []
+            layers.append(nn.Linear(input_dim, hidden_dims[0]))
+            layers.append(deepcopy(activation))
+            for i in range(len(hidden_dims) - 1):
+                layers.append(nn.Linear(hidden_dims[i], hidden_dims[i + 1]))
+                if layer_norm:
+                    layers.append(nn.LayerNorm(hidden_dims[i + 1]))
+                layers.append(deepcopy(activation))
+            layers.append(nn.Linear(hidden_dims[-1], 1))
+            # layers.append(nn.Sigmoid()) # NOTE: no sigmoid for amp
+            self.network = nn.Sequential(*layers)
+            self.network.to(device)
+        else:
+            tf_activation = resolve_nn_activation(tf_activation)
+            self.network = TransformerPolicy(
+                input_dim,
+                1,
+                hidden_dims,
+                activation,
+                tf_num_input_tokens,
+                tf_d_model,
+                tf_num_layers,
+                tf_num_heads,
+                tf_hidden_dim,
+                tf_dropout,
+                tf_activation,
+                enable_sdpa=False, # False to compute second order gradient
+            )
+            self.network.to(device)
 
         self.training = training
         if training:
             self.step_counter = 0
-            self.gen_storage = torch.zeros(max_buffer_size, input_dim, device=device)
-            self.ref_storage = torch.zeros(max_buffer_size, input_dim, device=device)
+            self.num_storage = 0
+            self.gen_storage = torch.zeros(max_buffer_size, input_dim, device=device if not offload_buffer else "cpu")
+            self.ref_storage = torch.zeros(max_buffer_size, input_dim, device=device if not offload_buffer else "cpu")
             self.optimizer = torch.optim.AdamW(self.network.parameters(), lr=learning_rate)
 
     def reset_storage(self):
@@ -138,16 +168,19 @@ class AmpReward:
         if not self.training:
             raise ValueError("AMP is not trained, call training=True")
         
-        gen_storage = self.gen_storage.clone()
-        ref_storage = self.ref_storage.clone()
-        batch_ids = torch.randperm(self.max_buffer_size, device=self.device)
+        gen_storage = self.gen_storage[:self.num_storage].clone()
+        ref_storage = self.ref_storage[:self.num_storage].clone()
+        batch_ids = torch.randperm(self.num_storage, device=self.device)
         for i in range(self.num_learning_epochs):
             start_idx = i * self.sample_k
-            end_idx = min(start_idx + self.sample_k, self.max_buffer_size)
+            end_idx = min(start_idx + self.sample_k, self.num_storage)
             if start_idx >= end_idx:
                 break
             gen_batch = gen_storage[batch_ids[start_idx:end_idx]]
             ref_batch = ref_storage[batch_ids[start_idx:end_idx]]
+            if self.offload_buffer:
+                gen_batch = gen_batch.to(self.device)
+                ref_batch = ref_batch.to(self.device)
             loss = self._optimize_amp(gen_batch, ref_batch)
         return loss
 
@@ -156,6 +189,10 @@ class AmpReward:
         if self.step_counter % self.store_interval == 0:
             start_idx = ((self.step_counter // self.store_interval) % self.max_buffer_step) * self.num_envs
             end_idx = start_idx + self.num_envs
+            if self.offload_buffer:
+                gen_obs = gen_obs.to("cpu")
+                ref_obs = ref_obs.to("cpu")
+            self.num_storage = max(self.max_buffer_size, self.num_storage + self.num_envs)
             self.gen_storage[start_idx:end_idx, :] = gen_obs.view(self.num_envs, -1).clamp(-self.clip_obs_value, self.clip_obs_value)
             self.ref_storage[start_idx:end_idx, :] = ref_obs.view(self.num_envs, -1).clamp(-self.clip_obs_value, self.clip_obs_value)
         self.step_counter += 1
