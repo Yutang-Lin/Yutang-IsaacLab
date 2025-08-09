@@ -137,8 +137,8 @@ class LNNStyleTransformerML(nn.Module):
             transpose_hidden_states = transpose_hidden_states + self.history_tokens_embeddings.unsqueeze(0)
 
             step_input = torch.cat([transpose_hidden_states, 
-                                    step_proprio, 
-                                    step_task], dim=1)
+                                    step_task,
+                                    step_proprio,], dim=1)
             output = self.model(step_input, attn_mask, return_all_layers=True)
             last_output = output[-1]
 
@@ -154,7 +154,7 @@ class LNNStyleTransformerML(nn.Module):
                 self._save_dict['task_align'] += task_align / seq_length
 
             transpose_hidden_states = self._lnn_update(transpose_hidden_states, last_output[:, :self.num_history_tokens])
-            all_outpus.append(self.out_proj(last_output[:, -self.num_task_tokens:].flatten(start_dim=1)))
+            all_outpus.append(self.out_proj(last_output[:, -self.num_proprio_tokens:].flatten(start_dim=1)))
 
         all_outputs = torch.stack(all_outpus, dim=1)
         if compute_align_loss:
