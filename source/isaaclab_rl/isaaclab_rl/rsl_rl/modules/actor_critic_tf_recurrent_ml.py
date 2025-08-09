@@ -113,10 +113,11 @@ class ActorCriticTFRecurrentML(ActorCritic):
         self.compute_align_loss = False
 
     def extra_loss(self, **kwargs):
-        hidden_align = self.memory_a.rnn._save_dict['hidden_align']
+        actuation_align = self.memory_a.rnn._save_dict['actuation_align']
         task_align = self.memory_a.rnn._save_dict['task_align']
+        memory_align = self.memory_a.rnn._save_dict['memory_align']
         self.memory_a.rnn._save_dict.clear()
-        return {'hidden_align': hidden_align, 'task_align': task_align}
+        return {'actuation_align': actuation_align, 'task_align': task_align, 'memory_align': memory_align}
     
     def pre_train(self):
         self.compute_align_loss = True

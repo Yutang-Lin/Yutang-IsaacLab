@@ -111,15 +111,16 @@ class LNNStyleTransformerML(nn.Module):
             proprio = torch.cat([proprio, proprio], dim=0)
             transpose_hidden_states = torch.cat([transpose_hidden_states, transpose_hidden_states], dim=0)
             assert text is not None and motion is not None, "text and motion must be provided if compute_align_loss is True"
-            task_tokens = torch.cat([motion, text], dim=0)
-            if 'hidden_align' not in self._save_dict:
-                self._save_dict['hidden_align'] = 0.0
+            task_tokens = torch.cat([text, motion], dim=0)
+            if 'actuation_align' not in self._save_dict:
+                self._save_dict['actuation_align'] = 0.0
                 self._save_dict['task_align'] = 0.0
+                self._save_dict['memory_align'] = 0.0
 
         elif not use_all_task_tokens:
             self._save_dict.clear()
             assert (text is None or motion is None) or blend_mask is not None, "blend_mask must be provided if text or motion is both provided"
-            task_tokens = motion * motion_mask + text * text_mask
+            task_tokens = text * text_mask + motion * motion_mask
         else:
             task_tokens = torch.cat([text, motion], dim=2)
 
@@ -141,30 +142,36 @@ class LNNStyleTransformerML(nn.Module):
                                     step_proprio,], dim=1)
             output = self.model(step_input, attn_mask, return_all_layers=True)
             last_output = output[-1]
-
+            
             if compute_align_loss:
-                hidden_align, task_align = 0.0, 0.0
+                actuation_align, task_align = 0.0, 0.0
                 for layer_output in output:
-                    motion_output, text_output = layer_output.chunk(2, dim=0)
-                    task_token_start = self.num_history_tokens + self.num_proprio_tokens
-                    hidden_align += F.mse_loss(text_output[:, -1], motion_output[:, -1])
-                    task_align += F.mse_loss(text_output[:, task_token_start:task_token_start+self.num_task_tokens], 
-                                            motion_output[:, task_token_start:task_token_start+self.num_task_tokens])
-                self._save_dict['hidden_align'] += hidden_align / seq_length
+                    task_token_start = self.num_history_tokens
+                    task_token_end = task_token_start + self.num_task_tokens
+                    text_output, motion_output = layer_output.chunk(2, dim=0)
+                    actuation_align += F.mse_loss(text_output[:, -self.num_proprio_tokens:], 
+                                                  motion_output[:, -self.num_proprio_tokens:])
+                    task_align += F.mse_loss(text_output[:, task_token_start:task_token_end], 
+                                             motion_output[:, task_token_start:task_token_end])
+                memory_align = F.mse_loss(*transpose_hidden_states.chunk(2, dim=0))
+                
+                self._save_dict['actuation_align'] += actuation_align / seq_length
                 self._save_dict['task_align'] += task_align / seq_length
+                self._save_dict['memory_align'] += memory_align / seq_length
 
             transpose_hidden_states = self._lnn_update(transpose_hidden_states, last_output[:, :self.num_history_tokens])
-            all_outpus.append(self.out_proj(last_output[:, -self.num_proprio_tokens:].flatten(start_dim=1)))
+            all_outpus.append(self.out_proj(
+                last_output[:, -self.num_proprio_tokens:].flatten(start_dim=1)))
 
         all_outputs = torch.stack(all_outpus, dim=1)
         if compute_align_loss:
-            motion_output, text_output = all_outputs.chunk(2, dim=0)
-            motion_hidden_states, text_hidden_states = transpose_hidden_states.chunk(2, dim=0)
+            text_output, motion_output = all_outputs.chunk(2, dim=0)
+            text_hidden_states, motion_hidden_states = transpose_hidden_states.chunk(2, dim=0)
 
             motion_mask, text_mask = motion_mask.squeeze(-1), text_mask.squeeze(-1)
-            all_outputs = motion_output * motion_mask + text_output * text_mask
+            all_outputs = text_output * text_mask + motion_output * motion_mask
             motion_mask, text_mask = motion_mask[:, -1:], text_mask[:, -1:]
-            transpose_hidden_states = motion_hidden_states * motion_mask + text_hidden_states * text_mask
+            transpose_hidden_states = text_hidden_states * text_mask + motion_hidden_states * motion_mask
         
         return all_outputs.transpose(0, 1).contiguous(), transpose_hidden_states.transpose(0, 1).contiguous()
     
