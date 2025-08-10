@@ -363,8 +363,9 @@ class BaseRunner(OnPolicyRunner):
             # update policy
             if self.amp_reward is not None:
                 self.amp_reward.train()
-                amp_loss = self.amp_reward.update()
-                loss_dict["amp"] = amp_loss
+                disc_loss, grad_penalty = self.amp_reward.update()
+                loss_dict["amp_disc_loss"] = disc_loss
+                loss_dict["amp_grad_penalty"] = grad_penalty
                 self.amp_reward.eval()
 
             # schedule

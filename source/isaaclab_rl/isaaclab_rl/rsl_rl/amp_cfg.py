@@ -17,6 +17,9 @@ class RslRlAmpCfg:
 
     learning_rate: float = 1e-3
     """The learning rate for the AMP module. Default is 1e-3."""
+    
+    weight_decay: float = 0.0
+    """The weight decay for the AMP module. Default is 0.0."""
 
     num_learning_epochs: int = 3
     """The number of learning epochs for the AMP module. Default is 1."""
@@ -69,8 +72,8 @@ class RslRlAmpCfg:
     reward_scale: float = 1.0
     """The reward scale for the AMP discriminator network. Default is 1.0."""
 
-    reward_factor: float = 1.0
-    """The reward factor for the AMP discriminator network. Default is 1.0."""
+    reward_factor: float = 0.25
+    """The reward factor for the AMP discriminator network. Default is 0.25."""
 
     clip_obs_value: float = 100.0
     """The clipping value for the AMP discriminator network. Default is 100.0."""

@@ -20,6 +20,7 @@ class AmpReward:
                  max_grad_norm: float = 1.0,
                  reward_scale: float = 1.0,
                  reward_factor: float = 0.0,
+                 weight_decay: float = 0.0, 
 
                  use_transformer: bool = False,
                  tf_d_model: int = 256,
@@ -116,7 +117,7 @@ class AmpReward:
             self.num_storage = 0
             self.gen_storage = torch.zeros(max_buffer_size, input_dim, device=device if not offload_buffer else "cpu")
             self.ref_storage = torch.zeros(max_buffer_size, input_dim, device=device if not offload_buffer else "cpu")
-            self.optimizer = torch.optim.AdamW(self.network.parameters(), lr=learning_rate)
+            self.optimizer = torch.optim.AdamW(self.network.parameters(), lr=learning_rate, weight_decay=weight_decay)
 
     def reset_storage(self):
         if self.training:
@@ -147,8 +148,9 @@ class AmpReward:
     def _optimize_amp(self, gen_batch, ref_batch) -> float:
         score_ref = self.network(ref_batch)
         score_gen = self.network(gen_batch)
-        amp_loss = torch.square(score_ref - 1.).mean() + torch.square(
-            score_gen + 1.).mean() + self._compute_gradient_penalty(ref_batch, gen_batch)
+        disc_loss = torch.square(score_ref - 1.).mean() + torch.square(score_gen + 1.).mean()
+        grad_penalty = self._compute_gradient_penalty(ref_batch, gen_batch)
+        amp_loss = disc_loss + grad_penalty
 
         self.optimizer.zero_grad()
         amp_loss.backward()
@@ -162,11 +164,13 @@ class AmpReward:
             self.optimizer.zero_grad()
         else:
             self.optimizer.step()
-        return amp_loss.item()
+        return disc_loss.item(), grad_penalty.item()
 
     def update(self):
         if not self.training:
             raise ValueError("AMP is not trained, call training=True")
+        mean_disc_loss, mean_grad_penalty = 0, 0
+        num_updates = 0
         
         gen_storage = self.gen_storage[:self.num_storage].clone()
         ref_storage = self.ref_storage[:self.num_storage].clone()
@@ -181,8 +185,14 @@ class AmpReward:
             if self.offload_buffer:
                 gen_batch = gen_batch.to(self.device)
                 ref_batch = ref_batch.to(self.device)
-            loss = self._optimize_amp(gen_batch, ref_batch)
-        return loss
+            disc_loss, grad_penalty = self._optimize_amp(gen_batch, ref_batch)
+            mean_disc_loss += disc_loss
+            mean_grad_penalty += grad_penalty
+            num_updates += 1
+
+        mean_disc_loss /= num_updates if num_updates > 0 else 1
+        mean_grad_penalty /= num_updates if num_updates > 0 else 1
+        return mean_disc_loss, mean_grad_penalty
 
     @torch.inference_mode()
     def update_storage(self, gen_obs: torch.Tensor, ref_obs: torch.Tensor):
@@ -203,7 +213,7 @@ class AmpReward:
         amp_score = self.network(features).view(self.num_envs)
 
         # if scale is low, reward will be high to make amp constraints less important
-        return (1 - scale * self.reward_factor * torch.square(amp_score - 1)).clamp(min=0) * self.reward_scale
+        return (1 - scale * self.reward_factor * torch.square(amp_score - 1)) * self.reward_scale
     
     def reduce_parameters(self):
         """Collect gradients from all GPUs and average them.

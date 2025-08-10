@@ -14,6 +14,7 @@ from .actor_critic_dp import ActorCriticDP
 from .actor_critic_transformer import ActorCriticTransformer
 from .actor_critic_tf_recurrent import ActorCriticTFRecurrent
 from .actor_critic_tf_recurrent_ml import ActorCriticTFRecurrentML
+from .actor_critic_tf_recurrent_ll import ActorCriticTFRecurrentLL
 from .actor_critic_dp_transformer import ActorCriticDPTransformer
 from .student_teacher import StudentTeacher
 
@@ -61,6 +62,7 @@ __all__ = [
     "ActorCriticDPTransformer",
     "ActorCriticTFRecurrent",
     "ActorCriticTFRecurrentML",
+    "ActorCriticTFRecurrentLL",
     "ActorCriticMoE",
     "ActorCriticMoP",
     "ActorCriticPNN",
