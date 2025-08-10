@@ -24,6 +24,9 @@ class RslRlAmpCfg:
     max_buffer_size: int = 49152
     """The maximum size of the buffer. Default is 49152."""
     
+    store_interval: int = 10
+    """The interval to store the buffer. Default is 10."""
+
     sample_k: int = 2048
     """The number of samples to sample from the buffer. Default is 2048."""
 

@@ -170,7 +170,6 @@ class BaseRunner(OnPolicyRunner):
             self.amp_reward = AmpReward(num_amp_obs, training=True, 
                                         num_envs=self.env.num_envs,
                                         device=self.device, 
-                                        store_interval=self.num_steps_per_env,
                                         multi_gpu_cfg=self.multi_gpu_cfg,
                                         **self.cfg["amp_cfg"])
         else:

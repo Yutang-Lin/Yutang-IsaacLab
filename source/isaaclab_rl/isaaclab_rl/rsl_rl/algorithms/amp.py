@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from copy import deepcopy
 from isaaclab_rl.rsl_rl.utils import resolve_nn_activation
-from isaaclab_rl.rsl_rl.networks.transformer_policy import TransformerPolicy
+from isaaclab_rl.rsl_rl.networks.transformer_discriminator import TransformerDiscriminator
 
 class AmpReward:
     def __init__(self, input_dim: int,
@@ -94,7 +94,7 @@ class AmpReward:
             self.network.to(device)
         else:
             tf_activation = resolve_nn_activation(tf_activation)
-            self.network = TransformerPolicy(
+            self.network = TransformerDiscriminator(
                 input_dim,
                 1,
                 hidden_dims,
@@ -170,7 +170,7 @@ class AmpReward:
         
         gen_storage = self.gen_storage[:self.num_storage].clone()
         ref_storage = self.ref_storage[:self.num_storage].clone()
-        batch_ids = torch.randperm(self.num_storage, device=self.device)
+        batch_ids = torch.randperm(self.num_storage, device=self.device if not self.offload_buffer else "cpu")
         for i in range(self.num_learning_epochs):
             start_idx = i * self.sample_k
             end_idx = min(start_idx + self.sample_k, self.num_storage)
