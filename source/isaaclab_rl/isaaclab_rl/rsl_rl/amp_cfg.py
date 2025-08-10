@@ -15,8 +15,8 @@ class RslRlAmpCfg:
     input_dim: int = 1
     """The input dimension for the AMP module. Default is 1."""
 
-    learning_rate: float = 1e-3
-    """The learning rate for the AMP module. Default is 1e-3."""
+    learning_rate: float = 2e-4
+    """The learning rate for the AMP module. Default is 2e-4."""
     
     weight_decay: float = 0.0
     """The weight decay for the AMP module. Default is 0.0."""
@@ -24,8 +24,11 @@ class RslRlAmpCfg:
     num_learning_epochs: int = 3
     """The number of learning epochs for the AMP module. Default is 1."""
 
-    max_buffer_size: int = 49152
-    """The maximum size of the buffer. Default is 49152."""
+    max_ref_buffer_size: int = 49152
+    """The maximum size of the reference buffer. Default is 49152."""
+
+    max_gen_buffer_size: int = 49152
+    """The maximum size of the generated buffer. Default is 49152."""
     
     store_interval: int = 10
     """The interval to store the buffer. Default is 10."""

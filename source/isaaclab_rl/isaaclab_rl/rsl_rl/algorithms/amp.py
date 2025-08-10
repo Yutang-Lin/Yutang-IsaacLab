@@ -10,7 +10,8 @@ class AmpReward:
                  learning_rate: float = 1e-4,
                  num_learning_epochs: int = 3,
                  store_interval: int = 8,
-                 max_buffer_size: int = 100000,
+                 max_ref_buffer_size: int = 100000,
+                 max_gen_buffer_size: int = 100000,
                  sample_k: int = 1024,
                  hidden_dims: list[int] = [128, 128],
                  activation: str = "relu",
@@ -53,10 +54,18 @@ class AmpReward:
         self.max_grad_norm = max_grad_norm
 
         self.store_interval = store_interval
-        max_buffer_size = max_buffer_size - max_buffer_size % num_envs
-        assert max_buffer_size > 0, "max_buffer_size must be greater than 0 after mod num_envs"
-        self.max_buffer_size = max_buffer_size
-        self.max_buffer_step = max_buffer_size // num_envs
+        max_ref_buffer_size = max_ref_buffer_size - max_ref_buffer_size % num_envs
+        assert max_ref_buffer_size > 0, "max_buffer_size must be greater than 0 after mod num_envs"
+        self.max_ref_buffer_size = max_ref_buffer_size
+        max_gen_buffer_size = max_gen_buffer_size - max_gen_buffer_size % num_envs
+        assert max_gen_buffer_size > 0, "max_gen_buffer_size must be greater than 0 after mod num_envs"
+        assert max_ref_buffer_size % sample_k == 0, "max_ref_buffer_size must be divisible by sample_k"
+        assert max_gen_buffer_size % sample_k == 0, "max_gen_buffer_size must be divisible by sample_k"
+        sample_k = min(sample_k, num_envs)
+        assert num_envs % sample_k == 0, "num_envs must be divisible by sample_k"
+        self.max_gen_buffer_size = max_gen_buffer_size
+        self.max_ref_buffer_step = max_ref_buffer_size // num_envs
+        self.max_gen_buffer_step = max_gen_buffer_size // num_envs
         self.sample_k = sample_k
 
         self.use_transformer = use_transformer
@@ -114,14 +123,17 @@ class AmpReward:
         self.training = training
         if training:
             self.step_counter = 0
-            self.num_storage = 0
-            self.gen_storage = torch.zeros(max_buffer_size, input_dim, device=device if not offload_buffer else "cpu")
-            self.ref_storage = torch.zeros(max_buffer_size, input_dim, device=device if not offload_buffer else "cpu")
+            self.num_ref_storage = 0
+            self.num_gen_storage = 0
+            self.gen_storage = torch.zeros(max_gen_buffer_size, input_dim, device=device if not offload_buffer else "cpu")
+            self.ref_storage = torch.zeros(max_ref_buffer_size, input_dim, device=device if not offload_buffer else "cpu")
             self.optimizer = torch.optim.AdamW(self.network.parameters(), lr=learning_rate, weight_decay=weight_decay)
 
     def reset_storage(self):
         if self.training:
             self.step_counter = 0
+            self.num_ref_storage = 0
+            self.num_gen_storage = 0
             self.gen_storage[:] = 0.
             self.ref_storage[:] = 0.
 
@@ -172,16 +184,22 @@ class AmpReward:
         mean_disc_loss, mean_grad_penalty = 0, 0
         num_updates = 0
         
-        gen_storage = self.gen_storage[:self.num_storage].clone()
-        ref_storage = self.ref_storage[:self.num_storage].clone()
-        batch_ids = torch.randperm(self.num_storage, device=self.device if not self.offload_buffer else "cpu")
+        gen_storage = self.gen_storage[:self.num_gen_storage].clone()
+        ref_storage = self.ref_storage[:self.num_ref_storage].clone()
+        gen_batch_ids = torch.randperm(self.num_gen_storage, device=self.device if not self.offload_buffer else "cpu")
+        ref_batch_ids = torch.randperm(self.num_ref_storage, device=self.device if not self.offload_buffer else "cpu")
+
+        assert self.step_counter > 0, "step_counter must be greater than 0 when updating"
+        latest_gen_idx = int((((self.step_counter - 1) // self.store_interval) % self.max_gen_buffer_step) * self.num_envs // self.sample_k)
+        latest_ref_idx = int((((self.step_counter - 1) // self.store_interval) % self.max_ref_buffer_step) * self.num_envs // self.sample_k)
         for i in range(self.num_learning_epochs):
-            start_idx = i * self.sample_k
-            end_idx = min(start_idx + self.sample_k, self.num_storage)
-            if start_idx >= end_idx:
-                break
-            gen_batch = gen_storage[batch_ids[start_idx:end_idx]]
-            ref_batch = ref_storage[batch_ids[start_idx:end_idx]]
+            gen_start_idx = ((i + latest_gen_idx) * self.sample_k) % self.num_gen_storage
+            gen_end_idx = gen_start_idx + self.sample_k
+            ref_start_idx = ((i + latest_ref_idx) * self.sample_k) % self.num_ref_storage
+            ref_end_idx = ref_start_idx + self.sample_k
+
+            gen_batch = gen_storage[gen_batch_ids[gen_start_idx:gen_end_idx]]
+            ref_batch = ref_storage[ref_batch_ids[ref_start_idx:ref_end_idx]]
             if self.offload_buffer:
                 gen_batch = gen_batch.to(self.device)
                 ref_batch = ref_batch.to(self.device)
@@ -190,21 +208,24 @@ class AmpReward:
             mean_grad_penalty += grad_penalty
             num_updates += 1
 
-        mean_disc_loss /= num_updates if num_updates > 0 else 1
-        mean_grad_penalty /= num_updates if num_updates > 0 else 1
+        mean_disc_loss /= num_updates if num_updates > 0 else torch.tensor(1.0, device=self.device)
+        mean_grad_penalty /= num_updates if num_updates > 0 else torch.tensor(1.0, device=self.device)
         return mean_disc_loss, mean_grad_penalty
 
     @torch.inference_mode()
     def update_storage(self, gen_obs: torch.Tensor, ref_obs: torch.Tensor):
         if self.step_counter % self.store_interval == 0:
-            start_idx = ((self.step_counter // self.store_interval) % self.max_buffer_step) * self.num_envs
-            end_idx = start_idx + self.num_envs
+            ref_start_idx = ((self.step_counter // self.store_interval) % self.max_ref_buffer_step) * self.num_envs
+            gen_start_idx = ((self.step_counter // self.store_interval) % self.max_gen_buffer_step) * self.num_envs
+            ref_end_idx = ref_start_idx + self.num_envs
+            gen_end_idx = gen_start_idx + self.num_envs
             if self.offload_buffer:
                 gen_obs = gen_obs.to("cpu")
                 ref_obs = ref_obs.to("cpu")
-            self.num_storage = min(self.max_buffer_size, self.num_storage + self.num_envs)
-            self.gen_storage[start_idx:end_idx, :] = gen_obs.view(self.num_envs, -1).clamp(-self.clip_obs_value, self.clip_obs_value)
-            self.ref_storage[start_idx:end_idx, :] = ref_obs.view(self.num_envs, -1).clamp(-self.clip_obs_value, self.clip_obs_value)
+            self.num_ref_storage = min(self.max_ref_buffer_size, self.num_ref_storage + self.num_envs)
+            self.num_gen_storage = min(self.max_gen_buffer_size, self.num_gen_storage + self.num_envs)
+            self.ref_storage[ref_start_idx:ref_end_idx, :] = ref_obs.view(self.num_envs, -1).clamp(-self.clip_obs_value, self.clip_obs_value)
+            self.gen_storage[gen_start_idx:gen_end_idx, :] = gen_obs.view(self.num_envs, -1).clamp(-self.clip_obs_value, self.clip_obs_value)
         self.step_counter += 1
 
     @torch.inference_mode()

@@ -76,13 +76,17 @@ class MultiHeadAttention(nn.Module):
         k = k.view(*v_shape[:-1], self.num_heads, self.head_dim).transpose(-2, -3)
         v = v.view(*v_shape[:-1], self.num_heads, self.head_dim).transpose(-2, -3)
 
+        if attn_mask is not None:
+            attn_mask = attn_mask.unsqueeze(-3) # match head dim
+
         if not self.enable_sdpa:
             q = q.reshape(-1, q.shape[-2], q.shape[-1])
             k = k.reshape(-1, k.shape[-2], k.shape[-1])
             v = v.reshape(-1, v.shape[-2], v.shape[-1])
             attn_score = torch.bmm(q, k.transpose(-2, -1))
             if attn_mask is not None:
-                attn_mask = - torch.inf * torch.repeat_interleave(attn_mask.unsqueeze(-3), self.num_heads, dim=-3).reshape(-1, q.shape[-2], k.shape[-2])
+                attn_mask = - torch.inf * torch.repeat_interleave(attn_mask, 
+                                                                  self.num_heads, dim=-3).reshape(-1, q.shape[-2], k.shape[-2])
                 attn_score = attn_score + attn_mask
             attn_score = F.softmax(attn_score / math.sqrt(self.head_dim), dim=-1)
             out = torch.bmm(attn_score, v).reshape(*q_shape[:-2], self.num_heads, -1, self.head_dim)
@@ -90,7 +94,7 @@ class MultiHeadAttention(nn.Module):
         else:
             # let torch decide the best backend
             out = scaled_dot_product_attention(q, k, v, dropout_p=self.dropout,
-                                                attn_mask=attn_mask.unsqueeze(-3), # match head dim
+                                                attn_mask=attn_mask,
                                                 is_causal=is_causal)
 
         out = out.transpose(-2, -3).contiguous().view(out.size(0), *q_shape[1:-1], self.d_model)
