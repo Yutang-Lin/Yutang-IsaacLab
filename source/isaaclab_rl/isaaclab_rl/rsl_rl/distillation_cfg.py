@@ -42,18 +42,6 @@ class RslRlDistillationStudentTeacherRecurrentCfg(RslRlDistillationStudentTeache
     class_name: str = "StudentTeacherRecurrent"
     """The policy class name. Default is StudentTeacherRecurrent."""
 
-    rnn_type: str = MISSING
-    """The type of the RNN network. Either "lstm" or "gru"."""
-
-    rnn_hidden_dim: int = MISSING
-    """The hidden dimension of the RNN network."""
-
-    rnn_num_layers: int = MISSING
-    """The number of layers of the RNN network."""
-
-    teacher_recurrent: bool = MISSING
-    """Whether the teacher network is recurrent too."""
-
 
 ############################
 # Algorithm configurations #

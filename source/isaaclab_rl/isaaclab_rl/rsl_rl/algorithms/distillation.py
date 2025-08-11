@@ -9,14 +9,14 @@ import torch.nn as nn
 import torch.optim as optim
 
 # rsl-rl
-from isaaclab_rl.rsl_rl.modules import StudentTeacher
+from isaaclab_rl.rsl_rl.modules import StudentTeacher, StudentTeacherRecurrent
 from isaaclab_rl.rsl_rl.storage import RolloutStorage
 
 
 class Distillation:
     """Distillation algorithm for training a student model to mimic a teacher model."""
 
-    policy: StudentTeacher
+    policy: StudentTeacher | StudentTeacherRecurrent
     """The student teacher model."""
 
     def __init__(
@@ -69,7 +69,8 @@ class Distillation:
         self.num_updates = 0
 
     def init_storage(
-        self, training_type, num_envs, num_transitions_per_env, student_obs_shape, teacher_obs_shape, actions_shape
+        self, training_type, num_envs, num_transitions_per_env, student_obs_shape, teacher_obs_shape, actions_shape, 
+        meta_tensors=None
     ):
         # create rollout storage
         self.storage = RolloutStorage(
@@ -81,6 +82,7 @@ class Distillation:
             actions_shape,
             None,
             self.device,
+            meta_tensors,
         )
 
     def act(self, obs, teacher_obs, infos=None, **kwargs):

@@ -523,7 +523,15 @@ class RslRlPpoAlgorithmCfg:
     adjust_critic_lr: bool = True
     """Whether to adjust the critic learning rate. Default is True."""
 
-    
+    use_distillation: bool = False
+    """Whether to use distillation. Default is False."""
+
+    distillation_only: bool = False
+    """Whether to only use distillation. Default is False."""
+
+    distillation_coef: float = 1.0
+    """The coefficient for the distillation loss. Default is 1.0."""
+
 
 @configclass
 class RslRlTd3AlgorithmCfg:

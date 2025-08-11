@@ -93,6 +93,7 @@ class BaseRunner(OnPolicyRunner):
 
         self.full_policy_cfg = deepcopy(self.policy_cfg)
         self.full_policy_cfg["_args"] = [num_obs, num_privileged_obs, self.env.num_actions]
+        self.full_policy_cfg.update(meta_dict)
 
         # evaluate the policy class
         policy_class = eval(self.policy_cfg.pop("class_name"))
