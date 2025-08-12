@@ -69,7 +69,7 @@ class StudentTeacher(nn.Module):
         teacher_policy_args = teacher_policy_cfg.pop("_args")
         assert num_teacher_obs == teacher_policy_args[0], f"Mismatch in number of teacher observations: num_teacher_obs: {num_teacher_obs}, teacher_policy_args[0]: {teacher_policy_args[0]}"
         assert num_actions == teacher_policy_args[2], f"Mismatch in number of actions: num_actions: {num_actions}, teacher_policy_args[2]: {teacher_policy_args[2]}"
-        self.teacher: ActorCritic = teacher_policy_class(*teacher_policy_args, **teacher_policy_cfg, **teacher_obs_meta)
+        self.teacher: ActorCritic = teacher_policy_class(*teacher_policy_args, **teacher_policy_cfg)
         self.teacher.load_state_dict(teacher_policy_ckpt["model_state_dict"], strict=True)
         self.teacher.eval()
 

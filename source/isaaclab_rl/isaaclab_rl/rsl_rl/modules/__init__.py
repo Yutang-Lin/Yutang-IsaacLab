@@ -20,8 +20,9 @@ import torch
 from typing import Callable
 
 class _ModuleWrapper(torch.nn.Module):
-    def __init__(self, module, normalizer=None):
+    def __init__(self, module_ori, module, normalizer=None):
         super().__init__()
+        self.module_ori = module_ori
         self.module = module
         self.normalizer = normalizer
 
@@ -29,8 +30,11 @@ class _ModuleWrapper(torch.nn.Module):
         if self.normalizer is not None:
             x = self.normalizer(x)
         return self.module(x)
+    
+    def __getattr__(self, name):
+        return getattr(self.module_ori, name)
 
-def resolve_module(checkpoint_path, device="cpu") -> tuple[torch.nn.Module | Callable, tuple, dict]:
+def resolve_module(checkpoint_path, device="cpu") -> tuple[torch.nn.Module, tuple, dict]:
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     policy_cfg = checkpoint["policy_cfg"]
     policy_class = eval(policy_cfg.pop("class_name"))
@@ -39,10 +43,10 @@ def resolve_module(checkpoint_path, device="cpu") -> tuple[torch.nn.Module | Cal
     policy.load_state_dict(checkpoint["model_state_dict"], strict=True)
     policy.to(device)
     policy.eval()
+    module_ori = policy
 
     if hasattr(policy, "student"):
         policy = policy.student
-
     if hasattr(policy, "act_inference"):
         policy = policy.act_inference
     elif hasattr(policy, "actor"):
@@ -56,7 +60,9 @@ def resolve_module(checkpoint_path, device="cpu") -> tuple[torch.nn.Module | Cal
         
         emperical_normalizer = EmpiricalNormalization(shape=[num_obs], until=1.0e8)
         emperical_normalizer.load_state_dict(emp_state_dict)
-        policy = _ModuleWrapper(policy, emperical_normalizer).eval()
+    else:
+        emperical_normalizer = None
+    policy = _ModuleWrapper(module_ori, policy, emperical_normalizer).eval()
 
     return policy, policy_args, policy_cfg
 
