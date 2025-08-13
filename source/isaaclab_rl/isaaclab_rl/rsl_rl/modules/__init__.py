@@ -1,4 +1,4 @@
-from rsl_rl.modules import EmpiricalNormalization
+from .empirical_normalization import EmpiricalNormalization
 from .actor_critic import ActorCritic
 from .actor_critic_recurrent import ActorCriticRecurrent
 from .twin_delayed import TwinDelayed
@@ -12,6 +12,7 @@ from .actor_critic_transformer import ActorCriticTransformer
 from .actor_critic_tf_recurrent import ActorCriticTFRecurrent
 from .actor_critic_tf_recurrent_ml import ActorCriticTFRecurrentML
 from .actor_critic_tf_recurrent_ll import ActorCriticTFRecurrentLL
+from .actor_critic_tf_recurrent_latent import ActorCriticTFRecurrentLatent
 from .actor_critic_dp_transformer import ActorCriticDPTransformer
 from .student_teacher import StudentTeacher
 from .student_teacher_recurrent import StudentTeacherRecurrent
@@ -22,7 +23,7 @@ from typing import Callable
 class _ModuleWrapper(torch.nn.Module):
     def __init__(self, module_ori, module, normalizer=None):
         super().__init__()
-        self.module_ori = module_ori
+        self.module_ori: ActorCritic = module_ori
         self.module = module
         self.normalizer = normalizer
 
@@ -32,9 +33,12 @@ class _ModuleWrapper(torch.nn.Module):
         return self.module(x)
     
     def __getattr__(self, name):
-        return getattr(self.module_ori, name)
+        try:
+            return super().__getattr__(name)
+        except:
+            return getattr(self.module_ori, name)
 
-def resolve_module(checkpoint_path, device="cpu") -> tuple[torch.nn.Module, tuple, dict]:
+def resolve_module(checkpoint_path, device="cpu") -> tuple[_ModuleWrapper, tuple, dict]:
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     policy_cfg = checkpoint["policy_cfg"]
     policy_class = eval(policy_cfg.pop("class_name"))
@@ -75,6 +79,7 @@ __all__ = [
     "ActorCriticTFRecurrent",
     "ActorCriticTFRecurrentML",
     "ActorCriticTFRecurrentLL",
+    "ActorCriticTFRecurrentLatent",
     "ActorCriticMoE",
     "ActorCriticMoP",
     "ActorCriticPNN",

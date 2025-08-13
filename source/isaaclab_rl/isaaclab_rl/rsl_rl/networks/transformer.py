@@ -54,17 +54,22 @@ class MultiHeadAttention(nn.Module):
         self.is_causal = is_causal
         self.enable_sdpa = enable_sdpa
 
+        assert d_model % num_heads == 0, "d_model must be divisible by num_heads"
         self.head_dim = d_model // num_heads
         self.q_proj = nn.Linear(d_model, d_model)
         self.k_proj = nn.Linear(d_model, d_model)
         self.v_proj = nn.Linear(d_model, d_model)
         self.out_proj = nn.Linear(d_model, d_model)
 
-    def forward(self, feature, other, attn_mask=None):
+    def forward(self, feature: torch.Tensor, 
+                other: torch.Tensor, 
+                attn_mask: torch.Tensor | None = None):
         is_causal = self.is_causal
         if is_causal and attn_mask is not None:
             is_causal = False
 
+        # for torch script exportable
+        assert (feature.ndim == 3 and other.ndim == 3), "feature and other must be 3D tensors, with B, L, D"
         q_shape = feature.shape
         v_shape = other.shape
             
@@ -72,24 +77,27 @@ class MultiHeadAttention(nn.Module):
         k = self.k_proj(other)
         v = self.v_proj(other)
 
-        q = q.view(*q_shape[:-1], self.num_heads, self.head_dim).transpose(-2, -3)
-        k = k.view(*v_shape[:-1], self.num_heads, self.head_dim).transpose(-2, -3)
-        v = v.view(*v_shape[:-1], self.num_heads, self.head_dim).transpose(-2, -3)
+        batch_size = q_shape[0]
+        q_length = q_shape[-2]
+        kv_length = v_shape[-2]
+        q = q.view(batch_size, q_length, self.num_heads, self.head_dim).transpose(-2, -3)
+        k = k.view(batch_size, kv_length, self.num_heads, self.head_dim).transpose(-2, -3)
+        v = v.view(batch_size, kv_length, self.num_heads, self.head_dim).transpose(-2, -3)
 
         if attn_mask is not None:
             attn_mask = attn_mask.unsqueeze(-3) # match head dim
 
         if not self.enable_sdpa:
-            q = q.reshape(-1, q.shape[-2], q.shape[-1])
-            k = k.reshape(-1, k.shape[-2], k.shape[-1])
-            v = v.reshape(-1, v.shape[-2], v.shape[-1])
+            q = q.reshape(batch_size * self.num_heads, q_length, self.head_dim)
+            k = k.reshape(batch_size * self.num_heads, kv_length, self.head_dim)
+            v = v.reshape(batch_size * self.num_heads, kv_length, self.head_dim)
             attn_score = torch.bmm(q, k.transpose(-2, -1))
             if attn_mask is not None:
                 attn_mask = - torch.inf * torch.repeat_interleave(attn_mask, 
                                                                   self.num_heads, dim=-3).reshape(-1, q.shape[-2], k.shape[-2])
                 attn_score = attn_score + attn_mask
             attn_score = F.softmax(attn_score / math.sqrt(self.head_dim), dim=-1)
-            out = torch.bmm(attn_score, v).reshape(*q_shape[:-2], self.num_heads, -1, self.head_dim)
+            out = torch.bmm(attn_score, v).reshape(batch_size, self.num_heads, q_length, self.head_dim)
 
         else:
             # let torch decide the best backend
@@ -97,7 +105,7 @@ class MultiHeadAttention(nn.Module):
                                                 attn_mask=attn_mask,
                                                 is_causal=is_causal)
 
-        out = out.transpose(-2, -3).contiguous().view(out.size(0), *q_shape[1:-1], self.d_model)
+        out = out.transpose(-2, -3).contiguous().view(batch_size, q_length, self.d_model)
         return self.out_proj(out)
         
 class TransformerDecoderLayer(nn.Module):
@@ -148,7 +156,8 @@ class TransformerEncoderLayer(nn.Module):
             nn.Linear(hidden_dim, d_model),
         )
     
-    def forward(self, feature, attn_mask=None):
+    def forward(self, feature: torch.Tensor, 
+                attn_mask: torch.Tensor | None = None):
         out = self.norm1(self.self_attn(feature, feature, attn_mask) + feature)
         out = self.norm2(self.mlp(out) + out)
         return out
@@ -183,14 +192,15 @@ class TransformerEncoder(nn.Module):
             for _ in range(num_layers)
         ])
 
-    def forward(self, feature, attn_mask=None, return_all_layers=False):
-        if return_all_layers:
-            features = []
+    def forward(self, feature: torch.Tensor, 
+                attn_mask: torch.Tensor | None = None, 
+                return_all_layers: bool = False):
+        features = [] # for torch script exportable
         for layer in self.layers:
             feature = layer(feature, attn_mask)
             if return_all_layers:
                 features.append(feature)
         if return_all_layers:
-            return features
+            return torch.stack(features, dim=0)
         else:
             return feature

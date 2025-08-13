@@ -336,8 +336,8 @@ class RolloutStorage:
         # For meta observations
         if self.have_meta_tensors:
             padded_meta_tensors_trajectories = self._disassemble_meta_tensors()
-            for k, v in padded_meta_tensors_trajectories.items():
-                padded_meta_tensors_trajectories[k], _ = split_and_pad_trajectories(v, self.dones)
+            # for k, v in padded_meta_tensors_trajectories.items():
+            #     padded_meta_tensors_trajectories[k], _ = split_and_pad_trajectories(v, self.dones)
 
         mini_batch_size = self.num_envs // num_mini_batches
         for ep in range(num_epochs):
@@ -381,7 +381,7 @@ class RolloutStorage:
                 if self.have_meta_tensors:
                     meta_tensors_batch = {}
                     for k, v in padded_meta_tensors_trajectories.items():
-                        meta_tensors_batch[k] = v[:, first_traj:last_traj]
+                        meta_tensors_batch[k] = v[:, start:stop]
                 else:
                     meta_tensors_batch = None
 
