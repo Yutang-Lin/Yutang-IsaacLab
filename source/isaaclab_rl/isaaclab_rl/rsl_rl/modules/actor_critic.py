@@ -151,9 +151,16 @@ class ActorCritic(RslRlActorCritic):
             raise ValueError(f"Unknown standard deviation type: {self.noise_std_type}. Should be 'scalar' or 'log'")
         if not self.learnable_noise_std:
             std = std.detach()
+
+        nan_std = torch.isnan(std).any(dim=1).nonzero().squeeze(-1)
+        if len(nan_std) > 0:
+            print(f"Found {len(nan_std)} NaN stds")
+            std = std.clone()
+            std[nan_std] = 1e-3
+        std = std.clamp(min=1e-3, max=10.0)
         
         # create distribution
-        self.distribution = Normal(mean, std + 1e-3) # add small epsilon to avoid log(0)
+        self.distribution = Normal(mean, std)
 
     def pre_train(self):
         pass
