@@ -658,3 +658,17 @@ class BaseRunner(OnPolicyRunner):
         if self.empirical_normalization:
             self.obs_normalizer.eval()
             self.privileged_obs_normalizer.eval()
+
+    def get_inference_policy(self, device=None):
+        self.eval_mode()  # switch to evaluation mode (dropout for example)
+        if device is not None:
+            self.alg.policy.to(device)
+        policy = self.alg.policy.act_inference
+        if self.cfg["empirical_normalization"]:
+            if device is not None:
+                self.obs_normalizer.to(device)
+            def inference_policy(x, *args, **kwargs):
+                return self.alg.policy.act_inference(self.obs_normalizer(x), *args, **kwargs)  # noqa: E731
+            return inference_policy
+        else:
+            return policy

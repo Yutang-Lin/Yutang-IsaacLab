@@ -83,9 +83,8 @@ class TransformerPolicyLatent(nn.Module):
     def forward(self, input: TensorDict, 
                 compute_latent_loss: bool = False, 
                 compute_stable_loss: bool = False,
-                no_encode_latent: bool = False):
+                return_latent: bool = False):
         if compute_stable_loss:
-            assert not no_encode_latent, "no_encode_latent must be False when compute_stable_loss is True"
             assert input.get('condition', None) is not None, "condition must be provided when compute_stable_loss is True"
             input['condition'].requires_grad_()
         proprio, tokenized_condition, condition, latent = self.encode_inputs(proprio=input['proprio'], 
@@ -107,25 +106,24 @@ class TransformerPolicyLatent(nn.Module):
                                                     grad_outputs=torch.ones_like(latent_mu), 
                                                     create_graph=True)[0]
                 self._save_dict['stable_loss'] = stable_loss.square().mean()
-
-            if not no_encode_latent:
-                latent_std = torch.exp(0.5 * latent_logvar)
-                latent = torch.randn_like(latent_mu) * latent_std + latent_mu
-            else:
-                latent = latent_mu
+            latent = latent_mu # only use noised version in decoder
 
         if compute_latent_loss:
-            assert not no_encode_latent, "latent loss is not supported when no_encode_latent is True"
             kl_loss: torch.Tensor = 0.5 * (latent_logvar.exp() + latent_mu ** 2 - 1 - latent_logvar)
             self._save_dict['kl_loss'] = kl_loss.mean()
         output = self.model(torch.cat([proprio + self.proprio_tokens_embeddings.unsqueeze(0), 
                                        latent + self.latent_tokens_embeddings.unsqueeze(0)], dim=1))
 
         if compute_latent_loss:
-            recons_latent = self.latent_decoder(output[:, -self.num_latent_tokens:].flatten(start_dim=1))
+            latent_std = torch.exp(0.5 * latent_logvar)
+            noised_latent = torch.randn_like(latent) * latent_std + latent_mu
+            recons_latent = self.latent_decoder(noised_latent.flatten(start_dim=1))
             self._save_dict['recons_loss'] = F.mse_loss(recons_latent, condition)
-
-        return self.output_proj(output.flatten(start_dim=1))
+        
+        if not return_latent:
+            return self.output_proj(output.flatten(start_dim=1))
+        else:
+            return self.output_proj(output.flatten(start_dim=1)), dict(latent_mu=latent_mu, latent_logvar=latent_logvar)
     
     def forward_inference(self, proprio: torch.Tensor, 
                           condition: torch.Tensor | None = None,

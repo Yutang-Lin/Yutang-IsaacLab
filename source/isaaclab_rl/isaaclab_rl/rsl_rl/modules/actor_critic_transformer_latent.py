@@ -190,6 +190,7 @@ class ActorCriticTransformerLatent(ActorCritic):
                       proprio=None,
                       condition=None,
                       latent=None,
+                      return_records=False,
                       **kwargs):
         if observations is not None:
             obs_dict = self._split_observations(observations)
@@ -197,11 +198,11 @@ class ActorCriticTransformerLatent(ActorCritic):
             assert proprio is not None and latent is not None
             obs_dict = TensorDict(proprio=proprio, condition=condition, latent=latent)
         actions_mean = self.actor(obs_dict, compute_latent_loss=self.compute_latent_loss,
-                                compute_stable_loss=self.compute_stable_loss and self.compute_latent_loss)
+                                compute_stable_loss=self.compute_stable_loss and self.compute_latent_loss,
+                                return_latent=return_records)
         return actions_mean
 
     def evaluate(self, critic_observations, **kwargs):
         tensor_dict = self._split_critic_observations(critic_observations)
         return self.critic(tensor_dict, compute_latent_loss=False,
-                                compute_stable_loss=False,
-                                no_encode_latent=True)
+                                compute_stable_loss=False)
