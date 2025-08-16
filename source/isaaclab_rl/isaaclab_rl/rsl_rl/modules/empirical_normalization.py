@@ -57,6 +57,11 @@ class EmpiricalNormalization(nn.Module):
         var_x = torch.var(x, dim=0, unbiased=False, keepdim=True)
         mean_x = torch.mean(x, dim=0, keepdim=True)
         delta_mean = mean_x - self._mean
+        if torch.isnan(var_x).any().item():
+            var_x = torch.zeros_like(var_x)
+        if torch.isnan(mean_x).any().item():
+            mean_x = self._mean.clone()
+            delta_mean = torch.zeros_like(delta_mean)
         self._mean += rate * delta_mean
         self._var += rate * (var_x - self._var + delta_mean * (mean_x - self._mean))
         self._std = torch.sqrt(self._var)

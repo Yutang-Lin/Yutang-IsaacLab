@@ -10,6 +10,7 @@ import torch.nn as nn
 from .transformer import TransformerEncoder
 from isaaclab_rl.rsl_rl.utils import TensorDict
 import torch.nn.functional as F
+
 class TransformerPolicyLatent(nn.Module):
     def __init__(self, 
                  input_size,
@@ -46,7 +47,11 @@ class TransformerPolicyLatent(nn.Module):
             nn.GELU(approximate="tanh"),
         )
         self.latent_encoder = nn.Linear(d_model, 2 * d_model)
-        self.latent_decoder = nn.Linear(num_latent_tokens * d_model, condition_size)
+        self.latent_decoder = nn.Sequential(
+            nn.Linear(num_latent_tokens * d_model, num_latent_tokens * d_model),
+            nn.GELU(approximate="tanh"),
+            nn.Linear(num_latent_tokens * d_model, condition_size),
+        )
         self.model = TransformerEncoder(d_model, 
                                        num_heads, 
                                        hidden_dim, 
