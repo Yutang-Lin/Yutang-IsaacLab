@@ -25,6 +25,7 @@ from .actor_critic_tf_recurrent_ml import ActorCriticTFRecurrentML
 from .actor_critic_tf_recurrent_ll import ActorCriticTFRecurrentLL
 from .actor_critic_tf_recurrent_latent import ActorCriticTFRecurrentLatent
 from .actor_critic_dp_transformer import ActorCriticDPTransformer
+from .actor_critic_transformer_latent import ActorCriticTransformerLatent
 
 class StudentTeacher(nn.Module):
     is_recurrent = False

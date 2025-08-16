@@ -38,6 +38,7 @@ class ActorCriticTFRecurrentLatent(ActorCritic):
         tf_lnn_tau=0.5,
         latent_kl_coef=1e-5,
         latent_recons_coef=1.0,
+        latent_stable_coef=1e-3,
         init_noise_std=1.0,
         load_noise_std: bool = True,
         learnable_noise_std: bool = True,
@@ -109,16 +110,23 @@ class ActorCriticTFRecurrentLatent(ActorCritic):
         
         self.latent_kl_coef = latent_kl_coef
         self.latent_recons_coef = latent_recons_coef
+        self.latent_stable_coef = latent_stable_coef
+        self.compute_stable_loss = self.latent_stable_coef > 0
 
         print(f"Actor Transformer: {self.memory_a}")
         print(f"Critic Transformer: {self.memory_c}")
         self.compute_latent_loss = False
 
     def extra_loss(self, **kwargs):
+        loss_dict = {}
         kl_loss = self.memory_a.rnn._save_dict['kl_loss'] * self.latent_kl_coef
         recons_loss = self.memory_a.rnn._save_dict['recons_loss'] * self.latent_recons_coef
+        loss_dict['latent_kl'] = kl_loss
+        loss_dict['latent_recons'] = recons_loss
+        if self.compute_stable_loss:
+            loss_dict['latent_stable'] = self.memory_a.rnn._save_dict['stable_loss'] * self.latent_stable_coef
         self.memory_a.rnn._save_dict.clear()
-        return {'latent_kl': kl_loss, 'latent_recons': recons_loss}
+        return loss_dict
     
     def pre_train(self):
         self.compute_latent_loss = True
@@ -154,7 +162,8 @@ class ActorCriticTFRecurrentLatent(ActorCritic):
 
     def act(self, observations, masks=None, hidden_states=None, **kwargs):
         tensor_dict = self._split_observations(observations)
-        input_a = self.memory_a(tensor_dict, masks, hidden_states, compute_latent_loss=self.compute_latent_loss)
+        input_a = self.memory_a(tensor_dict, masks, hidden_states, compute_latent_loss=self.compute_latent_loss, 
+                                compute_stable_loss=self.compute_stable_loss and self.compute_latent_loss)
         return super().act(input_a.squeeze(0))
 
     def act_inference(self, observations=None,
@@ -167,12 +176,15 @@ class ActorCriticTFRecurrentLatent(ActorCritic):
         else:
             assert proprio is not None and latent is not None
             obs_dict = TensorDict(proprio=proprio, condition=condition, latent=latent)
-        input_a = self.memory_a(obs_dict, compute_latent_loss=self.compute_latent_loss)
+        input_a = self.memory_a(obs_dict, compute_latent_loss=self.compute_latent_loss,
+                                compute_stable_loss=self.compute_stable_loss and self.compute_latent_loss)
         return super().act_inference(input_a.squeeze(0))
 
     def evaluate(self, critic_observations, masks=None, hidden_states=None, **kwargs):
         tensor_dict = self._split_critic_observations(critic_observations)
-        input_c = self.memory_c(tensor_dict, masks, hidden_states, compute_latent_loss=False, no_encode_latent=True)
+        input_c = self.memory_c(tensor_dict, masks, hidden_states, compute_latent_loss=False, 
+                                compute_stable_loss=False,
+                                no_encode_latent=True)
         return super().evaluate(input_c.squeeze(0))
 
     def get_hidden_states(self):

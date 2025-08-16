@@ -339,6 +339,26 @@ class RslRlPpoActorCriticTransformerCfg(RslRlPpoActorCriticCfg):
     """The activation function for the transformer."""
 
 @configclass
+class RslRlPpoActorCriticTransformerLatentCfg(RslRlPpoActorCriticTransformerCfg):
+    """Configuration for the PPO actor-critic networks with transformer layers."""
+
+    class_name: str = "ActorCriticTransformerLatent"
+    """The policy class name. Default is ActorCriticTransformerLatent."""
+
+    tf_num_latent_tokens: int = MISSING
+    """The number of latent tokens."""
+
+    latent_kl_coef: float = 1e-5
+    """The KL coefficient for the latent tokens."""
+
+    latent_recons_coef: float = 1.0
+    """The reconstruction coefficient for the latent tokens."""
+
+    latent_stable_coef: float = 1e-3
+    """The stable coefficient for the latent tokens."""
+    
+
+@configclass
 class RslRlPpoActorCriticTFRecurrentCfg(RslRlPpoActorCriticCfg):
     """Configuration for the PPO actor-critic networks with transformer layers."""
 
@@ -416,6 +436,9 @@ class RslRlPpoActorCriticTFRecurrentLatentCfg(RslRlPpoActorCriticTFRecurrentCfg)
 
     latent_recons_coef: float = 1.0
     """The reconstruction coefficient for the latent tokens."""
+
+    latent_stable_coef: float = 1e-3
+    """The stable coefficient for the latent tokens."""
 
     class_name: str = "ActorCriticTFRecurrentLatent"
     """The policy class name. Default is ActorCriticTFRecurrentLatent."""

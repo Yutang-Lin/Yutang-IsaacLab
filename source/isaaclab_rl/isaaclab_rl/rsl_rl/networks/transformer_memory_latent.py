@@ -95,7 +95,10 @@ class LNNStyleTransformerLatent(nn.Module):
         return hidden_states.clip(min=-10, max=10)
 
     def forward(self, input: TensorDict, hidden_states: torch.Tensor | None,
-                compute_latent_loss: bool = False, no_encode_latent: bool = False, masks: torch.Tensor | None = None):
+                compute_latent_loss: bool = False, 
+                compute_stable_loss: bool = False,
+                no_encode_latent: bool = False, 
+                masks: torch.Tensor | None = None):
         transpose_input = input.transpose(0, 1).contiguous()
         batch_size, seq_length = transpose_input.shape('proprio')[:2]
         if hidden_states is None:
@@ -103,10 +106,21 @@ class LNNStyleTransformerLatent(nn.Module):
         else:
             transpose_hidden_states = hidden_states.transpose(0, 1).contiguous()
 
+        if compute_stable_loss:
+            assert not no_encode_latent, "no_encode_latent must be False when compute_stable_loss is True"
+            assert 'condition' in transpose_input, "condition must be provided when compute_stable_loss is True"
+            transpose_input['condition'].requires_grad_()
+
         proprio, tokenized_condition, condition_ori, latent = self.encode_inputs(proprio=transpose_input['proprio'], 
                                                                                  condition=transpose_input.get('condition', None), 
                                                                                  latent=transpose_input.get('latent', None))
         proprio = proprio.view(batch_size, seq_length, self.num_proprio_tokens, self.d_model)
+
+        if masks is not None:
+            num_reduce = masks.sum().item()
+            masks = (~masks).transpose(0, 1).unsqueeze(-1).unsqueeze(-1)
+        else:
+            num_reduce = batch_size * seq_length
 
         if latent is not None:
             assert tokenized_condition is None, "latent and condition cannot be provided at the same time"
@@ -115,18 +129,22 @@ class LNNStyleTransformerLatent(nn.Module):
         else:
             assert tokenized_condition is not None, "condition must be provided when latent is not provided"
             tokenized_condition = tokenized_condition.view(batch_size, seq_length, self.num_latent_tokens, self.d_model)
+            latent_mu, latent_logvar = self.latent_encoder(tokenized_condition).chunk(2, dim=-1)
+
+            if compute_stable_loss:
+                stable_loss = torch.autograd.grad(outputs=latent_mu, inputs=condition_ori, 
+                                                    grad_outputs=torch.ones_like(latent_mu), 
+                                                    create_graph=True)[0]
+                if masks is not None:
+                    stable_loss = stable_loss * masks[..., 0]
+                stable_loss = stable_loss.square().mean(dim=-1)
+                self._save_dict['stable_loss'] = stable_loss.sum() / num_reduce
+
             if not no_encode_latent:
-                latent_mu, latent_logvar = self.latent_encoder(tokenized_condition).chunk(2, dim=-1)
                 latent_std = torch.exp(0.5 * latent_logvar)
                 latent = torch.randn_like(latent_mu) * latent_std + latent_mu
             else:
-                latent = tokenized_condition
-
-        if masks is not None:
-            num_reduce = masks.sum().item()
-            masks = (~masks).transpose(0, 1).unsqueeze(-1).unsqueeze(-1)
-        else:
-            num_reduce = batch_size * seq_length
+                latent = latent_mu
 
         if compute_latent_loss:
             assert not no_encode_latent, "latent loss is not supported when no_encode_latent is True"
