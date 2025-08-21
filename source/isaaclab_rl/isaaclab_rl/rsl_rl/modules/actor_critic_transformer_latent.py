@@ -183,13 +183,15 @@ class ActorCriticTransformerLatent(ActorCritic):
     def act(self, observations, **kwargs):
         self.update_distribution(self._split_observations(observations), 
                                  compute_latent_loss=self.compute_latent_loss,
-                                 compute_stable_loss=self.compute_stable_loss and self.compute_latent_loss)
+                                 compute_stable_loss=self.compute_stable_loss and self.compute_latent_loss,
+                                 apply_vae_noise=True)
         return self.distribution.sample()
 
     def act_inference(self, observations=None,
                       proprio=None,
                       condition=None,
                       latent=None,
+                      apply_vae_noise=False,
                       return_records=False,
                       **kwargs):
         if observations is not None:
@@ -199,10 +201,12 @@ class ActorCriticTransformerLatent(ActorCritic):
             obs_dict = TensorDict(proprio=proprio, condition=condition, latent=latent)
         actions_mean = self.actor(obs_dict, compute_latent_loss=self.compute_latent_loss,
                                 compute_stable_loss=self.compute_stable_loss and self.compute_latent_loss,
+                                apply_vae_noise=apply_vae_noise,
                                 return_latent=return_records)
         return actions_mean
 
     def evaluate(self, critic_observations, **kwargs):
         tensor_dict = self._split_critic_observations(critic_observations)
         return self.critic(tensor_dict, compute_latent_loss=False,
-                                compute_stable_loss=False)
+                                compute_stable_loss=False,
+                                apply_vae_noise=False)

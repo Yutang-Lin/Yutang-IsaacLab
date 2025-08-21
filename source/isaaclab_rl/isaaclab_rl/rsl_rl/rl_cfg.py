@@ -657,6 +657,9 @@ class RslRlOnPolicyRunnerCfg:
     max_checkpoint_num: int = 10
     """The maximum number of checkpoints to save."""
 
+    action_clip_range: list[float, float] = [-50.0, 50.0]
+    """The action clip range. Default is [-50.0, 50.0]."""
+
     empirical_normalization: bool = MISSING
     """Whether to use empirical normalization."""
 

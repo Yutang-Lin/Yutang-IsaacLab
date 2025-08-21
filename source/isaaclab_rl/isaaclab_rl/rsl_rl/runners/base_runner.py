@@ -41,6 +41,9 @@ class BaseRunner(OnPolicyRunner):
         # max checkpoint number
         self.max_checkpoint_num = self.cfg.get("max_checkpoint_num", 10)
 
+        # action clip range
+        self.action_clip_range = self.cfg.get("action_clip_range", [-50.0, 50.0])
+
         # resolve training type depending on the algorithm
         if self.alg_cfg["class_name"] == "PPO":
             self.training_type = "rl"
@@ -273,7 +276,7 @@ class BaseRunner(OnPolicyRunner):
 
                 for _ in range(self.num_steps_per_env):
                     # Sample actions
-                    actions = self.alg.act(obs, privileged_obs, infos=infos)
+                    actions = self.alg.act(obs, privileged_obs, infos=infos).clamp(*self.action_clip_range)
                     # Step the environment
                     obs, rewards, dones, infos = self.env.step(actions.to(self.env.device)) # type: ignore
                     # Move to device
