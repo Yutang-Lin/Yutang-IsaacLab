@@ -140,6 +140,11 @@ class ActorCritic(RslRlActorCritic):
         return value
 
     def update_distribution(self, observations):
+        nan_obs = torch.isnan(observations).any(dim=1).nonzero().squeeze(-1)
+        if len(nan_obs) > 0:
+            print(f"Found {len(nan_obs)} NaN observations")
+            observations = observations.nan_to_num(0.0)
+            
         # compute mean
         mean = self.actor(observations)
         # compute standard deviation
@@ -155,9 +160,13 @@ class ActorCritic(RslRlActorCritic):
         nan_std = torch.isnan(std).any(dim=1).nonzero().squeeze(-1)
         if len(nan_std) > 0:
             print(f"Found {len(nan_std)} NaN stds")
-            std = std.clone()
-            std[nan_std] = 1e-3
+            std = std.nan_to_num(1e-3)
         std = std.clamp(min=1e-3, max=10.0)
+        
+        nan_mean = torch.isnan(mean).any(dim=1).nonzero().squeeze(-1)
+        if len(nan_mean) > 0:
+            print(f"Found {len(nan_mean)} NaN means")
+            mean = mean.nan_to_num(0.0)
         
         # create distribution
         self.distribution = Normal(mean, std)

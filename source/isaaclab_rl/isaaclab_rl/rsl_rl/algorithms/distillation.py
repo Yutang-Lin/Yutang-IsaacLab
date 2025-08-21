@@ -89,7 +89,6 @@ class Distillation:
         # compute the actions
         self.transition.actions = self.policy.act(obs).detach() # type: ignore
         self.transition.privileged_actions = self.policy.evaluate(teacher_obs).detach()
-        self.transition.actions = self.transition.privileged_actions
         if infos is not None and 'teacher_residual' in infos:
             self.transition.privileged_actions = self.transition.privileged_actions + infos['teacher_residual']
         # record the observations
