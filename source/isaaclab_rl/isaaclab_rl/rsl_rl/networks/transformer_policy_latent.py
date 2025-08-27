@@ -49,9 +49,12 @@ class TransformerPolicyLatent(nn.Module):
             nn.LayerNorm(num_latent_tokens * d_model),
             nn.GELU(approximate="tanh"),
         )
-        self.latent_encoder = nn.Linear(d_model, 2 * d_model)
+        self.latent_encoder = nn.Linear(num_latent_tokens * d_model, 2 * num_latent_tokens * d_model)
         self.latent_decoder = nn.Sequential(
             nn.Linear(num_latent_tokens * d_model, num_latent_tokens * d_model),
+            nn.GELU(approximate="tanh"),
+            nn.Linear(num_latent_tokens * d_model, num_latent_tokens * d_model),
+            nn.LayerNorm(num_latent_tokens * d_model),
             nn.GELU(approximate="tanh"),
             nn.Linear(num_latent_tokens * d_model, condition_size),
         )
@@ -102,7 +105,7 @@ class TransformerPolicyLatent(nn.Module):
             latent = latent.view(batch_size, self.num_latent_tokens, self.d_model)
         else:
             assert tokenized_condition is not None, "condition must be provided when latent is not provided"
-            tokenized_condition = tokenized_condition.view(batch_size, self.num_latent_tokens, self.d_model)
+            tokenized_condition = tokenized_condition.view(batch_size, self.num_latent_tokens * self.d_model)
             latent_mu, latent_logvar = self.latent_encoder(tokenized_condition).chunk(2, dim=-1)
 
             if compute_stable_loss:
@@ -118,16 +121,16 @@ class TransformerPolicyLatent(nn.Module):
                 latent = latent_mu
 
             if compute_latent_loss:
+                recons_latent = self.latent_decoder(latent)
+                self._save_dict['recons_loss'] = F.mse_loss(recons_latent, condition)
                 kl_loss: torch.Tensor = 0.5 * (latent_logvar.exp() + latent_mu ** 2 - 1 - latent_logvar)
                 self._save_dict['kl_loss'] = kl_loss.mean()
+
+            latent = latent.detach().view(batch_size, self.num_latent_tokens, self.d_model)
+            
         output = self.model(torch.cat([proprio + self.proprio_tokens_embeddings.unsqueeze(0), 
                                        latent + self.latent_tokens_embeddings.unsqueeze(0)], dim=1))
 
-        if compute_latent_loss:
-            output_latent = output[:, -self.num_latent_tokens:].flatten(start_dim=1)
-            recons_latent = self.latent_decoder(output_latent)
-            self._save_dict['recons_loss'] = F.mse_loss(recons_latent, condition)
-        
         output = output.flatten(start_dim=1)
         if not return_latent:
             return self.output_proj(output)
