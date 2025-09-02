@@ -145,17 +145,19 @@ class TransformerPolicyLatent(nn.Module):
                                                                              condition=condition, 
                                                                              latent=latent)
         batch_size = proprio.shape[0]
+        proprio = proprio.view(batch_size, self.num_input_tokens, self.d_model)
         if latent is not None:
             assert tokenized_condition is None, "latent and condition cannot be provided at the same time"
             latent = latent.view(batch_size, self.num_latent_tokens, self.d_model)
         else:
             assert tokenized_condition is not None, "condition must be provided when latent is not provided"
-            tokenized_condition = tokenized_condition.view(batch_size, self.num_latent_tokens, self.d_model)
+            tokenized_condition = tokenized_condition.view(batch_size, self.num_latent_tokens * self.d_model)
             latent_mu, latent_logvar = self.latent_encoder(tokenized_condition).chunk(2, dim=-1)
             if apply_vae_noise:
                 latent_std = torch.exp(0.5 * latent_logvar)
                 latent = torch.randn_like(latent_mu) * latent_std + latent_mu
             else:
                 latent = latent_mu
+            latent = latent.view(batch_size, self.num_latent_tokens, self.d_model)
         return self.output_proj(self.model(torch.cat([proprio + self.proprio_tokens_embeddings.unsqueeze(0), 
                                                       latent + self.latent_tokens_embeddings.unsqueeze(0)], dim=1)).flatten(start_dim=1))

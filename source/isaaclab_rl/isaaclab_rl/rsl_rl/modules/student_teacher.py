@@ -144,7 +144,7 @@ class StudentTeacher(nn.Module):
         """
 
         # ignore teacher parameters
-        student_keys = [key for key in state_dict.keys() if key.startswith('student')]
+        student_keys = [key for key in state_dict.keys() if key.startswith('student') and 'critic' not in key]
         student_params = {key: value for key, value in state_dict.items() if key in student_keys}
         super().load_state_dict(student_params, strict=False)
         return True

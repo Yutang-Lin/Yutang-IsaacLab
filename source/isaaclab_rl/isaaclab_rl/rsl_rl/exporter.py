@@ -90,6 +90,13 @@ class _TorchPolicyExporter(torch.nn.Module):
                 raise NotImplementedError(f"Unsupported RNN type: {self.rnn_type}")
             self.hidden_state: torch.Tensor
 
+        # get policy
+        if hasattr(self.actor, "forward_inference"):
+            self.split_ids['proprio'] = policy.actor_proprio_ids
+            self.split_ids['condition'] = policy.actor_condition_ids
+            self.actor.forward = self.actor.forward_inference
+            self.forward = self.forward_latent
+
         # copy normalizer if exists
         if normalizer:
             self.normalizer = copy.deepcopy(normalizer)
@@ -140,6 +147,15 @@ class _TorchPolicyExporter(torch.nn.Module):
 
     def forward(self, x):
         return self.actor(self.normalizer(x))
+
+    def forward_latent(self, proprio: torch.Tensor, 
+                       condition: torch.Tensor | None = None, 
+                       latent: torch.Tensor | None = None,
+                       apply_vae_noise: bool = False):
+        proprio = self.split_normalizer['proprio'](proprio)
+        if condition is not None:
+            condition = self.split_normalizer['condition'](condition)
+        return self.actor.forward_inference(proprio, condition, latent, apply_vae_noise)
 
     @torch.jit.export
     def reset(self):

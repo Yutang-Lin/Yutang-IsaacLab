@@ -130,6 +130,7 @@ class TransformerDecoderLayer(nn.Module):
             nn.Linear(d_model, hidden_dim),
             activation,
             nn.Linear(hidden_dim, d_model),
+            nn.Dropout(dropout),
         )
         
     def forward(self, feature, other, self_attn_mask=None, cross_attn_mask=None):
@@ -154,6 +155,7 @@ class TransformerEncoderLayer(nn.Module):
             nn.Linear(d_model, hidden_dim),
             activation,
             nn.Linear(hidden_dim, d_model),
+            nn.Dropout(dropout),
         )
     
     def forward(self, feature: torch.Tensor, 
