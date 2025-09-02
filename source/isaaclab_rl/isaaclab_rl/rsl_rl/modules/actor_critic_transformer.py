@@ -79,7 +79,7 @@ class ActorCriticTransformer(ActorCritic):
                                         d_model=tf_d_model, 
                                         hidden_dim=tf_hidden_dim, 
                                         num_heads=tf_num_heads, 
-                                        dropout=tf_dropout,
+                                        dropout=0.0, # NOTE: no dropout in critic
                                         activation=tf_activation)
 
         print(f"Actor Transformer: {self.actor}")
