@@ -572,6 +572,8 @@ class PPO(RslRlPPO):
 
         # -- For PPO
         # num_updates = self.num_learning_epochs * self.num_mini_batches
+        if num_updates ==  0:
+            num_updates = 1
         mean_value_loss /= num_updates
         mean_surrogate_loss /= num_updates
         mean_entropy /= num_updates
