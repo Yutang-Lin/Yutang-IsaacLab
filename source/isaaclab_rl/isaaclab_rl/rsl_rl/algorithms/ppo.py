@@ -527,6 +527,14 @@ class PPO(RslRlPPO):
                 mseloss = torch.nn.MSELoss()
                 rnd_loss = mseloss(predicted_embedding, target_embedding)
 
+            # Detect if inf loss or nan loss
+            if torch.isinf(loss):
+                print("Inf loss detected, stopping training iteration")
+                break
+            if torch.isnan(loss):
+                print("Nan loss detected, stopping training iteration")
+                break
+
             # Compute the gradients
             # -- For PPO
             self.optimizer.zero_grad()
