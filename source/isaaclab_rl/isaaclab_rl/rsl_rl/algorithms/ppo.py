@@ -234,6 +234,9 @@ class PPO(RslRlPPO):
         num_all_ratios = 0
         num_clipped_ratios = 0
         num_updates = 0
+        
+        # zero loss flag
+        zero_loss = False
 
         # -- RND loss
         if self.rnd:
@@ -423,7 +426,7 @@ class PPO(RslRlPPO):
                         if kl_mean > 10.0:
                             self.learning_rate = max(1e-5, self.learning_rate / 5.0)
                             num_updates += 1 # avoid division by zero
-                            break # stop training if KL-divergence is too high
+                            zero_loss = True
 
                 num_all_ratios += ratio.numel()
                 num_clipped_ratios += torch.abs(ratio - 1.0).gt(self.clip_param).sum().item()
@@ -530,10 +533,13 @@ class PPO(RslRlPPO):
             # Detect if inf loss or nan loss
             if torch.isinf(loss):
                 print("Inf loss detected, stopping training iteration")
-                break
+                zero_loss = True
             if torch.isnan(loss):
                 print("Nan loss detected, stopping training iteration")
-                break
+                zero_loss = True
+
+            if zero_loss:
+                loss = torch.nan_to_num(loss, 0.0, 0.0, 0.0) * 0.0
 
             # Compute the gradients
             # -- For PPO
