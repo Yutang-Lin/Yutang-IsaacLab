@@ -589,7 +589,12 @@ class BaseRunner(OnPolicyRunner):
         resumed_training = self.alg.policy.load_state_dict(loaded_dict["model_state_dict"], strict=False)
         # -- Load RND model if used
         if self.alg.rnd:
-            self.alg.rnd.load_state_dict(loaded_dict["rnd_state_dict"])
+            try:
+                self.alg.rnd.load_state_dict(loaded_dict["rnd_state_dict"])
+                mismatch_rnd = False
+            except Exception as e:
+                mismatch_rnd = True
+                print(f"[WARNING]: Failed to load RND model. Error: {e}. Initializing new RND model.")
         # -- Load AMP model if used
         if self.amp_reward is not None:
             amp_loaded = False
@@ -628,8 +633,11 @@ class BaseRunner(OnPolicyRunner):
             print(f"[WARNING]: Failed to load optimizer. Error: {e}. Reinitializing optimizer.")
 
         # -- RND optimizer if used
-        if self.alg.rnd:
-            self.alg.rnd_optimizer.load_state_dict(loaded_dict["rnd_optimizer_state_dict"]) # type: ignore
+        if self.alg.rnd and not mismatch_rnd:
+            try:
+                self.alg.rnd_optimizer.load_state_dict(loaded_dict["rnd_optimizer_state_dict"]) # type: ignore
+            except Exception as e:
+                print(f"[WARNING]: Failed to load RND optimizer. Error: {e}. Reinitializing RND optimizer.")
 
         if hasattr(self.alg, "critic_optimizer") and 'critic_optimizer_state_dict' in loaded_dict:
             # -- critic optimizer
