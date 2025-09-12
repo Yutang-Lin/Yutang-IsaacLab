@@ -133,6 +133,7 @@ class BaseRunner(OnPolicyRunner):
         self.num_steps_per_env = self.cfg["num_steps_per_env"]
         self.save_interval = self.cfg["save_interval"]
         self.empirical_normalization = self.cfg["empirical_normalization"]
+        self.privileged_empirical_normalization_only = self.cfg.get("privileged_empirical_normalization_only", False)
         if self.empirical_normalization:
             self.obs_normalizer = EmpiricalNormalization(shape=[num_obs], until=1.0e8).to(self.device)
             self.privileged_obs_normalizer = EmpiricalNormalization(shape=[num_privileged_obs], until=1.0e8).to(
@@ -152,6 +153,10 @@ class BaseRunner(OnPolicyRunner):
         elif self.training_type == "distillation" and policy.obs_norm_state_dict is None:
             self.privileged_obs_normalizer = torch.nn.Identity().to(self.device)
             print('[INFO]: No teacher empirical normalizer loaded')
+
+        if self.privileged_empirical_normalization_only:
+            self.obs_normalizer = torch.nn.Identity().to(self.device)
+            print('[INFO]: Only privileged observations are normalized')
 
         # init storage and model
         self.alg.init_storage(
