@@ -8,6 +8,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 from .transformer_policy import TransformerPolicy
+from ..modules.empirical_normalization import EmpiricalNormalization
 
 class TransformerPolicyResidual(TransformerPolicy):
     def __init__(self, input_size, output_size, base_policy_path: str, is_actor: bool = True, *args, **kwargs):
@@ -16,11 +17,20 @@ class TransformerPolicyResidual(TransformerPolicy):
 
         self.base_policy = TransformerPolicy(input_size, output_size, *args, **kwargs)
         try:
-            base_policy_state_dict = torch.load(base_policy_path, map_location="cpu", weights_only=False)
-            base_policy_state_dict = base_policy_state_dict["model_state_dict"]
+            state_dicts = torch.load(base_policy_path, map_location="cpu", weights_only=False)
+            base_policy_state_dict = state_dicts["model_state_dict"]
             replace_prefix = "actor." if is_actor else "critic."
             base_policy_state_dict = {k.replace(replace_prefix, ""): v for k, v in base_policy_state_dict.items() if replace_prefix in k}
             self.base_policy.load_state_dict(base_policy_state_dict, strict=True)
+            if "obs_norm_state_dict" in state_dicts:
+                self.base_policy_nomalizer = EmpiricalNormalization([input_size], until=1.0e8)
+                self.base_policy_nomalizer.load_state_dict(state_dicts["obs_norm_state_dict"])
+                self.base_policy_nomalizer.eval()
+                print(f"[INFO]: Loaded base policy normalizer from {base_policy_path}")
+            else:
+                self.base_policy_nomalizer = torch.nn.Identity()
+                print(f"[INFO]: No base policy normalizer found in {base_policy_path}")
+
         except Exception as e:
             print(f"[Warning]: Failed to load base policy from {base_policy_path}, using random weights.")
     
@@ -35,7 +45,9 @@ class TransformerPolicyResidual(TransformerPolicy):
     def forward_base(self, input: torch.Tensor):
         if self.base_policy.training:
             self.base_policy.eval()
-        return self.base_policy(input)
+        if self.base_policy_nomalizer.training:
+            self.base_policy_nomalizer.eval()
+        return self.base_policy(self.base_policy_nomalizer(input))
 
     def forward(self, input: torch.Tensor):
         base_output = self.forward_base(input).detach()
