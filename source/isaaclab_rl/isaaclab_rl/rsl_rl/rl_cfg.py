@@ -339,6 +339,16 @@ class RslRlPpoActorCriticTransformerCfg(RslRlPpoActorCriticCfg):
     """The activation function for the transformer."""
 
 @configclass
+class RslRlPpoActorCriticTransformerResidualCfg(RslRlPpoActorCriticTransformerCfg):
+    """Configuration for the PPO actor-critic networks with transformer layers."""
+
+    class_name: str = "ActorCriticTransformerResidual"
+    """The policy class name. Default is ActorCriticTransformerResidual."""
+
+    base_policy_path: str | None = None
+    """The path to the base policy."""
+
+@configclass
 class RslRlPpoActorCriticTransformerLatentCfg(RslRlPpoActorCriticTransformerCfg):
     """Configuration for the PPO actor-critic networks with transformer layers."""
 
