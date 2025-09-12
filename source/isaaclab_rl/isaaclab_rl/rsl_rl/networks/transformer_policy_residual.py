@@ -14,12 +14,16 @@ class TransformerPolicyResidual(TransformerPolicy):
         residual_input_size = input_size + output_size
         super().__init__(residual_input_size, output_size, *args, **kwargs)
 
-        base_policy_state_dict = torch.load(base_policy_path, map_location="cpu", weights_only=False)
-        base_policy_state_dict = base_policy_state_dict["model_state_dict"]
-        replace_prefix = "actor." if is_actor else "critic."
-        base_policy_state_dict = {k.replace(replace_prefix, ""): v for k, v in base_policy_state_dict.items() if replace_prefix in k}
         self.base_policy = TransformerPolicy(input_size, output_size, *args, **kwargs)
-        self.base_policy.load_state_dict(base_policy_state_dict, strict=True)
+        try:
+            base_policy_state_dict = torch.load(base_policy_path, map_location="cpu", weights_only=False)
+            base_policy_state_dict = base_policy_state_dict["model_state_dict"]
+            replace_prefix = "actor." if is_actor else "critic."
+            base_policy_state_dict = {k.replace(replace_prefix, ""): v for k, v in base_policy_state_dict.items() if replace_prefix in k}
+            self.base_policy.load_state_dict(base_policy_state_dict, strict=True)
+        except Exception as e:
+            print(f"[Warning]: Failed to load base policy from {base_policy_path}, using random weights.")
+    
         self.base_policy.requires_grad_(False)
         self._init_weights()
 
