@@ -24,9 +24,11 @@ class TransformerPolicyResidual(TransformerPolicy):
             replace_prefix = "actor." if is_actor else "critic."
             base_policy_state_dict = {k.replace(replace_prefix, ""): v for k, v in base_policy_state_dict.items() if replace_prefix in k}
             self.base_policy.load_state_dict(base_policy_state_dict, strict=True)
-            if "obs_norm_state_dict" in state_dicts:
+
+            norm_key = "obs_norm_state_dict" if is_actor else "privileged_obs_norm_state_dict"
+            if norm_key in state_dicts:
                 self.base_policy_nomalizer = EmpiricalNormalization([input_size], until=1.0e8)
-                self.base_policy_nomalizer.load_state_dict(state_dicts["obs_norm_state_dict"])
+                self.base_policy_nomalizer.load_state_dict(state_dicts[norm_key])
                 self.base_policy_nomalizer.eval()
                 print(f"[INFO]: Loaded base policy normalizer from {base_policy_path}")
             else:

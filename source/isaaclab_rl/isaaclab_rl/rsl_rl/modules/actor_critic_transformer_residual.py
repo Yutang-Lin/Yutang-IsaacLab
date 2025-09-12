@@ -8,7 +8,7 @@ from __future__ import annotations
 import warnings
 
 from isaaclab_rl.rsl_rl.modules import ActorCritic
-from isaaclab_rl.rsl_rl.networks import TransformerPolicyResidual
+from isaaclab_rl.rsl_rl.networks import TransformerPolicyResidual, TransformerPolicy
 from isaaclab_rl.rsl_rl.utils import resolve_nn_activation
 
 import torch
@@ -75,11 +75,8 @@ class ActorCriticTransformerResidual(ActorCritic):
                                        dropout=tf_dropout,
                                        activation=tf_activation)
 
-        self.critic = TransformerPolicyResidual(num_critic_obs,
+        self.critic = TransformerPolicy(num_critic_obs,
                                         1,
-                                        base_policy_path,
-                                        is_actor=False,
-                                        residual_as_input=False,
                                         mlp_hidden_dims=critic_hidden_dims,
                                         mlp_activation=activation,
                                         num_input_tokens=tf_num_input_tokens,
