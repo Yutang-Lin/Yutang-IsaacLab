@@ -11,8 +11,10 @@ from .transformer_policy import TransformerPolicy
 from ..modules.empirical_normalization import EmpiricalNormalization
 
 class TransformerPolicyResidual(TransformerPolicy):
-    def __init__(self, input_size, output_size, base_policy_path: str, is_actor: bool = True, *args, **kwargs):
-        residual_input_size = input_size + output_size
+    def __init__(self, input_size, output_size, base_policy_path: str, is_actor: bool = True,
+                 residual_as_input: bool = True, *args, **kwargs):
+        residual_input_size = input_size + output_size if residual_as_input else input_size
+        self.residual_as_input = residual_as_input
         super().__init__(residual_input_size, output_size, *args, **kwargs)
 
         self.base_policy = TransformerPolicy(input_size, output_size, *args, **kwargs)
@@ -51,5 +53,6 @@ class TransformerPolicyResidual(TransformerPolicy):
 
     def forward(self, input: torch.Tensor):
         base_output = self.forward_base(input).detach()
-        input = torch.cat([input, base_output], dim=-1)
+        if self.residual_as_input:
+            input = torch.cat([input, base_output], dim=-1)
         return super().forward(input) + base_output
