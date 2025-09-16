@@ -125,7 +125,9 @@ class Distillation:
                 actions = self.policy.act_inference(obs)
 
                 # compute the extra loss
-                extra_loss = self.policy.extra_loss()
+                extra_loss = self.policy.extra_loss(
+                    obs_batch=obs,
+                )
                 for key, value in extra_loss.items():
                     loss = loss + value
                     if key not in mean_extra_loss:

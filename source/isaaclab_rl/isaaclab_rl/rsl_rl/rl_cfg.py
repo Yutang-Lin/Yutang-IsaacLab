@@ -339,6 +339,43 @@ class RslRlPpoActorCriticTransformerCfg(RslRlPpoActorCriticCfg):
     """The activation function for the transformer."""
 
 @configclass
+class RslRlPpoActorCriticTransformerFlowCfg(RslRlPpoActorCriticCfg):
+    """Configuration for the PPO actor-critic networks with transformer layers."""
+
+    class_name: str = "ActorCriticTransformerFlow"
+    """The policy class name. Default is ActorCriticTransformerFlow."""
+
+    tf_d_model: int = MISSING
+    """The dimension of the transformer model."""
+
+    tf_num_proprio_tokens: int = MISSING
+    """The number of input tokens."""
+
+    tf_num_action_tokens: int = MISSING
+    """The number of action tokens."""
+
+    tf_control_obs_horizon: int = MISSING
+    """The number of control observation tokens."""
+
+    tf_num_heads: int = MISSING
+    """The number of transformer heads."""
+
+    tf_num_layers: int = MISSING
+    """The number of transformer layers."""
+
+    tf_hidden_dim: int = MISSING
+    """The dimension of the transformer hidden layers."""
+
+    tf_dropout: float = 0.0
+    """The dropout rate for the transformer."""
+
+    tf_activation: str = "gelu"
+    """The activation function for the transformer."""
+
+    denoise_loss_coef: float = 1.0
+    """The coefficient for the denoise loss."""
+
+@configclass
 class RslRlPpoActorCriticTransformerResidualCfg(RslRlPpoActorCriticTransformerCfg):
     """Configuration for the PPO actor-critic networks with transformer layers."""
 

@@ -9,6 +9,7 @@ from .actor_critic_mop import ActorCriticMoP
 from .actor_critic_pnn import ActorCriticPNN
 from .actor_critic_dp import ActorCriticDP
 from .actor_critic_transformer import ActorCriticTransformer
+from .actor_critic_transformer_flow import ActorCriticTransformerFlow
 from .actor_critic_transformer_residual import ActorCriticTransformerResidual
 from .actor_critic_transformer_latent import ActorCriticTransformerLatent
 from .actor_critic_tf_recurrent import ActorCriticTFRecurrent
@@ -93,4 +94,5 @@ __all__ = [
     "TwinDelayed",
     "ActorDoubleCritic",
     "ActorCriticTransformer",
+    "ActorCriticTransformerFlow",
 ]

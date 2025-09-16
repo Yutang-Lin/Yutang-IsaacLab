@@ -5,6 +5,21 @@ import math
 from torch.nn.functional import scaled_dot_product_attention
 from torch.nn.attention import sdpa_kernel, SDPBackend
 
+class MLP(nn.Module):
+    def __init__(self, input_dim, hidden_dims, output_dim, activation: nn.Module | None = None):
+        super().__init__()
+        if activation is None:
+            activation = nn.ReLU()
+        layers = []
+        for i in range(len(hidden_dims)):
+            layers.append(nn.Linear(input_dim if i == 0 else hidden_dims[i-1], hidden_dims[i]))
+            layers.append(activation)
+        layers.append(nn.Linear(hidden_dims[-1], output_dim))
+        self.mlp = nn.Sequential(*layers)
+    
+    def forward(self, x):
+        return self.mlp(x)
+
 class MoEFFN(nn.Module):
     def __init__(self, d_model, hidden_dim, num_experts, top_k, activation: nn.Module | None = None):
         super().__init__()
@@ -206,3 +221,55 @@ class TransformerEncoder(nn.Module):
             return torch.stack(features, dim=0)
         else:
             return feature
+        
+class PositionalEncoding(nn.Module):
+    """Traditional sinusoidal positional encoding for transformers."""
+    def __init__(self, d_model, max_len=5000):
+        super().__init__()
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(0)  # [1, max_len, d_model]
+        self.register_buffer('pe', pe)
+
+    def forward(self, x):
+        """
+        Args:
+            x: Tensor, shape [batch_size, seq_len, d_model]
+        """
+        seq_len = x.size(1)
+        return x + self.pe[:, :seq_len, :] # type: ignore
+
+class SinusoidalTimestepEmbedder(nn.Module):
+    """
+    Transform a scalar timestep into a vector embedding.
+    """
+    def __init__(self, hidden_size, frequency_embedding_size=256):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(frequency_embedding_size, hidden_size),
+            nn.SiLU(),
+            nn.Linear(hidden_size, hidden_size),
+        )
+        self.hidden_size = hidden_size
+        # frequency matrix, for generating sinusoidal embedding
+        self.freq_emb = nn.Embedding(frequency_embedding_size // 2, frequency_embedding_size)
+        # precompute
+        half_dim = frequency_embedding_size // 2
+        self.register_buffer("emb", 10000 ** (-torch.arange(half_dim) / half_dim) )
+
+    def forward(self, t):
+        # t's shape is [batch_size]
+        if t.dim() == 0:
+            t = t.unsqueeze(0)
+        t_shape = t.squeeze(-1).shape
+        t = t.view(-1)
+        # 1. generate sinusoidal position embedding
+        emb = t[:, None] * self.emb[None, :]  # type: ignore
+        emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=-1) 
+        
+        # 2. transform and nonlinear activation through MLP with SiLU activation
+        emb = self.mlp(emb)
+        return emb.view(*t_shape, self.hidden_size)

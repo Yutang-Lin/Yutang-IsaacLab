@@ -26,6 +26,7 @@ from .actor_critic_tf_recurrent_ll import ActorCriticTFRecurrentLL
 from .actor_critic_tf_recurrent_latent import ActorCriticTFRecurrentLatent
 from .actor_critic_dp_transformer import ActorCriticDPTransformer
 from .actor_critic_transformer_latent import ActorCriticTransformerLatent
+from .actor_critic_transformer_flow import ActorCriticTransformerFlow
 
 class StudentTeacher(nn.Module):
     is_recurrent = False
@@ -91,8 +92,8 @@ class StudentTeacher(nn.Module):
     def forward(self):
         raise NotImplementedError
     
-    def extra_loss(self):
-        return self.student.extra_loss()
+    def extra_loss(self, **kwargs):
+        return self.student.extra_loss(**kwargs)
     
     def pre_train(self):
         self.student.pre_train()
