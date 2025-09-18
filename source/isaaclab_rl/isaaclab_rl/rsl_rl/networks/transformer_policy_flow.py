@@ -87,7 +87,7 @@ class TransformerPolicyFlow(PreTrainedModel):
                                        self.hidden_dim, 
                                        self.num_layers, 
                                        self.dropout, 
-                                       is_causal=True, 
+                                       is_causal=False, 
                                        activation=self.activation,
                                        enable_sdpa=self.enable_sdpa)
         self.action_output_proj = MLP(self.num_action_tokens * self.d_model, self.mlp_hidden_dims, self.action_dim, self.mlp_activation)
@@ -122,3 +122,16 @@ class TransformerPolicyFlow(PreTrainedModel):
                                             ].flatten(start_dim=1))
         control_obs_velocity = self.control_obs_output_proj(input[:, self.num_proprio_tokens + self.num_action_tokens:])
         return actions, control_obs_velocity
+    
+    def denoise(self, proprio: torch.Tensor, 
+                control: torch.Tensor, 
+                timestep: torch.Tensor, 
+                step_size: torch.Tensor | float,
+                timestep_target: torch.Tensor | None = None):
+        actions, control_obs_velocity = self.forward(proprio, control, timestep)
+        if timestep_target is None:
+            timestep_target = torch.ones_like(timestep)
+        step_size = (timestep_target - timestep).clamp(max=step_size).clamp(min=0.0)
+        control = control + control_obs_velocity * step_size.unsqueeze(-1)
+        timestep = timestep + step_size
+        return actions, control, timestep

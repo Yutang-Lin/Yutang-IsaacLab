@@ -60,6 +60,7 @@ class ActorCriticTransformerFlow(ActorCritic):
         self.learnable_noise_std = learnable_noise_std
         self.actor_obs_meta = actor_obs_meta
         self.control_obs_horizon = tf_control_obs_horizon
+        self.control_dt = 1 / tf_control_obs_horizon
         assert actor_obs_meta is not None, "actor_obs_meta must be provided"
         assert 'proprios' in actor_obs_meta, "proprios must be provided in actor_obs_meta"
         assert 'control_observations' in actor_obs_meta, "control_observations must be provided in actor_obs_meta"
@@ -109,7 +110,10 @@ class ActorCriticTransformerFlow(ActorCritic):
         self.denoise_buffer = dict()
 
     def extra_loss(self, **kwargs):
-        denoise_loss = self.denoise_loss_coef * self.mse_loss(self.denoise_buffer['velocity'], self.denoise_buffer['control_obs_velocity'])
+        denoise_loss = self.denoise_loss_coef * self.mse_loss(
+            self.denoise_buffer['velocity'], 
+            self.denoise_buffer['control_obs_velocity']
+        )
         self.denoise_buffer.clear()
         return {"denoise_loss": denoise_loss}
     
@@ -171,7 +175,7 @@ class ActorCriticTransformerFlow(ActorCritic):
     
     def act(self, observations, **kwargs):
         obs_dict = self._split_observations(observations)
-        obs_dict['timestep'] = torch.linspace(1, 0, self.control_obs_horizon, device=observations.device).unsqueeze(0).repeat(observations.shape[0], 1)
+        obs_dict['timestep'] = torch.linspace(1 - self.control_dt, 0, self.control_obs_horizon, device=observations.device).unsqueeze(0).repeat(observations.shape[0], 1)
         obs_dict['control'], _, _ = self._apply_noise(obs_dict['control'], obs_dict['timestep'])
         self.update_distribution(obs_dict)
         return self.distribution.sample()
@@ -181,7 +185,7 @@ class ActorCriticTransformerFlow(ActorCritic):
         if self.save_denoise_velocity:
             obs_dict['timestep'] = torch.rand(observations.shape[0], self.control_obs_horizon, device=observations.device)
         else:
-            obs_dict['timestep'] = torch.linspace(1, 0, self.control_obs_horizon, device=observations.device).unsqueeze(0).repeat(observations.shape[0], 1)
+            obs_dict['timestep'] = torch.linspace(1 - self.control_dt, 0, self.control_obs_horizon, device=observations.device).unsqueeze(0).repeat(observations.shape[0], 1)
         obs_dict['control'], _, self.denoise_buffer['velocity'] = self._apply_noise(obs_dict['control'], obs_dict['timestep'])
 
         actions_mean, control_obs_velocity = self.actor(**obs_dict, **kwargs)
