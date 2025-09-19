@@ -320,20 +320,38 @@ class RslRlPpoActorCriticTransformerCfg(RslRlPpoActorCriticCfg):
     tf_d_model: int = MISSING
     """The dimension of the transformer model."""
 
+    tf_critic_d_model: int | None = None
+    """The dimension of the critic transformer model."""
+
     tf_num_input_tokens: int = MISSING
     """The number of input tokens."""
+
+    tf_critic_num_input_tokens: int | None = None
+    """The number of input tokens for the critic transformer model."""
 
     tf_num_heads: int = MISSING
     """The number of transformer heads."""
 
+    tf_critic_num_heads: int | None = None
+    """The number of transformer heads for the critic."""
+
     tf_num_layers: int = MISSING
     """The number of transformer layers."""
+
+    tf_critic_num_layers: int | None = None
+    """The number of transformer layers for the critic."""
 
     tf_hidden_dim: int = MISSING
     """The dimension of the transformer hidden layers."""
 
+    tf_critic_hidden_dim: int | None = None
+    """The dimension of the transformer hidden layers for the critic."""
+
     tf_dropout: float = 0.0
     """The dropout rate for the transformer."""
+
+    tf_critic_dropout: float | None = None
+    """The dropout rate for the critic transformer."""
 
     tf_activation: str = "gelu"
     """The activation function for the transformer."""

@@ -33,6 +33,12 @@ class ActorCriticTransformer(ActorCritic):
         tf_hidden_dim=256,
         tf_dropout=0.05,
         tf_activation="gelu",
+        tf_critic_d_model=None,
+        tf_critic_num_input_tokens=None,
+        tf_critic_num_layers=None,
+        tf_critic_num_heads=None,
+        tf_critic_hidden_dim=None,
+        tf_critic_dropout=None,
         init_noise_std=1.0,
         load_noise_std: bool = True,
         learnable_noise_std: bool = True,
@@ -52,6 +58,12 @@ class ActorCriticTransformer(ActorCritic):
         nn.Module.__init__(self)
         activation = resolve_nn_activation(activation)
         tf_activation = resolve_nn_activation(tf_activation)
+        tf_critic_d_model = tf_critic_d_model if tf_critic_d_model is not None else tf_d_model
+        tf_critic_num_input_tokens = tf_critic_num_input_tokens if tf_critic_num_input_tokens is not None else tf_num_input_tokens
+        tf_critic_num_layers = tf_critic_num_layers if tf_critic_num_layers is not None else tf_num_layers
+        tf_critic_num_heads = tf_critic_num_heads if tf_critic_num_heads is not None else tf_num_heads
+        tf_critic_hidden_dim = tf_critic_hidden_dim if tf_critic_hidden_dim is not None else tf_hidden_dim
+        tf_critic_dropout = tf_critic_dropout if tf_critic_dropout is not None else tf_dropout
 
         self.load_noise_std = load_noise_std
         self.learnable_noise_std = learnable_noise_std
@@ -74,12 +86,12 @@ class ActorCriticTransformer(ActorCritic):
                                         1,
                                         mlp_hidden_dims=critic_hidden_dims,
                                         mlp_activation=activation,
-                                        num_input_tokens=tf_num_input_tokens,
-                                        num_layers=tf_num_layers, 
-                                        d_model=tf_d_model, 
-                                        hidden_dim=tf_hidden_dim, 
-                                        num_heads=tf_num_heads, 
-                                        dropout=0.0, # NOTE: no dropout in critic
+                                        num_input_tokens=tf_critic_num_input_tokens,
+                                        num_layers=tf_critic_num_layers, 
+                                        d_model=tf_critic_d_model, 
+                                        hidden_dim=tf_critic_hidden_dim, 
+                                        num_heads=tf_critic_num_heads, 
+                                        dropout=tf_critic_dropout, # NOTE: no dropout in critic
                                         activation=tf_activation)
 
         print(f"Actor Transformer: {self.actor}")
