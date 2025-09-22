@@ -393,6 +393,15 @@ class RslRlPpoActorCriticTransformerFlowCfg(RslRlPpoActorCriticCfg):
     denoise_loss_coef: float = 1.0
     """The coefficient for the denoise loss."""
 
+    sim_learning_epochs: int = 1
+    """The number of epochs to simulate the learning."""
+
+    sim_action_loss_coef: float = 1.0
+    """The coefficient for the action loss."""
+
+    sim_state_loss_coef: float = 1.0
+    """The coefficient for the state loss."""
+
 @configclass
 class RslRlPpoActorCriticTransformerResidualCfg(RslRlPpoActorCriticTransformerCfg):
     """Configuration for the PPO actor-critic networks with transformer layers."""

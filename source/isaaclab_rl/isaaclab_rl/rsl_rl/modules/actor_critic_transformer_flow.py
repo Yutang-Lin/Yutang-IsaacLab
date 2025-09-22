@@ -36,6 +36,9 @@ class ActorCriticTransformerFlow(ActorCritic):
         tf_dropout=0.05,
         tf_activation="gelu",
         denoise_loss_coef=1.0,
+        sim_learning_epochs=1,
+        sim_action_loss_coef=1.0,
+        sim_state_loss_coef=1.0,
         init_noise_std=1.0,
         load_noise_std: bool = True,
         learnable_noise_std: bool = True,
@@ -61,6 +64,9 @@ class ActorCriticTransformerFlow(ActorCritic):
         self.actor_obs_meta = actor_obs_meta
         self.control_obs_horizon = tf_control_obs_horizon
         self.control_dt = 1 / tf_control_obs_horizon
+        self.sim_learning_epochs = sim_learning_epochs
+        self.sim_action_loss_coef = sim_action_loss_coef
+        self.sim_state_loss_coef = sim_state_loss_coef
         assert actor_obs_meta is not None, "actor_obs_meta must be provided"
         assert 'proprios' in actor_obs_meta, "proprios must be provided in actor_obs_meta"
         assert 'control_observations' in actor_obs_meta, "control_observations must be provided in actor_obs_meta"
@@ -109,13 +115,48 @@ class ActorCriticTransformerFlow(ActorCritic):
         self.save_denoise_velocity = False
         self.denoise_buffer = dict()
 
-    def extra_loss(self, **kwargs):
+    def extra_loss(self, student_actions_batch=None, flow_state_batch=None, flow_dones_batch=None, **kwargs):
+        loss_dict = dict()
+        
         denoise_loss = self.denoise_loss_coef * self.mse_loss(
             self.denoise_buffer['velocity'], 
             self.denoise_buffer['control_obs_velocity']
         )
+        loss_dict['denoise'] = denoise_loss
+
+        if flow_state_batch is not None and self.sim_learning_epochs > 0:
+            assert student_actions_batch is not None, "Student actions must be provided for Flow DAgger."
+            assert flow_dones_batch is not None, "Flow dones must be provided for Flow DAgger."
+            num_envs, num_steps = flow_state_batch.shape[:2]
+            assert num_steps == self.control_obs_horizon, "Flow state must have the same number of steps as the control observation horizon."
+            flow_mask = (torch.cumsum(flow_dones_batch, dim=1) > 0).float().view(num_envs, num_steps)
+            num_masked_future = flow_mask.sum(dim=1).float()
+            loss_weight = (1 - num_masked_future / num_steps).unsqueeze(1).unsqueeze(-1)
+            
+            sim_action_loss = torch.zeros(1, device=flow_state_batch.device)
+            sim_state_loss = torch.zeros(1, device=flow_state_batch.device)
+            for _ in range(self.sim_learning_epochs):
+                timestep = torch.rand(num_envs, self.control_obs_horizon, device=flow_state_batch.device)
+                timestep = (timestep + flow_mask).clamp(max=1.0)
+                control, _, velocity = self._apply_noise(flow_state_batch, timestep)
+                actions, predicted_velocity = self.actor(self.denoise_buffer['proprio'], control, timestep)
+                action_loss = self.sim_action_loss_coef * (
+                    actions - student_actions_batch
+                ).square() * loss_weight
+                sim_action_loss = sim_action_loss + action_loss.mean()
+
+                state_loss = self.sim_state_loss_coef * (
+                    velocity - predicted_velocity
+                ).square() * loss_weight
+                sim_state_loss = sim_state_loss + state_loss.mean()
+
+            sim_action_loss /= self.sim_learning_epochs
+            sim_state_loss /= self.sim_learning_epochs
+            loss_dict['sim_action'] = sim_action_loss * self.sim_action_loss_coef
+            loss_dict['sim_state'] = sim_state_loss * self.sim_state_loss_coef
+
         self.denoise_buffer.clear()
-        return {"denoise_loss": denoise_loss}
+        return loss_dict
     
     def pre_train(self):
         self.save_denoise_velocity = True
@@ -190,6 +231,7 @@ class ActorCriticTransformerFlow(ActorCritic):
 
         actions_mean, control_obs_velocity = self.actor(**obs_dict, **kwargs)
         if self.save_denoise_velocity:
+            self.denoise_buffer['proprio'] = obs_dict['proprio']
             self.denoise_buffer['control_obs_velocity'] = control_obs_velocity
         return actions_mean
 

@@ -47,7 +47,7 @@ class BaseRunner(OnPolicyRunner):
         # resolve training type depending on the algorithm
         if self.alg_cfg["class_name"] == "PPO":
             self.training_type = "rl"
-        elif self.alg_cfg["class_name"] == "Distillation":
+        elif self.alg_cfg["class_name"] in ["Distillation", "FlowDAgger"]:
             self.training_type = "distillation"
         else:
             print(f"Warning: Training type not found for algorithm {self.alg_cfg['class_name']}, using rl as default.")
@@ -267,6 +267,12 @@ class BaseRunner(OnPolicyRunner):
 
         # initialize best reward
         best_reward = -float("inf")
+
+        # set unwrapped env to algorithm
+        if not hasattr(self.alg, "unwrapped_env"):
+            setattr(self.alg, "unwrapped_env", self.env.unwrapped) # type: ignore
+        else:
+            print(f"[WARNING]: Unwrapped env already set to algorithm, skipping...")
 
         # Start training
         start_iter = self.current_learning_iteration

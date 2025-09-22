@@ -155,7 +155,7 @@ class PPO(RslRlPPO):
 
     def act(self, obs, critic_obs, infos, **kwargs):
         if self.policy.is_recurrent:
-            self.transition.hidden_states = self.policy.get_hidden_states()
+            self.transition.hidden_states = self.policy.get_hidden_states() # type: ignore
         meta_tensors = infos.get('meta_tensors', {})
         # compute the actions and values
         self.transition.actions = self.policy.act(obs, meta_tensors=meta_tensors).detach() # type: ignore
@@ -304,8 +304,8 @@ class PPO(RslRlPPO):
 
             # -- Distillation loss
             if self.use_distillation:
-                assert 'target_actions' in meta_tensors_batch, "target_actions must be provided for distillation"
-                target_actions_batch = meta_tensors_batch['target_actions']
+                assert 'target_actions' in meta_tensors_batch, "target_actions must be provided for distillation" # type: ignore
+                target_actions_batch = meta_tensors_batch['target_actions'] # type: ignore
             else:
                 target_actions_batch = None
 
@@ -354,7 +354,7 @@ class PPO(RslRlPPO):
                             meta_tensors=meta_tensors_batch)
             
             if self.use_distillation:
-                distillation_loss = F.mse_loss(self.policy.action_mean, target_actions_batch)
+                distillation_loss = F.mse_loss(self.policy.action_mean, target_actions_batch) # type: ignore
                 mean_extra_loss["distillation"] += distillation_loss.item()
             else:
                 distillation_loss = torch.tensor(0.0, device=self.device)

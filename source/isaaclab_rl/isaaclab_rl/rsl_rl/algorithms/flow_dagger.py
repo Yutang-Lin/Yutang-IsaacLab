@@ -10,11 +10,11 @@ import torch.optim as optim
 
 # rsl-rl
 from isaaclab_rl.rsl_rl.modules import StudentTeacher, StudentTeacherRecurrent
-from isaaclab_rl.rsl_rl.storage import RolloutStorage
+from isaaclab_rl.rsl_rl.storage import FlowDAggerStorage
 
 
-class Distillation:
-    """Distillation algorithm for training a student model to mimic a teacher model."""
+class FlowDAgger:
+    """Flow DAgger algorithm for training a student model to mimic a teacher model."""
 
     policy: StudentTeacher | StudentTeacherRecurrent
     """The student teacher model."""
@@ -28,6 +28,8 @@ class Distillation:
         max_grad_norm=None,
         loss_type="mse",
         device="cpu",
+        flow_state_horizon=None,
+        flow_state_normalizer=None,
         # Distributed training parameters
         multi_gpu_cfg: dict | None = None,
     ):
@@ -43,13 +45,15 @@ class Distillation:
             self.gpu_world_size = 1
 
         self.rnd = None  # TODO: remove when runner has a proper base class
+        self.flow_state_horizon = flow_state_horizon
+        self.flow_state_normalizer = flow_state_normalizer
 
         # distillation components
         self.policy = policy
         self.policy.to(self.device)
         self.storage = None  # initialized later
         self.optimizer = optim.Adam(self.policy.parameters(), lr=learning_rate)
-        self.transition = RolloutStorage.Transition()
+        self.transition = FlowDAggerStorage.Transition()
         self.last_hidden_states = None
 
         # distillation parameters
@@ -57,6 +61,9 @@ class Distillation:
         self.gradient_length = gradient_length
         self.learning_rate = learning_rate
         self.max_grad_norm = max_grad_norm
+
+        # flow state parameters
+        self.flow_state_storage = None
 
         # initialize the loss function
         if loss_type == "mse":
@@ -73,7 +80,7 @@ class Distillation:
         meta_tensors=None
     ):
         # create rollout storage
-        self.storage = RolloutStorage(
+        self.storage = FlowDAggerStorage(
             training_type,
             num_envs,
             num_transitions_per_env,
@@ -83,14 +90,15 @@ class Distillation:
             None,
             self.device,
             meta_tensors=meta_tensors,
+            flow_state_horizon=self.flow_state_horizon,
         )
 
     def act(self, obs, teacher_obs, infos=None, **kwargs):
         # compute the actions
         self.transition.actions = self.policy.act(obs).detach() # type: ignore
         self.transition.privileged_actions = self.policy.evaluate(teacher_obs).detach()
-        if infos is not None and 'teacher_residual' in infos:
-            self.transition.privileged_actions = self.transition.privileged_actions + infos['teacher_residual']
+        if infos is not None and 'robot_state' in infos:
+            self.transition.flow_state = infos['robot_state']
         # record the observations
         self.transition.observations = obs
         self.transition.privileged_observations = teacher_obs
@@ -100,6 +108,9 @@ class Distillation:
         # record the rewards and dones
         self.transition.rewards = rewards
         self.transition.dones = dones
+        assert 'robot_state' in infos, "Robot state must be provided for Flow DAgger."
+        if self.transition.flow_state is None:
+            self.transition.flow_state = infos['robot_state']
         # record the transition
         self.storage.add_transitions(self.transition, 
                                      meta_tensors=infos.get('meta_tensors', None))
@@ -119,14 +130,24 @@ class Distillation:
         for epoch in range(self.num_learning_epochs):
             self.policy.reset(hidden_states=self.last_hidden_states)
             self.policy.detach_hidden_states()
-            for obs, _, _, privileged_actions, dones in self.storage.generator():
+            for obs, _, student_actions, privileged_actions, dones, (flow_state, flow_dones) in self.storage.generator():
 
                 # inference the student for gradient computation
                 actions = self.policy.act_inference(obs)
 
+                # normalize the flow state
+                with torch.inference_mode():
+                    unwrapped_env = getattr(self, "unwrapped_env", None)
+                    if flow_state is not None and unwrapped_env is not None:
+                        normalizer = getattr(unwrapped_env, self.flow_state_normalizer, None)
+                        assert normalizer is not None, "Flow state normalizer must be provided for Flow DAgger."
+                        flow_state = normalizer(flow_state)
+
                 # compute the extra loss
                 extra_loss = self.policy.extra_loss(
-                    obs_batch=obs,
+                    student_actions_batch=student_actions,
+                    flow_state_batch=flow_state,
+                    flow_dones_batch=flow_dones,
                 )
                 for key, value in extra_loss.items():
                     loss = loss + value

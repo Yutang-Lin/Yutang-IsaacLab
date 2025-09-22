@@ -66,3 +66,28 @@ class RslRlDistillationAlgorithmCfg:
 
     max_grad_norm: None | float = None
     """The maximum norm the gradient is clipped to."""
+
+@configclass
+class RslRlFlowDAggerAlgorithmCfg:
+    """Configuration for the distillation algorithm."""
+
+    class_name: str = "FlowDAgger"
+    """The algorithm class name. Default is FlowDAgger."""
+
+    num_learning_epochs: int = MISSING
+    """The number of updates performed with each sample."""
+
+    learning_rate: float = MISSING
+    """The learning rate for the student policy."""
+
+    gradient_length: int = MISSING
+    """The number of environment steps the gradient flows back."""
+
+    max_grad_norm: None | float = None
+    """The maximum norm the gradient is clipped to."""
+
+    flow_state_horizon: None | int = None
+    """The horizon of the flow state."""
+
+    flow_state_normalizer: None | str = None
+    """The normalizer for the flow state. It matches the name of the method in the environment."""

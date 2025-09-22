@@ -1,4 +1,5 @@
 from .distillation import Distillation
+from .flow_dagger import FlowDAgger
 from .hrpo import HRPO  
 from .ppo import PPO
 from .ppo_kl import PPOKL
@@ -8,4 +9,4 @@ from .double_ppo import DoublePPO
 from .ppo_ou import PPOOU
 from .rdppo import RDPPO
 
-__all__ = ["PPO", "PPOKL", "Distillation", "HRPO", "AmpReward", "TD3", "DoublePPO", "PPOOU", "RDPPO"]
+__all__ = ["PPO", "PPOKL", "Distillation", "HRPO", "AmpReward", "TD3", "DoublePPO", "PPOOU", "RDPPO", "FlowDAgger"]
