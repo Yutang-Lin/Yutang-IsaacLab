@@ -2,8 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
-from torch.nn.functional import scaled_dot_product_attention
-from torch.nn.attention import sdpa_kernel, SDPBackend
+from jvp_flash_attention.jvp_attention import JVPAttn
 
 class MLP(nn.Module):
     def __init__(self, input_dim, hidden_dims, output_dim, activation: nn.Module | None = None):
@@ -76,9 +75,51 @@ class MultiHeadAttention(nn.Module):
         self.v_proj = nn.Linear(d_model, d_model)
         self.out_proj = nn.Linear(d_model, d_model)
 
+    @staticmethod
+    def _pad_qkv(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, 
+                 attn_mask: torch.Tensor | None,
+                 base: int = 32):
+        q_length = q.shape[-2]
+        kv_length = k.shape[-2]
+        batch_size, num_heads = q.shape[:2]
+        head_dim = q.shape[-1]
+        if q_length % base != 0:
+            delta_q = base - q_length % base
+            q = torch.cat([q, torch.zeros(
+                                batch_size, 
+                                num_heads, 
+                                delta_q, 
+                                head_dim, device=q.device, dtype=q.dtype)
+                            ], dim=-2)
+        else:
+            delta_q = 0
+
+        if kv_length % base != 0:
+            delta_k = base - kv_length % base
+            zeros_kv = torch.zeros(batch_size, 
+                                    num_heads, 
+                                    delta_k, 
+                                    head_dim, device=k.device, dtype=k.dtype)
+            k = torch.cat([k, zeros_kv], dim=-2)
+            v = torch.cat([v, zeros_kv], dim=-2)
+        else:
+            delta_k = 0
+        
+        if attn_mask is not None:
+            new_attn_mask = torch.zeros(batch_size, 
+                                        num_heads, 
+                                        q_length + delta_q, 
+                                        kv_length + delta_k, 
+                                        device=attn_mask.device, 
+                                        dtype=attn_mask.dtype)
+            new_attn_mask[:, :, :q_length, :kv_length] = attn_mask[:, :, :q_length, :kv_length]
+            attn_mask = new_attn_mask
+        return q, k, v, attn_mask
+
     def forward(self, feature: torch.Tensor, 
                 other: torch.Tensor, 
-                attn_mask: torch.Tensor | None = None):
+                attn_mask: torch.Tensor | None = None,
+                fwd_dual: bool = False):
         is_causal = self.is_causal
         if is_causal and attn_mask is not None:
             is_causal = False
@@ -100,7 +141,7 @@ class MultiHeadAttention(nn.Module):
         v = v.view(batch_size, kv_length, self.num_heads, self.head_dim).transpose(-2, -3)
 
         if attn_mask is not None:
-            attn_mask = attn_mask.unsqueeze(-3) # match head dim
+            attn_mask = attn_mask.unsqueeze(-3).repeat(1, self.num_heads, 1, 1) # match head dim
 
         if not self.enable_sdpa:
             q = q.reshape(batch_size * self.num_heads, q_length, self.head_dim)
@@ -108,17 +149,25 @@ class MultiHeadAttention(nn.Module):
             v = v.reshape(batch_size * self.num_heads, kv_length, self.head_dim)
             attn_score = torch.bmm(q, k.transpose(-2, -1))
             if attn_mask is not None:
-                attn_mask = - torch.inf * torch.repeat_interleave(attn_mask, 
-                                                                  self.num_heads, dim=-3).reshape(-1, q.shape[-2], k.shape[-2])
+                attn_mask = - torch.inf * (1 - attn_mask).reshape(-1, q.shape[-2], k.shape[-2])
                 attn_score = attn_score + attn_mask
             attn_score = F.softmax(attn_score / math.sqrt(self.head_dim), dim=-1)
             out = torch.bmm(attn_score, v).reshape(batch_size, self.num_heads, q_length, self.head_dim)
 
         else:
-            # let torch decide the best backend
-            out = scaled_dot_product_attention(q, k, v, dropout_p=self.dropout,
-                                                attn_mask=attn_mask,
-                                                is_causal=is_causal)
+            if attn_mask is None and not is_causal:
+                attn_mask = torch.ones(batch_size, self.num_heads, q_length, kv_length, device=q.device, dtype=torch.bool)
+
+            q, k, v, attn_mask = self._pad_qkv(q, k, v, attn_mask)
+            # use flash attention implemented in triton with jvp support
+            q = q.contiguous()
+            k = k.contiguous()
+            v = v.contiguous()
+            if fwd_dual:
+                out = JVPAttn.fwd_dual(q, k, v, attn_mask=attn_mask, causal=is_causal)
+            else:
+                out = JVPAttn.fwd(q, k, v, attn_mask=attn_mask, causal=is_causal)
+            out = out[:, :, :q_length]
 
         out = out.transpose(-2, -3).contiguous().view(batch_size, q_length, self.d_model)
         return self.out_proj(out)
@@ -174,8 +223,8 @@ class TransformerEncoderLayer(nn.Module):
         )
     
     def forward(self, feature: torch.Tensor, 
-                attn_mask: torch.Tensor | None = None):
-        out = self.norm1(self.self_attn(feature, feature, attn_mask) + feature)
+                attn_mask: torch.Tensor | None = None, **kwargs):
+        out = self.norm1(self.self_attn(feature, feature, attn_mask, **kwargs) + feature)
         out = self.norm2(self.mlp(out) + out)
         return out
     
@@ -211,10 +260,11 @@ class TransformerEncoder(nn.Module):
 
     def forward(self, feature: torch.Tensor, 
                 attn_mask: torch.Tensor | None = None, 
-                return_all_layers: bool = False):
+                return_all_layers: bool = False,
+                **kwargs):
         features = [] # for torch script exportable
         for layer in self.layers:
-            feature = layer(feature, attn_mask)
+            feature = layer(feature, attn_mask, **kwargs)
             if return_all_layers:
                 features.append(feature)
         if return_all_layers:

@@ -7,6 +7,7 @@ from isaaclab_rl.rsl_rl.networks.transformer_policy import TransformerPolicy
 from isaaclab_rl.rsl_rl.networks.transformer_policy_residual import TransformerPolicyResidual
 from isaaclab_rl.rsl_rl.networks.transformer_policy_latent import TransformerPolicyLatent
 from isaaclab_rl.rsl_rl.networks.transformer_policy_flow import TransformerPolicyFlow, TransformerPolicyFlowConfig
+from isaaclab_rl.rsl_rl.networks.transformer_policy_mean_flow import TransformerPolicyMeanFlow, TransformerPolicyMeanFlowConfig
 from isaaclab_rl.rsl_rl.networks.transformer_discriminator import TransformerDiscriminator
 
 __all__ = ["Memory", 
@@ -18,4 +19,5 @@ __all__ = ["Memory",
            "TransformerDiscriminator", 
            "TransformerPolicyLatent", 
            "TransformerPolicyResidual", 
-           "TransformerPolicyFlow", "TransformerPolicyFlowConfig"]
+           "TransformerPolicyFlow", "TransformerPolicyFlowConfig",
+           "TransformerPolicyMeanFlow", "TransformerPolicyMeanFlowConfig"]
