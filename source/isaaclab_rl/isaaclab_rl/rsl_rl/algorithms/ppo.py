@@ -445,10 +445,17 @@ class PPO(RslRlPPO):
                     obs_batch=obs_batch,
                     critic_obs_batch=critic_obs_batch,
                 )
+                if isinstance(extra_loss, tuple):
+                    extra_loss, value_dict = extra_loss
+                else:
+                    value_dict = {}
                 for key, value in extra_loss.items():
                     if key not in mean_extra_loss:
                         mean_extra_loss[key] = 0.0
-                    mean_extra_loss[key] += value.item()
+                    if key in value_dict:
+                        mean_extra_loss[key] += value_dict[key]
+                    else:
+                        mean_extra_loss[key] += value.item()
 
             # Value function loss
             if self.importance_sample_value:

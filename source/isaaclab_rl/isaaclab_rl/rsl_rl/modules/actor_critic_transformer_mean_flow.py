@@ -123,9 +123,11 @@ class ActorCriticTransformerMeanFlow(ActorCritic):
 
     def extra_loss(self, student_actions_batch=None, flow_state_batch=None, flow_dones_batch=None, **kwargs):
         loss_dict = dict()
+        value_dict = dict()
         
         denoise_loss = self.denoise_loss_coef * self.denoise_buffer['u_loss']
         loss_dict['denoise'] = denoise_loss
+        value_dict['denoise'] = self.denoise_buffer['u_loss_value']
 
         if flow_state_batch is not None and self.sim_learning_epochs > 0:
             assert student_actions_batch is not None, "Student actions must be provided for Flow DAgger."
@@ -134,25 +136,28 @@ class ActorCriticTransformerMeanFlow(ActorCritic):
             assert num_steps == self.control_obs_horizon, "Flow state must have the same number of steps as the control observation horizon."
             flow_mask = 1 - (torch.cumsum(flow_dones_batch, dim=1) > 0).float().view(num_envs, num_steps)
             
+            value_dict['sim_state'] = 0.0
             sim_action_loss = torch.zeros(1, device=flow_state_batch.device)
             sim_state_loss = torch.zeros(1, device=flow_state_batch.device)
             for _ in range(self.sim_learning_epochs):
                 t = torch.rand(num_envs, self.control_obs_horizon, device=flow_state_batch.device)
                 t = (t + (1 - flow_mask)).clamp(max=1.0)
-                _, _, a_loss, u_loss = self._standard_loss(
+                _, _, a_loss, u_loss, u_loss_value = self._standard_loss(
                     self.denoise_buffer['proprio'], flow_state_batch, t,
                     u_mask=flow_mask.unsqueeze(-1), target_actions=student_actions_batch
                 )
                 sim_action_loss = sim_action_loss + a_loss # type: ignore
                 sim_state_loss = sim_state_loss + u_loss
+                value_dict['sim_state'] += u_loss_value
 
             sim_action_loss /= self.sim_learning_epochs
             sim_state_loss /= self.sim_learning_epochs
+            value_dict['sim_state'] /= self.sim_learning_epochs
             loss_dict['sim_action'] = sim_action_loss * self.sim_action_loss_coef
             loss_dict['sim_state'] = sim_state_loss * self.sim_state_loss_coef
 
         self.denoise_buffer.clear()
-        return loss_dict
+        return loss_dict, value_dict
     
     def pre_train(self):
         self.save_denoise_velocity = True
@@ -206,11 +211,14 @@ class ActorCriticTransformerMeanFlow(ActorCritic):
             u_tgt = u_tgt * u_mask
             u = u * u_mask
 
+        # standard loss
         a_loss = self.mse_loss(a, target_actions).mean() if target_actions is not None else None
         u_loss = self.mse_loss(u, u_tgt).sum(dim=-1) # sum over the single control dimension
+        u_loss_value = u_loss.mean().item()
+        # adaptive loss
         u_loss = u_loss * (1 / torch.pow(u_loss.detach() + self.flow_loss_coef_c, self.flow_loss_coef_p))
         u_loss = u_loss.mean()
-        return a, u, a_loss, u_loss
+        return a, u, a_loss, u_loss, u_loss_value
     
     def _standard_inference(self, proprio: torch.Tensor, control: torch.Tensor, **kwargs):
         t = torch.linspace(self.control_dt, 1.0, self.control_obs_horizon, 
@@ -254,9 +262,10 @@ class ActorCriticTransformerMeanFlow(ActorCritic):
         if not self.save_denoise_velocity:
             return self._standard_inference(**obs_dict, **kwargs)[0]
         
-        actions_mean, _, _, u_loss = self._standard_loss(**obs_dict, **kwargs)
+        actions_mean, _, _, u_loss, u_loss_value = self._standard_loss(**obs_dict, **kwargs)
         self.denoise_buffer['proprio'] = obs_dict['proprio']
         self.denoise_buffer['u_loss'] = u_loss
+        self.denoise_buffer['u_loss_value'] = u_loss_value
         return actions_mean
 
     def evaluate(self, critic_observations, **kwargs):
