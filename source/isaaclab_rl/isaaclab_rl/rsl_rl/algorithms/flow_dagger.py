@@ -56,12 +56,11 @@ class FlowDAgger:
         self.policy = policy
         self.policy.to(self.device)
         self.storage = None  # initialized later
-        self.optimizer = optim.AdamW(self.policy.parameters(), lr=learning_rate, fused=True)
-        # if self.allow_amp:
-        #     self.grad_scaler = amp.GradScaler(device=self.device)
-        # else:
-        #     self.grad_scaler = None
-        self.grad_scaler = None # replaced by fused adamw
+        self.optimizer = optim.Adam(self.policy.parameters(), lr=learning_rate)
+        if self.allow_amp:
+            self.grad_scaler = amp.GradScaler(device=self.device)
+        else:
+            self.grad_scaler = None
         self.transition = FlowDAggerStorage.Transition()
         self.last_hidden_states = None
 
