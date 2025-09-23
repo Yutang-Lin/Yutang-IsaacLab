@@ -91,3 +91,6 @@ class RslRlFlowDAggerAlgorithmCfg:
 
     flow_state_normalizer: None | str = None
     """The normalizer for the flow state. It matches the name of the method in the environment."""
+
+    allow_amp: bool = False
+    """Whether to use automatic mixed precision."""

@@ -7,7 +7,7 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
-
+import torch.amp as amp
 # rsl-rl
 from isaaclab_rl.rsl_rl.modules import StudentTeacher, StudentTeacherRecurrent
 from isaaclab_rl.rsl_rl.storage import FlowDAggerStorage
@@ -30,12 +30,16 @@ class FlowDAgger:
         device="cpu",
         flow_state_horizon=None,
         flow_state_normalizer=None,
+        allow_amp=False,
         # Distributed training parameters
         multi_gpu_cfg: dict | None = None,
     ):
         # device-related parameters
         self.device = device
+        self.device_type = torch.device(self.device).type
         self.is_multi_gpu = multi_gpu_cfg is not None
+        self.allow_amp = allow_amp
+        self.amp_dtype = torch.bfloat16 if allow_amp else torch.float32
         # Multi-GPU parameters
         if multi_gpu_cfg is not None:
             self.gpu_global_rank = multi_gpu_cfg["global_rank"]
@@ -53,6 +57,10 @@ class FlowDAgger:
         self.policy.to(self.device)
         self.storage = None  # initialized later
         self.optimizer = optim.Adam(self.policy.parameters(), lr=learning_rate)
+        if self.allow_amp:
+            self.grad_scaler = amp.GradScaler(device=self.device)
+        else:
+            self.grad_scaler = None
         self.transition = FlowDAggerStorage.Transition()
         self.last_hidden_states = None
 
@@ -117,7 +125,7 @@ class FlowDAgger:
         self.transition.clear()
         self.policy.reset(dones)
 
-    def update(self):
+    def _inner_update(self):
         self.num_updates += 1
         mean_behavior_loss = 0
         mean_extra_loss = {}
@@ -133,6 +141,13 @@ class FlowDAgger:
             for obs, _, student_actions, privileged_actions, dones, (flow_state, flow_dones) in self.storage.generator():
 
                 # inference the student for gradient computation
+                obs = obs.to(self.amp_dtype)
+                student_actions = student_actions.to(self.amp_dtype)
+                privileged_actions = privileged_actions.to(self.amp_dtype)
+                if flow_state is not None:
+                    flow_state = flow_state.to(self.amp_dtype)
+
+                # forward the policy
                 actions = self.policy.act_inference(obs)
 
                 # normalize the flow state
@@ -166,12 +181,19 @@ class FlowDAgger:
                 # gradient step
                 if cnt % self.gradient_length == 0:
                     self.optimizer.zero_grad()
-                    loss.backward()
+                    if self.grad_scaler is not None:
+                        self.grad_scaler.scale(loss).backward()
+                    else:
+                        loss.backward()
                     if self.is_multi_gpu:
                         self.reduce_parameters()
                     if self.max_grad_norm:
                         nn.utils.clip_grad_norm_(self.policy.student.parameters(), self.max_grad_norm)
-                    self.optimizer.step()
+                    if self.grad_scaler is not None:
+                        self.grad_scaler.step(self.optimizer)
+                        self.grad_scaler.update()
+                    else:
+                        self.optimizer.step()
                     self.policy.detach_hidden_states()
                     loss = 0
 
@@ -193,6 +215,11 @@ class FlowDAgger:
         loss_dict = {"behavior": mean_behavior_loss,
                      **mean_extra_loss}
 
+        return loss_dict
+
+    def update(self):
+        with amp.autocast(device_type=self.device_type, dtype=self.amp_dtype):
+            loss_dict = self._inner_update()
         return loss_dict
 
     """
