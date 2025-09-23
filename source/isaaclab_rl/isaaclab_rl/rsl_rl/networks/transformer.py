@@ -1,6 +1,8 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn.functional import scaled_dot_product_attention
+from torch.nn.attention import sdpa_kernel, SDPBackend
 import math
 from jvp_flash_attention.jvp_attention import JVPAttn
 
@@ -144,15 +146,18 @@ class MultiHeadAttention(nn.Module):
             attn_mask = attn_mask.unsqueeze(-3).repeat(1, self.num_heads, 1, 1) # match head dim
 
         if not self.enable_sdpa:
-            q = q.reshape(batch_size * self.num_heads, q_length, self.head_dim)
-            k = k.reshape(batch_size * self.num_heads, kv_length, self.head_dim)
-            v = v.reshape(batch_size * self.num_heads, kv_length, self.head_dim)
-            attn_score = torch.bmm(q, k.transpose(-2, -1))
-            if attn_mask is not None:
-                attn_mask = - torch.inf * (1 - attn_mask).reshape(-1, q.shape[-2], k.shape[-2])
-                attn_score = attn_score + attn_mask
-            attn_score = F.softmax(attn_score / math.sqrt(self.head_dim), dim=-1)
-            out = torch.bmm(attn_score, v).reshape(batch_size, self.num_heads, q_length, self.head_dim)
+            # q = q.reshape(batch_size * self.num_heads, q_length, self.head_dim)
+            # k = k.reshape(batch_size * self.num_heads, kv_length, self.head_dim)
+            # v = v.reshape(batch_size * self.num_heads, kv_length, self.head_dim)
+            # attn_score = torch.bmm(q, k.transpose(-2, -1))
+            # if attn_mask is not None:
+            #     attn_mask = - torch.inf * (1 - attn_mask).reshape(-1, q.shape[-2], k.shape[-2])
+            #     attn_score = attn_score + attn_mask
+            # attn_score = F.softmax(attn_score / math.sqrt(self.head_dim), dim=-1)
+            # out = torch.bmm(attn_score, v).reshape(batch_size, self.num_heads, q_length, self.head_dim)
+            with sdpa_kernel(backends=[SDPBackend.MATH]):
+                out = scaled_dot_product_attention(q, k, v, dropout=self.dropout,
+                                                   attn_mask=attn_mask)
 
         else:
             if attn_mask is None and not is_causal:
@@ -164,9 +169,9 @@ class MultiHeadAttention(nn.Module):
             k = k.contiguous()
             v = v.contiguous()
             if fwd_dual:
-                out = JVPAttn.fwd_dual(q, k, v, attn_mask=attn_mask, causal=is_causal)
+                out = JVPAttn.fwd_dual(q, k, v, attn_mask=attn_mask, causal=is_causal, USE_TMA=False)
             else:
-                out = JVPAttn.fwd(q, k, v, attn_mask=attn_mask, causal=is_causal)
+                out = JVPAttn.fwd(q, k, v, attn_mask=attn_mask, causal=is_causal, USE_TMA=False)
             out = out[:, :, :q_length]
 
         out = out.transpose(-2, -3).contiguous().view(batch_size, q_length, self.d_model)
