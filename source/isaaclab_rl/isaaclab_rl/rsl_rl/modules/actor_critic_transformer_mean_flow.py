@@ -191,7 +191,7 @@ class ActorCriticTransformerMeanFlow(ActorCritic):
                        u_mask: torch.Tensor | None = None,
                        target_actions: torch.Tensor | None = None, **kwargs):
         if t is None:
-            t = torch.rand(proprio.shape[0], self.control_obs_horizon, device=proprio.device)
+            t = torch.rand(proprio.shape[0], self.control_obs_horizon, device=proprio.device, dtype=proprio.dtype)
         r = self._sample_r(t)
         control = control.view(control.shape[0], self.control_obs_horizon, -1)
         noise = torch.randn_like(control)
@@ -205,7 +205,8 @@ class ActorCriticTransformerMeanFlow(ActorCritic):
         return a, u, a_loss, u_loss
     
     def _standard_inference(self, proprio: torch.Tensor, control: torch.Tensor, **kwargs):
-        t = torch.linspace(self.control_dt, 1.0, self.control_obs_horizon, device=proprio.device).unsqueeze(0).repeat(proprio.shape[0], 1)
+        t = torch.linspace(self.control_dt, 1.0, self.control_obs_horizon, 
+                            device=proprio.device, dtype=proprio.dtype).unsqueeze(0).repeat(proprio.shape[0], 1)
         control = control.view(control.shape[0], self.control_obs_horizon, -1)
         control, _ = self._apply_noise(control, t)
         r = self._sample_r(t)

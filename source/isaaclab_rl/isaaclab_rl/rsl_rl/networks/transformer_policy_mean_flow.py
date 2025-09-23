@@ -149,7 +149,6 @@ class TransformerPolicyMeanFlow(PreTrainedModel):
                 torch.ones_like(t),
             ), has_aux=True
         )
-        u.retain_grad()
         # compute the target velocity
         u_tgt = velocity - dudt.detach() * (t - r).unsqueeze(-1)
         return a, u, u_tgt
