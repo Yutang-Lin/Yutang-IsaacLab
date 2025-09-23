@@ -213,7 +213,7 @@ class ActorCriticTransformerMeanFlow(ActorCritic):
 
         # standard loss
         a_loss = self.mse_loss(a, target_actions).mean() if target_actions is not None else None
-        u_loss = self.mse_loss(u, u_tgt).sum(dim=-1) # sum over the single control dimension
+        u_loss = self.mse_loss(u, u_tgt).mean(dim=-1) # sum over the single control dimension
         u_loss_value = u_loss.mean().item()
         # adaptive loss
         u_loss = u_loss * (1 / torch.pow(u_loss.detach() + self.flow_loss_coef_c, self.flow_loss_coef_p))
