@@ -157,6 +157,6 @@ class TransformerPolicyMeanFlow(PreTrainedModel):
                 control: torch.Tensor, 
                 r: torch.Tensor, 
                 t: torch.Tensor):
-        actions, control_obs_velocity = self.forward(proprio, control, r, t)
-        control = control - control_obs_velocity * (t - r).unsqueeze(-1)
-        return actions, control
+        u, a = self.forward(proprio, control, r, t)
+        control = control - u * (t - r).unsqueeze(-1)
+        return a, control
