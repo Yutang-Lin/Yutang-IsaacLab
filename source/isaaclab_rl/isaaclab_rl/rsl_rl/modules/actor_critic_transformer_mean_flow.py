@@ -39,6 +39,9 @@ class ActorCriticTransformerMeanFlow(ActorCritic):
         sim_learning_epochs=1,
         sim_action_loss_coef=1.0,
         sim_state_loss_coef=1.0,
+        flow_r_neq_t_prob=0.25,
+        flow_loss_coef_p=1.0,
+        flow_loss_coef_c=1e-3,
         init_noise_std=1.0,
         load_noise_std: bool = True,
         learnable_noise_std: bool = True,
@@ -67,6 +70,9 @@ class ActorCriticTransformerMeanFlow(ActorCritic):
         self.sim_learning_epochs = sim_learning_epochs
         self.sim_action_loss_coef = sim_action_loss_coef
         self.sim_state_loss_coef = sim_state_loss_coef
+        self.flow_r_neq_t_prob = flow_r_neq_t_prob
+        self.flow_loss_coef_p = flow_loss_coef_p
+        self.flow_loss_coef_c = flow_loss_coef_c
         assert actor_obs_meta is not None, "actor_obs_meta must be provided"
         assert 'proprios' in actor_obs_meta, "proprios must be provided in actor_obs_meta"
         assert 'control_observations' in actor_obs_meta, "control_observations must be provided in actor_obs_meta"
@@ -111,7 +117,7 @@ class ActorCriticTransformerMeanFlow(ActorCritic):
 
         # denoise loss
         self.denoise_loss_coef = denoise_loss_coef
-        self.mse_loss = nn.MSELoss()
+        self.mse_loss = nn.MSELoss(reduction='none')
         self.save_denoise_velocity = False
         self.denoise_buffer = dict()
 
@@ -181,9 +187,9 @@ class ActorCriticTransformerMeanFlow(ActorCritic):
         unsqueezed_t = t.unsqueeze(-1)
         return control * (1 - unsqueezed_t) + noise * unsqueezed_t, noise
     
-    def _sample_r(self, t: torch.Tensor, equal_prob: float = 0.5):
+    def _sample_r(self, t: torch.Tensor, neq_prob: float = 0.5):
         r = torch.rand_like(t) * t
-        r_eq_t = torch.rand_like(t) < equal_prob
+        r_eq_t = torch.rand_like(t) > neq_prob
         r[r_eq_t] = t[r_eq_t]
         return r
     
@@ -192,7 +198,7 @@ class ActorCriticTransformerMeanFlow(ActorCritic):
                        target_actions: torch.Tensor | None = None, **kwargs):
         if t is None:
             t = torch.rand(proprio.shape[0], self.control_obs_horizon, device=proprio.device, dtype=proprio.dtype)
-        r = self._sample_r(t)
+        r = self._sample_r(t, self.flow_r_neq_t_prob)
         control = control.view(control.shape[0], self.control_obs_horizon, -1)
         noise = torch.randn_like(control)
         a, u, u_tgt = self.actor.loss(proprio, control, noise, r, t)
@@ -200,8 +206,10 @@ class ActorCriticTransformerMeanFlow(ActorCritic):
             u_tgt = u_tgt * u_mask
             u = u * u_mask
 
-        a_loss = self.mse_loss(a, target_actions) if target_actions is not None else None
-        u_loss = self.mse_loss(u, u_tgt)
+        a_loss = self.mse_loss(a, target_actions).mean() if target_actions is not None else None
+        u_loss = self.mse_loss(u, u_tgt).sum(dim=-1) # sum over the single control dimension
+        u_loss = u_loss * (1 / torch.pow(u_loss.detach() + self.flow_loss_coef_c, self.flow_loss_coef_p))
+        u_loss = u_loss.mean()
         return a, u, a_loss, u_loss
     
     def _standard_inference(self, proprio: torch.Tensor, control: torch.Tensor, **kwargs):
@@ -209,7 +217,7 @@ class ActorCriticTransformerMeanFlow(ActorCritic):
                             device=proprio.device, dtype=proprio.dtype).unsqueeze(0).repeat(proprio.shape[0], 1)
         control = control.view(control.shape[0], self.control_obs_horizon, -1)
         control, _ = self._apply_noise(control, t)
-        r = self._sample_r(t)
+        r = self._sample_r(t, self.flow_r_neq_t_prob)
         u, a = self.actor(proprio, control, r, t)
         return a, u
     

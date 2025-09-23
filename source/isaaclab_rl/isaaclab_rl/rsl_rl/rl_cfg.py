@@ -408,6 +408,15 @@ class RslRlPpoActorCriticTransformerMeanFlowCfg(RslRlPpoActorCriticTransformerFl
 
     class_name: str = "ActorCriticTransformerMeanFlow"
     """The policy class name. Default is ActorCriticTransformerMeanFlow."""
+
+    flow_r_neq_t_prob: float = 0.25,
+    """The probability of r not equal to t. Default is 0.25."""
+
+    flow_loss_coef_p: float = 1.0,
+    """The power for the flow loss. Default is 1.0."""
+    
+    flow_loss_coef_c: float = 1e-3,
+    """The constant for the flow loss. Default is 1e-3."""
     
 
 @configclass
