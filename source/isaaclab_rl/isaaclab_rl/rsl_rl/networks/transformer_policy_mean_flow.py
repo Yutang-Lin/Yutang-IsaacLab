@@ -99,7 +99,8 @@ class TransformerPolicyMeanFlow(PreTrainedModel):
         self.proprio_embedding = nn.Parameter(torch.randn(1, self.num_proprio_tokens, self.d_model))
         self.action_embedding = nn.Parameter(torch.randn(1, self.num_action_tokens, self.d_model))
         self.control_obs_embedding = nn.Parameter(torch.randn(1, self.control_obs_horizon, self.d_model))
-        self.timestep_embedding = SinusoidalTimestepEmbedder(self.d_model)
+        self.t_embedding = SinusoidalTimestepEmbedder(self.d_model)
+        self.t_minus_r_embedding = SinusoidalTimestepEmbedder(self.d_model)
 
         # initial tokens
         self.initial_action_tokens = nn.Parameter(torch.randn(1, self.num_action_tokens, self.d_model))
@@ -115,7 +116,7 @@ class TransformerPolicyMeanFlow(PreTrainedModel):
         batch_size = proprio.shape[0]
         proprio_tokens = self.proprio_proj(proprio).unflatten(1, (self.num_proprio_tokens, self.d_model)) + self.proprio_embedding
         control_obs_tokens = control.view(batch_size, self.control_obs_horizon, self.single_control_obs_dim)
-        timestep_embedding = self.timestep_embedding(t) + self.timestep_embedding(t - r)
+        timestep_embedding = self.t_embedding(t) + self.t_minus_r_embedding(t - r)
         control_obs_tokens = self.control_obs_proj(control_obs_tokens) + self.control_obs_embedding + timestep_embedding
         action_tokens = self.initial_action_tokens.repeat(batch_size, 1, 1) + self.action_embedding
 
