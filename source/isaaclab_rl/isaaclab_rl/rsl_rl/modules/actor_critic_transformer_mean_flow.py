@@ -261,11 +261,12 @@ class ActorCriticTransformerMeanFlow(ActorCritic):
 
     def act_inference(self, observations, **kwargs):
         obs_dict = self._split_observations(observations)
+        if self.save_denoise_velocity:
+            self.denoise_buffer['proprio'] = obs_dict['proprio']
         if not self.save_denoise_velocity or self.denoise_loss_coef <= 0.0:
             return self._standard_inference(**obs_dict, **kwargs)[0]
         
         actions_mean, _, _, u_loss, u_loss_value = self._standard_loss(**obs_dict, **kwargs)
-        self.denoise_buffer['proprio'] = obs_dict['proprio']
         self.denoise_buffer['u_loss'] = u_loss
         self.denoise_buffer['u_loss_value'] = u_loss_value
         return actions_mean
