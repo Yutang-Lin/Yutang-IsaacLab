@@ -95,6 +95,10 @@ class FlowDAggerStorage:
         self.flow_state = None
         self.flow_state_horizon = flow_state_horizon
         assert self.flow_state_horizon is not None, "Flow state horizon must be provided for Flow DAgger storage."
+        self.num_flow_transitions = num_transitions_per_env
+        self.flow_dones = torch.zeros(self.num_flow_transitions, num_envs, device=self.device).byte()
+        self.flow_actions = torch.zeros(self.num_flow_transitions, num_envs, *actions_shape, device=self.device)
+        self.flow_data_filled = False
 
         # For RNN networks
         self.saved_hidden_states_a = None
@@ -163,8 +167,10 @@ class FlowDAggerStorage:
             self.rnd_state[self.step].copy_(transition.rnd_state)
         if transition.flow_state is not None:
             if self.flow_state is None:
-                self.flow_state = torch.zeros(self.num_transitions_per_env, self.num_envs, transition.flow_state.shape[1], device=self.device)
+                self.flow_state = torch.zeros(self.num_flow_transitions, self.num_envs, transition.flow_state.shape[1], device=self.device)
             self.flow_state[self.step].copy_(transition.flow_state)
+            self.flow_dones[self.step].copy_(transition.dones)
+            self.flow_actions[self.step].copy_(transition.actions)
 
         # For RNN networks
         self._save_hidden_states(transition.hidden_states)
@@ -175,6 +181,8 @@ class FlowDAggerStorage:
 
         # increment the counter
         self.step += 1
+        if self.step == self.num_transitions_per_env:
+            self.flow_data_filled = True
 
     def _save_hidden_states(self, hidden_states):
         if hidden_states is None or hidden_states == (None, None):
@@ -195,7 +203,12 @@ class FlowDAggerStorage:
             self.saved_hidden_states_a[i][self.step].copy_(hid_a[i])
             self.saved_hidden_states_c[i][self.step].copy_(hid_c[i]) # type: ignore
 
+    @torch.inference_mode()
     def clear(self):
+        # if self.flow_state is not None:
+        #     self.flow_state[:1 + self.flow_state_horizon].copy_(self.flow_state[-(1 + self.flow_state_horizon):])
+        #     self.flow_dones[:1 + self.flow_state_horizon].copy_(self.flow_dones[-(1 + self.flow_state_horizon):])
+        #     self.flow_actions[:1 + self.flow_state_horizon].copy_(self.flow_actions[-(1 + self.flow_state_horizon):])
         self.step = 0
 
     def compute_td_returns(self, last_values, gamma):
@@ -237,6 +250,10 @@ class FlowDAggerStorage:
     def generator(self):
         if self.training_type != "distillation":
             raise ValueError("This function is only available for distillation training.")
+        if self.flow_data_filled is not None:
+            transposed_flow_state = self.flow_state.transpose(0, 1)
+            transposed_flow_dones = self.flow_dones.transpose(0, 1)
+            transposed_flow_actions = self.flow_actions.transpose(0, 1)
 
         for i in range(self.num_transitions_per_env):
             if self.privileged_observations is not None:
@@ -244,15 +261,17 @@ class FlowDAggerStorage:
             else:
                 privileged_observations = self.observations[i]
             assert self.flow_state is not None and self.flow_state_horizon is not None, "Flow state must be provided for Flow DAgger storage."
-            if i + self.flow_state_horizon >= self.num_transitions_per_env:
-                flow_state = (None, None)
+            if self.flow_data_filled and i + self.flow_state_horizon < self.num_transitions_per_env:
+                flow_state = transposed_flow_state[:, i:i+self.flow_state_horizon+1] # the first is prev state for normalization
+                flow_dones = transposed_flow_dones[:, i:i+self.flow_state_horizon]
+                flow_actions = transposed_flow_actions[:, i:i+self.flow_state_horizon]
+                flow_data = (flow_state, flow_dones, flow_actions)
             else:
-                flow_state = self.flow_state[i:i+self.flow_state_horizon+1].transpose(0, 1) # the first is prev state for normalization
-                flow_dones = self.dones[i:i+self.flow_state_horizon].transpose(0, 1)
-                flow_state = (flow_state, flow_dones)
+                flow_data = (None, None, None)
+
             yield self.observations[i], privileged_observations, self.actions[i], self.privileged_actions[
                 i
-            ], self.dones[i], flow_state
+            ], self.dones[i], flow_data
 
     # for reinforcement learning with feedforward networks
     def mini_batch_generator(self, num_mini_batches, num_epochs=8):

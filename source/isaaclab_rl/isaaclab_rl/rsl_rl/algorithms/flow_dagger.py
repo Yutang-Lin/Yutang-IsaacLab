@@ -120,6 +120,7 @@ class FlowDAgger:
         assert 'robot_state' in infos, "Robot state must be provided for Flow DAgger."
         if self.transition.flow_state is None:
             self.transition.flow_state = infos['robot_state']
+            print("[WARNING]: Flow state is not provided for Flow DAgger before action is stepped.")
         # record the transition
         self.storage.add_transitions(self.transition, 
                                      meta_tensors=infos.get('meta_tensors', None))
@@ -139,7 +140,10 @@ class FlowDAgger:
         for epoch in range(self.num_learning_epochs):
             self.policy.reset(hidden_states=self.last_hidden_states)
             self.policy.detach_hidden_states()
-            for obs, _, student_actions, privileged_actions, dones, (flow_state, flow_dones) in self.storage.generator():
+            for (
+                obs, _, student_actions, privileged_actions, dones, 
+                (flow_state, flow_dones, flow_actions)
+            ) in self.storage.generator():
 
                 # inference the student for gradient computation
                 obs = obs.to(self.amp_dtype)
@@ -161,10 +165,9 @@ class FlowDAgger:
 
                 # compute the extra loss
                 extra_loss = self.policy.extra_loss(
-                    student_actions_batch=student_actions,
-                    teacher_actions_batch=privileged_actions,
                     flow_state_batch=flow_state,
                     flow_dones_batch=flow_dones,
+                    flow_actions_batch=flow_actions,
                 )
                 if isinstance(extra_loss, tuple):
                     extra_loss, value_dict = extra_loss

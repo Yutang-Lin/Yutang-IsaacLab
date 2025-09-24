@@ -27,8 +27,8 @@ class ActorCriticTransformerMeanFlow(ActorCritic):
         critic_hidden_dims=[256, 256, 256],
         activation="elu",
         tf_d_model=256,
-        tf_num_proprio_tokens=4,
         tf_num_action_tokens=4,
+        tf_proprio_horizon=5,
         tf_control_obs_horizon=20,
         tf_num_layers=1,
         tf_num_heads=4,
@@ -65,6 +65,7 @@ class ActorCriticTransformerMeanFlow(ActorCritic):
         self.load_noise_std = load_noise_std
         self.learnable_noise_std = learnable_noise_std
         self.actor_obs_meta = actor_obs_meta
+        self.proprio_horizon = tf_proprio_horizon
         self.control_obs_horizon = tf_control_obs_horizon
         self.control_dt = 1 / tf_control_obs_horizon
         self.sim_learning_epochs = sim_learning_epochs
@@ -84,10 +85,10 @@ class ActorCriticTransformerMeanFlow(ActorCritic):
             proprio_dim=self.actor_proprio_ids.shape[0],
             control_obs_dim=self.actor_control_ids.shape[0],
             action_dim=num_actions,
+            proprio_horizon=tf_proprio_horizon,
             control_obs_horizon=tf_control_obs_horizon,
             mlp_hidden_dims=actor_hidden_dims,
             mlp_activation=activation,
-            num_proprio_tokens=tf_num_proprio_tokens,
             num_action_tokens=tf_num_action_tokens,
             d_model=tf_d_model,
             num_layers=tf_num_layers,
@@ -121,10 +122,11 @@ class ActorCriticTransformerMeanFlow(ActorCritic):
         self.save_denoise_velocity = False
         self.denoise_buffer = dict()
 
-    def extra_loss(self, student_actions_batch=None, 
-                   teacher_actions_batch=None, 
+    def extra_loss(self,
                    flow_state_batch=None, 
-                   flow_dones_batch=None, **kwargs):
+                   flow_dones_batch=None,
+                   flow_actions_batch=None,
+                   **kwargs):
         loss_dict = dict()
         value_dict = dict()
         
@@ -134,7 +136,7 @@ class ActorCriticTransformerMeanFlow(ActorCritic):
             value_dict['denoise'] = self.denoise_buffer['u_loss_value']
 
         if flow_state_batch is not None and self.sim_learning_epochs > 0:
-            assert student_actions_batch is not None, "Student actions must be provided for Flow DAgger."
+            assert flow_actions_batch is not None, "Flow actions must be provided for Flow DAgger."
             assert flow_dones_batch is not None, "Flow dones must be provided for Flow DAgger."
             num_envs, num_steps = flow_state_batch.shape[:2]
             assert num_steps == self.control_obs_horizon, "Flow state must have the same number of steps as the control observation horizon."
@@ -148,7 +150,7 @@ class ActorCriticTransformerMeanFlow(ActorCritic):
                 t = (t + (1 - flow_mask)).clamp(max=1.0)
                 _, _, a_loss, u_loss, u_loss_value = self._standard_loss(
                     self.denoise_buffer['proprio'], flow_state_batch, t,
-                    u_mask=flow_mask.unsqueeze(-1), target_actions=student_actions_batch
+                    u_mask=flow_mask.unsqueeze(-1), target_actions=flow_actions_batch[:, 0] # the first is the current action
                 )
                 sim_action_loss = sim_action_loss + a_loss # type: ignore
                 sim_state_loss = sim_state_loss + u_loss

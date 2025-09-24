@@ -409,6 +409,9 @@ class RslRlPpoActorCriticTransformerMeanFlowCfg(RslRlPpoActorCriticTransformerFl
     class_name: str = "ActorCriticTransformerMeanFlow"
     """The policy class name. Default is ActorCriticTransformerMeanFlow."""
 
+    tf_proprio_horizon: int = MISSING
+    """The number of proprioceptive tokens."""
+
     flow_r_neq_t_prob: float = 0.25,
     """The probability of r not equal to t. Default is 0.25."""
 
