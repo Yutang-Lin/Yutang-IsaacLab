@@ -462,7 +462,10 @@ class BaseRunner(OnPolicyRunner):
                     self.writer.add_scalar("Episode/" + key, value, locs["it"])
                     ep_string += f"""{f'Mean episode {key}:':>{pad}} {value:.4f}\n"""
         
-        mean_std = self.alg.policy.action_std
+        if hasattr(self.alg.policy, "action_std"):
+            mean_std = self.alg.policy.action_std
+        else:
+            mean_std = 0.0
         if isinstance(mean_std, torch.Tensor):
             mean_std = mean_std.mean().item()
         fps = int(collection_size / (locs["collection_time"] + locs["learn_time"]))
