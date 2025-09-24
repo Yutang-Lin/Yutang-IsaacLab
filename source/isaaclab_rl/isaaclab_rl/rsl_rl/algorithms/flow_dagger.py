@@ -101,12 +101,14 @@ class FlowDAgger:
             meta_tensors=meta_tensors,
             flow_state_horizon=self.flow_state_horizon,
         )
+        self.max_noise_scale = 0.5
+        self.noise_scales = torch.rand(num_envs, 1, device=self.device) * self.max_noise_scale
 
     def act(self, obs, teacher_obs, infos=None, **kwargs):
         # compute the actions
         privileged_actions = self.policy.evaluate(teacher_obs).detach()
         # self.transition.actions = self.policy.act(obs).detach() # type: ignore
-        self.transition.actions = privileged_actions + torch.randn_like(privileged_actions) * 0.2
+        self.transition.actions = privileged_actions + torch.randn_like(privileged_actions) * self.noise_scales
         self.transition.privileged_actions = privileged_actions
         if infos is not None and 'robot_state' in infos:
             self.transition.flow_state = infos['robot_state']
@@ -119,6 +121,10 @@ class FlowDAgger:
         # record the rewards and dones
         self.transition.rewards = rewards
         self.transition.dones = dones
+        # reset the noise scales
+        dones_ids = dones.nonzero().squeeze(-1)
+        self.noise_scales[dones_ids] = torch.rand(len(dones_ids), 1, device=self.device) * self.max_noise_scale
+        # record the flow state
         assert 'robot_state' in infos, "Robot state must be provided for Flow DAgger."
         if self.transition.flow_state is None:
             self.transition.flow_state = infos['robot_state']
