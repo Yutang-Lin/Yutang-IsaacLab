@@ -162,6 +162,7 @@ class FlowDAgger:
                 # compute the extra loss
                 extra_loss = self.policy.extra_loss(
                     student_actions_batch=student_actions,
+                    teacher_actions_batch=privileged_actions,
                     flow_state_batch=flow_state,
                     flow_dones_batch=flow_dones,
                 )

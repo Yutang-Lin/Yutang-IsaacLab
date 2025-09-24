@@ -121,7 +121,10 @@ class ActorCriticTransformerMeanFlow(ActorCritic):
         self.save_denoise_velocity = False
         self.denoise_buffer = dict()
 
-    def extra_loss(self, student_actions_batch=None, flow_state_batch=None, flow_dones_batch=None, **kwargs):
+    def extra_loss(self, student_actions_batch=None, 
+                   teacher_actions_batch=None, 
+                   flow_state_batch=None, 
+                   flow_dones_batch=None, **kwargs):
         loss_dict = dict()
         value_dict = dict()
         
@@ -145,7 +148,7 @@ class ActorCriticTransformerMeanFlow(ActorCritic):
                 t = (t + (1 - flow_mask)).clamp(max=1.0)
                 _, _, a_loss, u_loss, u_loss_value = self._standard_loss(
                     self.denoise_buffer['proprio'], flow_state_batch, t,
-                    u_mask=flow_mask.unsqueeze(-1), target_actions=student_actions_batch
+                    u_mask=flow_mask.unsqueeze(-1), target_actions=teacher_actions_batch
                 )
                 sim_action_loss = sim_action_loss + a_loss # type: ignore
                 sim_state_loss = sim_state_loss + u_loss
