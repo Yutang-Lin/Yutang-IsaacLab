@@ -22,7 +22,7 @@ class TransformerPolicy(nn.Module):
                  hidden_dim, 
                  dropout, 
                  activation,
-                 enable_sdpa: bool = True):
+                 enable_sdpa: bool = False):
         super().__init__()
         self.d_model = d_model
         self.input_size = input_size

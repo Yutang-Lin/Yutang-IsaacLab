@@ -7,7 +7,7 @@ import math
 from jvp_flash_attention.jvp_attention import JVPAttn
 
 class MLP(nn.Module):
-    def __init__(self, input_dim, hidden_dims, output_dim, activation: nn.Module | None = None):
+    def __init__(self, input_dim, hidden_dims, output_dim, activation=None):
         super().__init__()
         if activation is None:
             activation = nn.ReLU()
@@ -22,7 +22,7 @@ class MLP(nn.Module):
         return self.mlp(x)
 
 class MoEFFN(nn.Module):
-    def __init__(self, d_model, hidden_dim, num_experts, top_k, activation: nn.Module | None = None):
+    def __init__(self, d_model, hidden_dim, num_experts, top_k, activation=None):
         super().__init__()
         if activation is None:
             activation = nn.GELU(approximate="tanh")
@@ -118,6 +118,24 @@ class MultiHeadAttention(nn.Module):
             attn_mask = new_attn_mask
         return q, k, v, attn_mask
 
+    @torch.jit.unused
+    def _forward_sdpa(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, 
+                      attn_mask: torch.Tensor | None, is_causal: bool, fwd_dual: bool,
+                      batch_size: int, q_length: int, kv_length: int):
+        if attn_mask is None and not is_causal:
+                attn_mask = torch.ones(batch_size, self.num_heads, q_length, kv_length, device=q.device, dtype=torch.bool)
+
+        q, k, v, attn_mask = self._pad_qkv(q, k, v, attn_mask)
+        # use flash attention implemented in triton with jvp support
+        q = q.contiguous()
+        k = k.contiguous()
+        v = v.contiguous()
+        if fwd_dual:
+            out = JVPAttn.fwd_dual(q, k, v, attn_mask=attn_mask, causal=is_causal, USE_TMA=False)
+        else:
+            out = JVPAttn.fwd(q, k, v, attn_mask=attn_mask, causal=is_causal, USE_TMA=False)
+        return out[:, :, :q_length]
+
     def forward(self, feature: torch.Tensor, 
                 other: torch.Tensor, 
                 attn_mask: torch.Tensor | None = None,
@@ -146,33 +164,10 @@ class MultiHeadAttention(nn.Module):
             attn_mask = attn_mask.unsqueeze(-3).repeat(1, self.num_heads, 1, 1) # match head dim
 
         if not self.enable_sdpa:
-            # q = q.reshape(batch_size * self.num_heads, q_length, self.head_dim)
-            # k = k.reshape(batch_size * self.num_heads, kv_length, self.head_dim)
-            # v = v.reshape(batch_size * self.num_heads, kv_length, self.head_dim)
-            # attn_score = torch.bmm(q, k.transpose(-2, -1))
-            # if attn_mask is not None:
-            #     attn_mask = - torch.inf * (1 - attn_mask).reshape(-1, q.shape[-2], k.shape[-2])
-            #     attn_score = attn_score + attn_mask
-            # attn_score = F.softmax(attn_score / math.sqrt(self.head_dim), dim=-1)
-            # out = torch.bmm(attn_score, v).reshape(batch_size, self.num_heads, q_length, self.head_dim)
-            with sdpa_kernel(backends=[SDPBackend.MATH]):
-                out = scaled_dot_product_attention(q, k, v, dropout=self.dropout,
-                                                   attn_mask=attn_mask)
-
+            out = scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, is_causal=is_causal)
         else:
-            if attn_mask is None and not is_causal:
-                attn_mask = torch.ones(batch_size, self.num_heads, q_length, kv_length, device=q.device, dtype=torch.bool)
-
-            q, k, v, attn_mask = self._pad_qkv(q, k, v, attn_mask)
-            # use flash attention implemented in triton with jvp support
-            q = q.contiguous()
-            k = k.contiguous()
-            v = v.contiguous()
-            if fwd_dual:
-                out = JVPAttn.fwd_dual(q, k, v, attn_mask=attn_mask, causal=is_causal, USE_TMA=False)
-            else:
-                out = JVPAttn.fwd(q, k, v, attn_mask=attn_mask, causal=is_causal, USE_TMA=False)
-            out = out[:, :, :q_length]
+            out = self._forward_sdpa(q, k, v, attn_mask, is_causal, fwd_dual, 
+                                     batch_size, q_length, kv_length)
 
         out = out.transpose(-2, -3).contiguous().view(batch_size, q_length, self.d_model)
         return self.out_proj(out)
@@ -183,7 +178,7 @@ class TransformerDecoderLayer(nn.Module):
                  hidden_dim,
                  dropout=0.0, 
                  is_causal=True,
-                 activation: nn.Module | None = None,
+                 activation=None,
                  **kwargs):
         super().__init__()
         if activation is None:
@@ -211,7 +206,7 @@ class TransformerDecoderLayer(nn.Module):
 class TransformerEncoderLayer(nn.Module):
     def __init__(self, d_model, num_heads, hidden_dim, dropout=0.0, 
                  is_causal=False,
-                 activation: nn.Module | None = None,
+                 activation=None,
                  enable_sdpa: bool = True):
         super().__init__()
         if activation is None:
@@ -228,8 +223,9 @@ class TransformerEncoderLayer(nn.Module):
         )
     
     def forward(self, feature: torch.Tensor, 
-                attn_mask: torch.Tensor | None = None, **kwargs):
-        out = self.norm1(self.self_attn(feature, feature, attn_mask, **kwargs) + feature)
+                attn_mask: torch.Tensor | None = None, 
+                fwd_dual: bool = False):
+        out = self.norm1(self.self_attn(feature, feature, attn_mask, fwd_dual) + feature)
         out = self.norm2(self.mlp(out) + out)
         return out
     
@@ -240,7 +236,7 @@ class TransformerDecoder(nn.Module):
                  num_layers, 
                  dropout=0.0, 
                  is_causal=True,
-                 activation: nn.Module | None = None):
+                 activation=None):
         super().__init__()
         self.layers = nn.ModuleList([
             TransformerDecoderLayer(d_model, num_heads, hidden_dim, dropout, is_causal, activation)
@@ -255,7 +251,7 @@ class TransformerDecoder(nn.Module):
 class TransformerEncoder(nn.Module):
     def __init__(self, d_model, num_heads, hidden_dim, num_layers, dropout=0.0, 
                  is_causal=False,
-                 activation: nn.Module | None = None,
+                 activation=None,
                  enable_sdpa: bool = True):
         super().__init__()
         self.layers = nn.ModuleList([
@@ -266,10 +262,10 @@ class TransformerEncoder(nn.Module):
     def forward(self, feature: torch.Tensor, 
                 attn_mask: torch.Tensor | None = None, 
                 return_all_layers: bool = False,
-                **kwargs):
+                fwd_dual: bool = False):
         features = [] # for torch script exportable
         for layer in self.layers:
-            feature = layer(feature, attn_mask, **kwargs)
+            feature = layer(feature, attn_mask, fwd_dual)
             if return_all_layers:
                 features.append(feature)
         if return_all_layers:
