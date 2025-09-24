@@ -106,7 +106,7 @@ class FlowDAgger:
         # compute the actions
         privileged_actions = self.policy.evaluate(teacher_obs).detach()
         # self.transition.actions = self.policy.act(obs).detach() # type: ignore
-        self.transition.actions = privileged_actions + torch.randn_like(privileged_actions) * 0.05
+        self.transition.actions = privileged_actions + torch.randn_like(privileged_actions) * 0.2
         self.transition.privileged_actions = privileged_actions
         if infos is not None and 'robot_state' in infos:
             self.transition.flow_state = infos['robot_state']
