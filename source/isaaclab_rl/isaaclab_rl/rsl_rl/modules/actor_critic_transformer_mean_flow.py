@@ -125,9 +125,10 @@ class ActorCriticTransformerMeanFlow(ActorCritic):
         loss_dict = dict()
         value_dict = dict()
         
-        denoise_loss = self.denoise_loss_coef * self.denoise_buffer['u_loss']
-        loss_dict['denoise'] = denoise_loss
-        value_dict['denoise'] = self.denoise_buffer['u_loss_value']
+        if self.denoise_loss_coef > 0.0:
+            denoise_loss = self.denoise_loss_coef * self.denoise_buffer['u_loss']
+            loss_dict['denoise'] = denoise_loss
+            value_dict['denoise'] = self.denoise_buffer['u_loss_value']
 
         if flow_state_batch is not None and self.sim_learning_epochs > 0:
             assert student_actions_batch is not None, "Student actions must be provided for Flow DAgger."
@@ -225,7 +226,8 @@ class ActorCriticTransformerMeanFlow(ActorCritic):
                             device=proprio.device, dtype=proprio.dtype).unsqueeze(0).repeat(proprio.shape[0], 1)
         control = control.view(control.shape[0], self.control_obs_horizon, -1)
         control, _ = self._apply_noise(control, t)
-        r = self._sample_r(t, self.flow_r_neq_t_prob)
+        # clamp the r to be between 0 and 1
+        r = (t - self.control_dt).clamp(0.0, 1.0)
         u, a = self.actor(proprio, control, r, t)
         return a, u
     
@@ -259,7 +261,7 @@ class ActorCriticTransformerMeanFlow(ActorCritic):
 
     def act_inference(self, observations, **kwargs):
         obs_dict = self._split_observations(observations)
-        if not self.save_denoise_velocity:
+        if not self.save_denoise_velocity or self.denoise_loss_coef <= 0.0:
             return self._standard_inference(**obs_dict, **kwargs)[0]
         
         actions_mean, _, _, u_loss, u_loss_value = self._standard_loss(**obs_dict, **kwargs)
