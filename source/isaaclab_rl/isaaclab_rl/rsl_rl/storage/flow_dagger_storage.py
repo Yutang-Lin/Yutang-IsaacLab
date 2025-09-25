@@ -170,7 +170,7 @@ class FlowDAggerStorage:
                 self.flow_state = torch.zeros(self.num_flow_transitions, self.num_envs, transition.flow_state.shape[1], device=self.device)
             self.flow_state[self.step].copy_(transition.flow_state)
             self.flow_dones[self.step].copy_(transition.dones)
-            self.flow_actions[self.step].copy_(transition.actions)
+            self.flow_actions[self.step].copy_(transition.privileged_actions)
 
         # For RNN networks
         self._save_hidden_states(transition.hidden_states)

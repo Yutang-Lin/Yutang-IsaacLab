@@ -28,6 +28,7 @@ from .actor_critic_dp_transformer import ActorCriticDPTransformer
 from .actor_critic_transformer_latent import ActorCriticTransformerLatent
 from .actor_critic_transformer_flow import ActorCriticTransformerFlow
 from .actor_critic_transformer_mean_flow import ActorCriticTransformerMeanFlow
+from .actor_critic_transformer_co_mean_flow import ActorCriticTransformerCoMeanFlow
 
 class StudentTeacher(nn.Module):
     is_recurrent = False

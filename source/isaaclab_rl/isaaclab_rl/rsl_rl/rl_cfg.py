@@ -420,7 +420,16 @@ class RslRlPpoActorCriticTransformerMeanFlowCfg(RslRlPpoActorCriticTransformerFl
     
     flow_loss_coef_c: float = 1e-3,
     """The constant for the flow loss. Default is 1e-3."""
-    
+
+@configclass
+class RslRlPpoActorCriticTransformerCoMeanFlowCfg(RslRlPpoActorCriticTransformerMeanFlowCfg):
+    """Configuration for the PPO actor-critic networks with transformer layers."""
+
+    class_name: str = "ActorCriticTransformerCoMeanFlow"
+    """The policy class name. Default is ActorCriticTransformerCoMeanFlow."""
+
+    tf_action_horizon: int = MISSING
+    """The number of action tokens."""
 
 @configclass
 class RslRlPpoActorCriticTransformerResidualCfg(RslRlPpoActorCriticTransformerCfg):
