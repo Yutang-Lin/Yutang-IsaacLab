@@ -131,9 +131,9 @@ class MultiHeadAttention(nn.Module):
         k = k.contiguous()
         v = v.contiguous()
         if fwd_dual:
-            out = JVPAttn.fwd_dual(q, k, v, attn_mask=attn_mask, causal=is_causal, USE_TMA=False)
+            out = JVPAttn.fwd_dual(q, k, v, attn_mask=attn_mask, causal=is_causal, USE_TMA=True)
         else:
-            out = JVPAttn.fwd(q, k, v, attn_mask=attn_mask, causal=is_causal, USE_TMA=False)
+            out = JVPAttn.fwd(q, k, v, attn_mask=attn_mask, causal=is_causal, USE_TMA=True)
         return out[:, :, :q_length]
 
     def forward(self, feature: torch.Tensor, 
@@ -207,7 +207,8 @@ class TransformerEncoderLayer(nn.Module):
     def __init__(self, d_model, num_heads, hidden_dim, dropout=0.0, 
                  is_causal=False,
                  activation=None,
-                 enable_sdpa: bool = True):
+                 enable_sdpa: bool = True,
+                 norm_first: bool = False):
         super().__init__()
         if activation is None:
             activation = nn.GELU(approximate="tanh")
@@ -215,6 +216,7 @@ class TransformerEncoderLayer(nn.Module):
         self.self_attn = MultiHeadAttention(d_model, num_heads, dropout, is_causal=is_causal, enable_sdpa=enable_sdpa)
         self.norm1 = nn.LayerNorm(d_model)
         self.norm2 = nn.LayerNorm(d_model)
+        self.norm_first = norm_first
         self.mlp = nn.Sequential(
             nn.Linear(d_model, hidden_dim),
             activation,
@@ -225,8 +227,12 @@ class TransformerEncoderLayer(nn.Module):
     def forward(self, feature: torch.Tensor, 
                 attn_mask: torch.Tensor | None = None, 
                 fwd_dual: bool = False):
-        out = self.norm1(self.self_attn(feature, feature, attn_mask, fwd_dual) + feature)
-        out = self.norm2(self.mlp(out) + out)
+        if not self.norm_first:
+            out = self.norm1(self.self_attn(feature, feature, attn_mask, fwd_dual) + feature)
+            out = self.norm2(self.mlp(out) + out)
+        else:
+            out = self.norm1(self.self_attn(feature, feature, attn_mask, fwd_dual) + feature)
+            out = self.norm2(self.mlp(out)) + out
         return out
     
 class TransformerDecoder(nn.Module):
@@ -252,10 +258,11 @@ class TransformerEncoder(nn.Module):
     def __init__(self, d_model, num_heads, hidden_dim, num_layers, dropout=0.0, 
                  is_causal=False,
                  activation=None,
-                 enable_sdpa: bool = True):
+                 enable_sdpa: bool = True,
+                 norm_first: bool = False):
         super().__init__()
         self.layers = nn.ModuleList([
-            TransformerEncoderLayer(d_model, num_heads, hidden_dim, dropout, is_causal, activation, enable_sdpa)
+            TransformerEncoderLayer(d_model, num_heads, hidden_dim, dropout, is_causal, activation, enable_sdpa, norm_first)
             for _ in range(num_layers)
         ])
 

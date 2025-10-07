@@ -403,6 +403,13 @@ class RslRlPpoActorCriticTransformerFlowCfg(RslRlPpoActorCriticCfg):
     """The coefficient for the state loss."""
 
 @configclass
+class RslRlPpoActorCriticTransformerDDIMCfg(RslRlPpoActorCriticTransformerFlowCfg):
+    """Configuration for the PPO actor-critic networks with transformer layers."""
+
+    class_name: str = "ActorCriticTransformerDDIM"
+    """The policy class name. Default is ActorCriticTransformerDDIM."""
+
+@configclass
 class RslRlPpoActorCriticTransformerMeanFlowCfg(RslRlPpoActorCriticTransformerFlowCfg):
     """Configuration for the PPO actor-critic networks with transformer layers."""
 

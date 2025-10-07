@@ -106,10 +106,8 @@ class FlowDAgger:
 
     def act(self, obs, teacher_obs, infos=None, **kwargs):
         # compute the actions
-        privileged_actions = self.policy.evaluate(teacher_obs).detach()
-        # self.transition.actions = self.policy.act(obs).detach() # type: ignore
-        self.transition.actions = privileged_actions + torch.randn_like(privileged_actions) * self.noise_scales
-        self.transition.privileged_actions = privileged_actions
+        self.transition.actions = self.policy.act(obs).detach() # type: ignore
+        self.transition.privileged_actions = self.policy.evaluate(teacher_obs).detach()
         if infos is not None and 'robot_state' in infos:
             self.transition.flow_state = infos['robot_state']
         # record the observations
@@ -173,6 +171,7 @@ class FlowDAgger:
 
                 # compute the extra loss
                 extra_loss = self.policy.extra_loss(
+                    student_actions_batch=student_actions,
                     flow_state_batch=flow_state,
                     flow_dones_batch=flow_dones,
                     flow_actions_batch=flow_actions,

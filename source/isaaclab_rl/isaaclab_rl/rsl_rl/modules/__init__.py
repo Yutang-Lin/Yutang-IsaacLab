@@ -19,6 +19,7 @@ from .actor_critic_tf_recurrent_ll import ActorCriticTFRecurrentLL
 from .actor_critic_tf_recurrent_latent import ActorCriticTFRecurrentLatent
 from .actor_critic_dp_transformer import ActorCriticDPTransformer
 from .actor_critic_transformer_co_mean_flow import ActorCriticTransformerCoMeanFlow
+from .actor_critic_transformer_ddim import ActorCriticTransformerDDIM
 from .student_teacher import StudentTeacher
 from .student_teacher_recurrent import StudentTeacherRecurrent
 
@@ -99,4 +100,5 @@ __all__ = [
     "ActorCriticTransformerFlow",
     "ActorCriticTransformerMeanFlow",
     "ActorCriticTransformerCoMeanFlow",
+    "ActorCriticTransformerDDIM",
 ]
