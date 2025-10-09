@@ -61,6 +61,9 @@ class RslRlDistillationAlgorithmCfg:
     learning_rate: float = MISSING
     """The learning rate for the student policy."""
 
+    weight_decay: float = 0.0
+    """The weight decay for the student policy."""
+
     gradient_length: int = MISSING
     """The number of environment steps the gradient flows back."""
 

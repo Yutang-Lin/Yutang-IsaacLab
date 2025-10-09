@@ -57,6 +57,19 @@ class RslRlPpoActorCriticCfg:
     residual: bool = False
     """Whether to use residual connections."""
 
+@configclass
+class RslRlPpoActorCriticHyperMLPCfg(RslRlPpoActorCriticCfg):
+    """Configuration for the PPO actor-critic networks with hyper-MLP."""
+
+    class_name: str = "ActorCriticHyperMLP"
+    """The policy class name. Default is ActorCriticHyperMLP."""
+
+    hyper_layer_idx: int = 0
+    """The index of the hyper-layer."""
+
+    proprio_horizon: int = 5
+    """The horizon of the proprioceptive observations."""
+
 
 @configclass
 class RslRlPpoActorCriticDPCfg(RslRlPpoActorCriticCfg):

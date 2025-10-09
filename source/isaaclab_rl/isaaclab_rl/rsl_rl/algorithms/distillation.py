@@ -7,6 +7,7 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import time
 
 # rsl-rl
 from isaaclab_rl.rsl_rl.modules import StudentTeacher, StudentTeacherRecurrent
@@ -25,6 +26,7 @@ class Distillation:
         num_learning_epochs=1,
         gradient_length=15,
         learning_rate=1e-3,
+        weight_decay=0.0,
         max_grad_norm=None,
         loss_type="mse",
         device="cpu",
@@ -48,7 +50,7 @@ class Distillation:
         self.policy = policy
         self.policy.to(self.device)
         self.storage = None  # initialized later
-        self.optimizer = optim.Adam(self.policy.parameters(), lr=learning_rate)
+        self.optimizer = optim.AdamW(self.policy.parameters(), lr=learning_rate, weight_decay=weight_decay)
         self.transition = RolloutStorage.Transition()
         self.last_hidden_states = None
 
@@ -56,6 +58,7 @@ class Distillation:
         self.num_learning_epochs = num_learning_epochs
         self.gradient_length = gradient_length
         self.learning_rate = learning_rate
+        self.weight_decay = weight_decay
         self.max_grad_norm = max_grad_norm
 
         # initialize the loss function
@@ -128,6 +131,7 @@ class Distillation:
                 extra_loss = self.policy.extra_loss(
                     obs_batch=obs,
                 )
+                
                 if isinstance(extra_loss, tuple):
                     extra_loss, value_dict = extra_loss
                 else:
@@ -160,7 +164,6 @@ class Distillation:
                     self.optimizer.step()
                     self.policy.detach_hidden_states()
                     loss = 0
-
                 # reset dones
                 self.policy.reset(dones.view(-1))
                 self.policy.detach_hidden_states(dones.view(-1))

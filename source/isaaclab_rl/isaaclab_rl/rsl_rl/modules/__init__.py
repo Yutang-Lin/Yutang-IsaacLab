@@ -8,6 +8,7 @@ from .actor_critic_moe import ActorCriticMoE
 from .actor_critic_mop import ActorCriticMoP
 from .actor_critic_pnn import ActorCriticPNN
 from .actor_critic_dp import ActorCriticDP
+from .actor_critic_hyper_mlp import ActorCriticHyperMLP
 from .actor_critic_transformer import ActorCriticTransformer
 from .actor_critic_transformer_flow import ActorCriticTransformerFlow
 from .actor_critic_transformer_mean_flow import ActorCriticTransformerMeanFlow
@@ -91,6 +92,7 @@ __all__ = [
     "ActorCriticMoE",
     "ActorCriticMoP",
     "ActorCriticPNN",
+    "ActorCriticHyperMLP",
     "EmpiricalNormalization",
     "StudentTeacher",
     "StudentTeacherRecurrent",
