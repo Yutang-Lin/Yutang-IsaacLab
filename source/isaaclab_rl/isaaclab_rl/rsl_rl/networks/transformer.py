@@ -164,8 +164,10 @@ class MultiHeadAttention(nn.Module):
             attn_mask = attn_mask.unsqueeze(-3).repeat(1, self.num_heads, 1, 1) # match head dim
 
         if not self.enable_sdpa:
-            out = scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, is_causal=is_causal)
+            out = scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, is_causal=is_causal,
+                                               dropout_p=self.dropout if self.training else 0.0)
         else:
+            assert self.dropout <= 0.0, "dropout must be 0.0 when enable_sdpa is True"
             out = self._forward_sdpa(q, k, v, attn_mask, is_causal, fwd_dual, 
                                      batch_size, q_length, kv_length)
 
