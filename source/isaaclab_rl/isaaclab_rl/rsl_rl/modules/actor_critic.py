@@ -41,6 +41,7 @@ class ActorCritic(RslRlActorCritic):
         layer_norm: bool = False,
         dropout_rate: float = 0.0,
         residual: bool = False,
+        init_zero: bool = False,
         actor_obs_meta: dict = None,
         critic_obs_meta: dict = None,
         **kwargs,
@@ -116,10 +117,17 @@ class ActorCritic(RslRlActorCritic):
         else:
             raise ValueError(f"Unknown standard deviation type: {self.noise_std_type}. Should be 'scalar' or 'log'")
 
+        if init_zero:
+            self._init_zero()
+
         # Action distribution (populated in update_distribution)
         self.distribution = None
         # disable args validation for speedup
         Normal.set_default_validate_args(False)
+
+    def _init_zero(self):
+        self.actor[-1].weight.data.zero_()
+        self.actor[-1].bias.data.zero_()
     
     def extra_loss(self, **kwargs):
         return {}

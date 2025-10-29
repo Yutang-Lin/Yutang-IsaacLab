@@ -110,3 +110,7 @@ class ActorCriticTransformer(ActorCritic):
         self.distribution = None
         # disable args validation for speedup
         Normal.set_default_validate_args(False)
+
+    def _init_zero(self):
+        self.actor.output_proj[-1].weight.data.zero_()
+        self.actor.output_proj[-1].bias.data.zero_()

@@ -57,6 +57,9 @@ class RslRlPpoActorCriticCfg:
     residual: bool = False
     """Whether to use residual connections."""
 
+    init_zero: bool = False
+    """Whether to initialize the actor and critic networks to zero."""
+
 @configclass
 class RslRlPpoActorCriticHyperMLPCfg(RslRlPpoActorCriticCfg):
     """Configuration for the PPO actor-critic networks with hyper-MLP."""
