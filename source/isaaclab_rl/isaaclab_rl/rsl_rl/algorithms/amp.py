@@ -229,7 +229,7 @@ class AmpReward:
         self.step_counter += 1
 
     @torch.inference_mode()
-    def compute_reward(self, obs: torch.Tensor, scale: float = 1.0):
+    def compute_reward(self, obs: torch.Tensor, scale: float | torch.Tensor = 1.0):
         features = obs.view(self.num_envs, -1).clamp(-self.clip_obs_value, self.clip_obs_value)
         amp_score = self.network(features).view(self.num_envs)
 

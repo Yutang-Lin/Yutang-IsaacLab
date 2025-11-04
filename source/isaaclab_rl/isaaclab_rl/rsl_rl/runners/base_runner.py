@@ -173,16 +173,22 @@ class BaseRunner(OnPolicyRunner):
         if "amp_cfg" in self.cfg and self.cfg["amp_cfg"] is not None:
             # add AMP to observation space
             amp_obs = obs_dict["amp_policy"]
-            num_amp_obs = amp_obs.shape[1]
+            amp_dict: dict[str, torch.Tensor] = {}
+            if isinstance(amp_obs, torch.Tensor):
+                amp_dict[''] = amp_obs
+            elif isinstance(amp_obs, dict):
+                amp_dict.update(amp_obs)
+            else:
+                raise ValueError(f"AMP observations must be a tensor or a dictionary, got {type(amp_obs)}")
 
             self.cfg["amp_cfg"].pop("input_dim")
-            self.amp_reward = AmpReward(num_amp_obs, training=True, 
+            self.amp_rewards = {k: AmpReward(v.shape[1], training=True, 
                                         num_envs=self.env.num_envs,
                                         device=self.device, 
                                         multi_gpu_cfg=self.multi_gpu_cfg,
-                                        **self.cfg["amp_cfg"])
+                                        **self.cfg["amp_cfg"]) for k, v in amp_dict.items()}
         else:
-            self.amp_reward = None
+            self.amp_rewards = None
 
         # Decide whether to disable logging
         # We only log from the process with rank 0 (main process)
@@ -258,9 +264,10 @@ class BaseRunner(OnPolicyRunner):
             # TODO: Do we need to synchronize empirical normalizers?
             #   Right now: No, because they all should converge to the same values "asymptotically".
 
-        if self.amp_reward is not None:
-            amp_reward_storage = torch.zeros(self.env.num_envs, device=self.device)
-            self.amp_reward.reset_storage()
+        if self.amp_rewards is not None:
+            amp_reward_storages = {k: torch.zeros(self.env.num_envs, device=self.device) for k in self.amp_rewards.keys()}
+            for k in self.amp_rewards.keys():
+                self.amp_rewards[k].reset_storage()
 
         # initialize infos
         infos = dict(meta_tensors={})
@@ -305,27 +312,37 @@ class BaseRunner(OnPolicyRunner):
                     if getattr(self.alg, "done_reset", False) and hasattr(self.alg.policy, "reset"):  
                         self.alg.policy.reset(resets) # type: ignore
 
-                    if self.amp_reward is not None:
+                    if self.amp_rewards is not None:
                         reward_scale = infos.get("overall_reward_scale", 1.0)
-                        gen_obs = infos["observations"]["amp_policy"].to(self.device)
-                        ref_obs = infos["observations"]["amp_motion"].to(self.device)
-                        self.amp_reward.update_storage(gen_obs, ref_obs)
+                        gen_obs = infos["observations"]["amp_policy"]
+                        ref_obs = infos["observations"]["amp_motion"]
+                        if isinstance(gen_obs, torch.Tensor):
+                            gen_obs = {'': gen_obs.to(self.device)}
+                        if isinstance(ref_obs, torch.Tensor):
+                            ref_obs = {'': ref_obs.to(self.device)}
+                        for k, v in gen_obs.items():
+                            self.amp_rewards[k].update_storage(v, ref_obs[k])
 
                         amp_reward_scale = 1.0
                         if 'reward_scales' in infos and 'amp' in infos['reward_scales']:
                             amp_reward_scale = infos['reward_scales']['amp']
                             if isinstance(amp_reward_scale, torch.Tensor):
                                 amp_reward_scale = amp_reward_scale.to(self.device)
-                        amp_rewards = self.amp_reward.compute_reward(gen_obs, amp_reward_scale) * reward_scale
 
-                        amp_reward_storage += amp_rewards
-                        rewards += amp_rewards
+                        for k in self.amp_rewards.keys():
+                            amp_reward = self.amp_rewards[k].compute_reward(gen_obs[k], amp_reward_scale) * reward_scale
+                            amp_reward_storages[k] += amp_reward
+                            rewards += amp_reward
 
-                        infos["episode"]["rew_amp"] = amp_reward_storage.mean().item()
-                        infos["episode"]["Perstep/rew_amp"] = (amp_reward_storage / infos["episode_length"].to(self.device)).mean().item()
-                        infos["episode"]["total_reward"] += infos["episode"]["rew_amp"]
-                        infos["episode"]["Perstep/total_reward"] += infos["episode"]["Perstep/rew_amp"]
-                        amp_reward_storage[dones == 1] = 0.
+                            # update episode info
+                            key_name = f"rew_amp_{k}" if k != '' else 'rew_amp'
+                            infos["episode"][key_name] = amp_reward_storages[k].mean().item()
+                            infos["episode"]["Perstep/" + key_name] = (amp_reward_storages[k] / infos["episode_length"].to(self.device)).mean().item()
+                            amp_reward_storages[k][dones == 1] = 0.
+
+                            # update total reward and perstep total reward
+                            infos["episode"]["total_reward"] += infos["episode"][key_name]
+                            infos["episode"]["Perstep/total_reward"] += infos["episode"]["Perstep/" + key_name]
 
                     # process the step
                     self.alg.process_env_step(rewards, dones, infos)
@@ -376,12 +393,14 @@ class BaseRunner(OnPolicyRunner):
             # update policy
             loss_dict = self.alg.update()
             # update policy
-            if self.amp_reward is not None:
-                self.amp_reward.train()
-                disc_loss, grad_penalty = self.amp_reward.update()
-                loss_dict["amp_disc_loss"] = disc_loss
-                loss_dict["amp_grad_penalty"] = grad_penalty
-                self.amp_reward.eval()
+            if self.amp_rewards is not None:
+                for k in self.amp_rewards.keys():
+                    self.amp_rewards[k].train()
+                    disc_loss, grad_penalty = self.amp_rewards[k].update()
+                    name = '' if k == '' else f"_{k}"
+                    loss_dict[f"amp_disc_loss{name}"] = disc_loss
+                    loss_dict[f"amp_grad_penalty{name}"] = grad_penalty
+                    self.amp_rewards[k].eval()
 
             # schedule
             doing_schedule = hasattr(self.env_unwrapped, "pre_schedule")
@@ -569,9 +588,11 @@ class BaseRunner(OnPolicyRunner):
             saved_dict["rnd_state_dict"] = self.alg.rnd.state_dict()
             saved_dict["rnd_optimizer_state_dict"] = self.alg.rnd_optimizer.state_dict() # type: ignore
         # -- Save AMP model if used
-        if self.amp_reward is not None:
-            saved_dict["amp_state_dict"] = self.amp_reward.network.state_dict()
-            saved_dict["amp_optimizer_state_dict"] = self.amp_reward.optimizer.state_dict()
+        if self.amp_rewards is not None:
+            for k in self.amp_rewards.keys():
+                name = '' if k == '' else f"_{k}"
+                saved_dict[f"amp_state_dict{name}"] = self.amp_rewards[k].network.state_dict()
+                saved_dict[f"amp_optimizer_state_dict{name}"] = self.amp_rewards[k].optimizer.state_dict()
         # -- Save observation normalizer if used
         if self.empirical_normalization:
             saved_dict["obs_norm_state_dict"] = self.obs_normalizer.state_dict()
@@ -610,12 +631,13 @@ class BaseRunner(OnPolicyRunner):
                 mismatch_rnd = True
                 print(f"[WARNING]: Failed to load RND model. Error: {e}. Initializing new RND model.")
         # -- Load AMP model if used
-        if self.amp_reward is not None:
-            amp_loaded = False
-            if 'amp_state_dict' in loaded_dict:
+        if self.amp_rewards is not None:
+            amp_loaded = {k: False for k in self.amp_rewards.keys()}
+            for k in self.amp_rewards.keys():
+                name = '' if k == '' else f"_{k}"
                 try:
-                    self.amp_reward.network.load_state_dict(loaded_dict["amp_state_dict"])
-                    amp_loaded = True
+                    self.amp_rewards[k].network.load_state_dict(loaded_dict[f"amp_state_dict{name}"])
+                    amp_loaded[k] = True
                 except Exception as e:
                     print(f"[WARNING]: Failed to load AMP model. Error: {e}. Initializing new AMP model.")
             else:
@@ -637,8 +659,13 @@ class BaseRunner(OnPolicyRunner):
             return loaded_dict["infos"]
 
         # -- load optimizer if used
-        if self.amp_reward is not None and 'amp_optimizer_state_dict' in loaded_dict and amp_loaded:
-            self.amp_reward.optimizer.load_state_dict(loaded_dict["amp_optimizer_state_dict"])
+        if self.amp_rewards is not None:
+            for k in self.amp_rewards.keys():
+                if not amp_loaded[k]:
+                    continue
+                name = '' if k == '' else f"_{k}"
+                if f"amp_optimizer_state_dict{name}" in loaded_dict:
+                    self.amp_rewards[k].optimizer.load_state_dict(loaded_dict[f"amp_optimizer_state_dict{name}"])
         
         # -- algorithm optimizer
         try:
