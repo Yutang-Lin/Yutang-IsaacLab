@@ -301,7 +301,7 @@ class BaseRunner(OnPolicyRunner):
                     else:
                         privileged_obs = obs
                     # try to get all resets
-                    resets = infos.get("resets", dones).to(self.device)
+                    resets = infos.get("resets", dones == 1).to(self.device)
                     if getattr(self.alg, "done_reset", False) and hasattr(self.alg.policy, "reset"):  
                         self.alg.policy.reset(resets) # type: ignore
 
@@ -317,7 +317,7 @@ class BaseRunner(OnPolicyRunner):
                             if isinstance(amp_reward_scale, torch.Tensor):
                                 amp_reward_scale = amp_reward_scale.to(self.device)
                         amp_rewards = self.amp_reward.compute_reward(gen_obs, amp_reward_scale) * reward_scale
-                        
+                        print(f"amp_rewards: {amp_rewards}")
                         amp_reward_storage += amp_rewards
                         rewards += amp_rewards
 
@@ -325,7 +325,7 @@ class BaseRunner(OnPolicyRunner):
                         infos["episode"]["Perstep/rew_amp"] = (amp_reward_storage / infos["episode_length"].to(self.device)).mean().item()
                         infos["episode"]["total_reward"] += infos["episode"]["rew_amp"]
                         infos["episode"]["Perstep/total_reward"] += infos["episode"]["Perstep/rew_amp"]
-                        amp_reward_storage[resets] = 0.
+                        amp_reward_storage[dones == 1] = 0.
 
                     # process the step
                     self.alg.process_env_step(rewards, dones, infos)
