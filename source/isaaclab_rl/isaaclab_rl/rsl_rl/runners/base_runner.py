@@ -621,7 +621,15 @@ class BaseRunner(OnPolicyRunner):
         loaded_dict = torch.load(path, weights_only=False)
         # -- Load model
         # loaded_dict["model_state_dict"].pop('log_std')
-        resumed_training = self.alg.policy.load_state_dict(loaded_dict["model_state_dict"], strict=False)
+        model_state_dict = loaded_dict["model_state_dict"]
+        load_class_name = loaded_dict["policy_cfg"].get('class_name', '')
+        if 'Student' in load_class_name and 'Teacher' in load_class_name and self.training_type == "rl":
+            model_state_dict = {k.replace('student.', ''): v for k, v in model_state_dict.items() if 'student.' in k}
+            self.alg.policy.load_state_dict(model_state_dict, strict=False)
+            print(f"[INFO]: Loaded RL finetuning model from: {path}")
+            return loaded_dict["infos"]
+        resumed_training = self.alg.policy.load_state_dict(model_state_dict, strict=False)
+
         # -- Load RND model if used
         if self.alg.rnd:
             try:
