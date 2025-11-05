@@ -182,10 +182,14 @@ class BaseRunner(OnPolicyRunner):
                 raise ValueError(f"AMP observations must be a tensor or a dictionary, got {type(amp_obs)}")
 
             self.cfg["amp_cfg"].pop("input_dim")
+            reward_scale = self.cfg["amp_cfg"].pop("reward_scale")
+            if isinstance(reward_scale, float):
+                reward_scale = {k: reward_scale for k in amp_dict.keys()}
             self.amp_rewards = {k: AmpReward(v.shape[1], training=True, 
                                         num_envs=self.env.num_envs,
                                         device=self.device, 
                                         multi_gpu_cfg=self.multi_gpu_cfg,
+                                        reward_scale=reward_scale[k],
                                         **self.cfg["amp_cfg"]) for k, v in amp_dict.items()}
         else:
             self.amp_rewards = None

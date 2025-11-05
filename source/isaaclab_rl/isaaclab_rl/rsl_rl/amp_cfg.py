@@ -72,7 +72,7 @@ class RslRlAmpCfg:
     layer_norm: bool = False
     """Whether to use layer normalization for the AMP discriminator network. Default is False."""
 
-    reward_scale: float = 1.0
+    reward_scale: float | dict[str, float] = 1.0
     """The reward scale for the AMP discriminator network. Default is 1.0."""
 
     reward_factor: float = 0.25
