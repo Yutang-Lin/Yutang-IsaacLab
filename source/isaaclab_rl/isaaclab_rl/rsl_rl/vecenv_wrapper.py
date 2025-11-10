@@ -162,9 +162,9 @@ class RslRlVecEnvWrapper(VecEnv):
     def seed(self, seed: int = -1) -> int:  # noqa: D102
         return self.unwrapped.seed(seed)
 
-    def reset(self) -> tuple[torch.Tensor, dict]:  # noqa: D102
+    def reset(self, *args, **kwargs) -> tuple[torch.Tensor, dict]:  # noqa: D102
         # reset the environment
-        obs_dict, _ = self.env.reset()
+        obs_dict, _ = self.env.reset(*args, **kwargs)
         # return observations
         return obs_dict["policy"], {"observations": obs_dict}
 

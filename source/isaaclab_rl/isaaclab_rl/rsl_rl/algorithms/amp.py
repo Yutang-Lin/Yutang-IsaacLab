@@ -139,8 +139,8 @@ class AmpReward:
 
     def _compute_gradient_penalty(self, real_samples, fake_samples):
         # Randomly interpolate between real and fake samples
-        interpolated = real_samples.clone() # NOTE: real only
-        interpolated.requires_grad_(True)
+        alpha = torch.rand(real_samples.shape[0], 1, device=real_samples.device)
+        interpolated = (alpha * real_samples + (1 - alpha) * fake_samples).requires_grad_(True)
 
         return self._compute_gradient_penalty_(interpolated)
 

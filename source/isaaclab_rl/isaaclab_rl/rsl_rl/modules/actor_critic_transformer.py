@@ -40,6 +40,7 @@ class ActorCriticTransformer(ActorCritic):
         tf_critic_hidden_dim=None,
         tf_critic_dropout=None,
         init_noise_std=1.0,
+        init_zero: bool = False,
         load_noise_std: bool = True,
         learnable_noise_std: bool = True,
         noise_std_type: str = "scalar",
@@ -96,6 +97,8 @@ class ActorCriticTransformer(ActorCritic):
 
         print(f"Actor Transformer: {self.actor}")
         print(f"Critic Transformer: {self.critic}")
+        if init_zero:
+            self._init_zero()
 
         # Action noise
         self.noise_std_type = noise_std_type

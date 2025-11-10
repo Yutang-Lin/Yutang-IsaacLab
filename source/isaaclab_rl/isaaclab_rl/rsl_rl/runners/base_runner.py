@@ -17,6 +17,7 @@ from rsl_rl.utils import store_code_state
 
 from isaaclab_rl.rsl_rl.algorithms import *
 from isaaclab_rl.rsl_rl.modules import *
+from isaaclab_rl.rsl_rl.utils import broadcast_parameters, reduce_gradients
 
 from collections import deque
 from copy import deepcopy
@@ -267,6 +268,9 @@ class BaseRunner(OnPolicyRunner):
             self.alg.broadcast_parameters()
             # TODO: Do we need to synchronize empirical normalizers?
             #   Right now: No, because they all should converge to the same values "asymptotically".
+            if self.amp_rewards is not None:
+                for k in self.amp_rewards.keys():
+                    broadcast_parameters(self.amp_rewards[k].network)
 
         if self.amp_rewards is not None:
             amp_reward_storages = {k: torch.zeros(self.env.num_envs, device=self.device) for k in self.amp_rewards.keys()}
