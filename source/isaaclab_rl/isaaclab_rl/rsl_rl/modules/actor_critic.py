@@ -110,6 +110,7 @@ class ActorCritic(RslRlActorCritic):
 
         # Action noise
         self.noise_std_type = noise_std_type
+        self.init_noise_std = init_noise_std
         if self.noise_std_type == "scalar":
             self.std = nn.Parameter(init_noise_std * torch.ones(num_actions))
         elif self.noise_std_type == "log":

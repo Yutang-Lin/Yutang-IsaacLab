@@ -563,8 +563,11 @@ class PPO(RslRlPPO):
 
             # Apply the gradients
             # -- For PPO
-            nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
-            self.optimizer.step()
+            norm = nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
+            if torch.isnan(norm).any().item() or torch.isinf(norm).any().item():
+                print("Nan or inf norm detected, stopping training iteration")
+            else:
+                self.optimizer.step()
             # -- For RND
             if self.rnd_optimizer:
                 self.rnd_optimizer.step()

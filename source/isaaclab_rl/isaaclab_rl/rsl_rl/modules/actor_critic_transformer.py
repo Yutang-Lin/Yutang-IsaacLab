@@ -115,5 +115,5 @@ class ActorCriticTransformer(ActorCritic):
         Normal.set_default_validate_args(False)
 
     def _init_zero(self):
-        self.actor.output_proj[-1].weight.data.zero_()
-        self.actor.output_proj[-1].bias.data.zero_()
+        self.actor.output_proj[-1].weight.data.normal_(0.0, 0.03)
+        self.actor.output_proj[-1].bias.data.normal_(0.0, 0.03)
