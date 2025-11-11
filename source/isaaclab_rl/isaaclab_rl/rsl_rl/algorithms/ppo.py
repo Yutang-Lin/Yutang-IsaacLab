@@ -23,6 +23,7 @@ class PPO(RslRlPPO):
         value_loss_coef=1.0,
         entropy_coef=0.0,
         learning_rate=1e-3,
+        max_learning_rate=1e-2,
         max_grad_norm=1.0,
         use_clipped_value_loss=True,
         use_distillation=False,
@@ -120,6 +121,7 @@ class PPO(RslRlPPO):
         self.max_grad_norm = max_grad_norm
         self.use_clipped_value_loss = use_clipped_value_loss
         self.desired_kl = desired_kl
+        self.max_learning_rate = max_learning_rate
         self.schedule = schedule
         self.learning_rate = learning_rate
         self.normalize_advantage_per_mini_batch = normalize_advantage_per_mini_batch
@@ -407,7 +409,7 @@ class PPO(RslRlPPO):
                                 if kl_mean > self.desired_kl * 2.0:
                                     self.learning_rate = max(1e-5, self.learning_rate / 1.5)
                                 elif kl_mean < self.desired_kl / 2.0 and kl_mean > 0.0:
-                                    self.learning_rate = min(1e-2, self.learning_rate * 1.5)
+                                    self.learning_rate = min(self.max_learning_rate, self.learning_rate * 1.5)
 
                             # Update the learning rate for all GPUs
                             if self.is_multi_gpu:

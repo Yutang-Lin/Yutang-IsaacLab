@@ -610,6 +610,9 @@ class RslRlPpoAlgorithmCfg:
     learning_rate: float = MISSING
     """The learning rate for the policy."""
 
+    max_learning_rate: float = 1e-2
+    """The maximum learning rate for the policy."""
+
     schedule: str = MISSING
     """The learning rate schedule."""
 
