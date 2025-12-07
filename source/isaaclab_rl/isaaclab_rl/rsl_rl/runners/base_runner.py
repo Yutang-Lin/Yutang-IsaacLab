@@ -171,7 +171,7 @@ class BaseRunner(OnPolicyRunner):
         )
 
         # init AMP reward
-        if "amp_cfg" in self.cfg and self.cfg["amp_cfg"] is not None:
+        if "amp_cfg" in self.cfg and self.cfg["amp_cfg"] is not None and not self.env_unwrapped.cfg.play_mode:
             # add AMP to observation space
             amp_obs = obs_dict["amp_policy"]
             amp_dict: dict[str, torch.Tensor] = {}
@@ -298,6 +298,10 @@ class BaseRunner(OnPolicyRunner):
         tot_iter = start_iter + num_learning_iterations
         for it in range(start_iter, tot_iter):
             start = time.time()
+            # call pre_rollout method of the environment
+            if hasattr(self.env.unwrapped, "pre_rollout"):
+                self.env.unwrapped.pre_rollout()
+
             # Rollout
             with torch.inference_mode():
                 self.alg.policy.eval()
@@ -400,6 +404,10 @@ class BaseRunner(OnPolicyRunner):
                     self.alg.compute_returns(privileged_obs, actions=actions,
                                              infos=infos) # type: ignore
 
+            # call post_rollout method of the environment
+            if hasattr(self.env.unwrapped, "post_rollout"):
+                self.env.unwrapped.post_rollout()
+
             # train policy
             self.alg.policy.train()
             # update policy
@@ -413,6 +421,12 @@ class BaseRunner(OnPolicyRunner):
                     loss_dict[f"amp_disc_loss{name}"] = disc_loss
                     loss_dict[f"amp_grad_penalty{name}"] = grad_penalty
                     self.amp_rewards[k].eval()
+
+            # call post_update method of the environment
+            if hasattr(self.env.unwrapped, "post_update"):
+                env_loss_dict = self.env.unwrapped.post_update()
+                if isinstance(env_loss_dict, dict):
+                    loss_dict.update(env_loss_dict)
 
             # schedule
             doing_schedule = hasattr(self.env_unwrapped, "pre_schedule")
@@ -437,7 +451,7 @@ class BaseRunner(OnPolicyRunner):
             if self.log_dir is not None and not self.disable_logs:
                 # Log information
                 self.log(locals())
-                # Save model
+                # Save mointeraction_contact_datasdel
                 if it % self.save_interval == 0:
                     if len(rewbuffer) > 0:
                         current_reward = statistics.mean(rewbuffer)
@@ -610,6 +624,10 @@ class BaseRunner(OnPolicyRunner):
             saved_dict["obs_norm_state_dict"] = self.obs_normalizer.state_dict()
             saved_dict["privileged_obs_norm_state_dict"] = self.privileged_obs_normalizer.state_dict()
 
+        # -- Save environment model if used
+        if hasattr(self.env.unwrapped, "state_dict"):
+            saved_dict["environment_state_dict"] = self.env.unwrapped.state_dict()
+
         # save model
         torch.save(saved_dict, path)
 
@@ -641,6 +659,10 @@ class BaseRunner(OnPolicyRunner):
             print(f"[INFO]: Loaded RL finetuning model from: {path}")
             return loaded_dict["infos"]
         resumed_training = self.alg.policy.load_state_dict(model_state_dict, strict=False)
+
+        # -- Load environment model if used
+        if hasattr(self.env.unwrapped, "load_state_dict"):
+            self.env.unwrapped.load_state_dict(loaded_dict.get("environment_state_dict", None))
 
         # -- Load RND model if used
         if self.alg.rnd:
