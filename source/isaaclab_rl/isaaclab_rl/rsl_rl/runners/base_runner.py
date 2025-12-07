@@ -293,6 +293,10 @@ class BaseRunner(OnPolicyRunner):
         else:
             print(f"[WARNING]: Unwrapped env already set to algorithm, skipping...")
 
+        # sync multi gpu
+        if hasattr(self.env.unwrapped, "sync_multi_gpu"):
+            self.env.unwrapped.sync_multi_gpu(self.multi_gpu_cfg)
+
         # Start training
         start_iter = self.current_learning_iteration
         tot_iter = start_iter + num_learning_iterations
