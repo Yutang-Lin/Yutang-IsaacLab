@@ -653,6 +653,9 @@ class BaseRunner(OnPolicyRunner):
 
     def load(self, path: str, load_optimizer: bool = True):
         loaded_dict = torch.load(path, weights_only=False)
+        # -- Load environment model if used
+        if hasattr(self.env.unwrapped, "load_state_dict"):
+            self.env.unwrapped.load_state_dict(loaded_dict.get("environment_state_dict", None))
         # -- Load model
         # loaded_dict["model_state_dict"].pop('log_std')
         model_state_dict = loaded_dict["model_state_dict"]
@@ -665,8 +668,7 @@ class BaseRunner(OnPolicyRunner):
         resumed_training = self.alg.policy.load_state_dict(model_state_dict, strict=False)
 
         # -- Load environment model if used
-        if hasattr(self.env.unwrapped, "load_state_dict"):
-            self.env.unwrapped.load_state_dict(loaded_dict.get("environment_state_dict", None))
+        
 
         # -- Load RND model if used
         if self.alg.rnd:
