@@ -482,6 +482,16 @@ class RslRlPpoActorCriticTransformerLatentCfg(RslRlPpoActorCriticTransformerCfg)
 
     latent_stable_coef: float = 1e-3
     """The stable coefficient for the latent tokens."""
+
+@configclass
+class RslRlPpoActorCriticTransformerInteractionFieldCfg(RslRlPpoActorCriticTransformerCfg):
+    """Configuration for the PPO actor-critic networks with transformer layers."""
+
+    class_name: str = "ActorCriticTransformerInteractionField"
+    """The policy class name. Default is ActorCriticTransformerLatent."""
+
+    tf_num_fusion_heads: int = MISSING
+    """The number of fusion heads for the interaction field."""
     
 
 @configclass

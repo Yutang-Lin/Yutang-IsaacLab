@@ -6,6 +6,7 @@ if not (os.environ.get("ENABLE_ISAACLAB", "True") == "False"):
     from isaaclab_rl.rsl_rl.networks.transformer_memory_ll import TransformerMemoryLL
     from isaaclab_rl.rsl_rl.networks.transformer_memory_latent import TransformerMemoryLatent
     from isaaclab_rl.rsl_rl.networks.transformer_policy import TransformerPolicy
+    from isaaclab_rl.rsl_rl.networks.transformer_policy_interaction_field import TransformerPolicyInteractionField
     from isaaclab_rl.rsl_rl.networks.transformer_policy_residual import TransformerPolicyResidual
     from isaaclab_rl.rsl_rl.networks.transformer_policy_latent import TransformerPolicyLatent
     from isaaclab_rl.rsl_rl.networks.transformer_policy_flow import TransformerPolicyFlow, TransformerPolicyFlowConfig
@@ -21,6 +22,7 @@ if not (os.environ.get("ENABLE_ISAACLAB", "True") == "False"):
             "TransformerPolicy", 
             "TransformerDiscriminator", 
             "TransformerPolicyLatent", 
+            "TransformerPolicyInteractionField",
             "TransformerPolicyResidual", 
             "TransformerPolicyFlow", "TransformerPolicyFlowConfig",
             "TransformerPolicyMeanFlow", "TransformerPolicyMeanFlowConfig",

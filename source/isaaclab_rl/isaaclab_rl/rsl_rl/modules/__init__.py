@@ -13,6 +13,7 @@ from .actor_critic_transformer import ActorCriticTransformer
 from .actor_critic_transformer_flow import ActorCriticTransformerFlow
 from .actor_critic_transformer_mean_flow import ActorCriticTransformerMeanFlow
 from .actor_critic_transformer_residual import ActorCriticTransformerResidual
+from .actor_critic_transformer_interaction_field import ActorCriticTransformerInteractionField
 from .actor_critic_transformer_latent import ActorCriticTransformerLatent
 from .actor_critic_tf_recurrent import ActorCriticTFRecurrent
 from .actor_critic_tf_recurrent_ml import ActorCriticTFRecurrentML
@@ -89,6 +90,7 @@ __all__ = [
     "ActorCriticTFRecurrentLatent",
     "ActorCriticTransformerResidual",
     "ActorCriticTransformerLatent",
+    "ActorCriticTransformerInteractionField",
     "ActorCriticMoE",
     "ActorCriticMoP",
     "ActorCriticPNN",
