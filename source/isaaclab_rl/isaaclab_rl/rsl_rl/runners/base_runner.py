@@ -663,12 +663,15 @@ class BaseRunner(OnPolicyRunner):
         if 'Student' in load_class_name and 'Teacher' in load_class_name and self.training_type == "rl":
             model_state_dict = {k.replace('student.', ''): v for k, v in model_state_dict.items() if 'student.' in k}
             self.alg.policy.load_state_dict(model_state_dict, strict=False)
+            if self.empirical_normalization:
+                try:
+                    self.obs_normalizer.load_state_dict(loaded_dict["obs_norm_state_dict"])
+                    print(f"[INFO]: Loaded observation normalizer from: {path}")
+                except Exception as e:
+                    print(f"[WARNING]: Failed to load observation normalizer. Error: {e}. Reinitializing observation normalizer.")
             print(f"[INFO]: Loaded RL finetuning model from: {path}")
             return loaded_dict["infos"]
         resumed_training = self.alg.policy.load_state_dict(model_state_dict, strict=False)
-
-        # -- Load environment model if used
-        
 
         # -- Load RND model if used
         if self.alg.rnd:
