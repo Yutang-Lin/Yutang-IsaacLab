@@ -45,7 +45,8 @@ class SelectiveFuser(nn.Module):
         attn_score = einsum(qs, ks, "b q d, b k d -> b q k")
         attn_score = attn_score.softmax(dim=-1) / math.sqrt(self.single_dim)
         out = einsum(attn_score, vs, "b q k, b k d -> b q d").flatten(start_dim=1)
-        return self.output_proj(out)
+        out = self.output_proj(out)
+        return out / (out.norm(dim=-1, keepdim=True) + 1e-8)
 
 class TransformerPolicyInteractionField(nn.Module):
     def __init__(self, 
