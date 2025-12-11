@@ -31,6 +31,7 @@ class SelectiveFuser(nn.Module):
         self.k_proj = nn.Linear(d_model, d_model)
         self.v_proj = nn.Linear(d_model, d_model)
         self.output_proj = nn.Linear(d_model, d_model)
+        self.attn_temperature = math.sqrt(self.single_dim)
 
     def forward(self, interaction_field, movement_goal, task_condition):
         batch_size = interaction_field.shape[0]
@@ -43,7 +44,7 @@ class SelectiveFuser(nn.Module):
         vs = self.v_proj(combined_tokens).view(batch_size, 2 * self.num_fusion_heads, self.single_dim)
         qs = self.q_proj(task_condition).view(batch_size, self.num_fusion_heads, self.single_dim)
         attn_score = einsum(qs, ks, "b q d, b k d -> b q k")
-        attn_score = attn_score.softmax(dim=-1) / math.sqrt(self.single_dim)
+        attn_score = (attn_score / self.attn_temperature).softmax(dim=-1)
         out = einsum(attn_score, vs, "b q k, b k d -> b q d").flatten(start_dim=1)
         out = self.output_proj(out)
         return out / (out.norm(dim=-1, keepdim=True) + 1e-8)
