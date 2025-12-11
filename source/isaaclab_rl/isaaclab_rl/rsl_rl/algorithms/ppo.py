@@ -133,6 +133,9 @@ class PPO(RslRlPPO):
         self.lipschitz_constraint_coef = kwargs.pop("lipschitz_constraint_coef", 2e-2)
         self.adjust_critic_lr = kwargs.pop("adjust_critic_lr", True)
 
+        self.num_total_updates = 0
+        self.critic_only_steps = kwargs.pop("critic_only_steps", 0)
+
     def init_storage(
         self, training_type, num_envs, num_transitions_per_env, actor_obs_shape, critic_obs_shape, actions_shape,
         meta_tensors=None
@@ -276,6 +279,7 @@ class PPO(RslRlPPO):
             rnd_state_batch,
             meta_tensors_batch,
         ) in enumerate(generator):
+            self.num_total_updates += 1
             if update_id // self.num_mini_batches > self.num_learning_epochs:
                 # critic extra epochs
                 value_batch = self.policy.evaluate(critic_obs_batch, masks=masks_batch, hidden_states=hid_states_batch[1])
@@ -483,6 +487,12 @@ class PPO(RslRlPPO):
                                                              self.lipschitz_constraint_coef
             else:
                 lipschitz_constraint_loss = 0.0
+
+            if self.num_total_updates < self.critic_only_steps:
+                surrogate_loss = surrogate_loss * 0.0
+                entropy_batch = entropy_batch * 0.0
+                lipschitz_constraint_loss = lipschitz_constraint_loss * 0.0
+                distillation_loss = distillation_loss * 0.0
 
             loss = surrogate_loss + \
                 self.value_loss_coef * value_loss - \

@@ -710,6 +710,9 @@ class RslRlPpoAlgorithmCfg:
     distillation_coef: float = 1.0
     """The coefficient for the distillation loss. Default is 1.0."""
 
+    critic_only_steps: int = 0
+    """The number of steps to only update the critic. Default is 0."""
+
 
 @configclass
 class RslRlTd3AlgorithmCfg:
