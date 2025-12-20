@@ -43,11 +43,11 @@ class SelectiveFuser(nn.Module):
         ks = self.k_proj(combined_tokens).view(batch_size, 2 * self.num_fusion_heads, self.single_dim)
         vs = self.v_proj(combined_tokens).view(batch_size, 2 * self.num_fusion_heads, self.single_dim)
         qs = self.q_proj(task_condition).view(batch_size, self.num_fusion_heads, self.single_dim)
-        attn_score = einsum(qs, ks, "b q d, b k d -> b q k")
+        attn_score = torch.bmm(qs, ks.transpose(-2, -1))
         attn_score = (attn_score / self.attn_temperature).softmax(dim=-1)
-        out = einsum(attn_score, vs, "b q k, b k d -> b q d").flatten(start_dim=1)
+        out = torch.bmm(attn_score, vs).flatten(start_dim=1)
         out = self.output_proj(out)
-        return out / (out.norm(dim=-1, keepdim=True) + 1e-8)
+        return out / (out.norm(dim=-1, keepdim=True, p=2) + 1e-8)
 
 class TransformerPolicyInteractionField(nn.Module):
     def __init__(self, 

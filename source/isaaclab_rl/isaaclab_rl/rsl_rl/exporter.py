@@ -97,6 +97,13 @@ class _TorchPolicyExporter(torch.nn.Module):
             self.actor.forward = self.actor.forward_inference
             self.forward = self.forward_latent
 
+        if self.actor.__class__.__name__ == "TransformerPolicyInteractionField":
+            self.split_ids['proprio'] = policy.actor_proprio_ids
+            self.split_ids['interaction_field'] = policy.actor_interaction_field_ids
+            self.split_ids['movement_goal'] = policy.actor_movement_goal_ids
+            self.split_ids['task_condition'] = policy.actor_task_condition_ids
+            self.forward = self.forward_interaction_field
+
         # copy normalizer if exists
         if normalizer:
             self.normalizer = copy.deepcopy(normalizer)
@@ -144,6 +151,17 @@ class _TorchPolicyExporter(torch.nn.Module):
         self.hidden_state[:] = h
         x = x.squeeze(0)
         return self.actor(x)
+    
+    def forward_interaction_field(self, proprio: torch.Tensor, 
+                                  interaction_field: torch.Tensor, 
+                                  movement_goal: torch.Tensor, 
+                                  task_condition: torch.Tensor):
+        proprio = self.split_normalizer['proprio'](proprio)
+        interaction_field = self.split_normalizer['interaction_field'](interaction_field)
+        movement_goal = self.split_normalizer['movement_goal'](movement_goal)
+        task_condition = self.split_normalizer['task_condition'](task_condition)
+        x = self.actor(proprio=proprio, interaction_field=interaction_field, movement_goal=movement_goal, task_condition=task_condition)
+        return x
 
     def forward(self, x):
         return self.actor(self.normalizer(x))
