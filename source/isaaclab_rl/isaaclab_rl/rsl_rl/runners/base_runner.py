@@ -672,6 +672,9 @@ class BaseRunner(OnPolicyRunner):
             print(f"[INFO]: Loaded RL finetuning model from: {path}")
             return loaded_dict["infos"]
         resumed_training = self.alg.policy.load_state_dict(model_state_dict, strict=False)
+        if resumed_training and ('Student' not in load_class_name and self.training_type == "distillation"):
+            # Distillation using RL model
+            resumed_training = False
 
         # -- Load RND model if used
         if self.alg.rnd:
