@@ -25,13 +25,17 @@ from copy import deepcopy
 class BaseRunner(OnPolicyRunner):
     """On-policy runner for training and evaluation."""
 
-    def __init__(self, env: VecEnv, train_cfg: dict, log_dir: str | None = None, device="cpu"):
+    def __init__(self, env: VecEnv, train_cfg: dict, log_dir: str | None = None, device="cpu", **kwargs):
         self.cfg = train_cfg
         self.alg_cfg = train_cfg["algorithm"]
         self.policy_cfg = train_cfg["policy"]
         self.device = device
         self.env = env
         self.env_unwrapped = env.unwrapped # type: ignore
+        if 'eval_mode' in kwargs:
+            self.load_actor_only = kwargs['eval_mode']
+        else:
+            self.load_actor_only = False
 
         # check if multi-gpu is enabled
         self._configure_multi_gpu()
@@ -659,6 +663,9 @@ class BaseRunner(OnPolicyRunner):
         # -- Load model
         # loaded_dict["model_state_dict"].pop('log_std')
         model_state_dict = loaded_dict["model_state_dict"]
+        if self.load_actor_only:
+            model_state_dict = {k: v for k, v in model_state_dict.items() if 'actor.' in k}
+            
         load_class_name = loaded_dict["policy_cfg"].get('class_name', '')
         if 'Student' in load_class_name and 'Teacher' in load_class_name and self.training_type == "rl":
             model_state_dict = {k.replace('student.', ''): v for k, v in model_state_dict.items() if 'student.' in k}
