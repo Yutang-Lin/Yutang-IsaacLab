@@ -77,6 +77,9 @@ class RslRlAmpCfg:
 
     reward_factor: float = 0.25
     """The reward factor for the AMP discriminator network. Default is 0.25."""
+    
+    reward_exp: float = 1.0
+    """The reward exponent for the AMP discriminator network. Default is 1.0."""
 
     clip_obs_value: float = 100.0
     """The clipping value for the AMP discriminator network. Default is 100.0."""

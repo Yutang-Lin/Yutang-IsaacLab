@@ -188,9 +188,12 @@ class BaseRunner(OnPolicyRunner):
 
             self.cfg["amp_cfg"].pop("input_dim")
             reward_scale = self.cfg["amp_cfg"].pop("reward_scale")
+            reward_exp = self.cfg["amp_cfg"].pop("reward_exp")
             w_grad_penalty = self.cfg["amp_cfg"].pop("w_grad_penalty")
             if isinstance(reward_scale, float):
                 reward_scale = {k: reward_scale for k in amp_dict.keys()}
+            if isinstance(reward_exp, float):
+                reward_exp = {k: reward_exp for k in amp_dict.keys()}
             if isinstance(w_grad_penalty, float):
                 w_grad_penalty = {k: w_grad_penalty for k in amp_dict.keys()}
             self.amp_rewards = {k: AmpReward(v.shape[1], training=True, 
@@ -198,6 +201,7 @@ class BaseRunner(OnPolicyRunner):
                                         device=self.device, 
                                         multi_gpu_cfg=self.multi_gpu_cfg,
                                         reward_scale=reward_scale[k],
+                                        reward_exp=reward_exp[k],
                                         w_grad_penalty=w_grad_penalty[k],
                                         **self.cfg["amp_cfg"]) for k, v in amp_dict.items()}
         else:

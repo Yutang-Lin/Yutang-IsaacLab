@@ -21,6 +21,7 @@ class AmpReward:
                  max_grad_norm: float = 1.0,
                  reward_scale: float = 1.0,
                  reward_factor: float = 0.0,
+                 reward_exp: float = 1.0,
                  weight_decay: float = 0.0, 
 
                  use_transformer: bool = False,
@@ -50,6 +51,7 @@ class AmpReward:
         self.clip_obs_value = clip_obs_value
         self.reward_scale = reward_scale
         self.reward_factor = reward_factor
+        self.reward_exp = reward_exp
         self.w_grad_penalty = w_grad_penalty
         self.max_grad_norm = max_grad_norm
 
@@ -231,10 +233,10 @@ class AmpReward:
     @torch.inference_mode()
     def compute_reward(self, obs: torch.Tensor, scale: float | torch.Tensor = 1.0):
         features = obs.view(self.num_envs, -1).clamp(-self.clip_obs_value, self.clip_obs_value)
-        amp_score = self.network(features).view(self.num_envs)
+        amp_score = self.network(features).view(self.num_envs).clamp(-1.0, 1.0)
 
         # if scale is low, reward will be high to make amp constraints less important
-        return (1 - scale * self.reward_factor * torch.square(amp_score - 1)) * self.reward_scale
+        return (1 - scale * ((self.reward_factor * torch.square(amp_score - 1)) ** self.reward_exp)) * self.reward_scale
     
     def reduce_parameters(self):
         """Collect gradients from all GPUs and average them.
