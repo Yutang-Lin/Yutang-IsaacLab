@@ -204,6 +204,13 @@ class ActorCritic(RslRlActorCritic):
             bool: Whether this training resumes a previous training. This flag is used by the `load()` function of
                   `OnPolicyRunner` to determine how to load further parameters (relevant for, e.g., distillation).
         """
+        if 'critic.input_proj.weight' in state_dict:
+            this_state_dict = self.state_dict()
+            if 'critic.input_proj.weight' in this_state_dict and \
+                this_state_dict['critic.input_proj.weight'].shape != state_dict['critic.input_proj.weight'].shape:
+                del state_dict['critic.input_proj.weight']
+                strict = False
+
         if hasattr(self, "std") and not self.load_noise_std and 'std' in state_dict:
             del state_dict["std"]
             super().load_state_dict(state_dict, strict=False)
