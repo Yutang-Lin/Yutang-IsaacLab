@@ -366,6 +366,10 @@ class BaseRunner(OnPolicyRunner):
                             key_name = f"rew_amp_{k}" if k != '' else 'rew_amp'
                             infos["episode"][key_name] = amp_reward_storages[k].mean().item()
                             infos["episode"]["Perstep/" + key_name] = (amp_reward_storages[k] / infos["episode_length"].to(self.device)).mean().item()
+                            infos["episode"]["Discriminator/" + key_name + "/mean"] = amp_reward.mean().item()
+                            infos["episode"]["Discriminator/" + key_name + "/std"] = amp_reward.std().item()
+                            infos["episode"]["Discriminator/" + key_name + "/min"] = amp_reward.min().item()
+                            infos["episode"]["Discriminator/" + key_name + "/max"] = amp_reward.max().item()
                             amp_reward_storages[k][dones == 1] = 0.
 
                             # update total reward and perstep total reward

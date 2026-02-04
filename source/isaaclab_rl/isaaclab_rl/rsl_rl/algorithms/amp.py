@@ -236,7 +236,7 @@ class AmpReward:
         amp_score = self.network(features).view(self.num_envs).clamp(-1.0, 1.0)
 
         # if scale is low, reward will be high to make amp constraints less important
-        return (1 - scale * ((self.reward_factor * torch.square(amp_score - 1)) ** self.reward_exp)) * self.reward_scale
+        return (1 - scale * ((self.reward_factor * torch.square(amp_score - 1)) ** self.reward_exp)).clamp(min=0.0) * self.reward_scale
     
     def reduce_parameters(self):
         """Collect gradients from all GPUs and average them.
