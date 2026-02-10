@@ -215,8 +215,11 @@ class _OnnxPolicyExporter(torch.nn.Module):
             self.actor = copy.deepcopy(policy.student.actor)
             if self.is_recurrent:
                 self.rnn = copy.deepcopy(policy.student.memory_a.rnn)
+            policy = policy.student
         else:
             raise ValueError("Policy does not have an actor/student module.")
+        
+        self.split_ids = dict()
         # set up recurrent network
         if self.is_recurrent:
             self.rnn.cpu()
@@ -229,11 +232,35 @@ class _OnnxPolicyExporter(torch.nn.Module):
                 self.forward = self.forward_transformer
             else:
                 raise NotImplementedError(f"Unsupported RNN type: {self.rnn_type}")
+        
+        # get policy
+        if hasattr(self.actor, "forward_inference"):
+            self.split_ids['proprio'] = policy.actor_proprio_ids
+            self.split_ids['condition'] = policy.actor_condition_ids
+            self.actor.forward = self.actor.forward_inference
+            self.forward = self.forward_latent
+
+        if self.actor.__class__.__name__ == "TransformerPolicyInteractionField":
+            self.split_ids['proprio'] = policy.actor_proprio_ids
+            self.split_ids['interaction_field'] = policy.actor_interaction_field_ids
+            self.split_ids['movement_goal'] = policy.actor_movement_goal_ids
+            self.split_ids['task_condition'] = policy.actor_task_condition_ids
+            self.forward = self.forward_interaction_field
+        
         # copy normalizer if exists
         if normalizer:
             self.normalizer = copy.deepcopy(normalizer)
         else:
             self.normalizer = torch.nn.Identity()
+
+        self.split_normalizer = torch.nn.ModuleDict()
+        if len(self.split_ids) > 0:
+            if isinstance(self.normalizer, EmpiricalNormalization):
+                for key in self.split_ids:
+                    self.split_normalizer[key] = self.normalizer.split(self.split_ids[key])
+            else:
+                for key in self.split_ids:
+                    self.split_normalizer[key] = torch.nn.Identity()
 
     def forward_lstm(self, x_in, h_in, c_in):
         x_in = self.normalizer(x_in)
@@ -253,6 +280,26 @@ class _OnnxPolicyExporter(torch.nn.Module):
         x = x.squeeze(0)
         return self.actor(x), h
 
+    def forward_interaction_field(self, proprio: torch.Tensor, 
+                                  interaction_field: torch.Tensor, 
+                                  movement_goal: torch.Tensor, 
+                                  task_condition: torch.Tensor):
+        proprio = self.split_normalizer['proprio'](proprio)
+        interaction_field = self.split_normalizer['interaction_field'](interaction_field)
+        movement_goal = self.split_normalizer['movement_goal'](movement_goal)
+        task_condition = self.split_normalizer['task_condition'](task_condition)
+        x = self.actor(proprio=proprio, interaction_field=interaction_field, movement_goal=movement_goal, task_condition=task_condition)
+        return x
+
+    def forward_latent(self, proprio: torch.Tensor, 
+                       condition: torch.Tensor | None = None, 
+                       latent: torch.Tensor | None = None,
+                       apply_vae_noise: bool = False):
+        proprio = self.split_normalizer['proprio'](proprio)
+        if condition is not None:
+            condition = self.split_normalizer['condition'](condition)
+        return self.actor.forward_inference(proprio, condition, latent, apply_vae_noise)
+
     def forward(self, x):
         return self.actor(self.normalizer(x))
 
@@ -260,7 +307,31 @@ class _OnnxPolicyExporter(torch.nn.Module):
         try:
             self.to("cpu")
             self.eval()
-            if self.is_recurrent:
+            # Check if this is an interaction field policy
+            if 'interaction_field' in self.split_ids:
+                # Get input sizes from split normalizers
+                proprio_size = len(self.split_ids['proprio'])
+                interaction_field_size = len(self.split_ids['interaction_field'])
+                movement_goal_size = len(self.split_ids['movement_goal'])
+                task_condition_size = len(self.split_ids['task_condition'])
+                
+                proprio = torch.zeros(1, proprio_size)
+                interaction_field = torch.zeros(1, interaction_field_size)
+                movement_goal = torch.zeros(1, movement_goal_size)
+                task_condition = torch.zeros(1, task_condition_size)
+                
+                torch.onnx.export(
+                    self,
+                    (proprio, interaction_field, movement_goal, task_condition),
+                    os.path.join(path, filename),
+                    export_params=True,
+                    opset_version=14,
+                    verbose=self.verbose,
+                    input_names=["proprio", "interaction_field", "movement_goal", "task_condition"],
+                    output_names=["actions"],
+                    dynamic_axes={},
+                )
+            elif self.is_recurrent:
                 obs = torch.zeros(1, self.rnn.input_size)
                 
                 if self.rnn_type == "lstm":
@@ -323,5 +394,5 @@ class _OnnxPolicyExporter(torch.nn.Module):
                 )
         except Exception as e:
             print(f"[WARNING]: Error exporting policy: {e}", flush=True)
-            # import traceback
-            # traceback.print_exc()
+            import traceback
+            traceback.print_exc()
