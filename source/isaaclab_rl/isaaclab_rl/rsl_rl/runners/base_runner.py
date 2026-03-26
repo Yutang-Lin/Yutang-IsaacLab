@@ -207,6 +207,20 @@ class BaseRunner(OnPolicyRunner):
         else:
             self.amp_rewards = None
 
+        # init SMP reward (Score-Matching Motion Prior)
+        if "smp_cfg" in self.cfg and self.cfg["smp_cfg"] is not None and not self.env_unwrapped.cfg.play_mode:
+            from latentctrl.tasks.direct.motion_imitation.smp_reward import SmpReward
+            smp_cfg = self.cfg["smp_cfg"].copy()
+            self.smp_reward = SmpReward(
+                num_envs=self.env.num_envs,
+                device=self.device,
+                **smp_cfg,
+            )
+            self.smp_reward.eval()
+            print(f"[INFO]: SMP reward initialized with config: {smp_cfg}")
+        else:
+            self.smp_reward = None
+
         # Decide whether to disable logging
         # We only log from the process with rank 0 (main process)
         self.disable_logs = self.is_distributed and self.gpu_global_rank != 0
@@ -289,6 +303,12 @@ class BaseRunner(OnPolicyRunner):
             for k in self.amp_rewards.keys():
                 self.amp_rewards[k].reset_storage()
 
+        # SMP trajectory buffers
+        if self.smp_reward is not None:
+            smp_body_pos_list = []
+            smp_body_quat_list = []
+            smp_body_lin_vel_list = []
+
         # initialize infos
         infos = dict(meta_tensors={})
 
@@ -304,6 +324,18 @@ class BaseRunner(OnPolicyRunner):
         # sync multi gpu
         if hasattr(self.env.unwrapped, "sync_multi_gpu"):
             self.env.unwrapped.sync_multi_gpu(self.multi_gpu_cfg)
+
+        # Actor warmup for finetuning: use small actor lr while critic warms up
+        self.actor_freeze_iters = self.cfg.get("actor_freeze_iterations", 0)
+        self.actor_warmup_lr_scale = self.cfg.get("actor_warmup_lr_scale", 0.1)
+        if self.actor_freeze_iters > 0:
+            self._actor_lr_backup = self.alg.optimizer.param_groups[0]["lr"]
+            self.alg.optimizer.param_groups[0]["lr"] = self._actor_lr_backup * self.actor_warmup_lr_scale
+            if len(self.alg.optimizer.param_groups) > 2:
+                self._other_lr_backup = self.alg.optimizer.param_groups[2]["lr"]
+                self.alg.optimizer.param_groups[2]["lr"] = self._other_lr_backup * self.actor_warmup_lr_scale
+            print(f"[INFO]: Actor warmup for first {self.actor_freeze_iters} iterations "
+                  f"(lr_scale={self.actor_warmup_lr_scale})")
 
         # Start training
         start_iter = self.current_learning_iteration
@@ -376,6 +408,12 @@ class BaseRunner(OnPolicyRunner):
                             infos["episode"]["total_reward"] += infos["episode"][key_name]
                             infos["episode"]["Perstep/total_reward"] += infos["episode"]["Perstep/" + key_name]
 
+                    # collect body states for SMP trajectory reward
+                    if self.smp_reward is not None:
+                        smp_body_pos_list.append(self.env_unwrapped.body_pos.clone())
+                        smp_body_quat_list.append(self.env_unwrapped.body_quat.clone())
+                        smp_body_lin_vel_list.append(self.env_unwrapped.body_lin_vel.clone())
+
                     # process the step
                     self.alg.process_env_step(rewards, dones, infos)
 
@@ -411,6 +449,36 @@ class BaseRunner(OnPolicyRunner):
                             cur_ereward_sum[new_ids] = 0
                             cur_ireward_sum[new_ids] = 0
 
+                # Compute trajectory-level SMP reward and add to rollout storage
+                if self.smp_reward is not None:
+                    smp_body_pos_seq = torch.stack(smp_body_pos_list, dim=0)       # [T, N, J, 3]
+                    smp_body_quat_seq = torch.stack(smp_body_quat_list, dim=0)     # [T, N, J, 4]
+                    smp_body_lin_vel_seq = torch.stack(smp_body_lin_vel_list, dim=0)  # [T, N, J, 3]
+                    smp_dones = self.alg.storage.dones[:self.num_steps_per_env]    # [T, N, 1]
+                    smp_rewards = self.smp_reward.compute_trajectory_reward(
+                        smp_body_pos_seq, smp_body_quat_seq, smp_dones, smp_body_lin_vel_seq
+                    )  # [T, N, 1]
+                    # Add SMP reward to stored rewards retroactively
+                    self.alg.storage.rewards[:self.num_steps_per_env] += smp_rewards.to(self.device)
+                    # Log SMP reward stats
+                    if "episode" in infos:
+                        # per-env cumulative SMP reward over the rollout
+                        smp_per_env = smp_rewards.squeeze(-1).sum(dim=0)  # [N]
+                        smp_mean = smp_per_env.mean().item()
+                        ep_len = infos["episode_length"].to(self.device).float()
+                        infos["episode"]["rew_smp"] = smp_mean
+                        infos["episode"]["Perstep/rew_smp"] = (smp_per_env / ep_len).mean().item()
+                        infos["episode"]["SMP/mean"] = smp_rewards.mean().item()
+                        infos["episode"]["SMP/std"] = smp_rewards.std().item()
+                        infos["episode"]["SMP/min"] = smp_rewards.min().item()
+                        infos["episode"]["SMP/max"] = smp_rewards.max().item()
+                        infos["episode"]["total_reward"] += smp_mean
+                        infos["episode"]["Perstep/total_reward"] += infos["episode"]["Perstep/rew_smp"]
+                    # Clear buffers for next rollout
+                    smp_body_pos_list.clear()
+                    smp_body_quat_list.clear()
+                    smp_body_lin_vel_list.clear()
+
                 stop = time.time()
                 collection_time = stop - start
                 start = stop
@@ -423,6 +491,13 @@ class BaseRunner(OnPolicyRunner):
             # call post_rollout method of the environment
             if hasattr(self.env.unwrapped, "post_rollout"):
                 self.env.unwrapped.post_rollout()
+
+            # Unfreeze actor after warmup period
+            if self.actor_freeze_iters > 0 and (it - start_iter) == self.actor_freeze_iters:
+                self.alg.optimizer.param_groups[0]["lr"] = self._actor_lr_backup
+                if len(self.alg.optimizer.param_groups) > 2:
+                    self.alg.optimizer.param_groups[2]["lr"] = self._other_lr_backup
+                print(f"[INFO]: Actor warmup complete at iteration {it}, lr restored to full")
 
             # train policy
             self.alg.policy.train()

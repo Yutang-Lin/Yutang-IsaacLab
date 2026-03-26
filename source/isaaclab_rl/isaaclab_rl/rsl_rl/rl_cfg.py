@@ -14,6 +14,7 @@ from .distillation_cfg import RslRlDistillationAlgorithmCfg, RslRlDistillationSt
 from .rnd_cfg import RslRlRndCfg
 from .symmetry_cfg import RslRlSymmetryCfg
 from .amp_cfg import RslRlAmpCfg
+from .smp_cfg import RslRlSmpCfg
 
 #########################
 # Policy configurations #
@@ -862,4 +863,9 @@ class RslRlOnPolicyRunnerCfg:
     amp_cfg: RslRlAmpCfg | None = None
     """The configuration for the Adversarial Model Priors (AMP) module. Default is None,
     in which case AMP is not used.
+    """
+
+    smp_cfg: RslRlSmpCfg | None = None
+    """The configuration for the Score-Matching Motion Prior (SMP) module. Default is None,
+    in which case SMP is not used.
     """
