@@ -307,7 +307,15 @@ class BaseRunner(OnPolicyRunner):
         if self.smp_reward is not None:
             smp_body_pos_list = []
             smp_body_quat_list = []
-            smp_body_lin_vel_list = []
+            smp_body_vel_list = []
+            smp_foot_contact_list = []
+            smp_reward_storage = torch.zeros(self.env.num_envs, device=self.device)
+            # Resolve foot contact body indices once
+            contact_sensor = self.env_unwrapped.robot_contact_sensor
+            smp_foot_body_ids = [
+                contact_sensor.body_names.index(n)
+                for n in ['left_ankle_roll_link', 'right_ankle_roll_link']
+            ]
 
         # initialize infos
         infos = dict(meta_tensors={})
@@ -412,7 +420,11 @@ class BaseRunner(OnPolicyRunner):
                     if self.smp_reward is not None:
                         smp_body_pos_list.append(self.env_unwrapped.body_pos.clone())
                         smp_body_quat_list.append(self.env_unwrapped.body_quat.clone())
-                        smp_body_lin_vel_list.append(self.env_unwrapped.body_lin_vel.clone())
+                        smp_body_vel_list.append(self.env_unwrapped.body_lin_vel.clone())
+                        # Foot contact: force norm > 1N → contact=1
+                        foot_forces = contact_sensor.data.net_forces_w[:, smp_foot_body_ids]  # [N, 2, 3]
+                        foot_in_contact = (foot_forces.norm(dim=-1) > 1.0).float()  # [N, 2]
+                        smp_foot_contact_list.append(foot_in_contact)
 
                     # process the step
                     self.alg.process_env_step(rewards, dones, infos)
@@ -453,31 +465,48 @@ class BaseRunner(OnPolicyRunner):
                 if self.smp_reward is not None:
                     smp_body_pos_seq = torch.stack(smp_body_pos_list, dim=0)       # [T, N, J, 3]
                     smp_body_quat_seq = torch.stack(smp_body_quat_list, dim=0)     # [T, N, J, 4]
-                    smp_body_lin_vel_seq = torch.stack(smp_body_lin_vel_list, dim=0)  # [T, N, J, 3]
-                    smp_dones = self.alg.storage.dones[:self.num_steps_per_env]    # [T, N, 1]
-                    smp_rewards = self.smp_reward.compute_trajectory_reward(
-                        smp_body_pos_seq, smp_body_quat_seq, smp_dones, smp_body_lin_vel_seq
-                    )  # [T, N, 1]
+                    smp_body_vel_seq = torch.stack(smp_body_vel_list, dim=0)       # [T, N, J, 3]
+                    smp_foot_contact_seq = torch.stack(smp_foot_contact_list, dim=0)  # [T, N, 2]
+                    smp_rewards, smp_raw_reward = self.smp_reward.compute_trajectory_reward(
+                        smp_body_pos_seq, smp_body_quat_seq,
+                        body_lin_vel_seq=smp_body_vel_seq,
+                        foot_contacts_seq=smp_foot_contact_seq,
+                    )  # [T, N, 1], [N, T]
                     # Add SMP reward to stored rewards retroactively
                     self.alg.storage.rewards[:self.num_steps_per_env] += smp_rewards.to(self.device)
-                    # Log SMP reward stats
+
+                    # Log per-step SMP stats (these are per-rollout, not per-episode)
                     if "episode" in infos:
-                        # per-env cumulative SMP reward over the rollout
-                        smp_per_env = smp_rewards.squeeze(-1).sum(dim=0)  # [N]
-                        smp_mean = smp_per_env.mean().item()
-                        ep_len = infos["episode_length"].to(self.device).float()
-                        infos["episode"]["rew_smp"] = smp_mean
-                        infos["episode"]["Perstep/rew_smp"] = (smp_per_env / ep_len).mean().item()
                         infos["episode"]["SMP/mean"] = smp_rewards.mean().item()
                         infos["episode"]["SMP/std"] = smp_rewards.std().item()
                         infos["episode"]["SMP/min"] = smp_rewards.min().item()
                         infos["episode"]["SMP/max"] = smp_rewards.max().item()
-                        infos["episode"]["total_reward"] += smp_mean
+                        infos["episode"]["SMP/raw_mean"] = smp_raw_reward.mean().item()
+                        infos["episode"]["SMP/raw_min"] = smp_raw_reward.min().item()
+                        infos["episode"]["SMP/raw_max"] = smp_raw_reward.max().item()
+
+                    # Accumulate per-env episodic SMP reward step-by-step (like AMP),
+                    # logging before reset so completed episodes are captured correctly.
+                    all_dones = self.alg.storage.dones[:self.num_steps_per_env].squeeze(-1)  # [T, N]
+                    smp_per_step = smp_rewards.squeeze(-1)  # [T, N]
+                    for t_idx in range(self.num_steps_per_env):
+                        smp_reward_storage += smp_per_step[t_idx]
+                        step_dones = all_dones[t_idx]  # [N]
+                        # Log before reset (same pattern as AMP)
+                        if "episode" in infos:
+                            ep_len = infos["episode_length"].to(self.device).float()
+                            infos["episode"]["rew_smp"] = smp_reward_storage.mean().item()
+                            infos["episode"]["Perstep/rew_smp"] = (smp_reward_storage / ep_len).mean().item()
+                        smp_reward_storage[step_dones == 1] = 0.
+
+                    if "episode" in infos:
+                        infos["episode"]["total_reward"] += infos["episode"]["rew_smp"]
                         infos["episode"]["Perstep/total_reward"] += infos["episode"]["Perstep/rew_smp"]
                     # Clear buffers for next rollout
                     smp_body_pos_list.clear()
                     smp_body_quat_list.clear()
-                    smp_body_lin_vel_list.clear()
+                    smp_body_vel_list.clear()
+                    smp_foot_contact_list.clear()
 
                 stop = time.time()
                 collection_time = stop - start
