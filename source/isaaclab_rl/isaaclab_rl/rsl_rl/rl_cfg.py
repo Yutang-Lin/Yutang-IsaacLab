@@ -373,6 +373,15 @@ class RslRlPpoActorCriticTransformerCfg(RslRlPpoActorCriticCfg):
     tf_activation: str = "gelu"
     """The activation function for the transformer."""
 
+    distributed_critic: bool = False
+    """Whether to use distributed critic (no gradient sync across ranks).
+
+    When enabled, each rank's critic does not sync gradients with other ranks.
+    Parameters are only synchronized at the beginning of training via broadcast.
+    This leads to a naturally multi-rank mixture of critics architecture.
+    Checkpoints will only include rank 0's critic parameters.
+    """
+
 @configclass
 class RslRlPpoActorCriticTransformerFlowCfg(RslRlPpoActorCriticCfg):
     """Configuration for the PPO actor-critic networks with transformer layers."""

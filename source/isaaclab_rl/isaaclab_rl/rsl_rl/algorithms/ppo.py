@@ -48,9 +48,11 @@ class PPO(RslRlPPO):
         if multi_gpu_cfg is not None:
             self.gpu_global_rank = multi_gpu_cfg["global_rank"]
             self.gpu_world_size = multi_gpu_cfg["world_size"]
+            self.distributed_critic = multi_gpu_cfg.get("distributed_critic", False)
         else:
             self.gpu_global_rank = 0
             self.gpu_world_size = 1
+            self.distributed_critic = False
 
         # RND components
         if rnd_cfg is not None:
@@ -655,3 +657,38 @@ class PPO(RslRlPPO):
             loss_dict["symmetry"] = mean_symmetry_loss
 
         return loss_dict
+
+    def reduce_parameters(self):
+        """Collect gradients from all GPUs and average them.
+
+        When distributed_critic is enabled, only actor (and other non-critic) gradients are synced.
+        Critic gradients remain local to each rank, creating a mixture of critics.
+        """
+        if self.distributed_critic:
+            # Only reduce gradients for non-critic parameters
+            grads = []
+            params_with_grads = []
+            for name, param in self.policy.named_parameters():
+                if param.grad is not None and "critic" not in name:
+                    grads.append(param.grad.view(-1))
+                    params_with_grads.append(param)
+            # Also include RND gradients
+            if self.rnd:
+                for param in self.rnd.parameters():
+                    if param.grad is not None:
+                        grads.append(param.grad.view(-1))
+                        params_with_grads.append(param)
+            if len(grads) == 0:
+                return
+            all_grads = torch.cat(grads)
+            torch.distributed.all_reduce(all_grads, op=torch.distributed.ReduceOp.SUM)
+            all_grads /= self.gpu_world_size
+            # Write back
+            offset = 0
+            for param in params_with_grads:
+                numel = param.numel()
+                param.grad.data.copy_(all_grads[offset : offset + numel].view_as(param.grad.data))
+                offset += numel
+        else:
+            # Default: sync all parameters
+            super().reduce_parameters()

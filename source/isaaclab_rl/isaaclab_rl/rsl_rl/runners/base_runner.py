@@ -103,6 +103,12 @@ class BaseRunner(OnPolicyRunner):
         self.full_policy_cfg["_args"] = [num_obs, num_privileged_obs, self.env.num_actions]
         self.full_policy_cfg.update(meta_dict)
 
+        # extract distributed_critic flag from policy config (if present) and forward to multi_gpu_cfg
+        distributed_critic = self.policy_cfg.pop("distributed_critic", False)
+        if distributed_critic and self.multi_gpu_cfg is not None:
+            self.multi_gpu_cfg["distributed_critic"] = True
+            print(f"[INFO]: Distributed critic enabled — each rank's critic will not sync gradients.")
+
         # evaluate the policy class
         policy_class = eval(self.policy_cfg.pop("class_name"))
         policy: ActorCritic | ActorCriticRecurrent | StudentTeacher | StudentTeacherRecurrent = policy_class(
@@ -719,6 +725,8 @@ class BaseRunner(OnPolicyRunner):
     
     def save(self, path: str, infos=None, remove_extras=True):
         # -- Save model
+        # Note: when distributed_critic is enabled, only rank 0 saves (disable_logs is True for other ranks).
+        # Rank 0's critic params are saved naturally — no special handling needed.
         saved_dict = {
             "policy_cfg": self.full_policy_cfg,
             "model_state_dict": self.alg.policy.state_dict(),
