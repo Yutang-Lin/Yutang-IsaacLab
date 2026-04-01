@@ -276,21 +276,19 @@ class BaseRunner(OnPolicyRunner):
             # With distributed_actor (MoE), only rank 0 creates wandb/neptune to avoid N runs.
             # Non-rank-0 ranks fall back to tensorboard for local logging only.
             if self.distributed_actor and self.gpu_global_rank != 0:
-                use_logger = "tensorboard"
-            else:
-                use_logger = self.logger_type
+                self.logger_type = "tensorboard"
 
-            if use_logger == "neptune":
+            if self.logger_type == "neptune":
                 from rsl_rl.utils.neptune_utils import NeptuneSummaryWriter
 
                 self.writer = NeptuneSummaryWriter(log_dir=self.log_dir, flush_secs=10, cfg=self.cfg)
                 self.writer.log_config(self.env.cfg, self.cfg, self.alg_cfg, self.policy_cfg)
-            elif use_logger == "wandb":
+            elif self.logger_type == "wandb":
                 from rsl_rl.utils.wandb_utils import WandbSummaryWriter
 
                 self.writer = WandbSummaryWriter(log_dir=self.log_dir, flush_secs=10, cfg=self.cfg)
                 self.writer.log_config(self.env.cfg, self.cfg, self.alg_cfg, self.policy_cfg)
-            elif use_logger == "tensorboard":
+            elif self.logger_type == "tensorboard":
                 from torch.utils.tensorboard import SummaryWriter # type: ignore
 
                 self.writer = SummaryWriter(log_dir=self.log_dir, flush_secs=10)
