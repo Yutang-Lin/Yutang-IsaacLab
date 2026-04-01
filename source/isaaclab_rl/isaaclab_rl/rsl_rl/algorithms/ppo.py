@@ -49,10 +49,12 @@ class PPO(RslRlPPO):
             self.gpu_global_rank = multi_gpu_cfg["global_rank"]
             self.gpu_world_size = multi_gpu_cfg["world_size"]
             self.distributed_critic = multi_gpu_cfg.get("distributed_critic", False)
+            self.distributed_actor = multi_gpu_cfg.get("distributed_actor", False)
         else:
             self.gpu_global_rank = 0
             self.gpu_world_size = 1
             self.distributed_critic = False
+            self.distributed_actor = False
 
         # RND components
         if rnd_cfg is not None:
@@ -400,26 +402,24 @@ class PPO(RslRlPPO):
                         kl_mean = torch.mean(kl)
 
                         # Reduce the KL divergence across all GPUs
-                        if self.is_multi_gpu:
+                        if self.is_multi_gpu and not self.distributed_actor:
                             torch.distributed.all_reduce(kl_mean, op=torch.distributed.ReduceOp.SUM)
                             kl_mean /= self.gpu_world_size
 
                         kl_mean = kl_mean.item()
                         mean_kl += kl_mean
                         # Update the learning rate
-                        # Perform this adaptation only on the main process
-                        # TODO: Is this needed? If KL-divergence is the "same" across all GPUs,
-                        #       then the learning rate should be the same across all GPUs.
                         # NOTE: using stablebaseline3 implementation
                         if self.desired_clipping < 1e-3:
-                            if self.gpu_global_rank == 0:
+                            if self.distributed_actor or self.gpu_global_rank == 0:
+                                # Each rank adapts its own LR when distributed_actor; otherwise only rank 0
                                 if kl_mean > self.desired_kl * 2.0:
                                     self.learning_rate = max(1e-5, self.learning_rate / 1.5)
                                 elif kl_mean < self.desired_kl / 2.0 and kl_mean > 0.0:
                                     self.learning_rate = min(self.max_learning_rate, self.learning_rate * 1.5)
 
-                            # Update the learning rate for all GPUs
-                            if self.is_multi_gpu:
+                            # Broadcast LR from rank 0 (skip when each rank is independent)
+                            if self.is_multi_gpu and not self.distributed_actor:
                                 lr_tensor = torch.tensor(self.learning_rate, device=self.device)
                                 torch.distributed.broadcast(lr_tensor, src=0)
                                 self.learning_rate = lr_tensor.item()
@@ -616,14 +616,14 @@ class PPO(RslRlPPO):
         mean_kl = mean_kl / num_updates
 
         if self.desired_clipping > 0.0:
-            if self.gpu_global_rank == 0:
+            if self.distributed_actor or self.gpu_global_rank == 0:
                 if mean_clipping_ratio > self.desired_clipping * 2.0:
                     self.learning_rate = max(1e-5, self.learning_rate / 1.5)
                 elif mean_clipping_ratio < self.desired_clipping / 2.0 and mean_clipping_ratio > 0.0:
                     self.learning_rate = min(1e-2, self.learning_rate * 1.5)
 
-            # Update the learning rate for all GPUs
-            if self.is_multi_gpu:
+            # Broadcast LR from rank 0 (skip when each rank is independent)
+            if self.is_multi_gpu and not self.distributed_actor:
                 lr_tensor = torch.tensor(self.learning_rate, device=self.device)
                 torch.distributed.broadcast(lr_tensor, src=0)
                 self.learning_rate = lr_tensor.item()
@@ -666,9 +666,12 @@ class PPO(RslRlPPO):
     def reduce_parameters(self):
         """Collect gradients from all GPUs and average them.
 
+        When distributed_actor is enabled, no gradients are synced (fully independent).
         When distributed_critic is enabled, only actor (and other non-critic) gradients are synced.
         Critic gradients remain local to each rank, creating a mixture of critics.
         """
+        if self.distributed_actor:
+            return  # fully independent — no gradient sync
         if self.distributed_critic:
             # Only reduce gradients for non-critic parameters
             grads = []

@@ -382,6 +382,21 @@ class RslRlPpoActorCriticTransformerCfg(RslRlPpoActorCriticCfg):
     Checkpoints will only include rank 0's critic parameters.
     """
 
+    distributed_actor: bool = False
+    """Fully distributed training — no gradient sync for actor or critic.
+
+    Each rank trains completely independently. Each rank saves its own
+    checkpoints and logs to a rank-specific subdirectory. Implies distributed_critic.
+    """
+
+    distributed_s3_prefix: str = ""
+    """S3 prefix for uploading per-rank checkpoints.
+
+    Example: 's3://far-research-internal/yutangl/checkpoints/{run_name}'.
+    '{run_name}' is replaced with the experiment run name at runtime.
+    Each rank uploads to {prefix}/rank_{rank}/.
+    """
+
 @configclass
 class RslRlPpoActorCriticTransformerFlowCfg(RslRlPpoActorCriticCfg):
     """Configuration for the PPO actor-critic networks with transformer layers."""

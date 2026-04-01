@@ -103,11 +103,19 @@ class BaseRunner(OnPolicyRunner):
         self.full_policy_cfg["_args"] = [num_obs, num_privileged_obs, self.env.num_actions]
         self.full_policy_cfg.update(meta_dict)
 
-        # extract distributed_critic flag from policy config (if present) and forward to multi_gpu_cfg
+        # extract distributed training flags from policy config and forward to multi_gpu_cfg
         distributed_critic = self.policy_cfg.pop("distributed_critic", False)
+        distributed_actor = self.policy_cfg.pop("distributed_actor", False)
+        self.distributed_s3_prefix = self.policy_cfg.pop("distributed_s3_prefix", "")
+        if distributed_actor:
+            distributed_critic = True  # distributed_actor implies distributed_critic
         if distributed_critic and self.multi_gpu_cfg is not None:
             self.multi_gpu_cfg["distributed_critic"] = True
-            print(f"[INFO]: Distributed critic enabled — each rank's critic will not sync gradients.")
+            self.multi_gpu_cfg["distributed_actor"] = distributed_actor
+            if distributed_actor:
+                print(f"[INFO]: Fully distributed training — no gradient sync. Each rank trains independently.")
+            else:
+                print(f"[INFO]: Distributed critic enabled — each rank's critic will not sync gradients.")
 
         # evaluate the policy class
         policy_class = eval(self.policy_cfg.pop("class_name"))
@@ -228,10 +236,30 @@ class BaseRunner(OnPolicyRunner):
             self.smp_reward = None
 
         # Decide whether to disable logging
-        # We only log from the process with rank 0 (main process)
-        self.disable_logs = self.is_distributed and self.gpu_global_rank != 0
-        # Logging
-        self.log_dir = log_dir
+        # With distributed_actor, every rank logs and saves independently
+        self.distributed_actor = distributed_actor and self.is_distributed
+        if self.distributed_actor:
+            self.disable_logs = False
+        else:
+            self.disable_logs = self.is_distributed and self.gpu_global_rank != 0
+        # Logging — each rank gets its own subdirectory when distributed_actor is enabled
+        if self.distributed_actor and log_dir is not None:
+            self.log_dir = os.path.join(log_dir, f"rank_{self.gpu_global_rank}")
+        else:
+            self.log_dir = log_dir
+        # Collect per-rank expert metadata (e.g. assigned motion names) for distributed training
+        self.expert_metas = self._collect_expert_metas() if self.distributed_actor else None
+        # Pre-gather all experts' dynamic scores to rank 0 (static, only once)
+        self.all_expert_dynamic_scores = None
+        if self.distributed_actor and self.expert_metas:
+            import torch.distributed as dist
+            local_ds = torch.tensor(
+                [self.expert_metas.get("dynamic_score_mean", 0.0)], device=self.device
+            )
+            gathered = torch.zeros(self.gpu_world_size, device=self.device)
+            dist.all_gather_into_tensor(gathered, local_ds)
+            if self.gpu_global_rank == 0:
+                self.all_expert_dynamic_scores = gathered.cpu().tolist()
         self.writer = None
         self.tot_timesteps = 0
         self.tot_time = 0
@@ -245,17 +273,24 @@ class BaseRunner(OnPolicyRunner):
             self.logger_type = self.cfg.get("logger", "tensorboard")
             self.logger_type = self.logger_type.lower()
 
-            if self.logger_type == "neptune":
+            # With distributed_actor (MoE), only rank 0 creates wandb/neptune to avoid N runs.
+            # Non-rank-0 ranks fall back to tensorboard for local logging only.
+            if self.distributed_actor and self.gpu_global_rank != 0:
+                use_logger = "tensorboard"
+            else:
+                use_logger = self.logger_type
+
+            if use_logger == "neptune":
                 from rsl_rl.utils.neptune_utils import NeptuneSummaryWriter
 
                 self.writer = NeptuneSummaryWriter(log_dir=self.log_dir, flush_secs=10, cfg=self.cfg)
                 self.writer.log_config(self.env.cfg, self.cfg, self.alg_cfg, self.policy_cfg)
-            elif self.logger_type == "wandb":
+            elif use_logger == "wandb":
                 from rsl_rl.utils.wandb_utils import WandbSummaryWriter
 
                 self.writer = WandbSummaryWriter(log_dir=self.log_dir, flush_secs=10, cfg=self.cfg)
                 self.writer.log_config(self.env.cfg, self.cfg, self.alg_cfg, self.policy_cfg)
-            elif self.logger_type == "tensorboard":
+            elif use_logger == "tensorboard":
                 from torch.utils.tensorboard import SummaryWriter # type: ignore
 
                 self.writer = SummaryWriter(log_dir=self.log_dir, flush_secs=10)
@@ -665,12 +700,14 @@ class BaseRunner(OnPolicyRunner):
                 self.writer.add_scalar("Rnd/mean_intrinsic_reward", statistics.mean(locs["irewbuffer"]), locs["it"])
                 self.writer.add_scalar("Rnd/weight", self.alg.rnd.weight, locs["it"])
             # everything else
-            self.writer.add_scalar("Train/mean_reward", statistics.mean(locs["rewbuffer"]), locs["it"])
-            self.writer.add_scalar("Train/mean_episode_length", statistics.mean(locs["lenbuffer"]), locs["it"])
+            local_mean_reward = statistics.mean(locs["rewbuffer"])
+            local_mean_ep_len = statistics.mean(locs["lenbuffer"])
+            self.writer.add_scalar("Train/mean_reward", local_mean_reward, locs["it"])
+            self.writer.add_scalar("Train/mean_episode_length", local_mean_ep_len, locs["it"])
             if self.logger_type != "wandb":  # wandb does not support non-integer x-axis logging
-                self.writer.add_scalar("Train/mean_reward/time", statistics.mean(locs["rewbuffer"]), self.tot_time)
+                self.writer.add_scalar("Train/mean_reward/time", local_mean_reward, self.tot_time)
                 self.writer.add_scalar(
-                    "Train/mean_episode_length/time", statistics.mean(locs["lenbuffer"]), self.tot_time
+                    "Train/mean_episode_length/time", local_mean_ep_len, self.tot_time
                 )
 
         str = f" \033[1m Learning iteration {locs['it']}/{locs['tot_iter']} \033[0m "
@@ -720,9 +757,37 @@ class BaseRunner(OnPolicyRunner):
                 )
             )}\n"""
         )
+        # MoE: log global average and per-expert metrics
+        # All ranks must participate in all_gather (collective op), but only rank 0 writes to wandb.
+        if self.distributed_actor:
+            import torch.distributed as dist
+            local_rew = statistics.mean(locs["rewbuffer"]) if len(locs["rewbuffer"]) > 0 else 0.0
+            local_len = statistics.mean(locs["lenbuffer"]) if len(locs["lenbuffer"]) > 0 else 0.0
+            # Pack reward + ep_len into one tensor for a single all_gather call
+            local_stats = torch.tensor([local_rew, local_len], device=self.device)
+            all_stats = torch.zeros(self.gpu_world_size, 2, device=self.device)
+            dist.all_gather_into_tensor(all_stats, local_stats)
+            all_rewards = all_stats[:, 0]
+            all_ep_lens = all_stats[:, 1]
+            global_mean_reward = all_rewards.mean().item()
+            global_mean_ep_len = all_ep_lens.mean().item()
+            # Only rank 0 logs to wandb; all per-expert metrics go to one run
+            if self.gpu_global_rank == 0 and self.writer is not None:
+                self.writer.add_scalar("MoE/global_mean_reward", global_mean_reward, locs["it"])
+                self.writer.add_scalar("MoE/global_mean_episode_length", global_mean_ep_len, locs["it"])
+                all_rew_cpu = all_rewards.cpu()
+                all_len_cpu = all_ep_lens.cpu()
+                for rank_i in range(self.gpu_world_size):
+                    self.writer.add_scalar(f"MoE/expert_{rank_i}_reward", all_rew_cpu[rank_i].item(), locs["it"])
+                    self.writer.add_scalar(f"MoE/expert_{rank_i}_episode_length", all_len_cpu[rank_i].item(), locs["it"])
+                if self.all_expert_dynamic_scores is not None:
+                    for rank_i, ds in enumerate(self.all_expert_dynamic_scores):
+                        self.writer.add_scalar(f"MoE/expert_{rank_i}_dynamic_score", ds, locs["it"])
+            log_string += f"""{'MoE global mean reward:':>{pad}} {global_mean_reward:.2f}\n"""
+
         print(log_string)
 
-    
+
     def save(self, path: str, infos=None, remove_extras=True):
         # -- Save model
         # Note: when distributed_critic is enabled, only rank 0 saves (disable_logs is True for other ranks).
@@ -756,6 +821,10 @@ class BaseRunner(OnPolicyRunner):
         if hasattr(self.env.unwrapped, "state_dict"):
             saved_dict["environment_state_dict"] = self.env.unwrapped.state_dict()
 
+        # -- Save expert metadata for distributed_actor training
+        if self.expert_metas is not None:
+            saved_dict["expert_metas"] = self.expert_metas
+
         # save model
         torch.save(saved_dict, path)
 
@@ -774,6 +843,53 @@ class BaseRunner(OnPolicyRunner):
         # upload model to external logging service
         if self.logger_type in ["neptune", "wandb"] and not self.disable_logs and self.upload_checkpoint:
             self.writer.save_model(path, self.current_learning_iteration) # type: ignore
+
+        # upload to S3 for distributed_actor training
+        if self.distributed_actor and self.distributed_s3_prefix:
+            self._upload_to_s3(path)
+
+    def _collect_expert_metas(self) -> dict:
+        """Collect metadata about this rank's expert (assigned motions, rank info)."""
+        metas = {
+            "rank": self.gpu_global_rank,
+            "world_size": self.gpu_world_size,
+        }
+        # Get motion names and dynamic scores from the env's motion loader if available
+        env_unwrapped = self.env.unwrapped
+        if hasattr(env_unwrapped, "motion_loader"):
+            ml = env_unwrapped.motion_loader
+            if hasattr(ml, "motion_names"):
+                metas["motion_names"] = ml.motion_names
+                metas["num_motions"] = len(ml.motion_names)
+            # Include dynamic score range if sorted by scores
+            if hasattr(ml, "distributed_motion_sort") and ml.distributed_motion_sort != "alphabetical":
+                try:
+                    import json
+                    with open(ml.distributed_motion_sort, 'r') as f:
+                        scores = json.load(f)
+                    rank_scores = [scores[k] for k in ml.motion_names if k in scores]
+                    if rank_scores:
+                        metas["dynamic_score_min"] = min(rank_scores)
+                        metas["dynamic_score_max"] = max(rank_scores)
+                        metas["dynamic_score_mean"] = sum(rank_scores) / len(rank_scores)
+                except Exception:
+                    pass
+        return metas
+
+    def _upload_to_s3(self, local_path: str):
+        """Upload a checkpoint to S3 in the background."""
+        import subprocess
+        # Derive run_name from log_dir: log_dir is .../experiment_name/timestamp_runname/rank_N
+        # We want the parent of rank_N (or log_dir itself if no rank subdir)
+        run_dir = os.path.dirname(self.log_dir) if self.distributed_actor else self.log_dir
+        run_name = os.path.basename(run_dir)
+        s3_prefix = self.distributed_s3_prefix.replace("{run_name}", run_name)
+        s3_path = f"{s3_prefix}/rank_{self.gpu_global_rank}/{os.path.basename(local_path)}"
+        cmd = ["aws", "s3", "cp", local_path, s3_path, "--quiet"]
+        try:
+            subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception as e:
+            print(f"[WARNING]: S3 upload failed for rank {self.gpu_global_rank}: {e}")
 
     def load(self, path: str, load_optimizer: bool = True):
         loaded_dict = torch.load(path, weights_only=False)
