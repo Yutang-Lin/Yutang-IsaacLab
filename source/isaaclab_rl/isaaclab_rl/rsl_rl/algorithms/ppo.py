@@ -110,6 +110,7 @@ class PPO(RslRlPPO):
         self.use_distillation = use_distillation
         self.distillation_only = distillation_only
         self.distillation_coef = distillation_coef
+        self.distillation_base_lr = learning_rate  # used to keep effective distillation lr constant under adaptive schedule
 
         # PPO parameters
         self.clip_param = clip_param
@@ -496,11 +497,15 @@ class PPO(RslRlPPO):
                 lipschitz_constraint_loss = lipschitz_constraint_loss * 0.0
                 distillation_loss = distillation_loss * 0.0
 
-            loss = surrogate_loss + \
+            # Scale distillation_coef inversely with lr change to keep effective distillation lr constant
+            # Scale PPO loss by 1/distillation_coef so increasing coef dampens PPO gradients
+            effective_distill_coef = self.distillation_coef * (self.distillation_base_lr / max(self.learning_rate, 1e-8))
+            ppo_scale = (1.0 / self.distillation_coef) if (self.use_distillation and self.distillation_coef > 0) else 1.0
+            loss = ppo_scale * (surrogate_loss + \
                 self.value_loss_coef * value_loss - \
                 self.entropy_coef * entropy_batch.mean() + \
-                self.lipschitz_constraint_coef * lipschitz_constraint_loss + \
-                self.distillation_coef * distillation_loss
+                self.lipschitz_constraint_coef * lipschitz_constraint_loss) + \
+                effective_distill_coef * distillation_loss
             
             if hasattr(self.policy, "extra_loss"):
                 for key, value in extra_loss.items():
