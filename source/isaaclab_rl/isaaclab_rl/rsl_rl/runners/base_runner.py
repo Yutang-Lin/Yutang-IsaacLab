@@ -117,6 +117,13 @@ class BaseRunner(OnPolicyRunner):
             else:
                 print(f"[INFO]: Distributed critic enabled — each rank's critic will not sync gradients.")
 
+        # For distributed distillation (MoE→student): each rank loads its own expert as teacher
+        if "teacher_policy_ckpt" in self.policy_cfg and "{rank}" in str(self.policy_cfg["teacher_policy_ckpt"]):
+            self.policy_cfg["teacher_policy_ckpt"] = self.policy_cfg["teacher_policy_ckpt"].replace(
+                "{rank}", str(self.gpu_global_rank)
+            )
+            print(f"[INFO]: Rank {self.gpu_global_rank} loading teacher from: {self.policy_cfg['teacher_policy_ckpt']}")
+
         # evaluate the policy class
         policy_class = eval(self.policy_cfg.pop("class_name"))
         policy: ActorCritic | ActorCriticRecurrent | StudentTeacher | StudentTeacherRecurrent = policy_class(
@@ -242,8 +249,16 @@ class BaseRunner(OnPolicyRunner):
             self.disable_logs = False
         else:
             self.disable_logs = self.is_distributed and self.gpu_global_rank != 0
-        # Logging — each rank gets its own subdirectory when distributed_actor is enabled
+        # Logging — each rank gets its own subdirectory when distributed_actor is enabled.
+        # Broadcast log_dir from rank 0 so all ranks share the same base dir (and wandb group name).
         if self.distributed_actor and log_dir is not None:
+            import torch.distributed as dist
+            if self.gpu_global_rank == 0:
+                dir_list = [log_dir]
+            else:
+                dir_list = [None]
+            dist.broadcast_object_list(dir_list, src=0)
+            log_dir = dir_list[0]
             self.log_dir = os.path.join(log_dir, f"rank_{self.gpu_global_rank}")
         else:
             self.log_dir = log_dir

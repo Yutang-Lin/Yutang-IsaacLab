@@ -189,13 +189,21 @@ class Distillation:
     """
 
     def broadcast_parameters(self):
-        """Broadcast model parameters to all GPUs."""
-        # obtain the model parameters on current GPU
-        model_params = [self.policy.state_dict()]
-        # broadcast the model parameters
-        torch.distributed.broadcast_object_list(model_params, src=0)
-        # load the model parameters on all GPUs from source GPU
-        self.policy.load_state_dict(model_params[0])
+        """Broadcast student parameters to all GPUs.
+
+        Only syncs student (trainable) parameters — teacher weights are kept
+        per-rank so that each rank can have its own expert teacher.
+        """
+        if hasattr(self.policy, "student"):
+            # StudentTeacher: only broadcast student params to preserve per-rank teachers
+            student_params = [self.policy.student.state_dict()]
+            torch.distributed.broadcast_object_list(student_params, src=0)
+            self.policy.student.load_state_dict(student_params[0])
+        else:
+            # fallback for non-StudentTeacher policies
+            model_params = [self.policy.state_dict()]
+            torch.distributed.broadcast_object_list(model_params, src=0)
+            self.policy.load_state_dict(model_params[0])
 
     def reduce_parameters(self):
         """Collect gradients from all GPUs and average them.
