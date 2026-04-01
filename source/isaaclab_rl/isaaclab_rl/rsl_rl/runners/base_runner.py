@@ -249,17 +249,6 @@ class BaseRunner(OnPolicyRunner):
             self.log_dir = log_dir
         # Collect per-rank expert metadata (e.g. assigned motion names) for distributed training
         self.expert_metas = self._collect_expert_metas() if self.distributed_actor else None
-        # Pre-gather all experts' dynamic scores to rank 0 (static, only once)
-        self.all_expert_dynamic_scores = None
-        if self.distributed_actor and self.expert_metas:
-            import torch.distributed as dist
-            local_ds = torch.tensor(
-                [self.expert_metas.get("dynamic_score_mean", 0.0)], device=self.device
-            )
-            gathered = torch.zeros(self.gpu_world_size, device=self.device)
-            dist.all_gather_into_tensor(gathered, local_ds)
-            if self.gpu_global_rank == 0:
-                self.all_expert_dynamic_scores = gathered.cpu().tolist()
         self.writer = None
         self.tot_timesteps = 0
         self.tot_time = 0
@@ -273,11 +262,6 @@ class BaseRunner(OnPolicyRunner):
             self.logger_type = self.cfg.get("logger", "tensorboard")
             self.logger_type = self.logger_type.lower()
 
-            # With distributed_actor (MoE), only rank 0 creates wandb/neptune to avoid N runs.
-            # Non-rank-0 ranks fall back to tensorboard for local logging only.
-            if self.distributed_actor and self.gpu_global_rank != 0:
-                self.logger_type = "tensorboard"
-
             if self.logger_type == "neptune":
                 from rsl_rl.utils.neptune_utils import NeptuneSummaryWriter
 
@@ -286,7 +270,32 @@ class BaseRunner(OnPolicyRunner):
             elif self.logger_type == "wandb":
                 from rsl_rl.utils.wandb_utils import WandbSummaryWriter
 
-                self.writer = WandbSummaryWriter(log_dir=self.log_dir, flush_secs=10, cfg=self.cfg)
+                # MoE: each rank gets its own grouped wandb run so every rank logs directly
+                if self.distributed_actor:
+                    import wandb
+                    run_name = os.path.split(self.log_dir)[-1]
+                    # parent dir name is the group (shared experiment timestamp)
+                    group_name = os.path.basename(os.path.dirname(self.log_dir))
+                    project = self.cfg.get("wandb_project", "LatentControl")
+                    entity = os.environ.get("WANDB_USERNAME", None)
+                    wandb.init(
+                        project=project, entity=entity,
+                        name=f"expert_{self.gpu_global_rank}",
+                        group=group_name,
+                        job_type=f"rank_{self.gpu_global_rank}",
+                    )
+                    wandb.config.update({"log_dir": self.log_dir, "rank": self.gpu_global_rank})
+                    if self.expert_metas:
+                        wandb.config.update({"expert_metas": self.expert_metas})
+                    # Patch wandb.init to no-op so WandbSummaryWriter doesn't create a second run
+                    _orig_wandb_init = wandb.init
+                    wandb.init = lambda *a, **kw: wandb.run
+                    try:
+                        self.writer = WandbSummaryWriter(log_dir=self.log_dir, flush_secs=10, cfg=self.cfg)
+                    finally:
+                        wandb.init = _orig_wandb_init
+                else:
+                    self.writer = WandbSummaryWriter(log_dir=self.log_dir, flush_secs=10, cfg=self.cfg)
                 self.writer.log_config(self.env.cfg, self.cfg, self.alg_cfg, self.policy_cfg)
             elif self.logger_type == "tensorboard":
                 from torch.utils.tensorboard import SummaryWriter # type: ignore
@@ -755,33 +764,15 @@ class BaseRunner(OnPolicyRunner):
                 )
             )}\n"""
         )
-        # MoE: log global average and per-expert metrics
-        # All ranks must participate in all_gather (collective op), but only rank 0 writes to wandb.
-        if self.distributed_actor:
-            import torch.distributed as dist
+        # MoE: each rank logs its own metrics to its own grouped wandb run.
+        # Wandb UI aggregates (mean/min/max) across the group automatically.
+        if self.distributed_actor and self.writer is not None:
             local_rew = statistics.mean(locs["rewbuffer"]) if len(locs["rewbuffer"]) > 0 else 0.0
             local_len = statistics.mean(locs["lenbuffer"]) if len(locs["lenbuffer"]) > 0 else 0.0
-            # Pack reward + ep_len into one tensor for a single all_gather call
-            local_stats = torch.tensor([local_rew, local_len], device=self.device)
-            all_stats = torch.zeros(self.gpu_world_size, 2, device=self.device)
-            dist.all_gather_into_tensor(all_stats, local_stats)
-            all_rewards = all_stats[:, 0]
-            all_ep_lens = all_stats[:, 1]
-            global_mean_reward = all_rewards.mean().item()
-            global_mean_ep_len = all_ep_lens.mean().item()
-            # Only rank 0 logs to wandb; all per-expert metrics go to one run
-            if self.gpu_global_rank == 0 and self.writer is not None:
-                self.writer.add_scalar("MoE/global_mean_reward", global_mean_reward, locs["it"])
-                self.writer.add_scalar("MoE/global_mean_episode_length", global_mean_ep_len, locs["it"])
-                all_rew_cpu = all_rewards.cpu()
-                all_len_cpu = all_ep_lens.cpu()
-                for rank_i in range(self.gpu_world_size):
-                    self.writer.add_scalar(f"MoE/expert_{rank_i}_reward", all_rew_cpu[rank_i].item(), locs["it"])
-                    self.writer.add_scalar(f"MoE/expert_{rank_i}_episode_length", all_len_cpu[rank_i].item(), locs["it"])
-                if self.all_expert_dynamic_scores is not None:
-                    for rank_i, ds in enumerate(self.all_expert_dynamic_scores):
-                        self.writer.add_scalar(f"MoE/expert_{rank_i}_dynamic_score", ds, locs["it"])
-            log_string += f"""{'MoE global mean reward:':>{pad}} {global_mean_reward:.2f}\n"""
+            self.writer.add_scalar("MoE/reward", local_rew, locs["it"])
+            self.writer.add_scalar("MoE/episode_length", local_len, locs["it"])
+            if self.expert_metas and "dynamic_score_mean" in self.expert_metas:
+                self.writer.add_scalar("MoE/dynamic_score", self.expert_metas["dynamic_score_mean"], locs["it"])
 
         print(log_string)
 
