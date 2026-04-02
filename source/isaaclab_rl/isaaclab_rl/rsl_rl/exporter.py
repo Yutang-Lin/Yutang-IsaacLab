@@ -42,6 +42,11 @@ def export_policy_as_onnx(
     """
     if not os.path.exists(path):
         os.makedirs(path, exist_ok=True)
+    from isaaclab_rl.rsl_rl.modules.student_cvae_tracker import StudentCVAETracker
+    target = policy.student if hasattr(policy, "student") else policy
+    if isinstance(target, StudentCVAETracker):
+        print("[INFO]: ONNX export not supported for StudentCVAETracker, skipping.")
+        return
     policy_exporter = _OnnxPolicyExporter(policy, normalizer, verbose)
     policy_exporter.export(path, filename)
 
