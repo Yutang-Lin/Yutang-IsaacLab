@@ -18,7 +18,13 @@ def export_policy_as_jit(policy: object, normalizer: object | None, path: str, f
         path: The path to the saving directory.
         filename: The name of exported JIT file. Defaults to "policy.pt".
     """
-    policy_exporter = _TorchPolicyExporter(policy, normalizer)
+    # StudentCVAETracker has no separate actor — use dedicated exporter
+    from isaaclab_rl.rsl_rl.modules.student_cvae_tracker import StudentCVAETracker
+    target = policy.student if hasattr(policy, "student") else policy
+    if isinstance(target, StudentCVAETracker):
+        policy_exporter = _CVAETrackerExporter(target, normalizer)
+    else:
+        policy_exporter = _TorchPolicyExporter(policy, normalizer)
     policy_exporter.export(path, filename)
 
 
@@ -45,6 +51,37 @@ Helper Classes - Private.
 """
 
 
+class _CVAETrackerExporter(torch.nn.Module):
+    """Exporter for StudentCVAETracker into JIT file.
+
+    Wraps the full act_inference path (obs splitting, prior, action decoding)
+    with an integrated normalizer so the exported model takes raw obs as input.
+    """
+
+    def __init__(self, policy, normalizer: EmpiricalNormalization | None = None):
+        super().__init__()
+        self.policy = copy.deepcopy(policy)
+        self.policy.eval()
+        if normalizer:
+            self.normalizer = copy.deepcopy(normalizer)
+        else:
+            self.normalizer = torch.nn.Identity()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.normalizer(x)
+        return self.policy.act_inference(x)
+
+    def export(self, path, filename):
+        try:
+            os.makedirs(path, exist_ok=True)
+            path = os.path.join(path, filename)
+            self.to("cpu")
+            traced_script_module = torch.jit.script(self)
+            traced_script_module.save(path)
+        except Exception as e:
+            print(f"[WARNING]: Error exporting CVAE tracker policy: {e}", flush=True)
+
+
 class _TorchPolicyExporter(torch.nn.Module):
     """Exporter of actor-critic into JIT file."""
 
@@ -58,7 +95,10 @@ class _TorchPolicyExporter(torch.nn.Module):
                 self.rnn = copy.deepcopy(policy.memory_a.rnn)
         elif hasattr(policy, "student"):
             self.is_recurrent = policy.student.is_recurrent
-            self.actor = copy.deepcopy(policy.student.actor)
+            if hasattr(policy.student, "actor"):
+                self.actor = copy.deepcopy(policy.student.actor)
+            else:
+                raise ValueError("Policy student does not have an actor module. Use _CVAETrackerExporter instead.")
             if self.is_recurrent:
                 self.rnn = copy.deepcopy(policy.student.memory_a.rnn)
             policy = policy.student
@@ -212,7 +252,10 @@ class _OnnxPolicyExporter(torch.nn.Module):
                 self.rnn = copy.deepcopy(policy.memory_a.rnn)
         elif hasattr(policy, "student"):
             self.is_recurrent = policy.student.is_recurrent
-            self.actor = copy.deepcopy(policy.student.actor)
+            if hasattr(policy.student, "actor"):
+                self.actor = copy.deepcopy(policy.student.actor)
+            else:
+                raise ValueError("Policy student does not have an actor module.")
             if self.is_recurrent:
                 self.rnn = copy.deepcopy(policy.student.memory_a.rnn)
             policy = policy.student
