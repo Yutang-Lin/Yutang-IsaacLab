@@ -120,6 +120,9 @@ class StudentCVAETracker(nn.Module):
         self.z_smooth_2nd_coef = cfg.pop("z_smooth_2nd_coef", 1e-3)
         self.c_smooth_1st_coef = cfg.pop("c_smooth_1st_coef", 1e-3)
         self.c_smooth_2nd_coef = cfg.pop("c_smooth_2nd_coef", 1e-3)
+        # Prior output regularization (L2 penalty to keep mu/logvar small)
+        self.prior_mu_reg_coef = cfg.pop("prior_mu_reg_coef", 1e-5)
+        self.prior_logvar_reg_coef = cfg.pop("prior_logvar_reg_coef", 1e-5)
 
         self.latent_dim = latent_dim
         self.corr_rank = corr_rank
@@ -372,6 +375,16 @@ class StudentCVAETracker(nn.Module):
             self._save_dict["cvae_latent_kl"] = latent_kl * self.latent_kl_coef
             self._save_log_dict["cvae_corr_kl"] = corr_kl.item()
             self._save_log_dict["cvae_latent_kl"] = latent_kl.item()
+
+            # -- Prior output regularization (keeps mu/logvar from exploding) --
+            if self.prior_mu_reg_coef > 0:
+                mu_reg = mu_prior.pow(2).mean()
+                self._save_dict["prior_mu_reg"] = mu_reg * self.prior_mu_reg_coef
+                self._save_log_dict["prior_mu_reg"] = mu_reg.item()
+            if self.prior_logvar_reg_coef > 0:
+                logvar_reg = logvar_prior.pow(2).mean()
+                self._save_dict["prior_logvar_reg"] = logvar_reg * self.prior_logvar_reg_coef
+                self._save_log_dict["prior_logvar_reg"] = logvar_reg.item()
 
             # -- Temporal smoothness losses --
             # h_t smoothness
