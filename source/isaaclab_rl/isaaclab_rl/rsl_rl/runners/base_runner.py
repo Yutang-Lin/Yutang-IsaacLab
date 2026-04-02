@@ -250,15 +250,23 @@ class BaseRunner(OnPolicyRunner):
         else:
             self.disable_logs = self.is_distributed and self.gpu_global_rank != 0
         # Logging — each rank gets its own subdirectory when distributed_actor is enabled.
-        # Broadcast log_dir from rank 0 so all ranks share the same base dir (and wandb group name).
+        # Sync log_dir from rank 0 so all ranks share the same base dir (and wandb group).
         if self.distributed_actor and log_dir is not None:
             import torch.distributed as dist
-            if self.gpu_global_rank == 0:
-                dir_list = [log_dir]
-            else:
-                dir_list = [None]
-            dist.broadcast_object_list(dir_list, src=0)
-            log_dir = dir_list[0]
+            import time as _time
+            # Broadcast rank 0's timestamp so all ranks use the same log directory
+            # log_dir ends with a timestamp like "2026-04-02_00-01-31[_run_name]"
+            # We broadcast rank 0's epoch time and reconstruct the same string on all ranks
+            ts = torch.tensor([_time.time()], dtype=torch.double, device=self.device)
+            dist.broadcast(ts, src=0)
+            from datetime import datetime
+            synced_ts = datetime.fromtimestamp(ts.item()).strftime("%Y-%m-%d_%H-%M-%S")
+            # Replace this rank's timestamp with rank 0's in the log_dir
+            base = os.path.dirname(log_dir)  # .../logs/rsl_rl/experiment_name
+            dir_name = os.path.basename(log_dir)  # timestamp[_run_name]
+            # The timestamp is always the first 19 chars (YYYY-MM-DD_HH-MM-SS)
+            suffix = dir_name[19:]  # e.g. "_run_name" or ""
+            log_dir = os.path.join(base, synced_ts + suffix)
             self.log_dir = os.path.join(log_dir, f"rank_{self.gpu_global_rank}")
         else:
             self.log_dir = log_dir
