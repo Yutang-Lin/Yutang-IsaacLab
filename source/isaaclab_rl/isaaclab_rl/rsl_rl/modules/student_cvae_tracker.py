@@ -264,10 +264,13 @@ class StudentCVAETracker(nn.Module):
         r_t = obs[..., self.keybody_ids].contiguous()
         return hp_t, o_t, y_t, r_t
 
+    _LOGVAR_CLAMP = (-20.0, 10.0)  # prevents exp() overflow in sampling and KL
+
     def _compute_prior(self, hp_t: torch.Tensor, y_t: torch.Tensor):
         """Encode history-stacked proprio, compute prior distribution."""
         h_t = self.history_encoder(hp_t)
         mu_prior, logvar_prior = self.prior(h_t, y_t)
+        logvar_prior = logvar_prior.clamp(*self._LOGVAR_CLAMP)
         return mu_prior, logvar_prior
 
     @staticmethod
@@ -340,6 +343,7 @@ class StudentCVAETracker(nn.Module):
 
         h_t = self.history_encoder(hp_t)
         mu_prior, logvar_prior = self.prior(h_t, y_t)
+        logvar_prior = logvar_prior.clamp(*self._LOGVAR_CLAMP)
 
         if self.compute_latent_loss and r_t.shape[-1] > 0:
             # training: use posterior correction
@@ -347,6 +351,7 @@ class StudentCVAETracker(nn.Module):
 
             # posterior correction in low-rank space
             mu_raw, logvar_raw = self.posterior(r_t)
+            logvar_raw = logvar_raw.clamp(*self._LOGVAR_CLAMP)
             c_t, c_raw = self.posterior.sample_and_lift(mu_raw, logvar_raw)
             z_t = z_prior + c_t
 
@@ -359,6 +364,7 @@ class StudentCVAETracker(nn.Module):
             var_raw = logvar_raw.exp()  # [batch, corr_rank]
             W_var = torch.nn.functional.linear(var_raw, W.pow(2))  # [batch, latent_dim]
             logvar_zt = torch.log(logvar_prior.exp() + W_var + 1e-8)
+            logvar_zt = logvar_zt.clamp(*self._LOGVAR_CLAMP)
 
             latent_kl = self._kl_divergence(mu_zt, logvar_zt, mu_prior, logvar_prior)
 
