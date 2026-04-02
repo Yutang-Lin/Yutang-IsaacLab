@@ -45,7 +45,8 @@ def export_policy_as_onnx(
     from isaaclab_rl.rsl_rl.modules.student_cvae_tracker import StudentCVAETracker
     target = policy.student if hasattr(policy, "student") else policy
     if isinstance(target, StudentCVAETracker):
-        print("[INFO]: ONNX export not supported for StudentCVAETracker, skipping.")
+        policy_exporter = _CVAETrackerExporter(target, normalizer)
+        policy_exporter.export_onnx(path, filename)
         return
     policy_exporter = _OnnxPolicyExporter(policy, normalizer, verbose)
     policy_exporter.export(path, filename)
@@ -57,34 +58,78 @@ Helper Classes - Private.
 
 
 class _CVAETrackerExporter(torch.nn.Module):
-    """Exporter for StudentCVAETracker into JIT file.
+    """Exporter for StudentCVAETracker into JIT/ONNX file.
 
-    Wraps the full act_inference path (obs splitting, prior, action decoding)
-    with an integrated normalizer so the exported model takes raw obs as input.
+    Takes three separate inputs (history_proprio, current_proprio, condition),
+    each with its own split normalizer. Excludes the frozen teacher to avoid
+    JIT errors from ActorCritic.distribution being None.
+
+    Exported model signature::
+
+        actions = model(history_proprio, current_proprio, condition)
     """
 
     def __init__(self, policy, normalizer: EmpiricalNormalization | None = None):
         super().__init__()
-        self.policy = copy.deepcopy(policy)
-        self.policy.eval()
-        if normalizer:
-            self.normalizer = copy.deepcopy(normalizer)
-        else:
-            self.normalizer = torch.nn.Identity()
+        # Copy only inference components (no teacher)
+        self.history_encoder = copy.deepcopy(policy.history_encoder)
+        self.prior = copy.deepcopy(policy.prior)
+        self.action_decoder = copy.deepcopy(policy.action_decoder)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.normalizer(x)
-        return self.policy.act_inference(x)
+        # Store dims for dummy input generation
+        self.hp_dim = policy.history_proprio_ids.shape[0]
+        self.o_dim = policy.current_proprio_ids.shape[0]
+        self.y_dim = policy.condition_ids.shape[0]
+
+        # Split normalizer per group
+        if isinstance(normalizer, EmpiricalNormalization):
+            self.hp_normalizer = normalizer.split(policy.history_proprio_ids)
+            self.o_normalizer = normalizer.split(policy.current_proprio_ids)
+            self.y_normalizer = normalizer.split(policy.condition_ids)
+        else:
+            self.hp_normalizer = torch.nn.Identity()
+            self.o_normalizer = torch.nn.Identity()
+            self.y_normalizer = torch.nn.Identity()
+
+    def forward(self, history_proprio: torch.Tensor,
+                current_proprio: torch.Tensor,
+                condition: torch.Tensor) -> torch.Tensor:
+        hp_t = self.hp_normalizer(history_proprio)
+        o_t = self.o_normalizer(current_proprio)
+        y_t = self.y_normalizer(condition)
+        h_t = self.history_encoder(hp_t)
+        mu_prior, _ = self.prior(h_t, y_t)
+        return self.action_decoder(o_t, y_t, mu_prior)
 
     def export(self, path, filename):
+        os.makedirs(path, exist_ok=True)
+        filepath = os.path.join(path, filename)
+        self.to("cpu")
+        self.eval()
+        dummy_hp = torch.zeros(1, self.hp_dim)
+        dummy_o = torch.zeros(1, self.o_dim)
+        dummy_y = torch.zeros(1, self.y_dim)
         try:
-            os.makedirs(path, exist_ok=True)
-            path = os.path.join(path, filename)
-            self.to("cpu")
-            traced_script_module = torch.jit.script(self)
-            traced_script_module.save(path)
+            traced = torch.jit.trace(self, (dummy_hp, dummy_o, dummy_y))
+            traced.save(filepath)
         except Exception as e:
             print(f"[WARNING]: Error exporting CVAE tracker policy: {e}", flush=True)
+
+    def export_onnx(self, path, filename):
+        os.makedirs(path, exist_ok=True)
+        filepath = os.path.join(path, filename)
+        self.to("cpu")
+        self.eval()
+        dummy_hp = torch.zeros(1, self.hp_dim)
+        dummy_o = torch.zeros(1, self.o_dim)
+        dummy_y = torch.zeros(1, self.y_dim)
+        torch.onnx.export(
+            self, (dummy_hp, dummy_o, dummy_y), filepath,
+            export_params=True, opset_version=14,
+            input_names=["history_proprio", "current_proprio", "condition"],
+            output_names=["actions"],
+            dynamic_axes={},
+        )
 
 
 class _TorchPolicyExporter(torch.nn.Module):
