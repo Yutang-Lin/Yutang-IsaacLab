@@ -114,12 +114,12 @@ class StudentCVAETracker(nn.Module):
         self.corr_kl_coef = cfg.pop("corr_kl_coef", 1e-3)
         self.latent_kl_coef = cfg.pop("latent_kl_coef", 1e-3)
         # Temporal smoothness coefficients (first and second order)
-        self.h_smooth_1st_coef = cfg.pop("h_smooth_1st_coef", 0.0)
-        self.h_smooth_2nd_coef = cfg.pop("h_smooth_2nd_coef", 0.0)
-        self.z_smooth_1st_coef = cfg.pop("z_smooth_1st_coef", 0.0)
-        self.z_smooth_2nd_coef = cfg.pop("z_smooth_2nd_coef", 0.0)
-        self.c_smooth_1st_coef = cfg.pop("c_smooth_1st_coef", 0.0)
-        self.c_smooth_2nd_coef = cfg.pop("c_smooth_2nd_coef", 0.0)
+        self.h_smooth_1st_coef = cfg.pop("h_smooth_1st_coef", 1e-3)
+        self.h_smooth_2nd_coef = cfg.pop("h_smooth_2nd_coef", 1e-3)
+        self.z_smooth_1st_coef = cfg.pop("z_smooth_1st_coef", 1e-3)
+        self.z_smooth_2nd_coef = cfg.pop("z_smooth_2nd_coef", 1e-3)
+        self.c_smooth_1st_coef = cfg.pop("c_smooth_1st_coef", 1e-3)
+        self.c_smooth_2nd_coef = cfg.pop("c_smooth_2nd_coef", 1e-3)
 
         self.latent_dim = latent_dim
         self.corr_rank = corr_rank
