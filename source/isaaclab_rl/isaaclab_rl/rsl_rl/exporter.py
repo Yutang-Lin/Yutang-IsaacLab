@@ -97,7 +97,7 @@ class _CVAETrackerExporter(torch.nn.Module):
         hp_t = self.hp_normalizer(history_proprio)
         o_t = self.o_normalizer(current_proprio)
         y_t = self.y_normalizer(condition)
-        h_t = self.history_encoder(hp_t)
+        h_t = torch.nn.functional.normalize(self.history_encoder(hp_t), dim=-1)
         mu_prior, _ = self.prior(h_t, y_t)
         return self.action_decoder(o_t, y_t, mu_prior)
 
