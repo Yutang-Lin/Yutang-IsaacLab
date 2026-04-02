@@ -113,6 +113,13 @@ class StudentCVAETracker(nn.Module):
             tf_activation = resolve_nn_activation(tf_activation_name)
         self.corr_kl_coef = cfg.pop("corr_kl_coef", 1e-3)
         self.latent_kl_coef = cfg.pop("latent_kl_coef", 1e-3)
+        # Temporal smoothness coefficients (first and second order)
+        self.h_smooth_1st_coef = cfg.pop("h_smooth_1st_coef", 0.0)
+        self.h_smooth_2nd_coef = cfg.pop("h_smooth_2nd_coef", 0.0)
+        self.z_smooth_1st_coef = cfg.pop("z_smooth_1st_coef", 0.0)
+        self.z_smooth_2nd_coef = cfg.pop("z_smooth_2nd_coef", 0.0)
+        self.c_smooth_1st_coef = cfg.pop("c_smooth_1st_coef", 0.0)
+        self.c_smooth_2nd_coef = cfg.pop("c_smooth_2nd_coef", 0.0)
 
         self.latent_dim = latent_dim
         self.corr_rank = corr_rank
@@ -198,6 +205,14 @@ class StudentCVAETracker(nn.Module):
         self._save_dict = {}
         self._save_log_dict = {}
         self.compute_latent_loss = False
+
+        # -- Temporal smoothness buffers (populated lazily in act_inference) --
+        self._prev_h: torch.Tensor | None = None
+        self._prev_prev_h: torch.Tensor | None = None
+        self._prev_z: torch.Tensor | None = None
+        self._prev_prev_z: torch.Tensor | None = None
+        self._prev_c: torch.Tensor | None = None
+        self._prev_prev_c: torch.Tensor | None = None
 
     @property
     def student(self):
@@ -302,6 +317,19 @@ class StudentCVAETracker(nn.Module):
             actions = self.teacher.act_inference(teacher_observations, *args, **kwargs)
         return actions
 
+    def _smoothness_loss(self, x: torch.Tensor, prev: torch.Tensor | None, prev_prev: torch.Tensor | None):
+        """Compute first and second order temporal smoothness losses.
+
+        Returns (first_order, second_order) as scalars, or (None, None) if not enough history.
+        """
+        first = None
+        second = None
+        if prev is not None:
+            first = (x - prev).pow(2).mean()
+            if prev_prev is not None:
+                second = (x - 2 * prev + prev_prev).pow(2).mean()
+        return first, second
+
     def act_inference(self, observations, *args, **kwargs):
         """Training update or deployment inference.
 
@@ -310,7 +338,8 @@ class StudentCVAETracker(nn.Module):
         """
         hp_t, o_t, y_t, r_t = self._split_obs(observations)
 
-        mu_prior, logvar_prior = self._compute_prior(hp_t, y_t)
+        h_t = self.history_encoder(hp_t)
+        mu_prior, logvar_prior = self.prior(h_t, y_t)
 
         if self.compute_latent_loss and r_t.shape[-1] > 0:
             # training: use posterior correction
@@ -335,9 +364,47 @@ class StudentCVAETracker(nn.Module):
 
             self._save_dict["cvae_corr_kl"] = corr_kl * self.corr_kl_coef
             self._save_dict["cvae_latent_kl"] = latent_kl * self.latent_kl_coef
-            # Store raw (unscaled) KLs for logging
             self._save_log_dict["cvae_corr_kl"] = corr_kl.item()
             self._save_log_dict["cvae_latent_kl"] = latent_kl.item()
+
+            # -- Temporal smoothness losses --
+            # h_t smoothness
+            if self.h_smooth_1st_coef > 0 or self.h_smooth_2nd_coef > 0:
+                h1, h2 = self._smoothness_loss(h_t, self._prev_h, self._prev_prev_h)
+                if h1 is not None and self.h_smooth_1st_coef > 0:
+                    self._save_dict["smooth_h_1st"] = h1 * self.h_smooth_1st_coef
+                    self._save_log_dict["smooth_h_1st"] = h1.item()
+                if h2 is not None and self.h_smooth_2nd_coef > 0:
+                    self._save_dict["smooth_h_2nd"] = h2 * self.h_smooth_2nd_coef
+                    self._save_log_dict["smooth_h_2nd"] = h2.item()
+
+            # z_prior smoothness
+            if self.z_smooth_1st_coef > 0 or self.z_smooth_2nd_coef > 0:
+                z1, z2 = self._smoothness_loss(z_prior, self._prev_z, self._prev_prev_z)
+                if z1 is not None and self.z_smooth_1st_coef > 0:
+                    self._save_dict["smooth_z_1st"] = z1 * self.z_smooth_1st_coef
+                    self._save_log_dict["smooth_z_1st"] = z1.item()
+                if z2 is not None and self.z_smooth_2nd_coef > 0:
+                    self._save_dict["smooth_z_2nd"] = z2 * self.z_smooth_2nd_coef
+                    self._save_log_dict["smooth_z_2nd"] = z2.item()
+
+            # c_t smoothness
+            if self.c_smooth_1st_coef > 0 or self.c_smooth_2nd_coef > 0:
+                c1, c2 = self._smoothness_loss(c_t, self._prev_c, self._prev_prev_c)
+                if c1 is not None and self.c_smooth_1st_coef > 0:
+                    self._save_dict["smooth_c_1st"] = c1 * self.c_smooth_1st_coef
+                    self._save_log_dict["smooth_c_1st"] = c1.item()
+                if c2 is not None and self.c_smooth_2nd_coef > 0:
+                    self._save_dict["smooth_c_2nd"] = c2 * self.c_smooth_2nd_coef
+                    self._save_log_dict["smooth_c_2nd"] = c2.item()
+
+            # Shift temporal buffers
+            self._prev_prev_h = self._prev_h
+            self._prev_h = h_t.detach()
+            self._prev_prev_z = self._prev_z
+            self._prev_z = z_prior.detach()
+            self._prev_prev_c = self._prev_c
+            self._prev_c = c_t.detach()
         else:
             # inference: use prior mean, no sampling
             z_t = mu_prior
@@ -354,12 +421,22 @@ class StudentCVAETracker(nn.Module):
 
     def pre_train(self):
         self.compute_latent_loss = True
+        # Reset temporal buffers at start of each training epoch
+        self._prev_h = self._prev_prev_h = None
+        self._prev_z = self._prev_prev_z = None
+        self._prev_c = self._prev_prev_c = None
 
     def after_train(self):
         self.compute_latent_loss = False
 
     def reset(self, dones=None, hidden_states=None):
-        pass
+        """Reset temporal smoothness buffers for done environments."""
+        if dones is not None and dones.any():
+            mask = dones.bool()
+            for buf_name in ("_prev_h", "_prev_prev_h", "_prev_z", "_prev_prev_z", "_prev_c", "_prev_prev_c"):
+                buf = getattr(self, buf_name)
+                if buf is not None:
+                    buf[mask] = 0.0
 
     def get_hidden_states(self):
         return None
