@@ -43,6 +43,17 @@ class RslRlDistillationStudentTeacherRecurrentCfg(RslRlDistillationStudentTeache
     """The policy class name. Default is StudentTeacherRecurrent."""
 
 
+@configclass
+class RslRlDistillationStudentCVAETrackerCfg(RslRlDistillationStudentTeacherCfg):
+    """Configuration for the CVAE-based student tracking policy.
+
+    Uses a Conditional VAE with low-rank posterior correction from motion_keybody observations.
+    """
+
+    class_name: str = "StudentCVAETracker"
+    """The policy class name. Default is StudentCVAETracker."""
+
+
 ############################
 # Algorithm configurations #
 ############################

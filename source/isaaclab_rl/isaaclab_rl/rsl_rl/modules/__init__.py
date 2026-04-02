@@ -24,6 +24,7 @@ from .actor_critic_transformer_co_mean_flow import ActorCriticTransformerCoMeanF
 from .actor_critic_transformer_ddim import ActorCriticTransformerDDIM
 from .student_teacher import StudentTeacher
 from .student_teacher_recurrent import StudentTeacherRecurrent
+from .student_cvae_tracker import StudentCVAETracker
 
 import torch
 from typing import Callable
@@ -105,4 +106,5 @@ __all__ = [
     "ActorCriticTransformerMeanFlow",
     "ActorCriticTransformerCoMeanFlow",
     "ActorCriticTransformerDDIM",
+    "StudentCVAETracker",
 ]
