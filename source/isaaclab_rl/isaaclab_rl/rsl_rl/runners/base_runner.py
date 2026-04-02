@@ -22,6 +22,51 @@ from isaaclab_rl.rsl_rl.utils import broadcast_parameters, reduce_gradients
 from collections import deque
 from copy import deepcopy
 
+def _sync_normalizer(normalizer, device):
+    """All-reduce empirical normalizer stats across distributed ranks.
+
+    Combines running mean/var/count from all ranks using parallel statistics merging
+    so each rank benefits from observations seen by every other rank.
+    """
+    if not isinstance(normalizer, EmpiricalNormalization):
+        return
+    import torch.distributed as dist
+
+    count = normalizer.count.clone().float().to(device)
+    mean = normalizer._mean.clone().to(device)
+    var = normalizer._var.clone().to(device)
+
+    # Gather counts from all ranks to compute proper weighted merge
+    world_size = dist.get_world_size()
+    all_counts = [torch.zeros_like(count) for _ in range(world_size)]
+    all_means = [torch.zeros_like(mean) for _ in range(world_size)]
+    all_vars = [torch.zeros_like(var) for _ in range(world_size)]
+
+    dist.all_gather(all_counts, count)
+    dist.all_gather(all_means, mean)
+    dist.all_gather(all_vars, var)
+
+    # Merge using parallel Welford's algorithm
+    total_count = all_counts[0]
+    merged_mean = all_means[0]
+    merged_var = all_vars[0]
+
+    for i in range(1, world_size):
+        n_a = total_count
+        n_b = all_counts[i]
+        n_ab = n_a + n_b
+        if n_ab < 1:
+            continue
+        delta = all_means[i] - merged_mean
+        merged_var = (n_a * merged_var + n_b * all_vars[i] + delta.pow(2) * n_a * n_b / n_ab) / n_ab
+        merged_mean = (n_a * merged_mean + n_b * all_means[i]) / n_ab
+        total_count = n_ab
+
+    normalizer._mean.copy_(merged_mean)
+    normalizer._var.copy_(merged_var)
+    normalizer._std.copy_(torch.sqrt(merged_var))
+    normalizer.count.copy_(total_count.long())
+
 class BaseRunner(OnPolicyRunner):
     """On-policy runner for training and evaluation."""
 
@@ -363,8 +408,10 @@ class BaseRunner(OnPolicyRunner):
         if self.is_distributed:
             print(f"Synchronizing parameters for rank {self.gpu_global_rank}...")
             self.alg.broadcast_parameters()
-            # TODO: Do we need to synchronize empirical normalizers?
-            #   Right now: No, because they all should converge to the same values "asymptotically".
+            # Sync empirical normalizers across ranks (critical for MoE where each rank sees different data)
+            if self.empirical_normalization:
+                _sync_normalizer(self.obs_normalizer, self.device)
+                _sync_normalizer(self.privileged_obs_normalizer, self.device)
             if self.amp_rewards is not None:
                 for k in self.amp_rewards.keys():
                     broadcast_parameters(self.amp_rewards[k].network)
@@ -598,6 +645,11 @@ class BaseRunner(OnPolicyRunner):
                 if len(self.alg.optimizer.param_groups) > 2:
                     self.alg.optimizer.param_groups[2]["lr"] = self._other_lr_backup
                 print(f"[INFO]: Actor warmup complete at iteration {it}, lr restored to full")
+
+            # Sync normalizers across ranks after rollout collection
+            if self.is_distributed and self.empirical_normalization:
+                _sync_normalizer(self.obs_normalizer, self.device)
+                _sync_normalizer(self.privileged_obs_normalizer, self.device)
 
             # train policy
             self.alg.policy.train()
