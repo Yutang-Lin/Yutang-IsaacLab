@@ -75,13 +75,19 @@ class StudentCVAETracker(nn.Module):
         else:
             obs_meta = student_obs_meta
         self.student_obs_meta = obs_meta
-        self.history_proprio_ids, self.current_proprio_ids, self.condition_ids, self.keybody_ids = (
+        history_proprio_ids, current_proprio_ids, condition_ids, keybody_ids = (
             self._resolve_obs_meta(num_student_obs, obs_meta)
         )
-        history_proprio_dim = self.history_proprio_ids.shape[0]
-        current_proprio_dim = self.current_proprio_ids.shape[0]
-        cond_dim = self.condition_ids.shape[0]
-        keybody_dim = self.keybody_ids.shape[0]
+        # Register as buffers so they move with .to(device)
+        self.register_buffer("history_proprio_ids", history_proprio_ids)
+        self.register_buffer("current_proprio_ids", current_proprio_ids)
+        self.register_buffer("condition_ids", condition_ids)
+        self.register_buffer("keybody_ids", keybody_ids)
+
+        history_proprio_dim = history_proprio_ids.shape[0]
+        current_proprio_dim = current_proprio_ids.shape[0]
+        cond_dim = condition_ids.shape[0]
+        keybody_dim = keybody_ids.shape[0]
 
         # -- Extract CVAE hyperparams from student_policy_cfg --
         cfg = dict(student_policy_cfg)  # copy to avoid mutating
@@ -170,6 +176,8 @@ class StudentCVAETracker(nn.Module):
         self.teacher: ActorCritic = teacher_policy_class(*teacher_policy_args, **teacher_policy_cfg)
         self.teacher.load_state_dict(teacher_ckpt["model_state_dict"], strict=True)
         self.teacher.eval()
+        for param in self.teacher.parameters():
+            param.requires_grad = False
         self.loaded_teacher = True
 
         print(f"StudentCVAETracker obs split: history_proprio={history_proprio_dim}, "

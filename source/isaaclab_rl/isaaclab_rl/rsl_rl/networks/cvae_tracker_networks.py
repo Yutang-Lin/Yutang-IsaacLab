@@ -52,8 +52,8 @@ class CVAEPosterior(nn.Module):
         self.corr_rank = corr_rank
         self.latent_dim = latent_dim
 
-    def forward(self, r_t: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Returns (mu_raw, logvar_raw, W) where W is the lifting matrix."""
+    def forward(self, r_t: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Returns (mu_raw, logvar_raw) in low-rank space."""
         out = self.mlp(r_t)
         mu_raw, logvar_raw = out.chunk(2, dim=-1)
         return mu_raw, logvar_raw
