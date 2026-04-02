@@ -69,9 +69,14 @@ class StudentCVAETracker(nn.Module):
             num_student_obs, _ = num_student_obs
 
         # -- Resolve obs meta: split into history proprio, current proprio, condition, and keybody indices --
-        self.student_obs_meta = student_obs_meta
+        # Unwrap nesting: runner passes {actor_obs_meta: {...}, critic_obs_meta: {...}}
+        if "actor_obs_meta" in student_obs_meta:
+            obs_meta = student_obs_meta["actor_obs_meta"]
+        else:
+            obs_meta = student_obs_meta
+        self.student_obs_meta = obs_meta
         self.history_proprio_ids, self.current_proprio_ids, self.condition_ids, self.keybody_ids = (
-            self._resolve_obs_meta(num_student_obs, student_obs_meta)
+            self._resolve_obs_meta(num_student_obs, obs_meta)
         )
         history_proprio_dim = self.history_proprio_ids.shape[0]
         current_proprio_dim = self.current_proprio_ids.shape[0]
