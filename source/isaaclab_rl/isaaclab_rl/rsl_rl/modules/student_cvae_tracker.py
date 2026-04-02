@@ -114,12 +114,12 @@ class StudentCVAETracker(nn.Module):
         self.corr_kl_coef = cfg.pop("corr_kl_coef", 1e-3)
         self.latent_kl_coef = cfg.pop("latent_kl_coef", 1e-3)
         # Temporal smoothness coefficients (first and second order)
-        self.h_smooth_1st_coef = cfg.pop("h_smooth_1st_coef", 1e-3)
-        self.h_smooth_2nd_coef = cfg.pop("h_smooth_2nd_coef", 1e-3)
-        self.z_smooth_1st_coef = cfg.pop("z_smooth_1st_coef", 1e-3)
-        self.z_smooth_2nd_coef = cfg.pop("z_smooth_2nd_coef", 1e-3)
-        self.c_smooth_1st_coef = cfg.pop("c_smooth_1st_coef", 1e-3)
-        self.c_smooth_2nd_coef = cfg.pop("c_smooth_2nd_coef", 1e-3)
+        self.h_smooth_1st_coef = cfg.pop("h_smooth_1st_coef", 2e-4)
+        self.h_smooth_2nd_coef = cfg.pop("h_smooth_2nd_coef", 2e-4)
+        self.z_smooth_1st_coef = cfg.pop("z_smooth_1st_coef", 2e-4)
+        self.z_smooth_2nd_coef = cfg.pop("z_smooth_2nd_coef", 2e-4)
+        self.c_smooth_1st_coef = cfg.pop("c_smooth_1st_coef", 2e-4)
+        self.c_smooth_2nd_coef = cfg.pop("c_smooth_2nd_coef", 2e-4)
         # Prior output regularization (L2 penalty to keep mu/logvar small)
         self.prior_mu_reg_coef = cfg.pop("prior_mu_reg_coef", 1e-5)
         self.prior_logvar_reg_coef = cfg.pop("prior_logvar_reg_coef", 1e-5)
@@ -269,9 +269,15 @@ class StudentCVAETracker(nn.Module):
 
     _LOGVAR_CLAMP = (-20.0, 10.0)  # prevents exp() overflow in sampling and KL
 
+    def _encode_history(self, hp_t: torch.Tensor) -> torch.Tensor:
+        """Encode history-stacked proprio and L2-normalize to unit sphere."""
+        h_t = self.history_encoder(hp_t)
+        h_t = torch.nn.functional.normalize(h_t, dim=-1)
+        return h_t
+
     def _compute_prior(self, hp_t: torch.Tensor, y_t: torch.Tensor):
         """Encode history-stacked proprio, compute prior distribution."""
-        h_t = self.history_encoder(hp_t)
+        h_t = self._encode_history(hp_t)
         mu_prior, logvar_prior = self.prior(h_t, y_t)
         logvar_prior = logvar_prior.clamp(*self._LOGVAR_CLAMP)
         return mu_prior, logvar_prior
@@ -344,7 +350,7 @@ class StudentCVAETracker(nn.Module):
         """
         hp_t, o_t, y_t, r_t = self._split_obs(observations)
 
-        h_t = self.history_encoder(hp_t)
+        h_t = self._encode_history(hp_t)
         mu_prior, logvar_prior = self.prior(h_t, y_t)
         logvar_prior = logvar_prior.clamp(*self._LOGVAR_CLAMP)
 
