@@ -62,10 +62,10 @@ def _sync_normalizer(normalizer, device):
         merged_mean = (n_a * merged_mean + n_b * all_means[i]) / n_ab
         total_count = n_ab
 
-    normalizer._mean.copy_(merged_mean)
-    normalizer._var.copy_(merged_var)
-    normalizer._std.copy_(torch.sqrt(merged_var))
-    normalizer.count.copy_(total_count.long())
+    normalizer._mean.data.copy_(merged_mean)
+    normalizer._var.data.copy_(merged_var)
+    normalizer._std.data.copy_(torch.sqrt(merged_var))
+    normalizer.count.data.copy_(total_count.long())
 
 class BaseRunner(OnPolicyRunner):
     """On-policy runner for training and evaluation."""
