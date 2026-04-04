@@ -119,9 +119,9 @@ class StudentCoDiTTracker(nn.Module):
             f"{self.num_future_frames}*{self.num_keypoints}*{self.dims_per_keypoint} = {expected_cond_dim}"
         )
 
-        # Corruption config
-        sigma_keypoint_range = tuple(cfg.pop("sigma_keypoint_range", [0.0, 0.5]))
-        sigma_frame_range = tuple(cfg.pop("sigma_frame_range", [0.0, 0.3]))
+        # Corruption config (flow-matching time ranges)
+        t_keypoint_range = tuple(cfg.pop("t_keypoint_range", [0.0, 0.5]))
+        t_frame_range = tuple(cfg.pop("t_frame_range", [0.0, 0.3]))
 
         # Transformer config
         tf_d_model = cfg.pop("tf_d_model", 256)
@@ -155,8 +155,8 @@ class StudentCoDiTTracker(nn.Module):
         self.corruptor = FutureCorruptor(
             num_keypoints=self.num_keypoints,
             dims_per_keypoint=self.dims_per_keypoint,
-            sigma_keypoint_range=sigma_keypoint_range,
-            sigma_frame_range=sigma_frame_range,
+            t_keypoint_range=t_keypoint_range,
+            t_frame_range=t_frame_range,
         )
 
         # CoDiT Transformer
@@ -420,8 +420,8 @@ class StudentCoDiTTracker(nn.Module):
 
             # Corruption statistics (tau: [B, T, K+1])
             tau_1 = c["tau_1"]
-            log_dict["codit_sigma_kp_mean"] = tau_1[:, :, :-1].mean().item()
-            log_dict["codit_sigma_frame_mean"] = tau_1[:, :, -1].mean().item()
+            log_dict["codit_t_kp_mean"] = tau_1[:, :, :-1].mean().item()
+            log_dict["codit_t_frame_mean"] = tau_1[:, :, -1].mean().item()
 
             # Per-timestep future prediction error
             y_err = (c["y_hat_1"] - c["y_clean"]).pow(2).mean(dim=(0, 2))  # [T]

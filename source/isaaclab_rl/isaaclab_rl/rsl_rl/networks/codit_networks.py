@@ -20,21 +20,24 @@ from isaaclab_rl.rsl_rl.networks.cvae_tracker_networks import _build_mlp
 
 
 class FutureCorruptor(nn.Module):
-    """Two-level stochastic corruption for future keypoint conditions.
+    """Two-level flow-matching corruption for future keypoint conditions.
 
     For each future frame k (of T total frames), corruption is applied at two levels:
 
-    (A) Keypoint-wise: each of the K keypoints gets an independent noise scale
-        σ_j ~ Uniform(σ_kp_lo, σ_kp_hi) for j = 1..K
+    (A) Keypoint-wise: each of the K keypoints gets an independent time
+        t_j ~ Uniform(t_kp_lo, t_kp_hi) for j = 1..K
 
-    (B) Frame-wise: one additional noise scale shared across all keypoints in the frame
-        σ_frame ~ Uniform(σ_fr_lo, σ_fr_hi)
+    (B) Frame-wise: one additional time shared across all keypoints in the frame
+        t_frame ~ Uniform(t_fr_lo, t_fr_hi)
 
-    The corrupted value for keypoint j in frame k is:
-        y_corrupted[k,j] = y_clean[k,j] + ε_kp * σ_j + ε_frame * σ_frame
+    Combined time per keypoint: t = clamp(t_kp + t_frame, max=1).
+    Linear interpolation (flow matching):
+        y_corrupted[k,j] = (1 - t) * y_clean[k,j] + t * ε,  ε ~ N(0, 1)
 
-    The corruption-state vector tau[k] ∈ R^{K+1} records the sampled sigmas:
-        tau[k] = [σ_1, ..., σ_K, σ_frame]
+    t=0 → clean data, t=1 → pure Gaussian noise.
+
+    The corruption-state vector tau[k] ∈ R^{K+1} records the sampled times:
+        tau[k] = [t_1, ..., t_K, t_frame]
 
     This vector is fed to the transformer so it knows how much corruption was applied.
     No learnable parameters — corruption is purely stochastic.
@@ -44,44 +47,43 @@ class FutureCorruptor(nn.Module):
         self,
         num_keypoints: int = 6,
         dims_per_keypoint: int = 9,
-        sigma_keypoint_range: tuple[float, float] = (0.0, 0.5),
-        sigma_frame_range: tuple[float, float] = (0.0, 0.3),
+        t_keypoint_range: tuple[float, float] = (0.0, 0.5),
+        t_frame_range: tuple[float, float] = (0.0, 0.3),
     ):
         super().__init__()
         self.num_keypoints = num_keypoints
         self.dims_per_keypoint = dims_per_keypoint
-        self.sigma_kp_lo, self.sigma_kp_hi = sigma_keypoint_range
-        self.sigma_fr_lo, self.sigma_fr_hi = sigma_frame_range
+        self.t_kp_lo, self.t_kp_hi = t_keypoint_range
+        self.t_fr_lo, self.t_fr_hi = t_frame_range
 
     def corrupt(self, y_clean: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Apply two-level stochastic corruption to clean future conditions.
+        """Apply two-level flow-matching corruption to clean future conditions.
 
         Args:
             y_clean: [B, T, K, D] clean future keypoints.
 
         Returns:
             y_corrupted: [B, T, K, D] corrupted future keypoints.
-            tau: [B, T, K+1] corruption-state vector (sampled sigmas per frame).
+            tau: [B, T, K+1] corruption-state vector (sampled times per frame).
         """
         B, T, K, D = y_clean.shape
         device = y_clean.device
 
-        # Sample per-keypoint noise scales: [B, T, K]
-        sigma_kp = torch.empty(B, T, K, device=device).uniform_(self.sigma_kp_lo, self.sigma_kp_hi)
+        # Sample per-keypoint times: [B, T, K]
+        t_kp = torch.empty(B, T, K, device=device).uniform_(self.t_kp_lo, self.t_kp_hi)
 
-        # Sample per-frame noise scales: [B, T, 1]
-        sigma_frame = torch.empty(B, T, 1, device=device).uniform_(self.sigma_fr_lo, self.sigma_fr_hi)
+        # Sample per-frame times: [B, T, 1]
+        t_frame = torch.empty(B, T, 1, device=device).uniform_(self.t_fr_lo, self.t_fr_hi)
 
-        # Keypoint-level noise: [B, T, K, D] * [B, T, K, 1]
-        eps_kp = torch.randn(B, T, K, D, device=device) * sigma_kp.unsqueeze(-1)
+        # Combined time per keypoint, clamped to [0, 1]
+        t = (t_kp + t_frame).clamp(max=1.0)  # [B, T, K]
 
-        # Frame-level noise: [B, T, 1, D] * [B, T, 1, 1]
-        eps_frame = torch.randn(B, T, 1, D, device=device) * sigma_frame.unsqueeze(-1)
-
-        y_corrupted = y_clean + eps_kp + eps_frame
+        # Flow-matching linear interpolation: y_t = (1 - t) * y_clean + t * ε
+        eps = torch.randn(B, T, K, D, device=device)
+        y_corrupted = (1.0 - t).unsqueeze(-1) * y_clean + t.unsqueeze(-1) * eps
 
         # Corruption-state vector: [B, T, K+1]
-        tau = torch.cat([sigma_kp, sigma_frame], dim=-1)
+        tau = torch.cat([t_kp, t_frame], dim=-1)
 
         return y_corrupted, tau
 
