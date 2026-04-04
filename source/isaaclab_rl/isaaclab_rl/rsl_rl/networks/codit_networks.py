@@ -194,8 +194,8 @@ class CoDiTTransformer(nn.Module):
         total = T + 2
         mask = torch.ones(total, total, dtype=torch.bool)
         mask[1, 2:] = False  # history cannot attend to future tokens
-        # Register as [1, 1, T+2, T+2] for broadcasting over batch and heads
-        self.register_buffer("attn_mask", mask.unsqueeze(0).unsqueeze(0))
+        # Register as [1, T+2, T+2] — MultiHeadAttention adds the head dim via unsqueeze(-3)
+        self.register_buffer("attn_mask", mask.unsqueeze(0))
 
     def forward(
         self,
