@@ -130,6 +130,7 @@ class Distillation:
                 # compute the extra loss
                 extra_loss = self.policy.extra_loss(
                     obs_batch=obs,
+                    privileged_actions_batch=privileged_actions,
                 )
                 
                 if isinstance(extra_loss, tuple):

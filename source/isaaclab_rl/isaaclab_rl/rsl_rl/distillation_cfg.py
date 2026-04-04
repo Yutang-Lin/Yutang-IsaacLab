@@ -54,6 +54,18 @@ class RslRlDistillationStudentCVAETrackerCfg(RslRlDistillationStudentTeacherCfg)
     """The policy class name. Default is StudentCVAETracker."""
 
 
+@configclass
+class RslRlDistillationStudentCoDiTTrackerCfg(RslRlDistillationStudentTeacherCfg):
+    """Configuration for CoDiT-Track distillation policy.
+
+    Uses a Condition-Denoising Transformer with two-view corruption training,
+    dual action heads (base + conditional), and future denoising auxiliary loss.
+    """
+
+    class_name: str = "StudentCoDiTTracker"
+    """The policy class name. Default is StudentCoDiTTracker."""
+
+
 ############################
 # Algorithm configurations #
 ############################
