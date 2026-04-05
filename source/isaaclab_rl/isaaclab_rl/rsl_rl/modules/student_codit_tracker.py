@@ -364,9 +364,11 @@ class StudentCoDiTTracker(nn.Module):
         B = observations.shape[0]
         T, K = self.num_future_frames, self.num_keypoints
         if self._ep_t_combined is None or self._ep_t_combined.shape[0] != B:
-            self._ep_t_combined = torch.zeros(B, T, K, device=observations.device)
-            self._ep_tau_fixed = torch.zeros(B, T, K + 1, device=observations.device)
-            self._sample_episode_corruption(torch.arange(B, device=observations.device), observations.device)
+            # Create outside inference mode — these buffers are mutated in reset()
+            with torch.inference_mode(False):
+                self._ep_t_combined = torch.zeros(B, T, K, device=observations.device)
+                self._ep_tau_fixed = torch.zeros(B, T, K + 1, device=observations.device)
+                self._sample_episode_corruption(torch.arange(B, device=observations.device), observations.device)
 
         # Corrupt with precomputed episode t (only ε is fresh)
         y_corrupted, tau = self.corruptor.corrupt_rollout(y_clean, self._ep_t_combined, self._ep_tau_fixed)
@@ -500,7 +502,8 @@ class StudentCoDiTTracker(nn.Module):
         if dones is not None and self._ep_t_combined is not None:
             env_ids = dones.bool().flatten().nonzero(as_tuple=False).squeeze(-1)
             if env_ids.numel() > 0:
-                self._sample_episode_corruption(env_ids, self._ep_t_combined.device)
+                with torch.inference_mode(False):
+                    self._sample_episode_corruption(env_ids, self._ep_t_combined.device)
 
     def get_hidden_states(self):
         return None
