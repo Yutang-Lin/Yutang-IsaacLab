@@ -87,8 +87,29 @@ class FutureCorruptor(nn.Module):
 
         return y_corrupted, tau
 
+    def corrupt_fixed(self, y_clean: torch.Tensor, t_per_env: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Apply fixed per-env corruption level (for rollout with episode-level corruption).
+
+        Args:
+            y_clean: [B, T, K, D] clean future keypoints.
+            t_per_env: [B] per-env flow-matching time (held constant for entire episode).
+
+        Returns:
+            y_corrupted: [B, T, K, D] corrupted future keypoints.
+            tau: [B, T, K+1] corruption-state vector (uniform t across all keypoints/frames).
+        """
+        B, T, K, D = y_clean.shape
+        t = t_per_env[:, None, None].expand(B, T, K)  # [B, T, K]
+
+        eps = torch.randn(B, T, K, D, device=y_clean.device)
+        y_corrupted = (1.0 - t).unsqueeze(-1) * y_clean + t.unsqueeze(-1) * eps
+
+        # tau: all keypoint slots = t, frame slot = 0
+        tau = torch.cat([t, torch.zeros(B, T, 1, device=y_clean.device)], dim=-1)
+        return y_corrupted, tau
+
     def no_corrupt(self, y_clean: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return clean conditions with zero corruption state (for inference / rollout).
+        """Return clean conditions with zero corruption state (for pure inference).
 
         Args:
             y_clean: [B, T, K, D] clean future keypoints.

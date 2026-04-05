@@ -141,6 +141,9 @@ class StudentCoDiTTracker(nn.Module):
         self.lambda_base_cons = cfg.pop("lambda_base_cons", 0.1)
         self.lambda_act_view2 = cfg.pop("lambda_act_view2", 1.0)
 
+        # Rollout corruption: per-episode fixed t sampled at reset
+        self.rollout_t_range = tuple(cfg.pop("rollout_t_range", [0.0, 0.8]))
+
         self.num_actions = num_actions
 
         if cfg:
@@ -217,6 +220,8 @@ class StudentCoDiTTracker(nn.Module):
         self._save_log_dict = {}
         self._training_mode = False
         self._cached = {}
+        # Per-env episode corruption level (lazily initialized on first act() call)
+        self._episode_t: torch.Tensor | None = None
 
     @property
     def student(self):
@@ -274,7 +279,7 @@ class StudentCoDiTTracker(nn.Module):
         return y_flat.view(B, self.num_future_frames, self.num_keypoints, self.dims_per_keypoint)
 
     def _forward_clean(self, o_t: torch.Tensor, h_t: torch.Tensor, y_clean: torch.Tensor):
-        """Forward pass with zero corruption (for rollout and inference).
+        """Forward pass with zero corruption (for deployment inference).
 
         Args:
             o_t: [B, proprio_dim]
@@ -308,13 +313,28 @@ class StudentCoDiTTracker(nn.Module):
         raise NotImplementedError
 
     def act(self, observations, *args, **kwargs):
-        """Rollout: forward with clean conditions (no corruption), sample with noise."""
+        """Rollout: forward with per-episode fixed corruption, sample with action noise.
+
+        Obs from env contains clean y_t. We corrupt internally using the per-env
+        episode corruption level (_episode_t). The obs tensor is NOT modified,
+        so the rollout buffer stores clean conditions for training.
+        """
         hp_t, o_t, y_flat = self._split_obs(observations)
         h_t = self.history_encoder(hp_t)
         y_clean = self._reshape_conditions(y_flat)
 
-        # No corruption during rollout — clean conditions, tau=0
-        action_mean = self._forward_clean(o_t, h_t, y_clean)
+        # Lazily init per-env corruption levels
+        B = observations.shape[0]
+        if self._episode_t is None or self._episode_t.shape[0] != B:
+            self._episode_t = torch.empty(B, device=observations.device).uniform_(
+                self.rollout_t_range[0], self.rollout_t_range[1]
+            )
+
+        # Corrupt with per-episode fixed t (fresh noise each step, fixed level per episode)
+        y_corrupted, tau = self.corruptor.corrupt_fixed(y_clean, self._episode_t)
+        y_corrupted_flat = y_corrupted.flatten(start_dim=2)
+        a_base, a_cond, _ = self.transformer(o_t, h_t, y_corrupted_flat, tau)
+        action_mean = a_base + a_cond
 
         std = self.std.expand_as(action_mean)
         self.distribution = Normal(action_mean, std)
@@ -438,7 +458,14 @@ class StudentCoDiTTracker(nn.Module):
         self._cached = {}
 
     def reset(self, dones=None, hidden_states=None):
-        pass  # No recurrence, no temporal buffers
+        """Resample per-episode corruption level for reset envs."""
+        if dones is not None and self._episode_t is not None:
+            reset_mask = dones.bool().flatten()
+            n_reset = reset_mask.sum().item()
+            if n_reset > 0:
+                self._episode_t[reset_mask] = torch.empty(
+                    n_reset, device=self._episode_t.device
+                ).uniform_(self.rollout_t_range[0], self.rollout_t_range[1])
 
     def get_hidden_states(self):
         return None
