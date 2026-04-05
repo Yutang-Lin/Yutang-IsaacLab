@@ -141,8 +141,13 @@ class StudentCoDiTTracker(nn.Module):
         self.lambda_base_cons = cfg.pop("lambda_base_cons", 0.1)
         self.lambda_act_view2 = cfg.pop("lambda_act_view2", 1.0)
 
-        # Rollout corruption: per-episode fixed t sampled at reset
-        self.rollout_t_range = tuple(cfg.pop("rollout_t_range", [0.0, 0.8]))
+        # Rollout corruption: per-episode parameters sampled at reset
+        # t_kp/t_frame: noise level when a keypoint/frame is noisy
+        # p_clean_kp/p_clean_frame: probability of staying clean
+        self.rollout_t_kp_range = tuple(cfg.pop("rollout_t_kp_range", [0.0, 1.0]))
+        self.rollout_t_frame_range = tuple(cfg.pop("rollout_t_frame_range", [0.0, 0.5]))
+        self.rollout_p_clean_kp_range = tuple(cfg.pop("rollout_p_clean_kp_range", [0.0, 1.0]))
+        self.rollout_p_clean_frame_range = tuple(cfg.pop("rollout_p_clean_frame_range", [0.0, 1.0]))
 
         self.num_actions = num_actions
 
@@ -220,8 +225,10 @@ class StudentCoDiTTracker(nn.Module):
         self._save_log_dict = {}
         self._training_mode = False
         self._cached = {}
-        # Per-env episode corruption level (lazily initialized on first act() call)
-        self._episode_t: torch.Tensor | None = None
+        # Per-env episode corruption state (lazily initialized on first act() call)
+        # Precomputed at reset, held constant for entire episode (only ε changes per step)
+        self._ep_t_combined: torch.Tensor | None = None  # [N, T, K]
+        self._ep_tau_fixed: torch.Tensor | None = None    # [N, T, K+1]
 
     @property
     def student(self):
@@ -312,26 +319,57 @@ class StudentCoDiTTracker(nn.Module):
     def forward(self):
         raise NotImplementedError
 
+    def _sample_episode_corruption(self, env_ids: torch.Tensor, device: torch.device):
+        """Sample and precompute corruption state for given env indices.
+
+        Per env: sample t_kp per keypoint (Bernoulli clean/noisy), t_frame per frame
+        (Bernoulli clean/noisy), then combine. All held constant for the episode.
+        """
+        n = env_ids.shape[0]
+        T, K = self.num_future_frames, self.num_keypoints
+
+        # Per-keypoint: each keypoint independently clean or noisy for entire episode
+        t_kp_level = torch.empty(n, device=device).uniform_(*self.rollout_t_kp_range)
+        p_clean_kp = torch.empty(n, device=device).uniform_(*self.rollout_p_clean_kp_range)
+        kp_noisy = torch.rand(n, 1, K, device=device) > p_clean_kp[:, None, None]  # [n, 1, K] broadcast over T
+        t_kp = kp_noisy.float() * t_kp_level[:, None, None]  # [n, 1, K]
+        t_kp = t_kp.expand(n, T, K)  # same mask across all frames
+
+        # Per-frame: each frame independently clean or noisy for entire episode
+        t_frame_level = torch.empty(n, device=device).uniform_(*self.rollout_t_frame_range)
+        p_clean_frame = torch.empty(n, device=device).uniform_(*self.rollout_p_clean_frame_range)
+        frame_noisy = torch.rand(n, T, 1, device=device) > p_clean_frame[:, None, None]  # [n, T, 1]
+        t_frame = frame_noisy.float() * t_frame_level[:, None, None]  # [n, T, 1]
+
+        # Combined t and tau
+        t_combined = (t_kp + t_frame.expand(n, T, K)).clamp(max=1.0)  # [n, T, K]
+        tau = torch.cat([t_kp, t_frame], dim=-1)  # [n, T, K+1]
+
+        self._ep_t_combined[env_ids] = t_combined
+        self._ep_tau_fixed[env_ids] = tau
+
     def act(self, observations, *args, **kwargs):
         """Rollout: forward with per-episode fixed corruption, sample with action noise.
 
-        Obs from env contains clean y_t. We corrupt internally using the per-env
-        episode corruption level (_episode_t). The obs tensor is NOT modified,
-        so the rollout buffer stores clean conditions for training.
+        Obs from env contains clean y_t. We corrupt internally using precomputed
+        per-env episode corruption (t_combined, tau_fixed). Only the Gaussian ε
+        changes each step. The obs tensor is NOT modified, so the rollout buffer
+        stores clean conditions for training.
         """
         hp_t, o_t, y_flat = self._split_obs(observations)
         h_t = self.history_encoder(hp_t)
         y_clean = self._reshape_conditions(y_flat)
 
-        # Lazily init per-env corruption levels
+        # Lazily init per-env corruption state
         B = observations.shape[0]
-        if self._episode_t is None or self._episode_t.shape[0] != B:
-            self._episode_t = torch.empty(B, device=observations.device).uniform_(
-                self.rollout_t_range[0], self.rollout_t_range[1]
-            )
+        T, K = self.num_future_frames, self.num_keypoints
+        if self._ep_t_combined is None or self._ep_t_combined.shape[0] != B:
+            self._ep_t_combined = torch.zeros(B, T, K, device=observations.device)
+            self._ep_tau_fixed = torch.zeros(B, T, K + 1, device=observations.device)
+            self._sample_episode_corruption(torch.arange(B, device=observations.device), observations.device)
 
-        # Corrupt with per-episode fixed t (fresh noise each step, fixed level per episode)
-        y_corrupted, tau = self.corruptor.corrupt_fixed(y_clean, self._episode_t)
+        # Corrupt with precomputed episode t (only ε is fresh)
+        y_corrupted, tau = self.corruptor.corrupt_rollout(y_clean, self._ep_t_combined, self._ep_tau_fixed)
         y_corrupted_flat = y_corrupted.flatten(start_dim=2)
         a_base, a_cond, _ = self.transformer(o_t, h_t, y_corrupted_flat, tau)
         action_mean = a_base + a_cond
@@ -458,14 +496,11 @@ class StudentCoDiTTracker(nn.Module):
         self._cached = {}
 
     def reset(self, dones=None, hidden_states=None):
-        """Resample per-episode corruption level for reset envs."""
-        if dones is not None and self._episode_t is not None:
-            reset_mask = dones.bool().flatten()
-            n_reset = reset_mask.sum().item()
-            if n_reset > 0:
-                self._episode_t[reset_mask] = torch.empty(
-                    n_reset, device=self._episode_t.device
-                ).uniform_(self.rollout_t_range[0], self.rollout_t_range[1])
+        """Resample per-episode corruption state for reset envs."""
+        if dones is not None and self._ep_t_combined is not None:
+            env_ids = dones.bool().flatten().nonzero(as_tuple=False).squeeze(-1)
+            if env_ids.numel() > 0:
+                self._sample_episode_corruption(env_ids, self._ep_t_combined.device)
 
     def get_hidden_states(self):
         return None

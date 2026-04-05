@@ -87,26 +87,30 @@ class FutureCorruptor(nn.Module):
 
         return y_corrupted, tau
 
-    def corrupt_fixed(self, y_clean: torch.Tensor, t_per_env: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Apply fixed per-env corruption level (for rollout with episode-level corruption).
+    def corrupt_rollout(
+        self,
+        y_clean: torch.Tensor,
+        t_combined: torch.Tensor,
+        tau_fixed: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Rollout corruption with per-episode fixed noise levels.
+
+        The combined t per keypoint and the tau vector are precomputed at episode
+        reset and held constant. Only the Gaussian ε is fresh each step.
 
         Args:
             y_clean: [B, T, K, D] clean future keypoints.
-            t_per_env: [B] per-env flow-matching time (held constant for entire episode).
+            t_combined: [B, T, K] precomputed combined t = clamp(t_kp + t_frame, max=1).
+            tau_fixed: [B, T, K+1] precomputed corruption-state vector.
 
         Returns:
             y_corrupted: [B, T, K, D] corrupted future keypoints.
-            tau: [B, T, K+1] corruption-state vector (uniform t across all keypoints/frames).
+            tau_fixed: [B, T, K+1] unchanged corruption-state vector.
         """
         B, T, K, D = y_clean.shape
-        t = t_per_env[:, None, None].expand(B, T, K)  # [B, T, K]
-
         eps = torch.randn(B, T, K, D, device=y_clean.device)
-        y_corrupted = (1.0 - t).unsqueeze(-1) * y_clean + t.unsqueeze(-1) * eps
-
-        # tau: all keypoint slots = t, frame slot = 0
-        tau = torch.cat([t, torch.zeros(B, T, 1, device=y_clean.device)], dim=-1)
-        return y_corrupted, tau
+        y_corrupted = (1.0 - t_combined).unsqueeze(-1) * y_clean + t_combined.unsqueeze(-1) * eps
+        return y_corrupted, tau_fixed
 
     def no_corrupt(self, y_clean: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Return clean conditions with zero corruption state (for pure inference).
