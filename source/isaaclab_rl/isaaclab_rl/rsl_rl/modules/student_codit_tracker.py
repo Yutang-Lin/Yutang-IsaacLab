@@ -119,9 +119,8 @@ class StudentCoDiTTracker(nn.Module):
             f"{self.num_future_frames}*{self.num_keypoints}*{self.dims_per_keypoint} = {expected_cond_dim}"
         )
 
-        # Corruption config (flow-matching time ranges)
-        t_keypoint_range = tuple(cfg.pop("t_keypoint_range", [0.0, 0.5]))
-        t_frame_range = tuple(cfg.pop("t_frame_range", [0.0, 0.3]))
+        # Corruption config (flow-matching time range)
+        t_range = tuple(cfg.pop("t_range", [0.0, 1.0]))
 
         # Transformer config
         tf_d_model = cfg.pop("tf_d_model", 256)
@@ -139,12 +138,9 @@ class StudentCoDiTTracker(nn.Module):
         self.lambda_future = cfg.pop("lambda_future", 1.0)
 
         # Rollout corruption: per-episode parameters sampled at reset
-        # t_kp/t_frame: noise level when a keypoint/frame is noisy
-        # p_clean_kp/p_clean_frame: probability of staying clean
-        self.rollout_t_kp_range = tuple(cfg.pop("rollout_t_kp_range", [0.0, 1.0]))
-        self.rollout_t_frame_range = tuple(cfg.pop("rollout_t_frame_range", [0.0, 0.5]))
-        self.rollout_p_clean_kp_range = tuple(cfg.pop("rollout_p_clean_kp_range", [0.0, 1.0]))
-        self.rollout_p_clean_frame_range = tuple(cfg.pop("rollout_p_clean_frame_range", [0.0, 1.0]))
+        # Each keypoint independently: clean (t=0) or noisy (t sampled from rollout_t_range)
+        self.rollout_t_range = tuple(cfg.pop("rollout_t_range", [0.0, 1.0]))
+        self.rollout_p_clean_range = tuple(cfg.pop("rollout_p_clean_range", [0.0, 1.0]))
 
         self.num_actions = num_actions
 
@@ -160,8 +156,7 @@ class StudentCoDiTTracker(nn.Module):
         self.corruptor = FutureCorruptor(
             num_keypoints=self.num_keypoints,
             dims_per_keypoint=self.dims_per_keypoint,
-            t_keypoint_range=t_keypoint_range,
-            t_frame_range=t_frame_range,
+            t_range=t_range,
         )
 
         # CoDiT Transformer
@@ -225,7 +220,6 @@ class StudentCoDiTTracker(nn.Module):
         # Per-env episode corruption state (lazily initialized on first act() call)
         # Precomputed at reset, held constant for entire episode (only ε changes per step)
         self._ep_t_combined: torch.Tensor | None = None  # [N, T, K]
-        self._ep_tau_fixed: torch.Tensor | None = None    # [N, T, K+1]
 
     @property
     def student(self):
@@ -306,7 +300,7 @@ class StudentCoDiTTracker(nn.Module):
             a_cond: [B, num_actions]
             a_total: [B, num_actions]
             y_hat: [B, T, K*D] denoised future predictions
-            tau: [B, T, K+1] corruption state (for logging)
+            tau: [B, T, K] corruption state (for logging)
         """
         y_corrupted, tau = self.corruptor.corrupt(y_clean)
         y_corrupted_flat = y_corrupted.flatten(start_dim=2)  # [B, T, K*D]
@@ -317,33 +311,27 @@ class StudentCoDiTTracker(nn.Module):
         raise NotImplementedError
 
     def _sample_episode_corruption(self, env_ids: torch.Tensor, device: torch.device):
-        """Sample and precompute corruption state for given env indices.
+        """Sample and precompute per-keypoint corruption state for given env indices.
 
-        Per env: sample t_kp per keypoint (Bernoulli clean/noisy), t_frame per frame
-        (Bernoulli clean/noisy), then combine. All held constant for the episode.
+        Per env: each keypoint independently clean (t=0) or noisy (t sampled).
+        Same mask across all T frames, held constant for the episode.
         """
         n = env_ids.shape[0]
         T, K = self.num_future_frames, self.num_keypoints
 
-        # Per-keypoint: each keypoint independently clean or noisy for entire episode
-        t_kp_level = torch.empty(n, device=device).uniform_(*self.rollout_t_kp_range)
-        p_clean_kp = torch.empty(n, device=device).uniform_(*self.rollout_p_clean_kp_range)
-        kp_noisy = torch.rand(n, 1, K, device=device) > p_clean_kp[:, None, None]  # [n, 1, K] broadcast over T
-        t_kp = kp_noisy.float() * t_kp_level[:, None, None]  # [n, 1, K]
-        t_kp = t_kp.expand(n, T, K)  # same mask across all frames
+        # Per-env: sample noise level and clean probability
+        t_level = torch.empty(n, device=device).uniform_(*self.rollout_t_range)
+        p_clean = torch.empty(n, device=device).uniform_(*self.rollout_p_clean_range)
 
-        # Per-frame: each frame independently clean or noisy for entire episode
-        t_frame_level = torch.empty(n, device=device).uniform_(*self.rollout_t_frame_range)
-        p_clean_frame = torch.empty(n, device=device).uniform_(*self.rollout_p_clean_frame_range)
-        frame_noisy = torch.rand(n, T, 1, device=device) > p_clean_frame[:, None, None]  # [n, T, 1]
-        t_frame = frame_noisy.float() * t_frame_level[:, None, None]  # [n, T, 1]
+        # Per-keypoint Bernoulli: clean or noisy (same across all frames)
+        kp_noisy = torch.rand(n, 1, K, device=device) > p_clean[:, None, None]  # [n, 1, K]
+        t_kp = kp_noisy.float() * t_level[:, None, None]  # [n, 1, K]
+        t_combined = t_kp.expand(n, T, K).contiguous()  # [n, T, K]
 
-        # Combined t and tau
-        t_combined = (t_kp + t_frame.expand(n, T, K)).clamp(max=1.0)  # [n, T, K]
-        tau = torch.cat([t_kp, t_frame], dim=-1)  # [n, T, K+1]
+        # Snap t > 0.75 to 1.0 (pure noise)
+        t_combined = torch.where(t_combined > 0.75, torch.ones_like(t_combined), t_combined)
 
         self._ep_t_combined[env_ids] = t_combined
-        self._ep_tau_fixed[env_ids] = tau
 
     def act(self, observations, *args, **kwargs):
         """Rollout: forward with per-episode fixed corruption, sample with action noise.
@@ -364,11 +352,10 @@ class StudentCoDiTTracker(nn.Module):
             # Create outside inference mode — these buffers are mutated in reset()
             with torch.inference_mode(False):
                 self._ep_t_combined = torch.zeros(B, T, K, device=observations.device)
-                self._ep_tau_fixed = torch.zeros(B, T, K + 1, device=observations.device)
                 self._sample_episode_corruption(torch.arange(B, device=observations.device), observations.device)
 
         # Corrupt with precomputed episode t (only ε is fresh)
-        y_corrupted, tau = self.corruptor.corrupt_rollout(y_clean, self._ep_t_combined, self._ep_tau_fixed)
+        y_corrupted, tau = self.corruptor.corrupt_rollout(y_clean, self._ep_t_combined)
         y_corrupted_flat = y_corrupted.flatten(start_dim=2)
         a_base, a_cond, _ = self.transformer(o_t, h_t, y_corrupted_flat, tau)
         action_mean = a_base + a_cond
@@ -439,8 +426,7 @@ class StudentCoDiTTracker(nn.Module):
             log_dict["codit_a_cond_norm"] = c["a_cond"].norm(dim=-1).mean().item()
 
             tau = c["tau"]
-            log_dict["codit_t_kp_mean"] = tau[:, :, :-1].mean().item()
-            log_dict["codit_t_frame_mean"] = tau[:, :, -1].mean().item()
+            log_dict["codit_t_mean"] = tau.mean().item()
 
             y_err = (c["y_hat"] - c["y_clean"]).pow(2).mean(dim=(0, 2))  # [T]
             log_dict["codit_future_err_mean"] = y_err.mean().item()

@@ -20,25 +20,15 @@ from isaaclab_rl.rsl_rl.networks.cvae_tracker_networks import _build_mlp
 
 
 class FutureCorruptor(nn.Module):
-    """Two-level flow-matching corruption for future keypoint conditions.
+    """Flow-matching corruption for future keypoint conditions.
 
-    For each future frame k (of T total frames), corruption is applied at two levels:
-
-    (A) Keypoint-wise: each of the K keypoints gets an independent time
-        t_j ~ Uniform(t_kp_lo, t_kp_hi) for j = 1..K
-
-    (B) Frame-wise: one additional time shared across all keypoints in the frame
-        t_frame ~ Uniform(t_fr_lo, t_fr_hi)
-
-    Combined time per keypoint: t = clamp(t_kp + t_frame, max=1).
-    Linear interpolation (flow matching):
+    Samples t ~ Uniform(t_lo, t_hi) independently per keypoint per frame.
+    Linear interpolation:
         y_corrupted[k,j] = (1 - t) * y_clean[k,j] + t * ε,  ε ~ N(0, 1)
 
     t=0 → clean data, t=1 → pure Gaussian noise.
 
-    The corruption-state vector tau[k] ∈ R^{K+1} records the sampled times:
-        tau[k] = [t_1, ..., t_K, t_frame]
-
+    The corruption-state vector tau[k] ∈ R^{K} records the sampled t per keypoint.
     This vector is fed to the transformer so it knows how much corruption was applied.
     No learnable parameters — corruption is purely stochastic.
     """
@@ -47,70 +37,58 @@ class FutureCorruptor(nn.Module):
         self,
         num_keypoints: int = 6,
         dims_per_keypoint: int = 9,
-        t_keypoint_range: tuple[float, float] = (0.0, 0.5),
-        t_frame_range: tuple[float, float] = (0.0, 0.3),
+        t_range: tuple[float, float] = (0.0, 1.0),
     ):
         super().__init__()
         self.num_keypoints = num_keypoints
         self.dims_per_keypoint = dims_per_keypoint
-        self.t_kp_lo, self.t_kp_hi = t_keypoint_range
-        self.t_fr_lo, self.t_fr_hi = t_frame_range
+        self.t_lo, self.t_hi = t_range
 
     def corrupt(self, y_clean: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Apply two-level flow-matching corruption to clean future conditions.
+        """Apply flow-matching corruption to clean future conditions.
 
         Args:
             y_clean: [B, T, K, D] clean future keypoints.
 
         Returns:
             y_corrupted: [B, T, K, D] corrupted future keypoints.
-            tau: [B, T, K+1] corruption-state vector (sampled times per frame).
+            tau: [B, T, K] corruption-state vector (sampled t per keypoint per frame).
         """
         B, T, K, D = y_clean.shape
         device = y_clean.device
 
-        # Sample per-keypoint times: [B, T, K]
-        t_kp = torch.empty(B, T, K, device=device).uniform_(self.t_kp_lo, self.t_kp_hi)
-
-        # Sample per-frame times: [B, T, 1]
-        t_frame = torch.empty(B, T, 1, device=device).uniform_(self.t_fr_lo, self.t_fr_hi)
-
-        # Combined time per keypoint, clamped to [0, 1]
-        t = (t_kp + t_frame).clamp(max=1.0)  # [B, T, K]
+        # Sample t directly per keypoint per frame: [B, T, K]
+        t = torch.empty(B, T, K, device=device).uniform_(self.t_lo, self.t_hi)
 
         # Flow-matching linear interpolation: y_t = (1 - t) * y_clean + t * ε
         eps = torch.randn(B, T, K, D, device=device)
         y_corrupted = (1.0 - t).unsqueeze(-1) * y_clean + t.unsqueeze(-1) * eps
 
-        # Corruption-state vector: [B, T, K+1]
-        tau = torch.cat([t_kp, t_frame], dim=-1)
-
-        return y_corrupted, tau
+        # Corruption-state vector: [B, T, K]
+        return y_corrupted, t
 
     def corrupt_rollout(
         self,
         y_clean: torch.Tensor,
-        t_combined: torch.Tensor,
-        tau_fixed: torch.Tensor,
+        t_fixed: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Rollout corruption with per-episode fixed noise levels.
+        """Rollout corruption with per-episode fixed t levels.
 
-        The combined t per keypoint and the tau vector are precomputed at episode
-        reset and held constant. Only the Gaussian ε is fresh each step.
+        t_fixed is precomputed at episode reset and held constant.
+        Only the Gaussian ε is fresh each step.
 
         Args:
             y_clean: [B, T, K, D] clean future keypoints.
-            t_combined: [B, T, K] precomputed combined t = clamp(t_kp + t_frame, max=1).
-            tau_fixed: [B, T, K+1] precomputed corruption-state vector.
+            t_fixed: [B, T, K] precomputed t per keypoint per frame.
 
         Returns:
             y_corrupted: [B, T, K, D] corrupted future keypoints.
-            tau_fixed: [B, T, K+1] unchanged corruption-state vector.
+            t_fixed: [B, T, K] unchanged corruption-state vector.
         """
         B, T, K, D = y_clean.shape
         eps = torch.randn(B, T, K, D, device=y_clean.device)
-        y_corrupted = (1.0 - t_combined).unsqueeze(-1) * y_clean + t_combined.unsqueeze(-1) * eps
-        return y_corrupted, tau_fixed
+        y_corrupted = (1.0 - t_fixed).unsqueeze(-1) * y_clean + t_fixed.unsqueeze(-1) * eps
+        return y_corrupted, t_fixed
 
     def no_corrupt(self, y_clean: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Return clean conditions with zero corruption state (for pure inference).
@@ -120,10 +98,10 @@ class FutureCorruptor(nn.Module):
 
         Returns:
             y_clean: [B, T, K, D] unchanged.
-            tau: [B, T, K+1] all-zeros corruption-state vector.
+            tau: [B, T, K] all-zeros corruption-state vector.
         """
         B, T, K, _ = y_clean.shape
-        tau = torch.zeros(B, T, K + 1, device=y_clean.device)
+        tau = torch.zeros(B, T, K, device=y_clean.device)
         return y_clean, tau
 
 
@@ -166,7 +144,7 @@ class CoDiTTransformer(nn.Module):
 
         self.num_future_frames = num_future_frames
         future_raw_dim = num_keypoints * dims_per_keypoint  # K*D per frame
-        future_token_input_dim = future_raw_dim + num_keypoints + 1  # K*D + tau(K+1)
+        future_token_input_dim = future_raw_dim + num_keypoints  # K*D + tau(K)
         future_output_dim = future_raw_dim  # denoised K*D per frame
 
         # --- Token projections ---
