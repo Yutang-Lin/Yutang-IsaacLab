@@ -137,9 +137,6 @@ class StudentCoDiTTracker(nn.Module):
 
         # Loss weights
         self.lambda_future = cfg.pop("lambda_future", 1.0)
-        self.lambda_shared = cfg.pop("lambda_shared", 0.5)
-        self.lambda_base_cons = cfg.pop("lambda_base_cons", 0.1)
-        self.lambda_act_view2 = cfg.pop("lambda_act_view2", 1.0)
 
         # Rollout corruption: per-episode parameters sampled at reset
         # t_kp/t_frame: noise level when a keypoint/frame is noisy
@@ -387,14 +384,13 @@ class StudentCoDiTTracker(nn.Module):
         return actions
 
     def act_inference(self, observations, *args, **kwargs):
-        """Training: two-view corrupted forward. Inference: clean forward.
+        """Training: single corrupted forward. Inference: clean forward.
 
         During training (_training_mode=True):
           - Applies fresh stochastic corruption to clean conditions
-          - Runs two independent corrupted forwards
-          - Caches all intermediates for extra_loss computation
-          - Each call samples new corruption, so each epoch sees different views
-          - Returns view 1's total action for standard behavior_loss
+          - Runs one corrupted forward, caches for extra_loss (future denoising)
+          - Each call samples new corruption, so each epoch sees different noise
+          - Returns total action (a_base + a_cond) for standard behavior_loss
 
         During inference:
           - Forward with zero corruption (clean conditions, tau=0)
@@ -405,34 +401,25 @@ class StudentCoDiTTracker(nn.Module):
         y_clean = self._reshape_conditions(y_flat)
 
         if self._training_mode:
-            # Two independent corrupted views of the same clean future
-            a_base_1, a_cond_1, a_1, y_hat_1, tau_1 = self._forward_corrupted(o_t, h_t, y_clean)
-            a_base_2, a_cond_2, a_2, y_hat_2, tau_2 = self._forward_corrupted(o_t, h_t, y_clean)
+            a_base, a_cond, a_total, y_hat, tau = self._forward_corrupted(o_t, h_t, y_clean)
 
-            # Cache for extra_loss
+            # Cache for extra_loss (future denoising only)
             y_clean_flat = y_clean.flatten(start_dim=2)  # [B, T, K*D]
             self._cached = {
-                "a_1": a_1, "a_2": a_2,
-                "a_base_1": a_base_1, "a_base_2": a_base_2,
-                "a_cond_1": a_cond_1, "a_cond_2": a_cond_2,
-                "y_hat_1": y_hat_1, "y_hat_2": y_hat_2,
+                "y_hat": y_hat,
                 "y_clean": y_clean_flat,
-                "tau_1": tau_1, "tau_2": tau_2,
+                "tau": tau,
+                "a_base": a_base,
+                "a_cond": a_cond,
             }
-            return a_1  # view 1's action for standard behavior_loss
+            return a_total
         else:
             return self._forward_clean(o_t, h_t, y_clean)
 
     def extra_loss(self, **kwargs):
-        """Compute CoDiT auxiliary losses from cached two-view training results.
+        """Compute future denoising auxiliary loss.
 
-        Losses:
-          - L_act_view2: action distillation for view 2 (if teacher actions available)
-          - L_future: future denoising loss (both views must reconstruct clean future)
-          - L_shared: shared explainability (base branch explains other view's total action)
-          - L_base_cons: weak base action consistency across views
-
-        Also logs norms, variances, and corruption statistics.
+        Also logs action norms and corruption statistics.
         """
         if not self._cached:
             return {}, {}
@@ -441,50 +428,21 @@ class StudentCoDiTTracker(nn.Module):
         loss_dict = {}
         log_dict = {}
 
-        # -- L_future: denoising loss for both views --
-        # Each future token must reconstruct its own clean future value
-        l_future_1 = F.mse_loss(c["y_hat_1"], c["y_clean"])
-        l_future_2 = F.mse_loss(c["y_hat_2"], c["y_clean"])
-        l_future = l_future_1 + l_future_2
+        # -- L_future: denoising loss --
+        l_future = F.mse_loss(c["y_hat"], c["y_clean"])
         loss_dict["codit_future"] = l_future * self.lambda_future
         log_dict["codit_future"] = l_future.item()
 
-        # -- L_shared: shared explainability loss --
-        # Base branch should explain the shared, corruption-invariant part of the teacher-consistent action
-        # Asymmetric through stop-gradient to prevent collapse
-        l_shared = (
-            F.mse_loss(c["a_base_1"], c["a_2"].detach()) +
-            F.mse_loss(c["a_base_2"], c["a_1"].detach())
-        )
-        loss_dict["codit_shared"] = l_shared * self.lambda_shared
-        log_dict["codit_shared"] = l_shared.item()
-
-        # -- L_base_cons: weak base action consistency --
-        l_base_cons = F.mse_loss(c["a_base_1"], c["a_base_2"])
-        loss_dict["codit_base_cons"] = l_base_cons * self.lambda_base_cons
-        log_dict["codit_base_cons"] = l_base_cons.item()
-
-        # -- L_act view 2: action distillation for second corrupted view --
-        privileged_actions = kwargs.get("privileged_actions_batch", None)
-        if privileged_actions is not None:
-            l_act_2 = F.mse_loss(c["a_2"], privileged_actions)
-            loss_dict["codit_act_view2"] = l_act_2 * self.lambda_act_view2
-            log_dict["codit_act_view2"] = l_act_2.item()
-
-        # -- Logging: norms and variances --
+        # -- Logging --
         with torch.no_grad():
-            log_dict["codit_a_base_norm"] = c["a_base_1"].norm(dim=-1).mean().item()
-            log_dict["codit_a_cond_norm"] = c["a_cond_1"].norm(dim=-1).mean().item()
-            log_dict["codit_a_base_var"] = c["a_base_1"].var(dim=0).mean().item()
-            log_dict["codit_a_cond_var"] = c["a_cond_1"].var(dim=0).mean().item()
+            log_dict["codit_a_base_norm"] = c["a_base"].norm(dim=-1).mean().item()
+            log_dict["codit_a_cond_norm"] = c["a_cond"].norm(dim=-1).mean().item()
 
-            # Corruption statistics (tau: [B, T, K+1])
-            tau_1 = c["tau_1"]
-            log_dict["codit_t_kp_mean"] = tau_1[:, :, :-1].mean().item()
-            log_dict["codit_t_frame_mean"] = tau_1[:, :, -1].mean().item()
+            tau = c["tau"]
+            log_dict["codit_t_kp_mean"] = tau[:, :, :-1].mean().item()
+            log_dict["codit_t_frame_mean"] = tau[:, :, -1].mean().item()
 
-            # Per-timestep future prediction error
-            y_err = (c["y_hat_1"] - c["y_clean"]).pow(2).mean(dim=(0, 2))  # [T]
+            y_err = (c["y_hat"] - c["y_clean"]).pow(2).mean(dim=(0, 2))  # [T]
             log_dict["codit_future_err_mean"] = y_err.mean().item()
 
         self._cached = {}
