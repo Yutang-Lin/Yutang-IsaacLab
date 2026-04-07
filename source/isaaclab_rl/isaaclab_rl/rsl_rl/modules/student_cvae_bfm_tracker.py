@@ -114,9 +114,9 @@ class StudentCVAEBFMTracker(nn.Module):
             f"{self.num_frames}*{self.frame_dim} = {expected_cond_dim}"
         )
 
-        # Episodic frame interval range (in steps)
-        self.min_frame_interval = cfg.pop("min_frame_interval", 1)
-        self.max_frame_interval = cfg.pop("max_frame_interval", 5)
+        # Episodic frame interval range (in seconds)
+        self.min_frame_dt = cfg.pop("min_frame_dt", 0.02)
+        self.max_frame_dt = cfg.pop("max_frame_dt", 0.1)
         # Episodic frame mask probability
         self.frame_p_active_range = tuple(cfg.pop("frame_p_active_range", [0.5, 1.0]))
         # Episodic keypoint mask
@@ -318,18 +318,20 @@ class StudentCVAEBFMTracker(nn.Module):
         F = self.num_frames
         K = self.rollout_mask_num_keypoints
 
-        # Sample per-env interval, build sorted offsets
-        intervals = torch.empty(n, device=device).uniform_(
-            self.min_frame_interval * self.step_dt,
-            self.max_frame_interval * self.step_dt)
+        # Sample per-env interval (seconds), build sorted offsets
+        intervals = torch.empty(n, device=device).uniform_(self.min_frame_dt, self.max_frame_dt)
         step_indices = torch.arange(1, F + 1, device=device, dtype=torch.float32)
-        offsets = step_indices[None, :] * intervals[:, None]  # [n, F], starts at interval, not 0
+        offsets = step_indices[None, :] * intervals[:, None]  # [n, F]
         self._ep_frame_offsets[env_ids] = offsets
 
-        # Frame mask: episodic per-frame active mask
+        # Frame mask: episodic per-frame active mask (at least 1 active)
         p_active = torch.empty(n, device=device).uniform_(*self.frame_p_active_range)
         frame_mask = torch.rand(n, F, device=device) < p_active[:, None]
-        frame_mask[:, 0] = True
+        # Ensure at least 1 active: if all False, activate a random slot
+        all_off = ~frame_mask.any(dim=1)  # [n]
+        if all_off.any():
+            rand_slot = torch.randint(0, F, (all_off.sum(),), device=device)
+            frame_mask[all_off, rand_slot] = True
         self._ep_frame_mask[env_ids] = frame_mask
 
         # Keypoint mask
@@ -363,8 +365,7 @@ class StudentCVAEBFMTracker(nn.Module):
             n = consumed.sum()
             last = offsets[consumed, -2]
             new_interval = torch.empty(n, device=offsets.device).uniform_(
-                self.min_frame_interval * self.step_dt,
-                self.max_frame_interval * self.step_dt)
+                self.min_frame_dt, self.max_frame_dt)
             offsets[consumed, -1] = last + new_interval
 
             # New frame mask for appended slot
@@ -465,10 +466,13 @@ class StudentCVAEBFMTracker(nn.Module):
 
         # During training: apply fresh random masks each call
         if self.compute_latent_loss:
-            # Random frame mask
+            # Random frame mask (at least 1 active)
             p_active = torch.empty(B, device=frames.device).uniform_(*self.frame_p_active_range)
             frame_mask = torch.rand(B, F, device=frames.device) < p_active[:, None]
-            frame_mask[:, 0] = True
+            all_off = ~frame_mask.any(dim=1)
+            if all_off.any():
+                rand_slot = torch.randint(0, F, (all_off.sum(),), device=frames.device)
+                frame_mask[all_off, rand_slot] = True
             # Random keypoint mask
             kp_mask = None
             if K > 0:
