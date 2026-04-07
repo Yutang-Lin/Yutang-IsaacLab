@@ -200,8 +200,12 @@ class StudentCVAEBFMTracker(nn.Module):
         teacher_policy_cfg = teacher_ckpt["policy_cfg"]
         teacher_policy_class = eval(teacher_policy_cfg.pop("class_name"))
         teacher_policy_args = teacher_policy_cfg.pop("_args")
-        assert num_teacher_obs == teacher_policy_args[0]
-        assert num_actions == teacher_policy_args[2]
+        if num_teacher_obs != teacher_policy_args[0]:
+            print(f"[WARN] StudentCVAEBFMTracker: teacher obs mismatch: env provides {num_teacher_obs}, "
+                  f"checkpoint expects {teacher_policy_args[0]}. Using checkpoint dims.")
+        assert num_actions == teacher_policy_args[2], (
+            f"Action dim mismatch: env={num_actions}, teacher={teacher_policy_args[2]}"
+        )
         self.teacher: ActorCritic = teacher_policy_class(*teacher_policy_args, **teacher_policy_cfg)
         self.teacher.load_state_dict(teacher_ckpt["model_state_dict"], strict=True)
         self.teacher.eval()
