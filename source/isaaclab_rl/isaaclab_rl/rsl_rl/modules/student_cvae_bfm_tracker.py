@@ -32,7 +32,7 @@ from .actor_critic_tf_recurrent_latent import ActorCriticTFRecurrentLatent
 from .actor_critic_transformer_latent import ActorCriticTransformerLatent
 from .actor_critic_transformer_residual import ActorCriticTransformerResidual
 
-from isaaclab_rl.rsl_rl.networks.cvae_tracker_networks import _build_mlp, CVAEPosterior
+from isaaclab_rl.rsl_rl.networks.cvae_tracker_networks import _build_mlp
 from isaaclab_rl.rsl_rl.networks.cvae_bfm_networks import CVAEBFMDecoder
 
 
@@ -96,9 +96,9 @@ class StudentCVAEBFMTracker(nn.Module):
         activation = resolve_nn_activation(activation_name)
 
         latent_dim = cfg.pop("latent_dim", 32)
-        corr_rank = cfg.pop("corr_rank", 8)
+        cfg.pop("corr_rank", None)  # unused, posterior outputs latent_dim directly
         cfg.pop("history_hidden_dims", None)  # unused, prior handles compression
-        prior_hidden_dims = cfg.pop("prior_hidden_dims", [256, 128])
+        prior_hidden_dims = cfg.pop("prior_hidden_dims", [512, 256, 128])
         posterior_hidden_dims = cfg.pop("posterior_hidden_dims", [256, 128])
 
         # BFM frame parameters
@@ -135,35 +135,22 @@ class StudentCVAEBFMTracker(nn.Module):
         else:
             tf_activation = resolve_nn_activation(tf_activation_name)
 
-        # KL and smoothness coefficients
+        # Loss coefficients
         self.corr_kl_coef = cfg.pop("corr_kl_coef", 1e-3)
-        self.latent_kl_coef = cfg.pop("latent_kl_coef", 1e-3)
-        # Smoothness losses removed: training batches aren't temporally ordered,
-        # so comparing consecutive act_inference calls is meaningless.
-        self.prior_mu_reg_coef = cfg.pop("prior_mu_reg_coef", 1e-5)
-        self.prior_logvar_reg_coef = cfg.pop("prior_logvar_reg_coef", 1e-5)
+        self.prior_reg_coef = cfg.pop("prior_reg_coef", 1e-5)
 
         self.latent_dim = latent_dim
-        self.corr_rank = corr_rank
         self.num_actions = num_actions
 
         if cfg:
             print(f"StudentCVAEBFMTracker: unused config keys: {list(cfg.keys())}")
 
         # -- Build sub-networks --
-        # Prior: MLP from raw history proprio → (mu, logvar)
-        # No separate history encoder — prior handles compression directly
-        prior_hidden_dims = cfg.pop("prior_hidden_dims", [512, 256, 128])
-        prior_output_dim = 2 * latent_dim  # mu + logvar
-        self.prior = _build_mlp(history_proprio_dim, prior_hidden_dims, prior_output_dim, activation)
+        # Prior: MLP(hp_t) → h_prior (deterministic, latent_dim)
+        self.prior = _build_mlp(history_proprio_dim, prior_hidden_dims, latent_dim, activation)
 
-        self.posterior = CVAEPosterior(
-            keybody_dim=keybody_dim,
-            corr_rank=corr_rank,
-            latent_dim=latent_dim,
-            hidden_dims=posterior_hidden_dims,
-            activation=activation,
-        )
+        # Posterior: MLP(r_t) → (mu, logvar) in latent_dim directly (no low-rank)
+        self.posterior = _build_mlp(keybody_dim, posterior_hidden_dims, 2 * latent_dim, activation)
 
         # BFM decoder: per-frame tokens with pad masking
         self.action_decoder = CVAEBFMDecoder(
@@ -269,20 +256,21 @@ class StudentCVAEBFMTracker(nn.Module):
         return frames, delta_t
 
     def _compute_prior(self, hp_t):
-        """Compute prior from raw history proprio."""
-        prior_out = self.prior(hp_t)
-        return prior_out.chunk(2, dim=-1)  # mu, logvar
+        """Prior: deterministic encoding from history."""
+        return self.prior(hp_t)  # [B, latent_dim]
 
-    def _sample_gaussian(self, mu, logvar):
+    def _compute_posterior(self, r_t):
+        """Posterior: sample correction from clean keybody."""
+        out = self.posterior(r_t)
+        mu, logvar = out.chunk(2, dim=-1)
+        logvar = logvar.clamp(*self._LOGVAR_CLAMP)
         std = (0.5 * logvar).exp()
-        return mu + std * torch.randn_like(std)
+        c_t = mu + std * torch.randn_like(std)
+        return c_t, mu, logvar
 
-    def _kl_divergence(self, mu, logvar, mu_t=None, logvar_t=None):
-        if mu_t is None:
-            return 0.5 * (mu.pow(2) + logvar.exp() - logvar - 1).mean()
-        else:
-            kl = 0.5 * ((logvar_t - logvar) + (logvar.exp() + (mu - mu_t).pow(2)) / logvar_t.exp() - 1)
-            return kl.mean()
+    def _kl_standard_normal(self, mu, logvar):
+        """KL(N(mu, sigma) || N(0, I))."""
+        return 0.5 * (mu.pow(2) + logvar.exp() - logvar - 1).mean()
 
 
     # -- Episodic sampling + sliding window --
@@ -417,11 +405,10 @@ class StudentCVAEBFMTracker(nn.Module):
         masked_frames = self._apply_masks(frames, self._ep_frame_mask, self._ep_kp_mask)
         cur_frame_mask = self._ep_frame_mask[:B]
 
-        mu_prior, logvar_prior = self._compute_prior(hp_t)
-        logvar_prior = logvar_prior.clamp(*self._LOGVAR_CLAMP)
-        z_t = self._sample_gaussian(mu_prior, logvar_prior)
+        h_prior = self._compute_prior(hp_t)
+        c_t = torch.zeros(B, self.latent_dim, device=observations.device)
 
-        action_mean = self.action_decoder(o_t, z_t, masked_frames, delta_t, cur_frame_mask)
+        action_mean = self.action_decoder(o_t, h_prior, c_t, masked_frames, delta_t, cur_frame_mask)
 
         std = self.std.expand_as(action_mean)
         self.distribution = Normal(action_mean, std)
@@ -460,30 +447,20 @@ class StudentCVAEBFMTracker(nn.Module):
 
         masked_frames = self._apply_masks(frames, frame_mask, kp_mask)
 
-        mu_prior, logvar_prior = self._compute_prior(hp_t)
-        logvar_prior = logvar_prior.clamp(*self._LOGVAR_CLAMP)
+        h_prior = self._compute_prior(hp_t)
 
         if self.compute_latent_loss and r_t.shape[-1] > 0:
-            z_prior = self._sample_gaussian(mu_prior, logvar_prior)
-            mu_raw, logvar_raw = self.posterior(r_t)
-            logvar_raw = logvar_raw.clamp(*self._LOGVAR_CLAMP)
-            c_t, c_raw = self.posterior.sample_and_lift(mu_raw, logvar_raw)
-            z_t = z_prior + c_t
-
-            corr_kl = self._kl_divergence(mu_raw, logvar_raw)
-            # KL(q(z_t) || p(z_prior)): posterior mean is prior + lifted correction
-            mu_posterior = mu_prior + self.posterior.lift(mu_raw)
-            latent_kl = self._kl_divergence(mu_posterior, logvar_prior,
-                                            mu_prior.detach(), logvar_prior.detach())
+            c_t, mu_post, logvar_post = self._compute_posterior(r_t)
+            corr_kl = self._kl_standard_normal(mu_post, logvar_post)
 
             self._save_dict = {
-                "corr_kl": corr_kl, "latent_kl": latent_kl,
-                "mu_prior": mu_prior, "logvar_prior": logvar_prior,
+                "corr_kl": corr_kl,
+                "h_prior": h_prior,
             }
         else:
-            z_t = mu_prior
+            c_t = torch.zeros(B, self.latent_dim, device=frames.device)
 
-        action_mean = self.action_decoder(o_t, z_t, masked_frames, delta_t, frame_mask)
+        action_mean = self.action_decoder(o_t, h_prior, c_t, masked_frames, delta_t, frame_mask)
         return action_mean
 
     def extra_loss(self, **kwargs):
@@ -496,16 +473,10 @@ class StudentCVAEBFMTracker(nn.Module):
 
         loss_dict["corr_kl"] = d["corr_kl"] * self.corr_kl_coef
         log_dict["corr_kl"] = d["corr_kl"].item()
-        loss_dict["latent_kl"] = d["latent_kl"] * self.latent_kl_coef
-        log_dict["latent_kl"] = d["latent_kl"].item()
 
-        # Prior regularization
-        mu_p = d["mu_prior"]
-        lv_p = d["logvar_prior"]
-        if self.prior_mu_reg_coef > 0:
-            loss_dict["prior_mu_reg"] = mu_p.pow(2).mean() * self.prior_mu_reg_coef
-        if self.prior_logvar_reg_coef > 0:
-            loss_dict["prior_logvar_reg"] = lv_p.pow(2).mean() * self.prior_logvar_reg_coef
+        # Prior regularization (L2 on h_prior)
+        if self.prior_reg_coef > 0:
+            loss_dict["prior_reg"] = d["h_prior"].pow(2).mean() * self.prior_reg_coef
 
         self._save_dict = {}
         return dict(loss_dict), dict(log_dict)

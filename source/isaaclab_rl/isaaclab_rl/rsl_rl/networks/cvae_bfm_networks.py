@@ -117,17 +117,16 @@ class CVAEBFMPrior(nn.Module):
 
 
 class CVAEBFMDecoder(nn.Module):
-    """Transformer action decoder with per-frame future tokens.
+    """Transformer action decoder with prior, posterior, and per-frame tokens.
 
-    Token layout: [proprio(0), latent(1), frame_0(2), ..., frame_{F-1}(F+1)]
+    Token layout: [proprio(0), prior(1), posterior(2), frame_0(3), ..., frame_{F-1}(F+2)]
 
-    Each frame token is projected from: keypoint_data(K*D) + delta_t(1).
-    Masked frames are excluded from attention via a dynamic pad mask.
+    - proprio: current proprioceptive state
+    - prior: deterministic history encoding (h_prior from prior MLP)
+    - posterior: correction token (c_t sampled from posterior, zero at inference)
+    - frames: future keypoint targets with delta_t and pad masking
+
     Action is decoded from the proprio token output.
-
-    The latent token (z_t from CVAE prior/posterior) provides stochastic
-    conditioning that captures mode information beyond what the sparse
-    frames provide.
     """
 
     def __init__(
@@ -154,16 +153,18 @@ class CVAEBFMDecoder(nn.Module):
 
         # Token projections
         self.proprio_proj = nn.Linear(proprio_dim, d_model)
-        self.latent_proj = nn.Linear(latent_dim, d_model)
+        self.prior_proj = nn.Linear(latent_dim, d_model)
+        self.posterior_proj = nn.Linear(latent_dim, d_model)
         self.frame_proj = nn.Sequential(
             nn.Linear(frame_input_dim, d_model),
             activation,
             nn.Linear(d_model, d_model),
         )
 
-        # Learned embeddings for proprio and latent tokens
+        # Learned embeddings
         self.proprio_embed = nn.Parameter(torch.randn(d_model) * 0.02)
-        self.latent_embed = nn.Parameter(torch.randn(d_model) * 0.02)
+        self.prior_embed = nn.Parameter(torch.randn(d_model) * 0.02)
+        self.posterior_embed = nn.Parameter(torch.randn(d_model) * 0.02)
 
         # Sinusoidal time embedding for frame tokens (computed from delta_t)
         # Precompute frequency bands: exp(-i * log(10000) / (d/2))
@@ -202,7 +203,8 @@ class CVAEBFMDecoder(nn.Module):
     def forward(
         self,
         o_t: torch.Tensor,
-        z_t: torch.Tensor,
+        h_prior: torch.Tensor,
+        c_t: torch.Tensor,
         frames_flat: torch.Tensor,
         delta_t: torch.Tensor,
         frame_mask: torch.Tensor,
@@ -211,7 +213,8 @@ class CVAEBFMDecoder(nn.Module):
 
         Args:
             o_t: [B, proprio_dim] current proprio.
-            z_t: [B, latent_dim] CVAE latent sample.
+            h_prior: [B, latent_dim] deterministic prior encoding.
+            c_t: [B, latent_dim] posterior correction (zero at inference).
             frames_flat: [B, F, K*D] selected future keypoint data.
             delta_t: [B, F] time offset per frame (seconds).
             frame_mask: [B, F] bool, True=active, False=pad.
@@ -221,35 +224,30 @@ class CVAEBFMDecoder(nn.Module):
         """
         B, F = frames_flat.shape[:2]
 
-        tok_proprio = self.proprio_proj(o_t) + self.proprio_embed  # [B, d]
-        tok_latent = self.latent_proj(z_t) + self.latent_embed  # [B, d]
+        tok_proprio = self.proprio_proj(o_t) + self.proprio_embed
+        tok_prior = self.prior_proj(h_prior) + self.prior_embed
+        tok_posterior = self.posterior_proj(c_t) + self.posterior_embed
 
-        # Frame tokens: concat keypoint data + delta_t, project
-        frame_input = torch.cat([frames_flat, delta_t.unsqueeze(-1)], dim=-1)  # [B, F, K*D+1]
-        tok_frames = self.frame_proj(frame_input)  # [B, F, d]
-        # Sinusoidal time embedding from delta_t
-        tok_frames = tok_frames + self._sinusoidal_embed(delta_t)  # [B, F, d]
+        # Frame tokens
+        frame_input = torch.cat([frames_flat, delta_t.unsqueeze(-1)], dim=-1)
+        tok_frames = self.frame_proj(frame_input)
+        tok_frames = tok_frames + self._sinusoidal_embed(delta_t)
 
-        # Assemble: [B, F+2, d]
+        # Assemble: [B, F+3, d]
         tokens = torch.cat([
             tok_proprio.unsqueeze(1),
-            tok_latent.unsqueeze(1),
+            tok_prior.unsqueeze(1),
+            tok_posterior.unsqueeze(1),
             tok_frames,
         ], dim=1)
 
-        # Build attention mask: [B, F+2, F+2]
-        # proprio and latent always attend to each other and all active frames
-        # masked frames can't be attended to or attend to anything
-        total = F + 2
+        # Attention mask: proprio, prior, posterior always attend to each other
+        # Masked frames excluded from attention
+        total = F + 3
         attn_mask = torch.ones(B, total, total, dtype=torch.bool, device=o_t.device)
-
-        # Mask out inactive frame columns (no one can attend to them)
-        # and inactive frame rows (they can't attend to anything)
-        frame_active = frame_mask  # [B, F]
-        # Columns 2..F+1: set to False where frame is inactive
-        attn_mask[:, :, 2:] &= frame_active.unsqueeze(1)  # [B, total, F]
-        # Rows 2..F+1: set to False where frame is inactive
-        attn_mask[:, 2:, :] &= frame_active.unsqueeze(2)  # [B, F, total]
+        frame_active = frame_mask
+        attn_mask[:, :, 3:] &= frame_active.unsqueeze(1)
+        attn_mask[:, 3:, :] &= frame_active.unsqueeze(2)
 
         out = self.transformer(tokens, attn_mask=attn_mask)
 
