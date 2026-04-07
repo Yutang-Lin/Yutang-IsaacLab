@@ -78,6 +78,18 @@ class RslRlDistillationStudentCoDiTMFTrackerCfg(RslRlDistillationStudentTeacherC
     """The policy class name. Default is StudentCoDiTMFTracker."""
 
 
+@configclass
+class RslRlDistillationStudentCVAEBFMTrackerCfg(RslRlDistillationStudentTeacherCfg):
+    """Configuration for CVAE-BFM foundation model distillation policy.
+
+    Uses variable-interval 10-frame future conditioning with delta_t,
+    per-frame pad masking, and binary keypoint masking.
+    """
+
+    class_name: str = "StudentCVAEBFMTracker"
+    """The policy class name. Default is StudentCVAEBFMTracker."""
+
+
 ############################
 # Algorithm configurations #
 ############################

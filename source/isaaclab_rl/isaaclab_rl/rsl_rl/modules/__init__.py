@@ -27,6 +27,7 @@ from .student_teacher_recurrent import StudentTeacherRecurrent
 from .student_cvae_tracker import StudentCVAETracker
 from .student_codit_tracker import StudentCoDiTTracker
 from .student_codit_mf_tracker import StudentCoDiTMFTracker
+from .student_cvae_bfm_tracker import StudentCVAEBFMTracker
 
 import torch
 from typing import Callable
@@ -111,4 +112,5 @@ __all__ = [
     "StudentCVAETracker",
     "StudentCoDiTTracker",
     "StudentCoDiTMFTracker",
+    "StudentCVAEBFMTracker",
 ]
