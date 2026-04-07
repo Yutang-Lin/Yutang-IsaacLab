@@ -341,9 +341,10 @@ class StudentCVAEBFMTracker(nn.Module):
         self._push_offsets_to_env(env_ids)
 
     def _step_offsets(self):
-        """Advance sliding window: decrement offsets, recycle consumed frames.
+        """Advance sliding window: decrement offsets, recycle consumed frame.
 
-        Operates on full [N, F] tensor in parallel, no per-env loops.
+        Offsets are sorted and we step by exactly step_dt, so at most one
+        frame (the leftmost) crosses zero per step. No loops needed.
         """
         offsets = self._ep_frame_offsets  # [N, F]
         mask = self._ep_frame_mask  # [N, F]
@@ -351,37 +352,24 @@ class StudentCVAEBFMTracker(nn.Module):
         # Decrement all offsets by step_dt
         offsets -= self.step_dt
 
-        # Count consumed frames per env (offset <= 0)
-        consumed = (offsets[:, 0] <= 0)  # [N] bool — only check leftmost (sorted)
-        if not consumed.any():
-            self._push_offsets_to_env()
-            return
+        # Check which envs have their leftmost frame consumed
+        consumed = offsets[:, 0] <= 0  # [N] bool
+        if consumed.any():
+            # Shift left by 1: drop slot 0, append new at end
+            offsets[consumed, :-1] = offsets[consumed, 1:].clone()
+            mask[consumed, :-1] = mask[consumed, 1:].clone()
 
-        # For envs with consumed frame(s): shift left, append new at end
-        # Since offsets are sorted and step_dt is small, usually only 1 consumed per step
-        # Handle multiple by checking how many are <= 0
-        n_consumed = (offsets <= 0).long().sum(dim=1)  # [N]
-        max_consumed = n_consumed.max().item()
-
-        for shift in range(1, max_consumed + 1):
-            shift_mask = n_consumed >= shift  # [N] envs that need at least this many shifts
-            if not shift_mask.any():
-                break
-            # Shift offsets and masks left by 1 for these envs
-            offsets[shift_mask, :-1] = offsets[shift_mask, 1:].clone()
-            mask[shift_mask, :-1] = mask[shift_mask, 1:].clone()
-
-            # Append new offset at last position: last_offset + random interval
-            last_valid = offsets[shift_mask, -2]  # second-to-last after shift
-            new_interval = torch.empty(shift_mask.sum(), device=offsets.device).uniform_(
+            # New offset at end: last_offset + random interval
+            n = consumed.sum()
+            last = offsets[consumed, -2]
+            new_interval = torch.empty(n, device=offsets.device).uniform_(
                 self.min_frame_interval * self.step_dt,
                 self.max_frame_interval * self.step_dt)
-            offsets[shift_mask, -1] = last_valid + new_interval
+            offsets[consumed, -1] = last + new_interval
 
             # New frame mask for appended slot
-            p_active = torch.empty(shift_mask.sum(), device=offsets.device).uniform_(
-                *self.frame_p_active_range)
-            mask[shift_mask, -1] = torch.rand(shift_mask.sum(), device=offsets.device) < p_active
+            p_active = torch.empty(n, device=offsets.device).uniform_(*self.frame_p_active_range)
+            mask[consumed, -1] = torch.rand(n, device=offsets.device) < p_active
 
         self._push_offsets_to_env()
 
