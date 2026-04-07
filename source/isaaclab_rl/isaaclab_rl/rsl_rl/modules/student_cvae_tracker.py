@@ -124,6 +124,13 @@ class StudentCVAETracker(nn.Module):
         self.prior_mu_reg_coef = cfg.pop("prior_mu_reg_coef", 1e-5)
         self.prior_logvar_reg_coef = cfg.pop("prior_logvar_reg_coef", 1e-5)
 
+        # Episodic binary keypoint masking for rollout
+        # Keypoint order in 6-keypoint obs: [lw, rw, la, ra, head, pelvis] × T frames × D dims
+        self.rollout_mask_num_keypoints = cfg.pop("rollout_mask_num_keypoints", 0)  # 0 = disabled
+        self.rollout_mask_dims_per_keypoint = cfg.pop("rollout_mask_dims_per_keypoint", 9)
+        self.rollout_mask_num_frames = cfg.pop("rollout_mask_num_frames", 5)
+        self.rollout_mask_p_clean_range = tuple(cfg.pop("rollout_mask_p_clean_range", [0.2, 1.0]))
+
         self.latent_dim = latent_dim
         self.corr_rank = corr_rank
         self.num_actions = num_actions
@@ -208,6 +215,9 @@ class StudentCVAETracker(nn.Module):
         self._save_dict = {}
         self._save_log_dict = {}
         self.compute_latent_loss = False
+
+        # -- Episodic keypoint masking state (lazily initialized) --
+        self._ep_kp_mask: torch.Tensor | None = None  # [N, K] bool, True=visible
 
         # -- Temporal smoothness buffers (populated lazily in act_inference) --
         self._prev_h: torch.Tensor | None = None
@@ -310,9 +320,43 @@ class StudentCVAETracker(nn.Module):
     def forward(self):
         raise NotImplementedError
 
+    def _sample_episode_kp_mask(self, env_ids: torch.Tensor, device: torch.device):
+        """Sample per-env binary keypoint mask for rollout. True=visible, False=masked."""
+        n = env_ids.shape[0]
+        K = self.rollout_mask_num_keypoints
+        p_clean = torch.empty(n, device=device).uniform_(*self.rollout_mask_p_clean_range)
+        mask = torch.rand(n, K, device=device) < p_clean[:, None]  # [n, K]
+        self._ep_kp_mask[env_ids] = mask
+
+    def _apply_kp_mask(self, y_t: torch.Tensor) -> torch.Tensor:
+        """Apply per-env binary keypoint mask to condition vector.
+
+        y_t layout: [B, T*K*D] where T=num_frames, K=num_keypoints, D=dims_per_keypoint.
+        Masked keypoints are zeroed out.
+        """
+        K = self.rollout_mask_num_keypoints
+        D = self.rollout_mask_dims_per_keypoint
+        T = self.rollout_mask_num_frames
+        B = y_t.shape[0]
+        # Reshape to [B, T, K, D], apply mask, flatten back
+        y = y_t.view(B, T, K, D)
+        mask = self._ep_kp_mask[:B, None, :, None].expand_as(y)  # [B, 1, K, 1] → [B, T, K, D]
+        y = y * mask.float()
+        return y.flatten(start_dim=1)
+
     def act(self, observations, *args, **kwargs):
-        """Rollout: use prior only, sample with noise."""
+        """Rollout: use prior only, sample with noise. Apply episodic keypoint masking."""
         hp_t, o_t, y_t, r_t = self._split_obs(observations)
+
+        # Episodic binary keypoint masking (if enabled)
+        if self.rollout_mask_num_keypoints > 0:
+            B = observations.shape[0]
+            K = self.rollout_mask_num_keypoints
+            if self._ep_kp_mask is None or self._ep_kp_mask.shape[0] != B:
+                with torch.inference_mode(False):
+                    self._ep_kp_mask = torch.ones(B, K, dtype=torch.bool, device=observations.device)
+                    self._sample_episode_kp_mask(torch.arange(B, device=observations.device), observations.device)
+            y_t = self._apply_kp_mask(y_t)
 
         mu_prior, logvar_prior = self._compute_prior(hp_t, y_t)
         z_t = self._sample_gaussian(mu_prior, logvar_prior)
@@ -455,13 +499,19 @@ class StudentCVAETracker(nn.Module):
         self.compute_latent_loss = False
 
     def reset(self, dones=None, hidden_states=None):
-        """Reset temporal smoothness buffers for done environments."""
+        """Reset temporal smoothness buffers and resample keypoint masks for done environments."""
         if dones is not None and dones.any():
             mask = dones.bool()
             for buf_name in ("_prev_h", "_prev_prev_h", "_prev_z", "_prev_prev_z", "_prev_c", "_prev_prev_c"):
                 buf = getattr(self, buf_name)
                 if buf is not None:
                     buf[mask] = 0.0
+            # Resample episodic keypoint masks
+            if self.rollout_mask_num_keypoints > 0 and self._ep_kp_mask is not None:
+                env_ids = mask.flatten().nonzero(as_tuple=False).squeeze(-1)
+                if env_ids.numel() > 0:
+                    with torch.inference_mode(False):
+                        self._sample_episode_kp_mask(env_ids, self._ep_kp_mask.device)
 
     def get_hidden_states(self):
         return None
