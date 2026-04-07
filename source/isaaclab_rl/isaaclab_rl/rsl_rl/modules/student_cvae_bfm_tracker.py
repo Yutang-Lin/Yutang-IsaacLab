@@ -489,14 +489,15 @@ class StudentCVAEBFMTracker(nn.Module):
             latent_kl = self._kl_divergence(mu_posterior, logvar_prior,
                                             mu_prior.detach(), logvar_prior.detach())
 
-            # Smoothness (z_prior and c_t only, no history encoder)
-            z_s1, z_s2 = self._smoothness_loss(z_prior, self._prev_z, self._prev_prev_z)
-            c_s1, c_s2 = self._smoothness_loss(c_t, self._prev_c, self._prev_prev_c)
+            # Smoothness on deterministic means (not stochastic samples)
+            mu_c = self.posterior.lift(mu_raw)
+            z_s1, z_s2 = self._smoothness_loss(mu_prior, self._prev_z, self._prev_prev_z)
+            c_s1, c_s2 = self._smoothness_loss(mu_c, self._prev_c, self._prev_prev_c)
 
             self._prev_prev_z = self._prev_z
-            self._prev_z = z_prior.detach()
+            self._prev_z = mu_prior.detach()
             self._prev_prev_c = self._prev_c
-            self._prev_c = c_t.detach()
+            self._prev_c = mu_c.detach()
 
             self._save_dict = {
                 "corr_kl": corr_kl, "latent_kl": latent_kl,
