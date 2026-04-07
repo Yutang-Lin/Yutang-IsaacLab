@@ -75,10 +75,10 @@ def _build_frame_attn_mask(B: int, F: int, frame_mask: torch.Tensor,
 
 
 class CVAEBFMPosterior(nn.Module):
-    """Transformer posterior: clean keybody + shared frame tokens → (mu, logvar).
+    """Cross-attention posterior: keybody queries against shared frame tokens.
 
-    Token layout: [keybody(0), frame_0(1), ..., frame_{F-1}(F)]
-    1-layer transformer. Masked frames are pad-masked.
+    Keybody token cross-attends to frame tokens (with pad mask).
+    Frames don't self-attend or pass through FFN — they're just a KV bank.
     """
 
     def __init__(self, keybody_dim: int, latent_dim: int, d_model: int,
@@ -89,16 +89,27 @@ class CVAEBFMPosterior(nn.Module):
         if activation is None:
             activation = nn.GELU(approximate="tanh")
 
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.head_dim = d_model // num_heads
         self.frame_encoder = frame_encoder  # shared with decoder
 
         self.keybody_proj = nn.Linear(keybody_dim, d_model)
         self.keybody_embed = nn.Parameter(torch.randn(d_model) * 0.02)
 
-        self.transformer = TransformerEncoder(
-            d_model=d_model, num_heads=num_heads, hidden_dim=hidden_dim,
-            num_layers=1, dropout=dropout, is_causal=False,
-            activation=activation, enable_sdpa=False,
+        # Cross-attention: Q from keybody, KV from frames
+        self.q_proj = nn.Linear(d_model, d_model)
+        self.k_proj = nn.Linear(d_model, d_model)
+        self.v_proj = nn.Linear(d_model, d_model)
+        self.out_proj = nn.Linear(d_model, d_model)
+
+        # FFN on keybody only
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.ffn = nn.Sequential(
+            nn.Linear(d_model, hidden_dim), activation, nn.Linear(hidden_dim, d_model),
         )
+
         self.mu_head = nn.Linear(d_model, latent_dim)
         self.logvar_head = nn.Linear(d_model, latent_dim)
 
@@ -114,14 +125,32 @@ class CVAEBFMPosterior(nn.Module):
             mu, logvar: [B, latent_dim] each
         """
         B, F = frames_flat.shape[:2]
-        tok_kb = self.keybody_proj(r_t) + self.keybody_embed
-        tok_frames = self.frame_encoder(frames_flat, delta_t)
 
-        tokens = torch.cat([tok_kb.unsqueeze(1), tok_frames], dim=1)
-        attn_mask = _build_frame_attn_mask(B, F, frame_mask, n_prefix=1, device=r_t.device)
+        tok_kb = self.keybody_proj(r_t) + self.keybody_embed  # [B, d]
+        tok_frames = self.frame_encoder(frames_flat, delta_t)  # [B, F, d]
 
-        out = self.transformer(tokens, attn_mask=attn_mask)
-        kb_out = out[:, 0]
+        # Cross-attention: keybody (Q) attends to frames (KV)
+        q = self.q_proj(tok_kb).unsqueeze(1)  # [B, 1, d]
+        k = self.k_proj(tok_frames)  # [B, F, d]
+        v = self.v_proj(tok_frames)  # [B, F, d]
+
+        # Reshape for multi-head: [B, H, L, hd]
+        q = q.view(B, 1, self.num_heads, self.head_dim).transpose(1, 2)
+        k = k.view(B, F, self.num_heads, self.head_dim).transpose(1, 2)
+        v = v.view(B, F, self.num_heads, self.head_dim).transpose(1, 2)
+
+        # Attention with frame mask: [B, 1, F] → [B, H, 1, F]
+        attn_mask = frame_mask[:, None, None, :].expand(-1, self.num_heads, 1, -1)
+        attn = (q @ k.transpose(-2, -1)) * (self.head_dim ** -0.5)
+        attn = attn.masked_fill(~attn_mask, float('-inf'))
+        attn = attn.softmax(dim=-1)
+        out = (attn @ v).transpose(1, 2).reshape(B, 1, self.d_model)
+        out = self.out_proj(out).squeeze(1)  # [B, d]
+
+        # Residual + norm + FFN
+        kb_out = self.norm1(tok_kb + out)
+        kb_out = self.norm2(kb_out + self.ffn(kb_out))
+
         return self.mu_head(kb_out), self.logvar_head(kb_out)
 
 
