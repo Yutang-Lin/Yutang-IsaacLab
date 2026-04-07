@@ -138,10 +138,8 @@ class StudentCVAEBFMTracker(nn.Module):
         # KL and smoothness coefficients
         self.corr_kl_coef = cfg.pop("corr_kl_coef", 1e-3)
         self.latent_kl_coef = cfg.pop("latent_kl_coef", 1e-3)
-        self.z_smooth_1st_coef = cfg.pop("z_smooth_1st_coef", 2e-4)
-        self.z_smooth_2nd_coef = cfg.pop("z_smooth_2nd_coef", 2e-4)
-        self.c_smooth_1st_coef = cfg.pop("c_smooth_1st_coef", 2e-4)
-        self.c_smooth_2nd_coef = cfg.pop("c_smooth_2nd_coef", 2e-4)
+        # Smoothness losses removed: training batches aren't temporally ordered,
+        # so comparing consecutive act_inference calls is meaningless.
         self.prior_mu_reg_coef = cfg.pop("prior_mu_reg_coef", 1e-5)
         self.prior_logvar_reg_coef = cfg.pop("prior_logvar_reg_coef", 1e-5)
 
@@ -211,10 +209,6 @@ class StudentCVAEBFMTracker(nn.Module):
 
         # -- State --
         self.compute_latent_loss = False
-        self._prev_z = None
-        self._prev_prev_z = None
-        self._prev_c = None
-        self._prev_prev_c = None
         # Episodic state (lazily initialized)
         self._ep_frame_mask: torch.Tensor | None = None  # [N, F] bool
         self._ep_kp_mask: torch.Tensor | None = None  # [N, K] bool
@@ -290,13 +284,6 @@ class StudentCVAEBFMTracker(nn.Module):
             kl = 0.5 * ((logvar_t - logvar) + (logvar.exp() + (mu - mu_t).pow(2)) / logvar_t.exp() - 1)
             return kl.mean()
 
-    def _smoothness_loss(self, x, prev, prev_prev):
-        first, second = None, None
-        if prev is not None:
-            first = (x - prev).pow(2).mean()
-            if prev_prev is not None:
-                second = (x - 2 * prev + prev_prev).pow(2).mean()
-        return first, second
 
     # -- Episodic sampling + sliding window --
 
@@ -489,20 +476,8 @@ class StudentCVAEBFMTracker(nn.Module):
             latent_kl = self._kl_divergence(mu_posterior, logvar_prior,
                                             mu_prior.detach(), logvar_prior.detach())
 
-            # Smoothness on deterministic means (not stochastic samples)
-            mu_c = self.posterior.lift(mu_raw)
-            z_s1, z_s2 = self._smoothness_loss(mu_prior, self._prev_z, self._prev_prev_z)
-            c_s1, c_s2 = self._smoothness_loss(mu_c, self._prev_c, self._prev_prev_c)
-
-            self._prev_prev_z = self._prev_z
-            self._prev_z = mu_prior.detach()
-            self._prev_prev_c = self._prev_c
-            self._prev_c = mu_c.detach()
-
             self._save_dict = {
                 "corr_kl": corr_kl, "latent_kl": latent_kl,
-                "z_s1": z_s1, "z_s2": z_s2,
-                "c_s1": c_s1, "c_s2": c_s2,
                 "mu_prior": mu_prior, "logvar_prior": logvar_prior,
             }
         else:
@@ -523,17 +498,6 @@ class StudentCVAEBFMTracker(nn.Module):
         log_dict["corr_kl"] = d["corr_kl"].item()
         loss_dict["latent_kl"] = d["latent_kl"] * self.latent_kl_coef
         log_dict["latent_kl"] = d["latent_kl"].item()
-
-        for name, coef, key in [
-            ("z_smooth_1st", self.z_smooth_1st_coef, "z_s1"),
-            ("z_smooth_2nd", self.z_smooth_2nd_coef, "z_s2"),
-            ("c_smooth_1st", self.c_smooth_1st_coef, "c_s1"),
-            ("c_smooth_2nd", self.c_smooth_2nd_coef, "c_s2"),
-        ]:
-            val = d[key]
-            if val is not None:
-                loss_dict[name] = val * coef
-                log_dict[name] = val.item()
 
         # Prior regularization
         mu_p = d["mu_prior"]
@@ -556,10 +520,6 @@ class StudentCVAEBFMTracker(nn.Module):
     def reset(self, dones=None, hidden_states=None):
         if dones is not None and dones.any():
             mask = dones.bool().flatten()
-            for buf_name in ("_prev_z", "_prev_prev_z", "_prev_c", "_prev_prev_c"):
-                buf = getattr(self, buf_name)
-                if buf is not None:
-                    buf[mask] = 0.0
             # Resample episodic offsets + masks for reset envs
             env_ids = mask.nonzero(as_tuple=False).squeeze(-1)
             if env_ids.numel() > 0 and self._ep_frame_mask is not None:
