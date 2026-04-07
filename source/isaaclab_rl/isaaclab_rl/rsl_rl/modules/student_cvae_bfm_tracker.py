@@ -496,7 +496,9 @@ class StudentCVAEBFMTracker(nn.Module):
             z_t = z_prior + c_t
 
             corr_kl = self._kl_divergence(mu_raw, logvar_raw)
-            latent_kl = self._kl_divergence(mu_prior, logvar_prior,
+            # KL(q(z_t) || p(z_prior)): posterior mean is prior + lifted correction
+            mu_posterior = mu_prior + self.posterior.lift(mu_raw)
+            latent_kl = self._kl_divergence(mu_posterior, logvar_prior,
                                             mu_prior.detach(), logvar_prior.detach())
 
             # Smoothness
