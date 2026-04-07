@@ -114,9 +114,9 @@ class StudentCVAEBFMTracker(nn.Module):
             f"{self.num_frames}*{self.frame_dim} = {expected_cond_dim}"
         )
 
-        # Episodic frame interval range (in seconds)
-        self.min_frame_dt = cfg.pop("min_frame_dt", 0.02)
-        self.max_frame_dt = cfg.pop("max_frame_dt", 0.1)
+        # Frame time range: each frame's delta_t is sampled from U(min, max) relative to current
+        self.min_frame_delta = cfg.pop("min_frame_delta", 0.02)
+        self.max_frame_delta = cfg.pop("max_frame_delta", 1.0)
         # Episodic frame mask probability
         self.frame_p_active_range = tuple(cfg.pop("frame_p_active_range", [0.5, 1.0]))
         # Episodic keypoint mask
@@ -318,10 +318,9 @@ class StudentCVAEBFMTracker(nn.Module):
         F = self.num_frames
         K = self.rollout_mask_num_keypoints
 
-        # Sample per-env interval (seconds), build sorted offsets
-        intervals = torch.empty(n, device=device).uniform_(self.min_frame_dt, self.max_frame_dt)
-        step_indices = torch.arange(1, F + 1, device=device, dtype=torch.float32)
-        offsets = step_indices[None, :] * intervals[:, None]  # [n, F]
+        # Sample F independent deltas per env, then sort to maintain order
+        offsets = torch.empty(n, F, device=device).uniform_(self.min_frame_delta, self.max_frame_delta)
+        offsets = offsets.sort(dim=1).values  # [n, F] sorted ascending
         self._ep_frame_offsets[env_ids] = offsets
 
         # Frame mask: episodic per-frame active mask (at least 1 active)
@@ -361,12 +360,11 @@ class StudentCVAEBFMTracker(nn.Module):
             offsets[consumed, :-1] = offsets[consumed, 1:].clone()
             mask[consumed, :-1] = mask[consumed, 1:].clone()
 
-            # New offset at end: last_offset + random interval
+            # New offset at end: sample beyond current last, keep sorted
             n = consumed.sum()
             last = offsets[consumed, -2]
-            new_interval = torch.empty(n, device=offsets.device).uniform_(
-                self.min_frame_dt, self.max_frame_dt)
-            offsets[consumed, -1] = last + new_interval
+            gap = torch.empty(n, device=offsets.device).uniform_(self.min_frame_delta, self.max_frame_delta)
+            offsets[consumed, -1] = last + gap
 
             # New frame mask for appended slot
             p_active = torch.empty(n, device=offsets.device).uniform_(*self.frame_p_active_range)
