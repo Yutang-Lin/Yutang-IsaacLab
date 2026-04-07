@@ -71,6 +71,7 @@ class CoDiTMFTransformer(nn.Module):
         self.future_index_embed = nn.Embedding(num_future_frames, d_model)
 
         # --- Transformer encoder ---
+        # enable_sdpa=True uses JVPAttn (flash attention with JVP support)
         self.transformer = TransformerEncoder(
             d_model=d_model,
             num_heads=num_heads,
@@ -79,7 +80,7 @@ class CoDiTMFTransformer(nn.Module):
             dropout=dropout,
             is_causal=False,
             activation=activation,
-            enable_sdpa=False,
+            enable_sdpa=True,
         )
 
         # --- Output heads ---
@@ -156,10 +157,12 @@ class CoDiTMFTransformer(nn.Module):
         r: torch.Tensor,
         tok_proprio: torch.Tensor,
         tok_history: torch.Tensor,
+        fwd_dual: bool = False,
     ) -> torch.Tensor:
         """JVP-friendly path: (y, t, r) → u. proprio/history tokens are constants.
 
-        Used for computing du/dt via torch.autograd.functional.jvp.
+        Args:
+            fwd_dual: if True, use JVP-compatible flash attention kernel.
         """
         tok_future = self._build_future_tokens(y_corrupted_flat, t, r)
 
@@ -169,5 +172,5 @@ class CoDiTMFTransformer(nn.Module):
             tok_future,
         ], dim=1)
 
-        out = self.transformer(tokens, attn_mask=self.attn_mask)
+        out = self.transformer(tokens, attn_mask=self.attn_mask, fwd_dual=fwd_dual)
         return self.velocity_head(out[:, 2:])

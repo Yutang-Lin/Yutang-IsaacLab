@@ -18,7 +18,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import Normal
-from torch.autograd.functional import jvp as torch_jvp
+from torch.func import jvp as func_jvp, functional_call
 
 from rsl_rl.utils import resolve_nn_activation
 from .actor_critic import ActorCritic
@@ -269,20 +269,15 @@ class StudentCoDiTMFTracker(nn.Module):
         tok_proprio = self.transformer.proprio_proj(o_t) + self.transformer.proprio_embed
         tok_history = self.transformer.history_proj(h_t) + self.transformer.history_embed
 
-        # JVP: compute u and du/dt through denoise_only path
-        # Force math-only SDPA backend to support double backward required by JVP
-        from torch.nn.attention import sdpa_kernel, SDPBackend
-
+        # JVP via torch.func with fwd_dual flash attention
         def denoise_fn(y, r_, t_):
-            return self.transformer.denoise_only(y, t_, r_, tok_proprio, tok_history)
+            return self.transformer.denoise_only(y, t_, r_, tok_proprio, tok_history, fwd_dual=True)
 
-        with sdpa_kernel(SDPBackend.MATH):
-            u, du_dt = torch_jvp(
-                denoise_fn,
-                (y_flat, r, t),
-                (v_flat, torch.zeros_like(r), torch.ones_like(t)),
-                create_graph=True,
-            )
+        u, du_dt = func_jvp(
+            denoise_fn,
+            (y_flat, r, t),
+            (v_flat, torch.zeros_like(r), torch.ones_like(t)),
+        )
 
         # MeanFlow target: u_target = v_flat - (t - r) * du_dt
         # t-r is [B, T, K], expand to [B, T, K*D] by repeating each K value D times
