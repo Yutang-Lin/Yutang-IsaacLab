@@ -273,7 +273,7 @@ class StudentCoDiTMFTracker(nn.Module):
         def denoise_fn(y, r_, t_):
             return self.transformer.denoise_only(y, t_, r_, tok_proprio, tok_history)
 
-        (u,), (du_dt,) = torch_jvp(
+        u, du_dt = torch_jvp(
             denoise_fn,
             (y_flat, r, t),
             (v_flat, torch.zeros_like(r), torch.ones_like(t)),
@@ -281,7 +281,8 @@ class StudentCoDiTMFTracker(nn.Module):
         )
 
         # MeanFlow target: u_target = v_flat - (t - r) * du_dt
-        t_minus_r = (t - r).unsqueeze(-1).expand_as(u)  # [B, T, K*D]
+        # t-r is [B, T, K], expand to [B, T, K*D] by repeating each K value D times
+        t_minus_r = (t - r).unsqueeze(-1).expand(B, T, K, D).flatten(start_dim=2)  # [B, T, K*D]
         u_target = v_flat - t_minus_r * du_dt
 
         # Full forward for action heads + features
