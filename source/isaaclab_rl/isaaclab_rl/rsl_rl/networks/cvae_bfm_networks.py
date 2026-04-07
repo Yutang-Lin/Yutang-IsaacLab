@@ -15,6 +15,107 @@ import torch.nn.functional as F
 from isaaclab_rl.rsl_rl.networks.transformer import TransformerEncoder
 
 
+class CVAEBFMPrior(nn.Module):
+    """Transformer-based prior for sparse frame conditions.
+
+    Token layout: [history(0), frame_0(1), ..., frame_{F-1}(F)]
+
+    Masked frames are pad-masked in attention. The history token aggregates
+    information from available frames and outputs mu_prior, logvar_prior.
+    1-layer lightweight transformer.
+    """
+
+    def __init__(
+        self,
+        h_dim: int,
+        num_keypoints: int,
+        dims_per_keypoint: int,
+        latent_dim: int,
+        d_model: int,
+        num_heads: int = 4,
+        hidden_dim: int = 512,
+        dropout: float = 0.0,
+        activation: nn.Module | None = None,
+    ):
+        super().__init__()
+        if activation is None:
+            activation = nn.GELU(approximate="tanh")
+
+        frame_input_dim = num_keypoints * dims_per_keypoint + 1  # K*D + delta_t
+
+        self.history_proj = nn.Linear(h_dim, d_model)
+        self.frame_proj = nn.Sequential(
+            nn.Linear(frame_input_dim, d_model),
+            activation,
+            nn.Linear(d_model, d_model),
+        )
+
+        self.history_embed = nn.Parameter(torch.randn(d_model) * 0.02)
+
+        # Sinusoidal time embedding
+        half_d = d_model // 2
+        freq = torch.exp(-torch.arange(half_d, dtype=torch.float32) * (math.log(10000.0) / half_d))
+        self.register_buffer("_sin_freq", freq)
+
+        self.transformer = TransformerEncoder(
+            d_model=d_model,
+            num_heads=num_heads,
+            hidden_dim=hidden_dim,
+            num_layers=1,
+            dropout=dropout,
+            is_causal=False,
+            activation=activation,
+            enable_sdpa=False,
+        )
+
+        # Output: mu and logvar from history token
+        self.mu_head = nn.Linear(d_model, latent_dim)
+        self.logvar_head = nn.Linear(d_model, latent_dim)
+
+    def _sinusoidal_embed(self, t: torch.Tensor) -> torch.Tensor:
+        angles = t.unsqueeze(-1) * self._sin_freq
+        return torch.cat([angles.sin(), angles.cos()], dim=-1)
+
+    def forward(
+        self,
+        h_t: torch.Tensor,
+        frames_flat: torch.Tensor,
+        delta_t: torch.Tensor,
+        frame_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Compute prior distribution from history + sparse frames.
+
+        Args:
+            h_t: [B, h_dim] L2-normalized history encoding.
+            frames_flat: [B, F, K*D] keypoint data per frame (masked keypoints zeroed).
+            delta_t: [B, F] time offset per frame.
+            frame_mask: [B, F] bool, True=active.
+
+        Returns:
+            mu_prior: [B, latent_dim]
+            logvar_prior: [B, latent_dim]
+        """
+        B, F = frames_flat.shape[:2]
+
+        tok_history = self.history_proj(h_t) + self.history_embed  # [B, d]
+
+        frame_input = torch.cat([frames_flat, delta_t.unsqueeze(-1)], dim=-1)
+        tok_frames = self.frame_proj(frame_input) + self._sinusoidal_embed(delta_t)  # [B, F, d]
+
+        tokens = torch.cat([tok_history.unsqueeze(1), tok_frames], dim=1)  # [B, F+1, d]
+
+        # Attention mask: history attends to all active frames, masked frames excluded
+        total = F + 1
+        attn_mask = torch.ones(B, total, total, dtype=torch.bool, device=h_t.device)
+        attn_mask[:, :, 1:] &= frame_mask.unsqueeze(1)   # columns
+        attn_mask[:, 1:, :] &= frame_mask.unsqueeze(2)   # rows
+
+        out = self.transformer(tokens, attn_mask=attn_mask)
+
+        h_out = out[:, 0]  # history token output
+        return self.mu_head(h_out), self.logvar_head(h_out)
+
+
 class CVAEBFMDecoder(nn.Module):
     """Transformer action decoder with per-frame future tokens.
 

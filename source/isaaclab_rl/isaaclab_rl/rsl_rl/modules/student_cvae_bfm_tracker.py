@@ -32,7 +32,7 @@ from .actor_critic_tf_recurrent_latent import ActorCriticTFRecurrentLatent
 from .actor_critic_transformer_latent import ActorCriticTransformerLatent
 from .actor_critic_transformer_residual import ActorCriticTransformerResidual
 
-from isaaclab_rl.rsl_rl.networks.cvae_tracker_networks import _build_mlp, CVAEPrior, CVAEPosterior
+from isaaclab_rl.rsl_rl.networks.cvae_tracker_networks import _build_mlp, CVAEPosterior
 from isaaclab_rl.rsl_rl.networks.cvae_bfm_networks import CVAEBFMDecoder
 
 
@@ -158,14 +158,11 @@ class StudentCVAEBFMTracker(nn.Module):
         history_output_dim = history_hidden_dims[-1] if history_hidden_dims else history_proprio_dim
         self.history_encoder = _build_mlp(history_proprio_dim, history_hidden_dims, history_output_dim, activation)
 
-        # Prior: input is h_t + y_flat (masked frames zeroed, includes delta_t)
-        self.prior = CVAEPrior(
-            h_dim=history_output_dim,
-            cond_dim=cond_dim,
-            latent_dim=latent_dim,
-            hidden_dims=prior_hidden_dims,
-            activation=activation,
-        )
+        # Prior: MLP on h_t only (frame conditioning handled by decoder)
+        prior_hidden_dims = cfg.pop("prior_hidden_dims", [256, 128])
+        prior_input_dim = history_output_dim
+        prior_output_dim = 2 * latent_dim  # mu + logvar
+        self.prior = _build_mlp(prior_input_dim, prior_hidden_dims, prior_output_dim, activation)
 
         self.posterior = CVAEPosterior(
             keybody_dim=keybody_dim,
@@ -437,14 +434,15 @@ class StudentCVAEBFMTracker(nn.Module):
 
         # Apply episodic masks
         masked_frames = self._apply_masks(frames, self._ep_frame_mask, self._ep_kp_mask)
-        y_masked_flat = torch.cat([masked_frames.flatten(1), delta_t], dim=-1)
+        cur_frame_mask = self._ep_frame_mask[:B]
 
         h_t = self._encode_history(hp_t)
-        mu_prior, logvar_prior = self.prior(h_t, y_masked_flat)
+        prior_out = self.prior(h_t)
+        mu_prior, logvar_prior = prior_out.chunk(2, dim=-1)
         logvar_prior = logvar_prior.clamp(*self._LOGVAR_CLAMP)
         z_t = self._sample_gaussian(mu_prior, logvar_prior)
 
-        action_mean = self.action_decoder(o_t, z_t, masked_frames, delta_t, self._ep_frame_mask[:B])
+        action_mean = self.action_decoder(o_t, z_t, masked_frames, delta_t, cur_frame_mask)
 
         std = self.std.expand_as(action_mean)
         self.distribution = Normal(action_mean, std)
@@ -482,10 +480,10 @@ class StudentCVAEBFMTracker(nn.Module):
             kp_mask = None
 
         masked_frames = self._apply_masks(frames, frame_mask, kp_mask)
-        y_masked_flat = torch.cat([masked_frames.flatten(1), delta_t], dim=-1)
 
         h_t = self._encode_history(hp_t)
-        mu_prior, logvar_prior = self.prior(h_t, y_masked_flat)
+        prior_out = self.prior(h_t)
+        mu_prior, logvar_prior = prior_out.chunk(2, dim=-1)
         logvar_prior = logvar_prior.clamp(*self._LOGVAR_CLAMP)
 
         if self.compute_latent_loss and r_t.shape[-1] > 0:
