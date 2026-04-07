@@ -66,6 +66,18 @@ class RslRlDistillationStudentCoDiTTrackerCfg(RslRlDistillationStudentTeacherCfg
     """The policy class name. Default is StudentCoDiTTracker."""
 
 
+@configclass
+class RslRlDistillationStudentCoDiTMFTrackerCfg(RslRlDistillationStudentTeacherCfg):
+    """Configuration for CoDiT-MF distillation policy.
+
+    Uses MeanFlow velocity prediction with JVP self-consistency,
+    contrastive feature regularization, and dual action heads.
+    """
+
+    class_name: str = "StudentCoDiTMFTracker"
+    """The policy class name. Default is StudentCoDiTMFTracker."""
+
+
 ############################
 # Algorithm configurations #
 ############################

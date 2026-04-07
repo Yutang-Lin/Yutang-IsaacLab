@@ -26,6 +26,7 @@ from .student_teacher import StudentTeacher
 from .student_teacher_recurrent import StudentTeacherRecurrent
 from .student_cvae_tracker import StudentCVAETracker
 from .student_codit_tracker import StudentCoDiTTracker
+from .student_codit_mf_tracker import StudentCoDiTMFTracker
 
 import torch
 from typing import Callable
@@ -109,4 +110,5 @@ __all__ = [
     "ActorCriticTransformerDDIM",
     "StudentCVAETracker",
     "StudentCoDiTTracker",
+    "StudentCoDiTMFTracker",
 ]
