@@ -33,7 +33,7 @@ from .actor_critic_transformer_latent import ActorCriticTransformerLatent
 from .actor_critic_transformer_residual import ActorCriticTransformerResidual
 
 from isaaclab_rl.rsl_rl.networks.cvae_tracker_networks import _build_mlp
-from isaaclab_rl.rsl_rl.networks.cvae_bfm_networks import CVAEBFMDecoder
+from isaaclab_rl.rsl_rl.networks.cvae_bfm_networks import BFMFrameEncoder, CVAEBFMPosterior, CVAEBFMDecoder
 
 
 class StudentCVAEBFMTracker(nn.Module):
@@ -149,17 +149,32 @@ class StudentCVAEBFMTracker(nn.Module):
         # Prior: MLP(hp_t) → h_prior (deterministic, latent_dim)
         self.prior = _build_mlp(history_proprio_dim, prior_hidden_dims, latent_dim, activation)
 
-        # Posterior: MLP(r_t) → (mu, logvar) in latent_dim directly (no low-rank)
-        self.posterior = _build_mlp(keybody_dim, posterior_hidden_dims, 2 * latent_dim, activation)
+        # Shared frame encoder (used by both posterior and decoder)
+        self.frame_encoder = BFMFrameEncoder(
+            num_keypoints=self.num_keypoints,
+            dims_per_keypoint=self.dims_per_keypoint,
+            d_model=tf_d_model,
+            activation=tf_activation,
+        )
 
-        # BFM decoder: per-frame tokens with pad masking
+        # Posterior: transformer with shared frame encoder
+        self.posterior = CVAEBFMPosterior(
+            keybody_dim=keybody_dim,
+            latent_dim=latent_dim,
+            d_model=tf_d_model,
+            frame_encoder=self.frame_encoder,
+            num_heads=tf_num_heads,
+            hidden_dim=tf_hidden_dim,
+            activation=tf_activation,
+        )
+
+        # Decoder: transformer with shared frame encoder
         self.action_decoder = CVAEBFMDecoder(
             proprio_dim=current_proprio_dim,
             latent_dim=latent_dim,
-            num_keypoints=self.num_keypoints,
-            dims_per_keypoint=self.dims_per_keypoint,
             max_frames=self.num_frames,
             d_model=tf_d_model,
+            frame_encoder=self.frame_encoder,
             num_heads=tf_num_heads,
             hidden_dim=tf_hidden_dim,
             num_layers=tf_num_layers,
@@ -259,10 +274,9 @@ class StudentCVAEBFMTracker(nn.Module):
         """Prior: deterministic encoding from history."""
         return self.prior(hp_t)  # [B, latent_dim]
 
-    def _compute_posterior(self, r_t):
-        """Posterior: sample correction from clean keybody."""
-        out = self.posterior(r_t)
-        mu, logvar = out.chunk(2, dim=-1)
+    def _compute_posterior(self, r_t, frames_flat, delta_t, frame_mask):
+        """Posterior: sample correction from clean keybody + frame context."""
+        mu, logvar = self.posterior(r_t, frames_flat, delta_t, frame_mask)
         logvar = logvar.clamp(*self._LOGVAR_CLAMP)
         std = (0.5 * logvar).exp()
         c_t = mu + std * torch.randn_like(std)
@@ -450,7 +464,7 @@ class StudentCVAEBFMTracker(nn.Module):
         h_prior = self._compute_prior(hp_t)
 
         if self.compute_latent_loss and r_t.shape[-1] > 0:
-            c_t, mu_post, logvar_post = self._compute_posterior(r_t)
+            c_t, mu_post, logvar_post = self._compute_posterior(r_t, masked_frames, delta_t, frame_mask)
             corr_kl = self._kl_standard_normal(mu_post, logvar_post)
 
             self._save_dict = {
