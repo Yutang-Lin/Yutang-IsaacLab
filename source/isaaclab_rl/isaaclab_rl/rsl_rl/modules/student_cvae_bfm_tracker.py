@@ -307,44 +307,99 @@ class StudentCVAEBFMTracker(nn.Module):
                 second = (x - 2 * prev + prev_prev).pow(2).mean()
         return first, second
 
-    # -- Episodic sampling --
+    # -- Episodic sampling + sliding window --
 
-    def _sample_episode_state(self, env_ids, device):
-        """Sample per-env frame intervals, frame mask, and keypoint mask."""
+    def _sample_initial_offsets(self, env_ids, device):
+        """Sample initial sorted future time offsets for given envs.
+
+        Also samples episodic keypoint mask (held for entire episode).
+        """
         n = env_ids.shape[0]
         F = self.num_frames
         K = self.rollout_mask_num_keypoints
 
-        # Frame intervals: sample one interval per env, compute cumulative offsets
-        intervals = torch.randint(
-            self.min_frame_interval, self.max_frame_interval + 1,
-            (n,), device=device, dtype=torch.float32)
-        # Frame offsets in seconds: [n, F]
-        step_indices = torch.arange(F, device=device, dtype=torch.float32)
-        offsets = (step_indices[None, :] * intervals[:, None]) * self.step_dt  # [n, F]
+        # Sample per-env interval, build sorted offsets
+        intervals = torch.empty(n, device=device).uniform_(
+            self.min_frame_interval * self.step_dt,
+            self.max_frame_interval * self.step_dt)
+        step_indices = torch.arange(1, F + 1, device=device, dtype=torch.float32)
+        offsets = step_indices[None, :] * intervals[:, None]  # [n, F], starts at interval, not 0
         self._ep_frame_offsets[env_ids] = offsets
 
-        # Frame mask: per env sample p_active, then Bernoulli per frame
-        # Frame 0 always active (current target)
+        # Frame mask: episodic per-frame active mask
         p_active = torch.empty(n, device=device).uniform_(*self.frame_p_active_range)
         frame_mask = torch.rand(n, F, device=device) < p_active[:, None]
-        frame_mask[:, 0] = True  # frame 0 always active
+        frame_mask[:, 0] = True
         self._ep_frame_mask[env_ids] = frame_mask
 
-        # Keypoint mask: binary per keypoint
+        # Keypoint mask
         if K > 0:
             p_clean = torch.empty(n, device=device).uniform_(*self.rollout_mask_p_clean_range)
             kp_mask = torch.rand(n, K, device=device) < p_clean[:, None]
             self._ep_kp_mask[env_ids] = kp_mask
 
-        # Push offsets to env for motion loader
-        if self._env_ref is not None:
-            env = self._env_ref
-            if not hasattr(env, '_bfm_future_offsets') or env._bfm_future_offsets is None:
-                env._bfm_future_offsets = torch.zeros(env.num_envs, F, device=device)
-                env._bfm_delta_t = torch.zeros(env.num_envs, F, device=device)
-            env._bfm_future_offsets[env_ids] = offsets
-            env._bfm_delta_t[env_ids] = offsets
+        self._push_offsets_to_env(env_ids)
+
+    def _step_offsets(self):
+        """Advance sliding window: decrement offsets, recycle consumed frames.
+
+        Operates on full [N, F] tensor in parallel, no per-env loops.
+        """
+        offsets = self._ep_frame_offsets  # [N, F]
+        mask = self._ep_frame_mask  # [N, F]
+
+        # Decrement all offsets by step_dt
+        offsets -= self.step_dt
+
+        # Count consumed frames per env (offset <= 0)
+        consumed = (offsets[:, 0] <= 0)  # [N] bool — only check leftmost (sorted)
+        if not consumed.any():
+            self._push_offsets_to_env()
+            return
+
+        # For envs with consumed frame(s): shift left, append new at end
+        # Since offsets are sorted and step_dt is small, usually only 1 consumed per step
+        # Handle multiple by checking how many are <= 0
+        n_consumed = (offsets <= 0).long().sum(dim=1)  # [N]
+        max_consumed = n_consumed.max().item()
+
+        for shift in range(1, max_consumed + 1):
+            shift_mask = n_consumed >= shift  # [N] envs that need at least this many shifts
+            if not shift_mask.any():
+                break
+            # Shift offsets and masks left by 1 for these envs
+            offsets[shift_mask, :-1] = offsets[shift_mask, 1:].clone()
+            mask[shift_mask, :-1] = mask[shift_mask, 1:].clone()
+
+            # Append new offset at last position: last_offset + random interval
+            last_valid = offsets[shift_mask, -2]  # second-to-last after shift
+            new_interval = torch.empty(shift_mask.sum(), device=offsets.device).uniform_(
+                self.min_frame_interval * self.step_dt,
+                self.max_frame_interval * self.step_dt)
+            offsets[shift_mask, -1] = last_valid + new_interval
+
+            # New frame mask for appended slot
+            p_active = torch.empty(shift_mask.sum(), device=offsets.device).uniform_(
+                *self.frame_p_active_range)
+            mask[shift_mask, -1] = torch.rand(shift_mask.sum(), device=offsets.device) < p_active
+
+        self._push_offsets_to_env()
+
+    def _push_offsets_to_env(self, env_ids=None):
+        """Push current offsets to env for motion sampling."""
+        if self._env_ref is None:
+            return
+        env = self._env_ref
+        F = self.num_frames
+        if not hasattr(env, '_bfm_future_offsets') or env._bfm_future_offsets is None:
+            env._bfm_future_offsets = torch.zeros(env.num_envs, F, device=self._ep_frame_offsets.device)
+            env._bfm_delta_t = torch.zeros(env.num_envs, F, device=self._ep_frame_offsets.device)
+        if env_ids is None:
+            env._bfm_future_offsets[:] = self._ep_frame_offsets
+            env._bfm_delta_t[:] = self._ep_frame_offsets
+        else:
+            env._bfm_future_offsets[env_ids] = self._ep_frame_offsets[env_ids]
+            env._bfm_delta_t[env_ids] = self._ep_frame_offsets[env_ids]
 
     def _apply_masks(self, frames, frame_mask=None, kp_mask=None):
         """Apply frame and keypoint masks to condition frames.
@@ -374,7 +429,7 @@ class StudentCVAEBFMTracker(nn.Module):
         raise NotImplementedError
 
     def act(self, observations, *args, **kwargs):
-        """Rollout: prior only, with episodic frame/keypoint masking."""
+        """Rollout: prior only, with sliding window offsets + frame/keypoint masking."""
         hp_t, o_t, y_flat, r_t = self._split_obs(observations)
         frames, delta_t = self._parse_condition(y_flat)
         B = observations.shape[0]
@@ -387,11 +442,14 @@ class StudentCVAEBFMTracker(nn.Module):
                 self._ep_frame_mask = torch.ones(B, F, dtype=torch.bool, device=observations.device)
                 self._ep_kp_mask = torch.ones(B, K, dtype=torch.bool, device=observations.device) if K > 0 else None
                 self._ep_frame_offsets = torch.zeros(B, F, device=observations.device)
-                self._sample_episode_state(torch.arange(B, device=observations.device), observations.device)
+                self._sample_initial_offsets(torch.arange(B, device=observations.device), observations.device)
+        else:
+            # Advance sliding window: decrement offsets, recycle consumed frames
+            with torch.inference_mode(False):
+                self._step_offsets()
 
         # Apply episodic masks
         masked_frames = self._apply_masks(frames, self._ep_frame_mask, self._ep_kp_mask)
-        # Flatten for prior input (masked frames zeroed)
         y_masked_flat = torch.cat([masked_frames.flatten(1), delta_t], dim=-1)
 
         h_t = self._encode_history(hp_t)
@@ -527,11 +585,11 @@ class StudentCVAEBFMTracker(nn.Module):
                 buf = getattr(self, buf_name)
                 if buf is not None:
                     buf[mask] = 0.0
-            # Resample episodic frame/keypoint masks
+            # Resample episodic offsets + masks for reset envs
             env_ids = mask.nonzero(as_tuple=False).squeeze(-1)
             if env_ids.numel() > 0 and self._ep_frame_mask is not None:
                 with torch.inference_mode(False):
-                    self._sample_episode_state(env_ids, self._ep_frame_mask.device)
+                    self._sample_initial_offsets(env_ids, self._ep_frame_mask.device)
 
     def get_hidden_states(self):
         return None
