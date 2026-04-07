@@ -99,7 +99,7 @@ class StudentCVAEBFMTracker(nn.Module):
         cfg.pop("corr_rank", None)  # unused, posterior outputs latent_dim directly
         cfg.pop("history_hidden_dims", None)  # unused, prior handles compression
         prior_hidden_dims = cfg.pop("prior_hidden_dims", [512, 256, 128])
-        posterior_hidden_dims = cfg.pop("posterior_hidden_dims", [256, 128])
+        cfg.pop("posterior_hidden_dims", None)  # unused, posterior is transformer
 
         # BFM frame parameters
         self.num_keypoints = cfg.pop("num_keypoints", 6)
