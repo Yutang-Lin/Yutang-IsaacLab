@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -59,10 +60,15 @@ class CVAEBFMDecoder(nn.Module):
             nn.Linear(d_model, d_model),
         )
 
-        # Learned embeddings
+        # Learned embeddings for proprio and latent tokens
         self.proprio_embed = nn.Parameter(torch.randn(d_model) * 0.02)
         self.latent_embed = nn.Parameter(torch.randn(d_model) * 0.02)
-        self.frame_index_embed = nn.Embedding(max_frames, d_model)
+
+        # Sinusoidal time embedding for frame tokens (computed from delta_t)
+        # Precompute frequency bands: exp(-i * log(10000) / (d/2))
+        half_d = d_model // 2
+        freq = torch.exp(-torch.arange(half_d, dtype=torch.float32) * (math.log(10000.0) / half_d))
+        self.register_buffer("_sin_freq", freq)  # [d/2]
 
         # Transformer
         self.transformer = TransformerEncoder(
@@ -78,6 +84,19 @@ class CVAEBFMDecoder(nn.Module):
 
         # Action head from proprio token
         self.action_head = nn.Linear(d_model, num_actions)
+
+    def _sinusoidal_embed(self, t: torch.Tensor) -> torch.Tensor:
+        """Sinusoidal positional embedding from continuous time values.
+
+        Args:
+            t: [B, F] time in seconds.
+
+        Returns:
+            embed: [B, F, d_model]
+        """
+        # t: [B, F] → [B, F, 1] * [d/2] → [B, F, d/2]
+        angles = t.unsqueeze(-1) * self._sin_freq  # [B, F, d/2]
+        return torch.cat([angles.sin(), angles.cos()], dim=-1)  # [B, F, d]
 
     def forward(
         self,
@@ -107,8 +126,8 @@ class CVAEBFMDecoder(nn.Module):
         # Frame tokens: concat keypoint data + delta_t, project
         frame_input = torch.cat([frames_flat, delta_t.unsqueeze(-1)], dim=-1)  # [B, F, K*D+1]
         tok_frames = self.frame_proj(frame_input)  # [B, F, d]
-        indices = torch.arange(F, device=o_t.device)
-        tok_frames = tok_frames + self.frame_index_embed(indices)
+        # Sinusoidal time embedding from delta_t
+        tok_frames = tok_frames + self._sinusoidal_embed(delta_t)  # [B, F, d]
 
         # Assemble: [B, F+2, d]
         tokens = torch.cat([
