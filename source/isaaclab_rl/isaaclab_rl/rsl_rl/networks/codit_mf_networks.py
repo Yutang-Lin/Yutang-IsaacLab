@@ -3,18 +3,13 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""CoDiT-MF: CoDiT-Track with MeanFlow denoising and contrastive features.
-
-Extends the base CoDiT transformer with:
-  - MeanFlow velocity prediction head (replaces direct denoising)
-  - JVP-friendly denoise_only() path for self-consistency training
-  - Future feature extraction for contrastive regularization
-"""
+"""CoDiT-MF: CoDiT-Track with MeanFlow denoising and contrastive features."""
 
 from __future__ import annotations
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from isaaclab_rl.rsl_rl.networks.transformer import TransformerEncoder
 
@@ -22,11 +17,10 @@ from isaaclab_rl.rsl_rl.networks.transformer import TransformerEncoder
 class CoDiTMFTransformer(nn.Module):
     """CoDiT Transformer with MeanFlow velocity prediction.
 
-    Same T+2 token architecture as CoDiTTransformer, but:
-    - Future tokens are conditioned on both t and r: input = [y_flat, t, r]
-    - Velocity head predicts average velocity u(y_t, r, t) instead of clean y
-    - Forward returns future features for contrastive loss
-    - denoise_only() provides JVP-compatible path through (y, t, r) → u
+    T+2 token architecture with:
+    - Future tokens conditioned on (y_flat, t, r)
+    - Velocity head predicts average velocity u(y_t, r, t)
+    - denoise_only() for JVP, forward() for full outputs
     """
 
     def __init__(
@@ -51,9 +45,8 @@ class CoDiTMFTransformer(nn.Module):
         self.num_future_frames = num_future_frames
         self.num_keypoints = num_keypoints
         self.dims_per_keypoint = dims_per_keypoint
-        future_raw_dim = num_keypoints * dims_per_keypoint  # K*D per frame
+        future_raw_dim = num_keypoints * dims_per_keypoint
         future_token_input_dim = future_raw_dim + 2 * num_keypoints  # K*D + t(K) + r(K)
-        future_output_dim = future_raw_dim  # velocity K*D per frame
 
         # --- Token projections ---
         self.proprio_proj = nn.Linear(proprio_dim, d_model)
@@ -71,7 +64,6 @@ class CoDiTMFTransformer(nn.Module):
         self.future_index_embed = nn.Embedding(num_future_frames, d_model)
 
         # --- Transformer encoder ---
-        # enable_sdpa=True uses JVPAttn (flash attention with JVP support)
         self.transformer = TransformerEncoder(
             d_model=d_model,
             num_heads=num_heads,
@@ -80,13 +72,13 @@ class CoDiTMFTransformer(nn.Module):
             dropout=dropout,
             is_causal=False,
             activation=activation,
-            enable_sdpa=True,
+            enable_sdpa=False,
         )
 
         # --- Output heads ---
         self.base_head = nn.Linear(d_model, num_actions)
         self.cond_head = nn.Linear(d_model, num_actions)
-        self.velocity_head = nn.Linear(d_model, future_output_dim)
+        self.velocity_head = nn.Linear(d_model, future_raw_dim)
 
         # --- Attention mask ---
         self._build_attention_mask(num_future_frames)
@@ -98,79 +90,36 @@ class CoDiTMFTransformer(nn.Module):
         self.register_buffer("attn_mask", mask.unsqueeze(0))
 
     def _build_future_tokens(self, y_corrupted_flat, t, r):
-        """Build future token embeddings from (y, t, r)."""
-        future_input = torch.cat([y_corrupted_flat, t, r], dim=-1)  # [B, T, K*D + 2K]
-        tok_future = self.future_proj(future_input)  # [B, T, d_model]
+        future_input = torch.cat([y_corrupted_flat, t, r], dim=-1)
+        tok_future = self.future_proj(future_input)
         indices = torch.arange(tok_future.shape[1], device=tok_future.device)
         tok_future = tok_future + self.future_index_embed(indices)
         return tok_future
 
-    def forward(
-        self,
-        o_t: torch.Tensor,
-        h_t: torch.Tensor,
-        y_corrupted_flat: torch.Tensor,
-        t: torch.Tensor,
-        r: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Full forward pass.
+    def _run_transformer(self, tok_proprio, tok_history, tok_future):
+        tokens = torch.cat([
+            tok_proprio.unsqueeze(1),
+            tok_history.unsqueeze(1),
+            tok_future,
+        ], dim=1)
+        return self.transformer(tokens, attn_mask=self.attn_mask)
 
-        Args:
-            o_t: [B, proprio_dim]
-            h_t: [B, history_dim]
-            y_corrupted_flat: [B, T, K*D]
-            t: [B, T, K] corruption time
-            r: [B, T, K] interval start time
-
-        Returns:
-            a_base: [B, num_actions]
-            a_cond: [B, num_actions]
-            u: [B, T, K*D] predicted average velocity
-            future_features: [B, T, d_model] L2-normalized future token features
-        """
+    def forward(self, o_t, h_t, y_corrupted_flat, t, r):
+        """Full forward: returns (a_base, a_cond, u, features_norm)."""
         tok_proprio = self.proprio_proj(o_t) + self.proprio_embed
         tok_history = self.history_proj(h_t) + self.history_embed
         tok_future = self._build_future_tokens(y_corrupted_flat, t, r)
-
-        tokens = torch.cat([
-            tok_proprio.unsqueeze(1),
-            tok_history.unsqueeze(1),
-            tok_future,
-        ], dim=1)
-
-        out = self.transformer(tokens, attn_mask=self.attn_mask)
+        out = self._run_transformer(tok_proprio, tok_history, tok_future)
 
         a_base = self.base_head(out[:, 1])
         a_cond = self.cond_head(out[:, 0])
-        future_features = out[:, 2:]  # [B, T, d_model]
+        future_features = out[:, 2:]
         u = self.velocity_head(future_features)
+        features_norm = F.normalize(future_features, dim=-1)
+        return a_base, a_cond, u, features_norm
 
-        # L2-normalize features for contrastive loss
-        future_features_norm = torch.nn.functional.normalize(future_features, dim=-1)
-
-        return a_base, a_cond, u, future_features_norm
-
-    def denoise_only(
-        self,
-        y_corrupted_flat: torch.Tensor,
-        t: torch.Tensor,
-        r: torch.Tensor,
-        tok_proprio: torch.Tensor,
-        tok_history: torch.Tensor,
-        fwd_dual: bool = False,
-    ) -> torch.Tensor:
-        """JVP-friendly path: (y, t, r) → u. proprio/history tokens are constants.
-
-        Args:
-            fwd_dual: if True, use JVP-compatible flash attention kernel.
-        """
+    def denoise_only(self, y_corrupted_flat, t, r, tok_proprio, tok_history):
+        """JVP-friendly: (y, t, r) → u only. tok_proprio/tok_history are constants."""
         tok_future = self._build_future_tokens(y_corrupted_flat, t, r)
-
-        tokens = torch.cat([
-            tok_proprio.unsqueeze(1),
-            tok_history.unsqueeze(1),
-            tok_future,
-        ], dim=1)
-
-        out = self.transformer(tokens, attn_mask=self.attn_mask, fwd_dual=fwd_dual)
+        out = self._run_transformer(tok_proprio, tok_history, tok_future)
         return self.velocity_head(out[:, 2:])

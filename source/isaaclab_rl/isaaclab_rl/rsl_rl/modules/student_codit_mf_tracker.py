@@ -18,7 +18,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import Normal
-import torch.autograd.forward_ad as fwAD
+from torch.func import jvp as func_jvp
 
 from rsl_rl.utils import resolve_nn_activation
 from .actor_critic import ActorCritic
@@ -241,9 +241,15 @@ class StudentCoDiTMFTracker(nn.Module):
         return a_base + a_cond
 
     def _forward_corrupted_mf(self, o_t, h_t, y_clean):
-        """Training forward with MeanFlow: single corruption + JVP.
+        """Training forward with MeanFlow.
 
-        Returns action, and caches all intermediates for extra_loss.
+        Optimizations vs naive implementation:
+        1. Single full forward for actions + u + features (no redundant pass)
+        2. torch.func.jvp (forward-mode AD) instead of backward-mode simulation
+        3. JVP only on propagation subset (r≠t), skip for instantaneous (r=t)
+
+        Cost: ~1 full forward + ~0.25 * 2x JVP on subset + 1 contrastive forward ≈ 2.5x
+        (vs 4x before: JVP backward-mode 2x + full forward 1x + contrastive 1x)
         """
         B, T, K, D = y_clean.shape
         device = y_clean.device
@@ -252,10 +258,12 @@ class StudentCoDiTMFTracker(nn.Module):
         t = torch.empty(B, T, K, device=device).uniform_(
             self.corruptor.t_lo, self.corruptor.t_hi)
 
-        # Sample r: 75% r=t (instantaneous), 25% r~U(0,t) (propagation)
-        propagation_mask = torch.rand(B, 1, 1, device=device) < self.mf_propagation_ratio
-        r_uniform = torch.rand(B, T, K, device=device) * t  # U(0, t)
-        r = torch.where(propagation_mask.expand_as(t), r_uniform, t)
+        # Sample r: per-sample decision (instantaneous vs propagation)
+        prop_mask = torch.rand(B, device=device) < self.mf_propagation_ratio  # [B]
+        r = t.clone()
+        prop_indices = prop_mask.nonzero(as_tuple=True)[0]
+        if prop_indices.numel() > 0:
+            r[prop_indices] = torch.rand_like(t[prop_indices]) * t[prop_indices]
 
         # Corrupt
         eps = torch.randn(B, T, K, D, device=device)
@@ -265,33 +273,43 @@ class StudentCoDiTMFTracker(nn.Module):
         y_flat = y_t.flatten(start_dim=2)  # [B, T, K*D]
         v_flat = v_t.flatten(start_dim=2)  # [B, T, K*D]
 
-        # Pre-compute proprio/history tokens (constants for JVP)
-        tok_proprio = self.transformer.proprio_proj(o_t) + self.transformer.proprio_embed
-        tok_history = self.transformer.history_proj(h_t) + self.transformer.history_embed
+        # 1. Full forward on entire batch → actions, u, features
+        a_base, a_cond, u, features1 = self.transformer(o_t, h_t, y_flat, t, r)
 
-        # JVP via forward-mode AD with JVPAttn (flash attention with native dual tensor support)
-        with fwAD.dual_level():
-            y_dual = fwAD.make_dual(y_flat, v_flat)
-            r_dual = fwAD.make_dual(r, torch.zeros_like(r))
-            t_dual = fwAD.make_dual(t, torch.ones_like(t))
+        # 2. JVP only on propagation subset (r≠t) for du_dt
+        # For instantaneous samples (r=t), t_minus_r=0 so du_dt doesn't matter
+        du_dt = torch.zeros_like(u)
+        if prop_indices.numel() > 0:
+            from torch.nn.attention import sdpa_kernel, SDPBackend
 
-            u_dual = self.transformer.denoise_only(y_dual, t_dual, r_dual, tok_proprio, tok_history, fwd_dual=True)
+            # Extract subset
+            y_sub = y_flat[prop_indices]
+            r_sub = r[prop_indices]
+            t_sub = t[prop_indices]
+            v_sub = v_flat[prop_indices]
+            # Pre-compute constant tokens for subset
+            tok_p_sub = self.transformer.proprio_proj(o_t[prop_indices]) + self.transformer.proprio_embed
+            tok_h_sub = self.transformer.history_proj(h_t[prop_indices]) + self.transformer.history_embed
 
-            u, du_dt = fwAD.unpack_dual(u_dual)
+            def denoise_fn(y, r_, t_):
+                return self.transformer.denoise_only(y, t_, r_, tok_p_sub, tok_h_sub)
+
+            with sdpa_kernel(SDPBackend.MATH):
+                _, du_dt_sub = func_jvp(
+                    denoise_fn,
+                    (y_sub, r_sub, t_sub),
+                    (v_sub, torch.zeros_like(r_sub), torch.ones_like(t_sub)),
+                )
+            du_dt[prop_indices] = du_dt_sub
 
         # MeanFlow target: u_target = v_flat - (t - r) * du_dt
-        # t-r is [B, T, K], expand to [B, T, K*D] by repeating each K value D times
-        t_minus_r = (t - r).unsqueeze(-1).expand(B, T, K, D).flatten(start_dim=2)  # [B, T, K*D]
+        t_minus_r = (t - r).unsqueeze(-1).expand(B, T, K, D).flatten(start_dim=2)
         u_target = v_flat - t_minus_r * du_dt
 
-        # Full forward for action heads + features
-        a_base, a_cond, _, features1 = self.transformer(o_t, h_t, y_flat, t, r)
-
-        # Second corruption for contrastive (same t, different eps)
+        # 3. Contrastive: second corruption with different eps
         eps2 = torch.randn(B, T, K, D, device=device)
         y_t2 = (1.0 - t).unsqueeze(-1) * y_clean + t.unsqueeze(-1) * eps2
-        y_flat2 = y_t2.flatten(start_dim=2)
-        _, _, _, features2 = self.transformer(o_t, h_t, y_flat2, t, r)
+        _, _, _, features2 = self.transformer(o_t, h_t, y_t2.flatten(start_dim=2), t, r)
 
         a_total = a_base + a_cond
 
