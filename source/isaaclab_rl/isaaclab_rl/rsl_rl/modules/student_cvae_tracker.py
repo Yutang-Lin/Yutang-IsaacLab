@@ -386,6 +386,21 @@ class StudentCVAETracker(nn.Module):
                 second = (x - 2 * prev + prev_prev).pow(2).mean()
         return first, second
 
+    def _random_kp_mask(self, y_t: torch.Tensor) -> torch.Tensor:
+        """Apply fresh random binary keypoint mask for training.
+
+        Each call samples a new mask — different from the episode-fixed rollout mask.
+        """
+        K = self.rollout_mask_num_keypoints
+        D = self.rollout_mask_dims_per_keypoint
+        T = self.rollout_mask_num_frames
+        B = y_t.shape[0]
+        p_clean = torch.empty(B, device=y_t.device).uniform_(*self.rollout_mask_p_clean_range)
+        mask = (torch.rand(B, K, device=y_t.device) < p_clean[:, None])  # [B, K] bool
+        y = y_t.view(B, T, K, D)
+        y = y * mask[:, None, :, None].float()
+        return y.flatten(start_dim=1)
+
     def act_inference(self, observations, *args, **kwargs):
         """Training update or deployment inference.
 
@@ -393,6 +408,10 @@ class StudentCVAETracker(nn.Module):
         During inference: uses prior mean only.
         """
         hp_t, o_t, y_t, r_t = self._split_obs(observations)
+
+        # Apply random keypoint masking during training (fresh each call)
+        if self.compute_latent_loss and self.rollout_mask_num_keypoints > 0:
+            y_t = self._random_kp_mask(y_t)
 
         h_t = self._encode_history(hp_t)
         mu_prior, logvar_prior = self.prior(h_t, y_t)
