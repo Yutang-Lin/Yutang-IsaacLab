@@ -97,7 +97,7 @@ class StudentCVAEBFMTracker(nn.Module):
 
         latent_dim = cfg.pop("latent_dim", 32)
         corr_rank = cfg.pop("corr_rank", 8)
-        history_hidden_dims = cfg.pop("history_hidden_dims", [512, 256])
+        cfg.pop("history_hidden_dims", None)  # unused, prior handles compression
         prior_hidden_dims = cfg.pop("prior_hidden_dims", [256, 128])
         posterior_hidden_dims = cfg.pop("posterior_hidden_dims", [256, 128])
 
@@ -138,8 +138,6 @@ class StudentCVAEBFMTracker(nn.Module):
         # KL and smoothness coefficients
         self.corr_kl_coef = cfg.pop("corr_kl_coef", 1e-3)
         self.latent_kl_coef = cfg.pop("latent_kl_coef", 1e-3)
-        self.h_smooth_1st_coef = cfg.pop("h_smooth_1st_coef", 2e-4)
-        self.h_smooth_2nd_coef = cfg.pop("h_smooth_2nd_coef", 2e-4)
         self.z_smooth_1st_coef = cfg.pop("z_smooth_1st_coef", 2e-4)
         self.z_smooth_2nd_coef = cfg.pop("z_smooth_2nd_coef", 2e-4)
         self.c_smooth_1st_coef = cfg.pop("c_smooth_1st_coef", 2e-4)
@@ -155,14 +153,11 @@ class StudentCVAEBFMTracker(nn.Module):
             print(f"StudentCVAEBFMTracker: unused config keys: {list(cfg.keys())}")
 
         # -- Build sub-networks --
-        history_output_dim = history_hidden_dims[-1] if history_hidden_dims else history_proprio_dim
-        self.history_encoder = _build_mlp(history_proprio_dim, history_hidden_dims, history_output_dim, activation)
-
-        # Prior: MLP on h_t only (frame conditioning handled by decoder)
-        prior_hidden_dims = cfg.pop("prior_hidden_dims", [256, 128])
-        prior_input_dim = history_output_dim
+        # Prior: MLP from raw history proprio → (mu, logvar)
+        # No separate history encoder — prior handles compression directly
+        prior_hidden_dims = cfg.pop("prior_hidden_dims", [512, 256, 128])
         prior_output_dim = 2 * latent_dim  # mu + logvar
-        self.prior = _build_mlp(prior_input_dim, prior_hidden_dims, prior_output_dim, activation)
+        self.prior = _build_mlp(history_proprio_dim, prior_hidden_dims, prior_output_dim, activation)
 
         self.posterior = CVAEPosterior(
             keybody_dim=keybody_dim,
@@ -216,8 +211,6 @@ class StudentCVAEBFMTracker(nn.Module):
 
         # -- State --
         self.compute_latent_loss = False
-        self._prev_h = None
-        self._prev_prev_h = None
         self._prev_z = None
         self._prev_prev_z = None
         self._prev_c = None
@@ -281,9 +274,10 @@ class StudentCVAEBFMTracker(nn.Module):
         delta_t = y[:, :, -1]  # [B, F]
         return frames, delta_t
 
-    def _encode_history(self, hp_t):
-        h_t = self.history_encoder(hp_t)
-        return F.normalize(h_t, dim=-1)
+    def _compute_prior(self, hp_t):
+        """Compute prior from raw history proprio."""
+        prior_out = self.prior(hp_t)
+        return prior_out.chunk(2, dim=-1)  # mu, logvar
 
     def _sample_gaussian(self, mu, logvar):
         std = (0.5 * logvar).exp()
@@ -436,9 +430,7 @@ class StudentCVAEBFMTracker(nn.Module):
         masked_frames = self._apply_masks(frames, self._ep_frame_mask, self._ep_kp_mask)
         cur_frame_mask = self._ep_frame_mask[:B]
 
-        h_t = self._encode_history(hp_t)
-        prior_out = self.prior(h_t)
-        mu_prior, logvar_prior = prior_out.chunk(2, dim=-1)
+        mu_prior, logvar_prior = self._compute_prior(hp_t)
         logvar_prior = logvar_prior.clamp(*self._LOGVAR_CLAMP)
         z_t = self._sample_gaussian(mu_prior, logvar_prior)
 
@@ -481,9 +473,7 @@ class StudentCVAEBFMTracker(nn.Module):
 
         masked_frames = self._apply_masks(frames, frame_mask, kp_mask)
 
-        h_t = self._encode_history(hp_t)
-        prior_out = self.prior(h_t)
-        mu_prior, logvar_prior = prior_out.chunk(2, dim=-1)
+        mu_prior, logvar_prior = self._compute_prior(hp_t)
         logvar_prior = logvar_prior.clamp(*self._LOGVAR_CLAMP)
 
         if self.compute_latent_loss and r_t.shape[-1] > 0:
@@ -499,13 +489,10 @@ class StudentCVAEBFMTracker(nn.Module):
             latent_kl = self._kl_divergence(mu_posterior, logvar_prior,
                                             mu_prior.detach(), logvar_prior.detach())
 
-            # Smoothness
-            h_s1, h_s2 = self._smoothness_loss(h_t, self._prev_h, self._prev_prev_h)
+            # Smoothness (z_prior and c_t only, no history encoder)
             z_s1, z_s2 = self._smoothness_loss(z_prior, self._prev_z, self._prev_prev_z)
             c_s1, c_s2 = self._smoothness_loss(c_t, self._prev_c, self._prev_prev_c)
 
-            self._prev_prev_h = self._prev_h
-            self._prev_h = h_t.detach()
             self._prev_prev_z = self._prev_z
             self._prev_z = z_prior.detach()
             self._prev_prev_c = self._prev_c
@@ -513,7 +500,6 @@ class StudentCVAEBFMTracker(nn.Module):
 
             self._save_dict = {
                 "corr_kl": corr_kl, "latent_kl": latent_kl,
-                "h_s1": h_s1, "h_s2": h_s2,
                 "z_s1": z_s1, "z_s2": z_s2,
                 "c_s1": c_s1, "c_s2": c_s2,
                 "mu_prior": mu_prior, "logvar_prior": logvar_prior,
@@ -538,8 +524,6 @@ class StudentCVAEBFMTracker(nn.Module):
         log_dict["latent_kl"] = d["latent_kl"].item()
 
         for name, coef, key in [
-            ("h_smooth_1st", self.h_smooth_1st_coef, "h_s1"),
-            ("h_smooth_2nd", self.h_smooth_2nd_coef, "h_s2"),
             ("z_smooth_1st", self.z_smooth_1st_coef, "z_s1"),
             ("z_smooth_2nd", self.z_smooth_2nd_coef, "z_s2"),
             ("c_smooth_1st", self.c_smooth_1st_coef, "c_s1"),
@@ -571,7 +555,7 @@ class StudentCVAEBFMTracker(nn.Module):
     def reset(self, dones=None, hidden_states=None):
         if dones is not None and dones.any():
             mask = dones.bool().flatten()
-            for buf_name in ("_prev_h", "_prev_prev_h", "_prev_z", "_prev_prev_z", "_prev_c", "_prev_prev_c"):
+            for buf_name in ("_prev_z", "_prev_prev_z", "_prev_c", "_prev_prev_c"):
                 buf = getattr(self, buf_name)
                 if buf is not None:
                     buf[mask] = 0.0
