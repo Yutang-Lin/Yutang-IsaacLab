@@ -18,7 +18,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import Normal
-from torch.func import jvp as func_jvp, functional_call
+import torch.autograd.forward_ad as fwAD
 
 from rsl_rl.utils import resolve_nn_activation
 from .actor_critic import ActorCritic
@@ -269,15 +269,15 @@ class StudentCoDiTMFTracker(nn.Module):
         tok_proprio = self.transformer.proprio_proj(o_t) + self.transformer.proprio_embed
         tok_history = self.transformer.history_proj(h_t) + self.transformer.history_embed
 
-        # JVP via torch.func with fwd_dual flash attention
-        def denoise_fn(y, r_, t_):
-            return self.transformer.denoise_only(y, t_, r_, tok_proprio, tok_history, fwd_dual=True)
+        # JVP via forward-mode AD with JVPAttn (flash attention with native dual tensor support)
+        with fwAD.dual_level():
+            y_dual = fwAD.make_dual(y_flat, v_flat)
+            r_dual = fwAD.make_dual(r, torch.zeros_like(r))
+            t_dual = fwAD.make_dual(t, torch.ones_like(t))
 
-        u, du_dt = func_jvp(
-            denoise_fn,
-            (y_flat, r, t),
-            (v_flat, torch.zeros_like(r), torch.ones_like(t)),
-        )
+            u_dual = self.transformer.denoise_only(y_dual, t_dual, r_dual, tok_proprio, tok_history, fwd_dual=True)
+
+            u, du_dt = fwAD.unpack_dual(u_dual)
 
         # MeanFlow target: u_target = v_flat - (t - r) * du_dt
         # t-r is [B, T, K], expand to [B, T, K*D] by repeating each K value D times
