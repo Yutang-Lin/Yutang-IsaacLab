@@ -270,7 +270,13 @@ class StudentVQVAEBFMTracker(nn.Module):
         n = env_ids.shape[0]
         n_frames, K = self.num_frames, self.rollout_mask_num_keypoints
         offsets = torch.empty(n, n_frames, device=device).uniform_(self.min_frame_delta, self.max_frame_delta)
-        self._ep_frame_offsets[env_ids] = offsets.sort(dim=1).values
+        offsets = (offsets / self.step_dt).round() * self.step_dt
+        offsets = offsets.clamp(min=self.step_dt)
+        offsets = offsets.sort(dim=1).values
+        # Deduplicate: bump repeated offsets by step_dt
+        for i in range(1, n_frames):
+            offsets[:, i] = torch.max(offsets[:, i], offsets[:, i - 1] + self.step_dt)
+        self._ep_frame_offsets[env_ids] = offsets
         p_active = torch.empty(n, device=device).uniform_(*self.frame_p_active_range)
         fm = torch.rand(n, n_frames, device=device) < p_active[:, None]
         all_off = ~fm.any(dim=1)
@@ -291,7 +297,10 @@ class StudentVQVAEBFMTracker(nn.Module):
             mask[consumed, :-1] = mask[consumed, 1:].clone()
             n = consumed.sum()
             last = offsets[consumed, -2]
-            offsets[consumed, -1] = last + torch.empty(n, device=offsets.device).uniform_(self.min_frame_delta, self.max_frame_delta)
+            gap = torch.empty(n, device=offsets.device).uniform_(self.min_frame_delta, self.max_frame_delta)
+            gap = (gap / self.step_dt).round() * self.step_dt
+            gap = gap.clamp(min=self.step_dt)
+            offsets[consumed, -1] = last + gap
             p = torch.empty(n, device=offsets.device).uniform_(*self.frame_p_active_range)
             mask[consumed, -1] = torch.rand(n, device=offsets.device) < p
 

@@ -303,7 +303,12 @@ class StudentCVAEBFMTracker(nn.Module):
 
         # Sample F independent deltas per env, then sort to maintain order
         offsets = torch.empty(n, nf, device=device).uniform_(self.min_frame_delta, self.max_frame_delta)
-        offsets = offsets.sort(dim=1).values  # [n, F] sorted ascending
+        offsets = (offsets / self.step_dt).round() * self.step_dt
+        offsets = offsets.clamp(min=self.step_dt)
+        offsets = offsets.sort(dim=1).values
+        # Deduplicate: bump repeated offsets by step_dt
+        for i in range(1, nf):
+            offsets[:, i] = torch.max(offsets[:, i], offsets[:, i - 1] + self.step_dt)
         self._ep_frame_offsets[env_ids] = offsets
 
         # Frame mask: episodic per-frame active mask (at least 1 active)
