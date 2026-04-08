@@ -149,7 +149,7 @@ class StudentVQVAEBFMTracker(nn.Module):
         # VQ codebook
         self.codebook = VQCodebook(num_codes, latent_dim, ema_decay, dead_code_threshold)
 
-        # VQ Posterior: cross-attention → continuous → quantize
+        # VQ Posterior: 2-layer cross-attention (keybody queries, frames KV)
         self.posterior = VQBFMPosterior(
             keybody_dim=keybody_dim,
             latent_dim=latent_dim,
@@ -157,17 +157,20 @@ class StudentVQVAEBFMTracker(nn.Module):
             frame_encoder=self.frame_encoder,
             num_heads=tf_num_heads,
             hidden_dim=tf_hidden_dim,
+            num_layers=2,
             activation=tf_activation,
         )
 
-        # VQ Prior: transformer predicting codebook index from history + frames
+        # VQ Prior: 2-layer cross-attention (o_t queries, [h_prior, frames] KV)
         self.prior_predictor = VQBFMPrior(
+            proprio_dim=current_proprio_dim,
             h_dim=latent_dim,
             num_codes=num_codes,
             d_model=tf_d_model,
             frame_encoder=self.frame_encoder,
             num_heads=tf_num_heads,
             hidden_dim=tf_hidden_dim,
+            num_layers=2,
             activation=tf_activation,
         )
 
@@ -332,7 +335,7 @@ class StudentVQVAEBFMTracker(nn.Module):
 
         # Prior: predict codebook index from history + masked frames
         h_prior = self.history_prior(hp_t)
-        logits = self.prior_predictor(h_prior, masked_frames, delta_t, cur_frame_mask)
+        logits = self.prior_predictor(o_t, h_prior, masked_frames, delta_t, cur_frame_mask)
         indices = logits.argmax(dim=-1)  # [B]
         e_q = self.codebook.embedding(indices)  # [B, latent_dim]
 
@@ -379,7 +382,7 @@ class StudentVQVAEBFMTracker(nn.Module):
             e_q, vq_indices, commit_loss = self.codebook.quantize(z_e)
 
             # Prior: predict codebook index
-            logits = self.prior_predictor(h_prior, masked_frames, delta_t, frame_mask)
+            logits = self.prior_predictor(o_t, h_prior, masked_frames, delta_t, frame_mask)
             prior_ce = F.cross_entropy(logits, vq_indices.detach())
 
             # Posterior dropout
@@ -399,7 +402,7 @@ class StudentVQVAEBFMTracker(nn.Module):
             }
         else:
             # Inference: prior argmax
-            logits = self.prior_predictor(h_prior, masked_frames, delta_t, frame_mask)
+            logits = self.prior_predictor(o_t, h_prior, masked_frames, delta_t, frame_mask)
             indices = logits.argmax(dim=-1)
             e_q = self.codebook.embedding(indices)
 

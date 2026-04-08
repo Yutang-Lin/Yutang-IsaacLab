@@ -98,128 +98,139 @@ class VQCodebook(nn.Module):
         return e_q, indices, commit_loss
 
 
-class VQBFMPosterior(nn.Module):
-    """Cross-attention posterior with vector quantization.
+class _CrossAttnLayer(nn.Module):
+    """Single cross-attention + FFN layer. Query attends to context (KV)."""
 
-    Same architecture as CVAEBFMPosterior but outputs a continuous embedding
-    that gets quantized through the codebook. No mu/logvar — direct embedding.
+    def __init__(self, d_model, num_heads, hidden_dim, activation):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = d_model // num_heads
+        self.d_model = d_model
+        self.q_proj = nn.Linear(d_model, d_model)
+        self.k_proj = nn.Linear(d_model, d_model)
+        self.v_proj = nn.Linear(d_model, d_model)
+        self.out_proj = nn.Linear(d_model, d_model)
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.ffn = nn.Sequential(nn.Linear(d_model, hidden_dim), activation, nn.Linear(hidden_dim, d_model))
+
+    def forward(self, q_tok, kv, kv_mask=None):
+        """
+        Args:
+            q_tok: [B, d] single query token
+            kv: [B, S, d] context tokens
+            kv_mask: [B, S] bool (True=valid) or None
+        """
+        B, S, _ = kv.shape
+        H, hd = self.num_heads, self.head_dim
+
+        q = self.q_proj(q_tok).view(B, 1, H, hd).transpose(1, 2)
+        k = self.k_proj(kv).view(B, S, H, hd).transpose(1, 2)
+        v = self.v_proj(kv).view(B, S, H, hd).transpose(1, 2)
+
+        attn = (q @ k.transpose(-2, -1)) * (hd ** -0.5)
+        if kv_mask is not None:
+            mask = kv_mask[:, None, None, :].expand(-1, H, 1, -1)
+            attn = attn.masked_fill(~mask, float('-inf'))
+        attn = attn.softmax(dim=-1)
+        out = (attn @ v).transpose(1, 2).reshape(B, self.d_model)
+        out = self.out_proj(out)
+
+        q_tok = self.norm1(q_tok + out)
+        q_tok = self.norm2(q_tok + self.ffn(q_tok))
+        return q_tok
+
+
+class VQBFMPosterior(nn.Module):
+    """2-layer cross-attention posterior. Keybody queries, frames are KV.
+
+    Outputs continuous embedding z_e for codebook quantization.
     """
 
     def __init__(self, keybody_dim: int, latent_dim: int, d_model: int,
                  frame_encoder: BFMFrameEncoder,
                  num_heads: int = 4, hidden_dim: int = 512,
-                 dropout: float = 0.0, activation: nn.Module | None = None):
+                 num_layers: int = 2, activation: nn.Module | None = None):
         super().__init__()
         if activation is None:
             activation = nn.GELU(approximate="tanh")
 
-        self.d_model = d_model
-        self.num_heads = num_heads
-        self.head_dim = d_model // num_heads
-        self.frame_encoder = frame_encoder  # shared
-
+        self.frame_encoder = frame_encoder
         self.keybody_proj = nn.Linear(keybody_dim, d_model)
         self.keybody_embed = nn.Parameter(torch.randn(d_model) * 0.02)
 
-        # Cross-attention
-        self.q_proj = nn.Linear(d_model, d_model)
-        self.k_proj = nn.Linear(d_model, d_model)
-        self.v_proj = nn.Linear(d_model, d_model)
-        self.out_proj = nn.Linear(d_model, d_model)
-
-        self.norm1 = nn.LayerNorm(d_model)
-        self.norm2 = nn.LayerNorm(d_model)
-        self.ffn = nn.Sequential(
-            nn.Linear(d_model, hidden_dim), activation, nn.Linear(hidden_dim, d_model),
-        )
-
-        # Project to continuous embedding (pre-quantization)
+        self.layers = nn.ModuleList([
+            _CrossAttnLayer(d_model, num_heads, hidden_dim, activation)
+            for _ in range(num_layers)
+        ])
         self.embed_head = nn.Linear(d_model, latent_dim)
 
     def forward(self, r_t, frames_flat, delta_t, frame_mask):
         """
-        Args:
-            r_t: [B, keybody_dim]
-            frames_flat: [B, F, K*D]
-            delta_t: [B, F]
-            frame_mask: [B, F] bool
-
         Returns:
             z_e: [B, latent_dim] continuous embedding (before quantization)
         """
-        B, nf = frames_flat.shape[:2]
-
         tok_kb = self.keybody_proj(r_t) + self.keybody_embed
         tok_frames = self.frame_encoder(frames_flat, delta_t)
 
-        q = self.q_proj(tok_kb).unsqueeze(1)
-        k = self.k_proj(tok_frames)
-        v = self.v_proj(tok_frames)
+        q = tok_kb
+        for layer in self.layers:
+            q = layer(q, tok_frames, frame_mask)
 
-        q = q.view(B, 1, self.num_heads, self.head_dim).transpose(1, 2)
-        k = k.view(B, nf, self.num_heads, self.head_dim).transpose(1, 2)
-        v = v.view(B, nf, self.num_heads, self.head_dim).transpose(1, 2)
-
-        attn_mask = frame_mask[:, None, None, :].expand(-1, self.num_heads, 1, -1)
-        attn = (q @ k.transpose(-2, -1)) * (self.head_dim ** -0.5)
-        attn = attn.masked_fill(~attn_mask, float('-inf'))
-        attn = attn.softmax(dim=-1)
-        out = (attn @ v).transpose(1, 2).reshape(B, 1, self.d_model)
-        out = self.out_proj(out).squeeze(1)
-
-        kb_out = self.norm1(tok_kb + out)
-        kb_out = self.norm2(kb_out + self.ffn(kb_out))
-
-        return self.embed_head(kb_out)  # [B, latent_dim]
+        return self.embed_head(q)
 
 
 class VQBFMPrior(nn.Module):
-    """Transformer prior that predicts codebook index from history + masked frames.
+    """2-layer cross-attention prior. o_t queries, [h_prior, frames] are KV.
 
-    Token layout: [history(0), frame_0(1), ..., frame_{F-1}(F)]
-    1-layer transformer. Outputs logits over codebook entries from history token.
+    Predicts codebook index from proprio + history + sparse frame context.
     """
 
-    def __init__(self, h_dim: int, num_codes: int, d_model: int,
+    def __init__(self, proprio_dim: int, h_dim: int, num_codes: int, d_model: int,
                  frame_encoder: BFMFrameEncoder,
                  num_heads: int = 4, hidden_dim: int = 512,
-                 dropout: float = 0.0, activation: nn.Module | None = None):
+                 num_layers: int = 2, activation: nn.Module | None = None):
         super().__init__()
         if activation is None:
             activation = nn.GELU(approximate="tanh")
 
-        self.frame_encoder = frame_encoder  # shared
-
+        self.frame_encoder = frame_encoder
+        self.proprio_proj = nn.Linear(proprio_dim, d_model)
+        self.proprio_embed = nn.Parameter(torch.randn(d_model) * 0.02)
         self.history_proj = nn.Linear(h_dim, d_model)
         self.history_embed = nn.Parameter(torch.randn(d_model) * 0.02)
 
-        self.transformer = TransformerEncoder(
-            d_model=d_model, num_heads=num_heads, hidden_dim=hidden_dim,
-            num_layers=1, dropout=dropout, is_causal=False,
-            activation=activation, enable_sdpa=False,
-        )
-
-        # Predict codebook index
+        self.layers = nn.ModuleList([
+            _CrossAttnLayer(d_model, num_heads, hidden_dim, activation)
+            for _ in range(num_layers)
+        ])
         self.logit_head = nn.Linear(d_model, num_codes)
 
-    def forward(self, h_prior, frames_flat, delta_t, frame_mask):
+    def forward(self, o_t, h_prior, frames_flat, delta_t, frame_mask):
         """
         Args:
-            h_prior: [B, h_dim] deterministic prior encoding from history MLP.
+            o_t: [B, proprio_dim] current proprio (query)
+            h_prior: [B, h_dim] history encoding (part of KV context)
             frames_flat: [B, F, K*D]
             delta_t: [B, F]
             frame_mask: [B, F] bool
 
         Returns:
-            logits: [B, num_codes] unnormalized log-probabilities over codebook.
+            logits: [B, num_codes]
         """
-        B, nf = frames_flat.shape[:2]
-
+        B = o_t.shape[0]
+        tok_q = self.proprio_proj(o_t) + self.proprio_embed
         tok_h = self.history_proj(h_prior) + self.history_embed
         tok_frames = self.frame_encoder(frames_flat, delta_t)
 
-        tokens = torch.cat([tok_h.unsqueeze(1), tok_frames], dim=1)
-        attn_mask = _build_frame_attn_mask(B, nf, frame_mask, n_prefix=1, device=h_prior.device)
+        # KV context: [h_prior, frame_0, ..., frame_{F-1}]
+        kv = torch.cat([tok_h.unsqueeze(1), tok_frames], dim=1)  # [B, 1+F, d]
+        # KV mask: h_prior always valid, frames follow frame_mask
+        kv_mask = torch.ones(B, 1 + tok_frames.shape[1], dtype=torch.bool, device=o_t.device)
+        kv_mask[:, 1:] = frame_mask
 
-        out = self.transformer(tokens, attn_mask=attn_mask)
-        return self.logit_head(out[:, 0])  # [B, num_codes]
+        q = tok_q
+        for layer in self.layers:
+            q = layer(q, kv, kv_mask)
+
+        return self.logit_head(q)
