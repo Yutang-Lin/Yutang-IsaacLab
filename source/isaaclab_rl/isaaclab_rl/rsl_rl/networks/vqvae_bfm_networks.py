@@ -180,12 +180,75 @@ class VQBFMPosterior(nn.Module):
         return self.embed_head(q)
 
 
-class VQBFMPrior(nn.Module):
-    """2-layer cross-attention prior with auto-regressive previous code.
+class _SelfCrossAttnLayer(nn.Module):
+    """Self-attention among input tokens, then cross-attention to context KV."""
 
-    Q: o_t (proprio). KV: [h_prior, prev_e_q, frame_0, ..., frame_{F-1}].
-    prev_e_q is the codebook embedding from the previous step (zero at episode start
-    or during training). Enables temporally coherent code prediction at rollout.
+    def __init__(self, d_model, num_heads, hidden_dim, activation):
+        super().__init__()
+        self.self_attn = _CrossAttnLayer(d_model, num_heads, hidden_dim, activation)
+        # Cross-attention to external KV
+        self.num_heads = num_heads
+        self.head_dim = d_model // num_heads
+        self.d_model = d_model
+        self.xq_proj = nn.Linear(d_model, d_model)
+        self.xk_proj = nn.Linear(d_model, d_model)
+        self.xv_proj = nn.Linear(d_model, d_model)
+        self.xout_proj = nn.Linear(d_model, d_model)
+        self.xnorm = nn.LayerNorm(d_model)
+        self.xnorm2 = nn.LayerNorm(d_model)
+        self.xffn = nn.Sequential(nn.Linear(d_model, hidden_dim), activation, nn.Linear(hidden_dim, d_model))
+
+    def forward(self, tokens, kv, kv_mask=None):
+        """
+        Args:
+            tokens: [B, N, d] input tokens (self-attend among these)
+            kv: [B, S, d] external context (cross-attend to these)
+            kv_mask: [B, S] bool or None
+
+        Returns:
+            tokens: [B, N, d] updated tokens
+        """
+        B, N, d = tokens.shape
+        S = kv.shape[1]
+        H, hd = self.num_heads, self.head_dim
+
+        # Self-attention: each token attends to all input tokens
+        # Use _CrossAttnLayer per-token (but we need batched multi-token self-attn)
+        # Actually, let's do it directly for N tokens
+        # Self-attn Q,K,V all from tokens
+        sq = self.self_attn.q_proj(tokens).view(B, N, H, hd).transpose(1, 2)
+        sk = self.self_attn.k_proj(tokens).view(B, N, H, hd).transpose(1, 2)
+        sv = self.self_attn.v_proj(tokens).view(B, N, H, hd).transpose(1, 2)
+        sa = (sq @ sk.transpose(-2, -1)) * (hd ** -0.5)
+        sa = sa.softmax(dim=-1)
+        s_out = (sa @ sv).transpose(1, 2).reshape(B, N, d)
+        s_out = self.self_attn.out_proj(s_out)
+        tokens = self.self_attn.norm1(tokens + s_out)
+        tokens = self.self_attn.norm2(tokens + self.self_attn.ffn(tokens))
+
+        # Cross-attention: each token attends to external KV
+        xq = self.xq_proj(tokens).view(B, N, H, hd).transpose(1, 2)  # [B, H, N, hd]
+        xk = self.xk_proj(kv).view(B, S, H, hd).transpose(1, 2)
+        xv = self.xv_proj(kv).view(B, S, H, hd).transpose(1, 2)
+        xa = (xq @ xk.transpose(-2, -1)) * (hd ** -0.5)
+        if kv_mask is not None:
+            mask = kv_mask[:, None, None, :].expand(-1, H, N, -1)
+            xa = xa.masked_fill(~mask, float('-inf'))
+        xa = xa.softmax(dim=-1)
+        x_out = (xa @ xv).transpose(1, 2).reshape(B, N, d)
+        x_out = self.xout_proj(x_out)
+        tokens = self.xnorm(tokens + x_out)
+        tokens = self.xnorm2(tokens + self.xffn(tokens))
+
+        return tokens
+
+
+class VQBFMPrior(nn.Module):
+    """Auto-regressive prior with self-attention + cross-attention to frames.
+
+    Input tokens: [prev_e_q, o_t, h_prior] — self-attend among these.
+    Cross-attention KV: frame tokens (pad-masked).
+    Output: logits from o_t token position.
     """
 
     def __init__(self, proprio_dim: int, h_dim: int, latent_dim: int,
@@ -206,7 +269,7 @@ class VQBFMPrior(nn.Module):
         self.prev_code_embed = nn.Parameter(torch.randn(d_model) * 0.02)
 
         self.layers = nn.ModuleList([
-            _CrossAttnLayer(d_model, num_heads, hidden_dim, activation)
+            _SelfCrossAttnLayer(d_model, num_heads, hidden_dim, activation)
             for _ in range(num_layers)
         ])
         self.logit_head = nn.Linear(d_model, num_codes)
@@ -214,9 +277,9 @@ class VQBFMPrior(nn.Module):
     def forward(self, o_t, h_prior, prev_e_q, frames_flat, delta_t, frame_mask):
         """
         Args:
-            o_t: [B, proprio_dim] current proprio (query)
-            h_prior: [B, h_dim] history encoding
-            prev_e_q: [B, latent_dim] previous step's codebook embedding (zero if none)
+            o_t: [B, proprio_dim]
+            h_prior: [B, h_dim]
+            prev_e_q: [B, latent_dim] (zero at episode start / training)
             frames_flat: [B, F, K*D]
             delta_t: [B, F]
             frame_mask: [B, F] bool
@@ -224,19 +287,18 @@ class VQBFMPrior(nn.Module):
         Returns:
             logits: [B, num_codes]
         """
-        B = o_t.shape[0]
-        tok_q = self.proprio_proj(o_t) + self.proprio_embed
-        tok_h = self.history_proj(h_prior) + self.history_embed
         tok_prev = self.prev_code_proj(prev_e_q) + self.prev_code_embed
-        tok_frames = self.frame_encoder(frames_flat, delta_t)
+        tok_o = self.proprio_proj(o_t) + self.proprio_embed
+        tok_h = self.history_proj(h_prior) + self.history_embed
 
-        # KV context: [h_prior, prev_e_q, frame_0, ..., frame_{F-1}]
-        kv = torch.cat([tok_h.unsqueeze(1), tok_prev.unsqueeze(1), tok_frames], dim=1)  # [B, 2+F, d]
-        kv_mask = torch.ones(B, 2 + tok_frames.shape[1], dtype=torch.bool, device=o_t.device)
-        kv_mask[:, 2:] = frame_mask  # first 2 (h_prior, prev_e_q) always valid
+        # Input tokens: [prev_e_q, o_t, h_prior]
+        tokens = torch.stack([tok_prev, tok_o, tok_h], dim=1)  # [B, 3, d]
 
-        q = tok_q
+        # Cross-attention KV: frame tokens (pad-masked)
+        tok_frames = self.frame_encoder(frames_flat, delta_t)  # [B, F, d]
+
         for layer in self.layers:
-            q = layer(q, kv, kv_mask)
+            tokens = layer(tokens, tok_frames, frame_mask)
 
-        return self.logit_head(q)
+        # Output from o_t token (index 1)
+        return self.logit_head(tokens[:, 1])
