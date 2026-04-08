@@ -17,17 +17,21 @@ from isaaclab_rl.rsl_rl.networks.cvae_bfm_networks import BFMFrameEncoder, _buil
 
 
 class VQCodebook(nn.Module):
-    """Vector quantization codebook with straight-through estimator.
+    """Vector quantization codebook with EMA updates and dead code reset.
 
     Maintains a codebook of `num_codes` vectors of dimension `latent_dim`.
     Uses EMA updates for codebook vectors during training.
+    Dead codes (unused for `dead_code_threshold` steps) are reset to
+    randomly sampled encoder outputs.
     """
 
-    def __init__(self, num_codes: int, latent_dim: int, ema_decay: float = 0.99):
+    def __init__(self, num_codes: int, latent_dim: int, ema_decay: float = 0.99,
+                 dead_code_threshold: int = 100):
         super().__init__()
         self.num_codes = num_codes
         self.latent_dim = latent_dim
         self.ema_decay = ema_decay
+        self.dead_code_threshold = dead_code_threshold
 
         self.embedding = nn.Embedding(num_codes, latent_dim)
         nn.init.uniform_(self.embedding.weight, -1.0 / num_codes, 1.0 / num_codes)
@@ -35,6 +39,8 @@ class VQCodebook(nn.Module):
         # EMA state
         self.register_buffer("_ema_cluster_size", torch.zeros(num_codes))
         self.register_buffer("_ema_embed_sum", self.embedding.weight.clone())
+        # Dead code tracking: steps since each code was last used
+        self.register_buffer("_steps_since_used", torch.zeros(num_codes, dtype=torch.long))
 
     def quantize(self, z_e: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Quantize continuous embeddings to nearest codebook vectors.
@@ -52,14 +58,17 @@ class VQCodebook(nn.Module):
         indices = dists.argmin(dim=-1)  # [B]
         e_q = self.embedding(indices)  # [B, latent_dim]
 
-        # Commitment loss: encourage encoder to commit to codebook
+        # Commitment loss
         commit_loss = F.mse_loss(z_e, e_q.detach())
 
-        # EMA codebook update (training only)
+        # EMA codebook update + dead code reset (training only)
         if self.training:
             with torch.no_grad():
                 onehot = F.one_hot(indices, self.num_codes).float()  # [B, num_codes]
-                self._ema_cluster_size = self._ema_cluster_size * self.ema_decay + onehot.sum(0) * (1 - self.ema_decay)
+                usage = onehot.sum(0)  # [num_codes]
+
+                # EMA update
+                self._ema_cluster_size = self._ema_cluster_size * self.ema_decay + usage * (1 - self.ema_decay)
                 embed_sum = onehot.T @ z_e  # [num_codes, latent_dim]
                 self._ema_embed_sum = self._ema_embed_sum * self.ema_decay + embed_sum * (1 - self.ema_decay)
 
@@ -68,7 +77,22 @@ class VQCodebook(nn.Module):
                 cluster_size = (self._ema_cluster_size + 1e-5) / (n + self.num_codes * 1e-5) * n
                 self.embedding.weight.data = self._ema_embed_sum / cluster_size.unsqueeze(1)
 
-        # Straight-through: gradient flows through e_q as if it were z_e
+                # Dead code tracking and reset
+                used = usage > 0
+                self._steps_since_used[used] = 0
+                self._steps_since_used[~used] += 1
+
+                dead = self._steps_since_used >= self.dead_code_threshold
+                n_dead = dead.sum().item()
+                if n_dead > 0:
+                    # Reset dead codes to randomly sampled encoder outputs
+                    rand_idx = torch.randint(0, z_e.shape[0], (n_dead,), device=z_e.device)
+                    self.embedding.weight.data[dead] = z_e[rand_idx].detach()
+                    self._ema_embed_sum[dead] = z_e[rand_idx].detach()
+                    self._ema_cluster_size[dead] = 1.0
+                    self._steps_since_used[dead] = 0
+
+        # Straight-through
         e_q = z_e + (e_q - z_e).detach()
 
         return e_q, indices, commit_loss

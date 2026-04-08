@@ -88,6 +88,7 @@ class StudentVQVAEBFMTracker(nn.Module):
         latent_dim = cfg.pop("latent_dim", 64)
         num_codes = cfg.pop("num_codes", 512)
         ema_decay = cfg.pop("ema_decay", 0.99)
+        dead_code_threshold = cfg.pop("dead_code_threshold", 100)
         cfg.pop("corr_rank", None)
         cfg.pop("history_hidden_dims", None)
         cfg.pop("posterior_hidden_dims", None)
@@ -146,7 +147,7 @@ class StudentVQVAEBFMTracker(nn.Module):
         )
 
         # VQ codebook
-        self.codebook = VQCodebook(num_codes, latent_dim, ema_decay)
+        self.codebook = VQCodebook(num_codes, latent_dim, ema_decay, dead_code_threshold)
 
         # VQ Posterior: cross-attention → continuous → quantize
         self.posterior = VQBFMPosterior(
@@ -429,6 +430,8 @@ class StudentVQVAEBFMTracker(nn.Module):
             # Prior accuracy: does prior predict the right code?
             prior_pred = d["logits"].argmax(dim=-1)
             log_dict["prior_accuracy"] = (prior_pred == d["vq_indices"]).float().mean().item()
+            # Dead codes
+            log_dict["dead_codes"] = (self.codebook._steps_since_used >= self.codebook.dead_code_threshold).sum().item()
 
         self._save_dict = {}
         return dict(loss_dict), dict(log_dict)
