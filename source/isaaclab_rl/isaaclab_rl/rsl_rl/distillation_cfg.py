@@ -98,6 +98,14 @@ class RslRlDistillationStudentVQVAEBFMTrackerCfg(RslRlDistillationStudentTeacher
     """The policy class name. Default is StudentVQVAEBFMTracker."""
 
 
+@configclass
+class RslRlDistillationStudentFlowBFMTrackerCfg(RslRlDistillationStudentTeacherCfg):
+    """Configuration for Flow-BFM distillation policy."""
+
+    class_name: str = "StudentFlowBFMTracker"
+    """The policy class name. Default is StudentFlowBFMTracker."""
+
+
 ############################
 # Algorithm configurations #
 ############################
