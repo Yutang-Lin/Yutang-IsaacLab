@@ -69,8 +69,10 @@ def _build_frame_attn_mask(B: int, F: int, frame_mask: torch.Tensor,
     """
     total = n_prefix + F
     attn_mask = torch.ones(B, total, total, dtype=torch.bool, device=device)
+    # Only mask columns: nobody can attend TO masked frames.
+    # Rows left unmasked: masked frames can still attend to prefix tokens,
+    # giving them valid softmax. Their outputs are harmless since nobody reads them.
     attn_mask[:, :, n_prefix:] &= frame_mask.unsqueeze(1)
-    attn_mask[:, n_prefix:, :] &= frame_mask.unsqueeze(2)
     return attn_mask
 
 
