@@ -180,6 +180,14 @@ class StudentFlowBFMTracker(nn.Module):
         print(f"StudentFlowBFMTracker: latent={latent_dim}, ode_steps={self.ode_steps}, "
               f"enc_layers={encoder_num_layers}, dec_layers={decoder_num_layers}")
 
+        # -- Action EMA min/max normalizer --
+        # Track EMA min/max of teacher actions for first warmup_iters, then freeze
+        self.register_buffer("_act_ema_min", torch.zeros(num_actions))
+        self.register_buffer("_act_ema_max", torch.ones(num_actions))
+        self._act_ema_decay = 0.99
+        self._act_warmup_iters = cfg.pop("act_warmup_iters", 100)
+        self._act_warmup_count = 0
+
         # -- Action noise --
         self.std = nn.Parameter(init_noise_std * torch.ones(num_actions))
         self.distribution = None
@@ -286,8 +294,34 @@ class StudentFlowBFMTracker(nn.Module):
         context, ctx_mask = self.encoder(h_prior, o_t, masked_frames, delta_t, frame_mask)
         return context, ctx_mask, h_prior
 
+    def _update_act_norm(self, actions):
+        """Update EMA min/max from teacher actions during warmup."""
+        if self._act_warmup_count >= self._act_warmup_iters:
+            return
+        with torch.no_grad():
+            batch_min = actions.min(dim=0).values
+            batch_max = actions.max(dim=0).values
+            d = self._act_ema_decay
+            if self._act_warmup_count == 0:
+                self._act_ema_min.copy_(batch_min)
+                self._act_ema_max.copy_(batch_max)
+            else:
+                self._act_ema_min.copy_(self._act_ema_min * d + batch_min * (1 - d))
+                self._act_ema_max.copy_(self._act_ema_max * d + batch_max * (1 - d))
+            self._act_warmup_count += 1
+
+    def _normalize_action(self, a):
+        """Normalize action to [-1, 1] using EMA min/max."""
+        r = (self._act_ema_max - self._act_ema_min).clamp(min=1e-6)
+        return 2.0 * (a - self._act_ema_min) / r - 1.0
+
+    def _denormalize_action(self, a_norm):
+        """Denormalize action from [-1, 1] to original scale."""
+        r = (self._act_ema_max - self._act_ema_min).clamp(min=1e-6)
+        return (a_norm + 1.0) * 0.5 * r + self._act_ema_min
+
     def _ode_sample(self, context, ctx_mask, B, device):
-        """K-step Euler ODE integration from noise to action, with KV cache."""
+        """K-step Euler ODE integration from noise to normalized action, then denormalize."""
         # Build KV cache once
         kv_cache, ctx_mask = self.decoder.build_kv_cache(context, ctx_mask)
 
@@ -299,9 +333,10 @@ class StudentFlowBFMTracker(nn.Module):
             t = 1.0 - k * dt  # t goes from 1 → dt
             t_tensor = torch.full((B,), t, device=device)
             v = self.decoder.forward_cached(a_t, t_tensor, kv_cache, ctx_mask)
-            a_t = a_t - dt * v  # Euler step: a_{t-dt} = a_t - dt * v
+            a_t = a_t - dt * v  # Euler step
 
-        return a_t  # a_0 ≈ clean action
+        # a_0 is in normalized [-1, 1] space, denormalize to action scale
+        return self._denormalize_action(a_t)
 
     # -- Forward paths --
 
@@ -364,32 +399,15 @@ class StudentFlowBFMTracker(nn.Module):
         context, ctx_mask, h_prior = self._encode_context(hp_t, o_t, masked_frames, delta_t, frame_mask)
 
         if self.compute_latent_loss:
-            # Flow matching: noise the teacher action, predict velocity
-            # Teacher action comes from behavior_loss in distillation loop,
-            # but we need it here for the flow loss. Use a dummy forward
-            # and cache for extra_loss.
-            # Actually, the distillation loop provides privileged_actions separately.
-            # We just need to return a_0 prediction for behavior_loss.
-            # For flow training: sample t, compute noised action, predict velocity.
-            # The behavior_loss will compare our output to teacher action.
-
-            # Single-step prediction at t=0 (clean): just run ODE
-            # But that's expensive. Instead, use 1-step prediction:
-            # at t=1, a_1 = noise, predict v → a_0 = a_1 - v
-            # This is a single decoder forward, equivalent to 1-step ODE.
-            eps = torch.randn(B, self.num_actions, device=frames.device)
-            t = torch.rand(B, device=frames.device)
-            # We don't have teacher action here — distillation loop handles behavior_loss.
-            # Just return the 1-step denoised action.
-            v = self.decoder(eps, torch.ones(B, device=frames.device), context, ctx_mask)
-            a_pred = eps - v  # 1-step from t=1
-
+            # Cache context for flow_loss in extra_loss (which receives teacher actions)
+            # Return zeros detached — behavior_loss from distillation loop is disabled
+            # (gradient blocked by detach, all training comes from flow_loss)
             self._save_dict = {
                 "h_prior": h_prior,
                 "context": context,
                 "ctx_mask": ctx_mask,
             }
-            return a_pred
+            return torch.zeros(B, self.num_actions, device=frames.device).detach()
         else:
             return self._ode_sample(context, ctx_mask, B, frames.device)
 
@@ -401,7 +419,7 @@ class StudentFlowBFMTracker(nn.Module):
         loss_dict = {}
         log_dict = {}
 
-        # Flow matching loss: computed here using privileged_actions from distillation
+        # Flow matching loss on normalized actions
         privileged_actions = kwargs.get("privileged_actions_batch", None)
         if privileged_actions is not None:
             context = d["context"]
@@ -409,11 +427,17 @@ class StudentFlowBFMTracker(nn.Module):
             B = privileged_actions.shape[0]
             device = privileged_actions.device
 
+            # Update EMA min/max during warmup
+            self._update_act_norm(privileged_actions)
+
+            # Normalize teacher actions to [-1, 1]
+            a_clean = self._normalize_action(privileged_actions)
+
             # Sample t ~ U(0, 1), construct a_t, compute velocity
             t = torch.rand(B, device=device)
-            eps = torch.randn_like(privileged_actions)
-            a_t = (1 - t.unsqueeze(-1)) * privileged_actions + t.unsqueeze(-1) * eps
-            v_target = eps - privileged_actions  # constant velocity for linear path
+            eps = torch.randn_like(a_clean)
+            a_t = (1 - t.unsqueeze(-1)) * a_clean + t.unsqueeze(-1) * eps
+            v_target = eps - a_clean  # constant velocity for linear path
 
             v_pred = self.decoder(a_t, t, context, ctx_mask)
             flow_loss = F.mse_loss(v_pred, v_target)
