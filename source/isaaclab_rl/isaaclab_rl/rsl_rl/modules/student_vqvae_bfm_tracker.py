@@ -294,6 +294,14 @@ class StudentVQVAEBFMTracker(nn.Module):
             offsets[consumed, -1] = last + torch.empty(n, device=offsets.device).uniform_(self.min_frame_delta, self.max_frame_delta)
             p = torch.empty(n, device=offsets.device).uniform_(*self.frame_p_active_range)
             mask[consumed, -1] = torch.rand(n, device=offsets.device) < p
+
+        # Ensure at least 1 frame active after shift (prevents all-masked → NaN in cross-attn)
+        all_off = ~mask.any(dim=1)
+        if all_off.any():
+            n_frames = mask.shape[1]
+            rand_slot = torch.randint(0, n_frames, (all_off.sum(),), device=mask.device)
+            mask[all_off, rand_slot] = True
+
         self._push_offsets_to_env()
 
     def _push_offsets_to_env(self, env_ids=None):
