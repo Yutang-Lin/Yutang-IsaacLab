@@ -347,11 +347,9 @@ class StudentVQVAEBFMTracker(nn.Module):
         indices = logits.argmax(dim=-1)  # [B]
         e_q = self.codebook.embedding(indices)  # [B, latent_dim]
 
-        # Update prev_e_q for next step (replace NaN with zero to prevent cascade)
+        # Update prev_e_q for next step
         with torch.inference_mode(False):
-            new_prev = e_q.detach().clone()
-            new_prev = torch.where(torch.isnan(new_prev), torch.zeros_like(new_prev), new_prev)
-            self._prev_e_q = new_prev
+            self._prev_e_q = e_q.detach().clone()
 
         # Decoder uses enriched o_t and h_prior from prior's transformer (already d_model-dim)
         action_mean = self.action_decoder(o_t_enc, h_prior_enc, e_q, masked_frames, delta_t, cur_frame_mask, pre_encoded=True)
