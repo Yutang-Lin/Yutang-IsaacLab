@@ -351,8 +351,22 @@ class StudentVQVAEBFMTracker(nn.Module):
         with torch.inference_mode(False):
             self._prev_e_q = e_q.detach().clone()
 
-        # Decoder uses enriched o_t and h_prior from prior (LayerNorm'd, d_model-dim)
+        # Debug NaN tracing
+        if torch.isnan(o_t_enc).any() or torch.isnan(h_prior_enc).any():
+            print(f"[NaN DEBUG] prior output: o_t_enc_nan={torch.isnan(o_t_enc).sum().item()}, "
+                  f"h_prior_enc_nan={torch.isnan(h_prior_enc).sum().item()}, "
+                  f"e_q_nan={torch.isnan(e_q).sum().item()}, "
+                  f"hp_t_nan={torch.isnan(hp_t).sum().item()}, "
+                  f"o_t_nan={torch.isnan(o_t).sum().item()}, "
+                  f"h_prior_nan={torch.isnan(h_prior).sum().item()}, "
+                  f"prev_e_q_nan={torch.isnan(self._prev_e_q).sum().item()}, "
+                  f"masked_frames_nan={torch.isnan(masked_frames).sum().item()}, "
+                  f"delta_t_nan={torch.isnan(delta_t).sum().item()}")
+
         action_mean = self.action_decoder(o_t_enc, h_prior_enc, e_q, masked_frames, delta_t, cur_frame_mask, pre_encoded=True)
+
+        if torch.isnan(action_mean).any():
+            print(f"[NaN DEBUG] decoder output NaN: {torch.isnan(action_mean).sum().item()}/{action_mean.numel()}")
 
         std = self.std.expand_as(action_mean)
         self.distribution = Normal(action_mean, std)
