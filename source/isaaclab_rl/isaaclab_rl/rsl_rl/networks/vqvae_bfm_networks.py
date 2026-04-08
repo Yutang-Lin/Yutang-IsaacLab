@@ -64,6 +64,11 @@ class VQCodebook(nn.Module):
         # EMA codebook update + dead code reset (training only)
         if self.training:
             with torch.no_grad():
+                # Skip EMA update if z_e contains NaN (e.g., first-step fallback)
+                if torch.isnan(z_e).any():
+                    e_q_st = z_e + (e_q - z_e).detach()
+                    return e_q_st, indices, commit_loss
+
                 onehot = F.one_hot(indices, self.num_codes).float()  # [B, num_codes]
                 usage = onehot.sum(0)  # [num_codes]
 
