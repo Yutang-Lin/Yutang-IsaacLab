@@ -161,10 +161,11 @@ class StudentVQVAEBFMTracker(nn.Module):
             activation=tf_activation,
         )
 
-        # VQ Prior: 2-layer cross-attention (o_t queries, [h_prior, frames] KV)
+        # VQ Prior: 2-layer cross-attention (o_t queries, [h_prior, prev_e_q, frames] KV)
         self.prior_predictor = VQBFMPrior(
             proprio_dim=current_proprio_dim,
             h_dim=latent_dim,
+            latent_dim=latent_dim,
             num_codes=num_codes,
             d_model=tf_d_model,
             frame_encoder=self.frame_encoder,
@@ -219,6 +220,8 @@ class StudentVQVAEBFMTracker(nn.Module):
         self._ep_kp_mask = None
         self._ep_frame_offsets = None
         self._env_ref = None
+        # Auto-regressive: previous step's e_q per env (zero at episode start)
+        self._prev_e_q: torch.Tensor | None = None  # [N, latent_dim]
 
     @property
     def student(self):
@@ -333,11 +336,20 @@ class StudentVQVAEBFMTracker(nn.Module):
         masked_frames = self._apply_masks(frames, self._ep_frame_mask, self._ep_kp_mask)
         cur_frame_mask = self._ep_frame_mask[:B]
 
-        # Prior: predict codebook index from history + masked frames
+        # Init prev_e_q buffer if needed
+        if self._prev_e_q is None or self._prev_e_q.shape[0] != B:
+            with torch.inference_mode(False):
+                self._prev_e_q = torch.zeros(B, self.latent_dim, device=observations.device)
+
+        # Prior: predict codebook index from history + prev code + masked frames
         h_prior = self.history_prior(hp_t)
-        logits = self.prior_predictor(o_t, h_prior, masked_frames, delta_t, cur_frame_mask)
+        logits = self.prior_predictor(o_t, h_prior, self._prev_e_q, masked_frames, delta_t, cur_frame_mask)
         indices = logits.argmax(dim=-1)  # [B]
         e_q = self.codebook.embedding(indices)  # [B, latent_dim]
+
+        # Update prev_e_q for next step (detach to avoid graph accumulation)
+        with torch.inference_mode(False):
+            self._prev_e_q = e_q.detach().clone()
 
         action_mean = self.action_decoder(o_t, h_prior, e_q, masked_frames, delta_t, cur_frame_mask)
 
@@ -382,7 +394,8 @@ class StudentVQVAEBFMTracker(nn.Module):
             e_q, vq_indices, commit_loss = self.codebook.quantize(z_e)
 
             # Prior: predict codebook index
-            logits = self.prior_predictor(o_t, h_prior, masked_frames, delta_t, frame_mask)
+            prev_e_q_zero = torch.zeros(B, self.latent_dim, device=frames.device)
+            logits = self.prior_predictor(o_t, h_prior, prev_e_q_zero, masked_frames, delta_t, frame_mask)
             prior_ce = F.cross_entropy(logits, vq_indices.detach())
 
             # Posterior dropout
@@ -402,7 +415,8 @@ class StudentVQVAEBFMTracker(nn.Module):
             }
         else:
             # Inference: prior argmax
-            logits = self.prior_predictor(o_t, h_prior, masked_frames, delta_t, frame_mask)
+            prev_e_q_zero = torch.zeros(B, self.latent_dim, device=frames.device)
+            logits = self.prior_predictor(o_t, h_prior, prev_e_q_zero, masked_frames, delta_t, frame_mask)
             indices = logits.argmax(dim=-1)
             e_q = self.codebook.embedding(indices)
 
@@ -451,9 +465,14 @@ class StudentVQVAEBFMTracker(nn.Module):
     def reset(self, dones=None, hidden_states=None):
         if dones is not None and dones.any():
             env_ids = dones.bool().flatten().nonzero(as_tuple=False).squeeze(-1)
-            if env_ids.numel() > 0 and self._ep_frame_mask is not None:
-                with torch.inference_mode(False):
-                    self._sample_initial_offsets(env_ids, self._ep_frame_mask.device)
+            if env_ids.numel() > 0:
+                if self._ep_frame_mask is not None:
+                    with torch.inference_mode(False):
+                        self._sample_initial_offsets(env_ids, self._ep_frame_mask.device)
+                # Zero prev_e_q for reset envs (episode start = no previous code)
+                if self._prev_e_q is not None:
+                    with torch.inference_mode(False):
+                        self._prev_e_q[env_ids] = 0.0
 
     def get_hidden_states(self):
         return None

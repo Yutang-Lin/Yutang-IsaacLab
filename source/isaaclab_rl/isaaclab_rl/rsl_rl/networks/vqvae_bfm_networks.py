@@ -181,12 +181,15 @@ class VQBFMPosterior(nn.Module):
 
 
 class VQBFMPrior(nn.Module):
-    """2-layer cross-attention prior. o_t queries, [h_prior, frames] are KV.
+    """2-layer cross-attention prior with auto-regressive previous code.
 
-    Predicts codebook index from proprio + history + sparse frame context.
+    Q: o_t (proprio). KV: [h_prior, prev_e_q, frame_0, ..., frame_{F-1}].
+    prev_e_q is the codebook embedding from the previous step (zero at episode start
+    or during training). Enables temporally coherent code prediction at rollout.
     """
 
-    def __init__(self, proprio_dim: int, h_dim: int, num_codes: int, d_model: int,
+    def __init__(self, proprio_dim: int, h_dim: int, latent_dim: int,
+                 num_codes: int, d_model: int,
                  frame_encoder: BFMFrameEncoder,
                  num_heads: int = 4, hidden_dim: int = 512,
                  num_layers: int = 2, activation: nn.Module | None = None):
@@ -199,6 +202,8 @@ class VQBFMPrior(nn.Module):
         self.proprio_embed = nn.Parameter(torch.randn(d_model) * 0.02)
         self.history_proj = nn.Linear(h_dim, d_model)
         self.history_embed = nn.Parameter(torch.randn(d_model) * 0.02)
+        self.prev_code_proj = nn.Linear(latent_dim, d_model)
+        self.prev_code_embed = nn.Parameter(torch.randn(d_model) * 0.02)
 
         self.layers = nn.ModuleList([
             _CrossAttnLayer(d_model, num_heads, hidden_dim, activation)
@@ -206,11 +211,12 @@ class VQBFMPrior(nn.Module):
         ])
         self.logit_head = nn.Linear(d_model, num_codes)
 
-    def forward(self, o_t, h_prior, frames_flat, delta_t, frame_mask):
+    def forward(self, o_t, h_prior, prev_e_q, frames_flat, delta_t, frame_mask):
         """
         Args:
             o_t: [B, proprio_dim] current proprio (query)
-            h_prior: [B, h_dim] history encoding (part of KV context)
+            h_prior: [B, h_dim] history encoding
+            prev_e_q: [B, latent_dim] previous step's codebook embedding (zero if none)
             frames_flat: [B, F, K*D]
             delta_t: [B, F]
             frame_mask: [B, F] bool
@@ -221,13 +227,13 @@ class VQBFMPrior(nn.Module):
         B = o_t.shape[0]
         tok_q = self.proprio_proj(o_t) + self.proprio_embed
         tok_h = self.history_proj(h_prior) + self.history_embed
+        tok_prev = self.prev_code_proj(prev_e_q) + self.prev_code_embed
         tok_frames = self.frame_encoder(frames_flat, delta_t)
 
-        # KV context: [h_prior, frame_0, ..., frame_{F-1}]
-        kv = torch.cat([tok_h.unsqueeze(1), tok_frames], dim=1)  # [B, 1+F, d]
-        # KV mask: h_prior always valid, frames follow frame_mask
-        kv_mask = torch.ones(B, 1 + tok_frames.shape[1], dtype=torch.bool, device=o_t.device)
-        kv_mask[:, 1:] = frame_mask
+        # KV context: [h_prior, prev_e_q, frame_0, ..., frame_{F-1}]
+        kv = torch.cat([tok_h.unsqueeze(1), tok_prev.unsqueeze(1), tok_frames], dim=1)  # [B, 2+F, d]
+        kv_mask = torch.ones(B, 2 + tok_frames.shape[1], dtype=torch.bool, device=o_t.device)
+        kv_mask[:, 2:] = frame_mask  # first 2 (h_prior, prev_e_q) always valid
 
         q = tok_q
         for layer in self.layers:
