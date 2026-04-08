@@ -69,11 +69,8 @@ def _build_frame_attn_mask(B: int, F: int, frame_mask: torch.Tensor,
     """
     total = n_prefix + F
     attn_mask = torch.ones(B, total, total, dtype=torch.bool, device=device)
-    attn_mask[:, :, n_prefix:] &= frame_mask.unsqueeze(1)   # columns: nobody sees masked frames
-    attn_mask[:, n_prefix:, :] &= frame_mask.unsqueeze(2)   # rows: masked frames see nothing
-    # Self-loop: masked frames attend to themselves to avoid all-inf softmax → NaN
-    diag_idx = torch.arange(n_prefix, total, device=device)
-    attn_mask[:, diag_idx, diag_idx] = True
+    attn_mask[:, :, n_prefix:] &= frame_mask.unsqueeze(1)
+    attn_mask[:, n_prefix:, :] &= frame_mask.unsqueeze(2)
     return attn_mask
 
 
