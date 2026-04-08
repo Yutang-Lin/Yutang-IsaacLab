@@ -298,21 +298,21 @@ class StudentCVAEBFMTracker(nn.Module):
         Also samples episodic keypoint mask (held for entire episode).
         """
         n = env_ids.shape[0]
-        F = self.num_frames
+        nf = self.num_frames
         K = self.rollout_mask_num_keypoints
 
         # Sample F independent deltas per env, then sort to maintain order
-        offsets = torch.empty(n, F, device=device).uniform_(self.min_frame_delta, self.max_frame_delta)
+        offsets = torch.empty(n, nf, device=device).uniform_(self.min_frame_delta, self.max_frame_delta)
         offsets = offsets.sort(dim=1).values  # [n, F] sorted ascending
         self._ep_frame_offsets[env_ids] = offsets
 
         # Frame mask: episodic per-frame active mask (at least 1 active)
         p_active = torch.empty(n, device=device).uniform_(*self.frame_p_active_range)
-        frame_mask = torch.rand(n, F, device=device) < p_active[:, None]
+        frame_mask = torch.rand(n, nf, device=device) < p_active[:, None]
         # Ensure at least 1 active: if all False, activate a random slot
         all_off = ~frame_mask.any(dim=1)  # [n]
         if all_off.any():
-            rand_slot = torch.randint(0, F, (all_off.sum(),), device=device)
+            rand_slot = torch.randint(0, nf, (all_off.sum(),), device=device)
             frame_mask[all_off, rand_slot] = True
         self._ep_frame_mask[env_ids] = frame_mask
 
@@ -360,10 +360,10 @@ class StudentCVAEBFMTracker(nn.Module):
         if self._env_ref is None:
             return
         env = self._env_ref
-        F = self.num_frames
+        nf = self.num_frames
         if not hasattr(env, '_bfm_future_offsets') or env._bfm_future_offsets is None:
-            env._bfm_future_offsets = torch.zeros(env.num_envs, F, device=self._ep_frame_offsets.device)
-            env._bfm_delta_t = torch.zeros(env.num_envs, F, device=self._ep_frame_offsets.device)
+            env._bfm_future_offsets = torch.zeros(env.num_envs, nf, device=self._ep_frame_offsets.device)
+            env._bfm_delta_t = torch.zeros(env.num_envs, nf, device=self._ep_frame_offsets.device)
         if env_ids is None:
             env._bfm_future_offsets[:] = self._ep_frame_offsets
             env._bfm_delta_t[:] = self._ep_frame_offsets
@@ -379,12 +379,12 @@ class StudentCVAEBFMTracker(nn.Module):
         kp_mask: [B, K] bool (True=visible)
         Returns masked frames [B, F, K*D]
         """
-        B, F, KD = frames.shape
+        B, nf, KD = frames.shape
         K = self.rollout_mask_num_keypoints
         D = self.dims_per_keypoint
 
         if kp_mask is not None and K > 0:
-            f = frames.view(B, F, K, D)
+            f = frames.view(B, nf, K, D)
             f = f * kp_mask[:, None, :, None].float()
             frames = f.flatten(start_dim=2)
 
@@ -405,13 +405,13 @@ class StudentCVAEBFMTracker(nn.Module):
         B = observations.shape[0]
 
         # Lazy init episodic state
-        F = self.num_frames
+        nf = self.num_frames
         K = self.rollout_mask_num_keypoints
         if self._ep_frame_mask is None or self._ep_frame_mask.shape[0] != B:
             with torch.inference_mode(False):
-                self._ep_frame_mask = torch.ones(B, F, dtype=torch.bool, device=observations.device)
+                self._ep_frame_mask = torch.ones(B, nf, dtype=torch.bool, device=observations.device)
                 self._ep_kp_mask = torch.ones(B, K, dtype=torch.bool, device=observations.device) if K > 0 else None
-                self._ep_frame_offsets = torch.zeros(B, F, device=observations.device)
+                self._ep_frame_offsets = torch.zeros(B, nf, device=observations.device)
                 self._sample_initial_offsets(torch.arange(B, device=observations.device), observations.device)
         else:
             # Advance sliding window: decrement offsets, recycle consumed frames
@@ -440,17 +440,17 @@ class StudentCVAEBFMTracker(nn.Module):
         hp_t, o_t, y_flat, r_t = self._split_obs(observations)
         frames, delta_t = self._parse_condition(y_flat)
         B = frames.shape[0]
-        F = self.num_frames
+        nf = self.num_frames
         K = self.rollout_mask_num_keypoints
 
         # During training: apply fresh random masks each call
         if self.compute_latent_loss:
             # Random frame mask (at least 1 active)
             p_active = torch.empty(B, device=frames.device).uniform_(*self.frame_p_active_range)
-            frame_mask = torch.rand(B, F, device=frames.device) < p_active[:, None]
+            frame_mask = torch.rand(B, nf, device=frames.device) < p_active[:, None]
             all_off = ~frame_mask.any(dim=1)
             if all_off.any():
-                rand_slot = torch.randint(0, F, (all_off.sum(),), device=frames.device)
+                rand_slot = torch.randint(0, nf, (all_off.sum(),), device=frames.device)
                 frame_mask[all_off, rand_slot] = True
             # Random keypoint mask
             kp_mask = None
@@ -459,7 +459,7 @@ class StudentCVAEBFMTracker(nn.Module):
                 kp_mask = torch.rand(B, K, device=frames.device) < p_clean[:, None]
         else:
             # Inference: all frames and keypoints active
-            frame_mask = torch.ones(B, F, dtype=torch.bool, device=frames.device)
+            frame_mask = torch.ones(B, nf, dtype=torch.bool, device=frames.device)
             kp_mask = None
 
         masked_frames = self._apply_masks(frames, frame_mask, kp_mask)
