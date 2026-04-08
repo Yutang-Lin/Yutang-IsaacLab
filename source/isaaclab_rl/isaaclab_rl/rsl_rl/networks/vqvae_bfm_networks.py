@@ -147,7 +147,7 @@ class VQBFMPosterior(nn.Module):
         Returns:
             z_e: [B, latent_dim] continuous embedding (before quantization)
         """
-        B, F = frames_flat.shape[:2]
+        B, nf = frames_flat.shape[:2]
 
         tok_kb = self.keybody_proj(r_t) + self.keybody_embed
         tok_frames = self.frame_encoder(frames_flat, delta_t)
@@ -157,8 +157,8 @@ class VQBFMPosterior(nn.Module):
         v = self.v_proj(tok_frames)
 
         q = q.view(B, 1, self.num_heads, self.head_dim).transpose(1, 2)
-        k = k.view(B, F, self.num_heads, self.head_dim).transpose(1, 2)
-        v = v.view(B, F, self.num_heads, self.head_dim).transpose(1, 2)
+        k = k.view(B, nf, self.num_heads, self.head_dim).transpose(1, 2)
+        v = v.view(B, nf, self.num_heads, self.head_dim).transpose(1, 2)
 
         attn_mask = frame_mask[:, None, None, :].expand(-1, self.num_heads, 1, -1)
         attn = (q @ k.transpose(-2, -1)) * (self.head_dim ** -0.5)
@@ -213,13 +213,13 @@ class VQBFMPrior(nn.Module):
         Returns:
             logits: [B, num_codes] unnormalized log-probabilities over codebook.
         """
-        B, F = frames_flat.shape[:2]
+        B, nf = frames_flat.shape[:2]
 
         tok_h = self.history_proj(h_prior) + self.history_embed
         tok_frames = self.frame_encoder(frames_flat, delta_t)
 
         tokens = torch.cat([tok_h.unsqueeze(1), tok_frames], dim=1)
-        attn_mask = _build_frame_attn_mask(B, F, frame_mask, n_prefix=1, device=h_prior.device)
+        attn_mask = _build_frame_attn_mask(B, nf, frame_mask, n_prefix=1, device=h_prior.device)
 
         out = self.transformer(tokens, attn_mask=attn_mask)
         return self.logit_head(out[:, 0])  # [B, num_codes]
