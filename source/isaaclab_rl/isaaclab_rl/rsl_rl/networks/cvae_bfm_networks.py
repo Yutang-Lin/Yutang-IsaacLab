@@ -189,23 +189,29 @@ class CVAEBFMDecoder(nn.Module):
         )
         self.action_head = nn.Linear(d_model, num_actions)
 
-    def forward(self, o_t, h_prior, c_t, frames_flat, delta_t, frame_mask):
+    def forward(self, o_t, h_prior, c_t, frames_flat, delta_t, frame_mask, pre_encoded=False):
         """
         Args:
-            o_t: [B, proprio_dim]
-            h_prior: [B, latent_dim]
+            o_t: [B, proprio_dim] or [B, d_model] if pre_encoded
+            h_prior: [B, latent_dim] or [B, d_model] if pre_encoded
             c_t: [B, latent_dim] (zero at inference)
             frames_flat: [B, F, K*D]
             delta_t: [B, F]
             frame_mask: [B, F] bool
+            pre_encoded: if True, o_t and h_prior are already in d_model space
+                (from prior transformer output), skip projection, add embed only.
 
         Returns:
             action: [B, num_actions]
         """
         B, F = frames_flat.shape[:2]
 
-        tok_proprio = self.proprio_proj(o_t) + self.proprio_embed
-        tok_prior = self.prior_proj(h_prior) + self.prior_embed
+        if pre_encoded:
+            tok_proprio = o_t + self.proprio_embed
+            tok_prior = h_prior + self.prior_embed
+        else:
+            tok_proprio = self.proprio_proj(o_t) + self.proprio_embed
+            tok_prior = self.prior_proj(h_prior) + self.prior_embed
         tok_posterior = self.posterior_proj(c_t) + self.posterior_embed
         tok_frames = self.frame_encoder(frames_flat, delta_t)
 

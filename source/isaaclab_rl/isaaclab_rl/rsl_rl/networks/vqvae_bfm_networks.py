@@ -300,5 +300,8 @@ class VQBFMPrior(nn.Module):
         for layer in self.layers:
             tokens = layer(tokens, tok_frames, frame_mask)
 
-        # Output from prev_e_q token (index 0) — predicts next code from previous
-        return self.logit_head(tokens[:, 0])
+        # tokens[:, 0] = prev_e_q (predicts next code)
+        # tokens[:, 1] = enriched o_t (for decoder)
+        # tokens[:, 2] = enriched h_prior (for decoder)
+        logits = self.logit_head(tokens[:, 0])
+        return logits, tokens[:, 1], tokens[:, 2]

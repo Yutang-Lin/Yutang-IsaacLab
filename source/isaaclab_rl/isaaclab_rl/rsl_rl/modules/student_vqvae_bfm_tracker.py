@@ -341,17 +341,18 @@ class StudentVQVAEBFMTracker(nn.Module):
             with torch.inference_mode(False):
                 self._prev_e_q = torch.zeros(B, self.latent_dim, device=observations.device)
 
-        # Prior: predict codebook index from history + prev code + masked frames
+        # Prior: predict codebook index + enriched tokens for decoder
         h_prior = self.history_prior(hp_t)
-        logits = self.prior_predictor(o_t, h_prior, self._prev_e_q, masked_frames, delta_t, cur_frame_mask)
+        logits, o_t_enc, h_prior_enc = self.prior_predictor(o_t, h_prior, self._prev_e_q, masked_frames, delta_t, cur_frame_mask)
         indices = logits.argmax(dim=-1)  # [B]
         e_q = self.codebook.embedding(indices)  # [B, latent_dim]
 
-        # Update prev_e_q for next step (detach to avoid graph accumulation)
+        # Update prev_e_q for next step
         with torch.inference_mode(False):
             self._prev_e_q = e_q.detach().clone()
 
-        action_mean = self.action_decoder(o_t, h_prior, e_q, masked_frames, delta_t, cur_frame_mask)
+        # Decoder uses enriched o_t and h_prior from prior's transformer (already d_model-dim)
+        action_mean = self.action_decoder(o_t_enc, h_prior_enc, e_q, masked_frames, delta_t, cur_frame_mask, pre_encoded=True)
 
         std = self.std.expand_as(action_mean)
         self.distribution = Normal(action_mean, std)
@@ -393,16 +394,15 @@ class StudentVQVAEBFMTracker(nn.Module):
             z_e = self.posterior(r_t, masked_frames, delta_t, frame_mask)
             e_q, vq_indices, commit_loss = self.codebook.quantize(z_e)
 
-            # Prior: predict codebook index
+            # Prior: predict codebook index + enriched tokens
             prev_e_q_zero = torch.zeros(B, self.latent_dim, device=frames.device)
-            logits = self.prior_predictor(o_t, h_prior, prev_e_q_zero, masked_frames, delta_t, frame_mask)
+            logits, o_t_enc, h_prior_enc = self.prior_predictor(o_t, h_prior, prev_e_q_zero, masked_frames, delta_t, frame_mask)
             prior_ce = F.cross_entropy(logits, vq_indices.detach())
 
             # Posterior dropout
             if self.posterior_dropout > 0:
                 drop_mask = torch.rand(B, device=e_q.device) < self.posterior_dropout
                 if drop_mask.any():
-                    # For dropped samples, use prior's prediction instead
                     prior_indices = logits.detach().argmax(dim=-1)
                     e_q_prior = self.codebook.embedding(prior_indices)
                     e_q = torch.where(drop_mask.unsqueeze(-1), e_q_prior, e_q)
@@ -414,13 +414,14 @@ class StudentVQVAEBFMTracker(nn.Module):
                 "vq_indices": vq_indices,
             }
         else:
-            # Inference: prior argmax
+            # Inference: prior argmax + enriched tokens
             prev_e_q_zero = torch.zeros(B, self.latent_dim, device=frames.device)
-            logits = self.prior_predictor(o_t, h_prior, prev_e_q_zero, masked_frames, delta_t, frame_mask)
+            logits, o_t_enc, h_prior_enc = self.prior_predictor(o_t, h_prior, prev_e_q_zero, masked_frames, delta_t, frame_mask)
             indices = logits.argmax(dim=-1)
             e_q = self.codebook.embedding(indices)
 
-        action_mean = self.action_decoder(o_t, h_prior, e_q, masked_frames, delta_t, frame_mask)
+        # Decoder uses enriched o_t and h_prior from prior's transformer
+        action_mean = self.action_decoder(o_t_enc, h_prior_enc, e_q, masked_frames, delta_t, frame_mask)
         return action_mean
 
     def extra_loss(self, **kwargs):
