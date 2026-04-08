@@ -234,10 +234,10 @@ class StudentFlowBFMTracker(nn.Module):
         return y[:, :, :-1], y[:, :, -1]
 
     def _apply_masks(self, frames, frame_mask=None, kp_mask=None):
-        B, F, KD = frames.shape
+        B, nf_local, KD = frames.shape
         K, D = self.rollout_mask_num_keypoints, self.dims_per_keypoint
         if kp_mask is not None and K > 0:
-            frames = (frames.view(B, F, K, D) * kp_mask[:, None, :, None].float()).flatten(2)
+            frames = (frames.view(B, nf_local, K, D) * kp_mask[:, None, :, None].float()).flatten(2)
         if frame_mask is not None:
             frames = frames * frame_mask.unsqueeze(-1).float()
         return frames
@@ -246,14 +246,14 @@ class StudentFlowBFMTracker(nn.Module):
 
     def _sample_initial_offsets(self, env_ids, device):
         n = env_ids.shape[0]
-        F, K = self.num_frames, self.rollout_mask_num_keypoints
-        offsets = torch.empty(n, F, device=device).uniform_(self.min_frame_delta, self.max_frame_delta)
+        nf, K = self.num_frames, self.rollout_mask_num_keypoints
+        offsets = torch.empty(n, nf, device=device).uniform_(self.min_frame_delta, self.max_frame_delta)
         self._ep_frame_offsets[env_ids] = offsets.sort(dim=1).values
         p_active = torch.empty(n, device=device).uniform_(*self.frame_p_active_range)
-        fm = torch.rand(n, F, device=device) < p_active[:, None]
+        fm = torch.rand(n, nf, device=device) < p_active[:, None]
         all_off = ~fm.any(dim=1)
         if all_off.any():
-            fm[all_off, torch.randint(0, F, (all_off.sum(),), device=device)] = True
+            fm[all_off, torch.randint(0, nf, (all_off.sum(),), device=device)] = True
         self._ep_frame_mask[env_ids] = fm
         if K > 0:
             p_clean = torch.empty(n, device=device).uniform_(*self.rollout_mask_p_clean_range)
@@ -277,10 +277,10 @@ class StudentFlowBFMTracker(nn.Module):
         if self._env_ref is None:
             return
         env = self._env_ref
-        F = self.num_frames
+        nf = self.num_frames
         if not hasattr(env, '_bfm_future_offsets') or env._bfm_future_offsets is None:
-            env._bfm_future_offsets = torch.zeros(env.num_envs, F, device=self._ep_frame_offsets.device)
-            env._bfm_delta_t = torch.zeros(env.num_envs, F, device=self._ep_frame_offsets.device)
+            env._bfm_future_offsets = torch.zeros(env.num_envs, nf, device=self._ep_frame_offsets.device)
+            env._bfm_delta_t = torch.zeros(env.num_envs, nf, device=self._ep_frame_offsets.device)
         if env_ids is None:
             env._bfm_future_offsets[:] = self._ep_frame_offsets
             env._bfm_delta_t[:] = self._ep_frame_offsets
@@ -348,13 +348,13 @@ class StudentFlowBFMTracker(nn.Module):
         hp_t, o_t, y_flat, r_t = self._split_obs(observations)
         frames, delta_t = self._parse_condition(y_flat)
         B = observations.shape[0]
-        F, K = self.num_frames, self.rollout_mask_num_keypoints
+        nf, K = self.num_frames, self.rollout_mask_num_keypoints
 
         if self._ep_frame_mask is None or self._ep_frame_mask.shape[0] != B:
             with torch.inference_mode(False):
-                self._ep_frame_mask = torch.ones(B, F, dtype=torch.bool, device=observations.device)
+                self._ep_frame_mask = torch.ones(B, nf, dtype=torch.bool, device=observations.device)
                 self._ep_kp_mask = torch.ones(B, K, dtype=torch.bool, device=observations.device) if K > 0 else None
-                self._ep_frame_offsets = torch.zeros(B, F, device=observations.device)
+                self._ep_frame_offsets = torch.zeros(B, nf, device=observations.device)
                 self._sample_initial_offsets(torch.arange(B, device=observations.device), observations.device)
         else:
             with torch.inference_mode(False):
@@ -378,21 +378,23 @@ class StudentFlowBFMTracker(nn.Module):
         """Training: flow matching loss. Inference: ODE integration."""
         hp_t, o_t, y_flat, r_t = self._split_obs(observations)
         frames, delta_t = self._parse_condition(y_flat)
-        B, F, K = frames.shape[0], self.num_frames, self.rollout_mask_num_keypoints
+        B = frames.shape[0]
+        nf = self.num_frames
+        K = self.rollout_mask_num_keypoints
 
         if self.compute_latent_loss:
             # Random masks
             p_active = torch.empty(B, device=frames.device).uniform_(*self.frame_p_active_range)
-            frame_mask = torch.rand(B, F, device=frames.device) < p_active[:, None]
+            frame_mask = torch.rand(B, nf, device=frames.device) < p_active[:, None]
             all_off = ~frame_mask.any(dim=1)
             if all_off.any():
-                frame_mask[all_off, torch.randint(0, F, (all_off.sum(),), device=frames.device)] = True
+                frame_mask[all_off, torch.randint(0, nf, (all_off.sum(),), device=frames.device)] = True
             kp_mask = None
             if K > 0:
                 p_clean = torch.empty(B, device=frames.device).uniform_(*self.rollout_mask_p_clean_range)
                 kp_mask = torch.rand(B, K, device=frames.device) < p_clean[:, None]
         else:
-            frame_mask = torch.ones(B, F, dtype=torch.bool, device=frames.device)
+            frame_mask = torch.ones(B, nf, dtype=torch.bool, device=frames.device)
             kp_mask = None
 
         masked_frames = self._apply_masks(frames, frame_mask, kp_mask)
