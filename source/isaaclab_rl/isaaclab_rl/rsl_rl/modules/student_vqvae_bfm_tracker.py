@@ -124,7 +124,7 @@ class StudentVQVAEBFMTracker(nn.Module):
         # Loss coefficients
         self.commit_coef = cfg.pop("commit_coef", 0.25)
         self.prior_ce_coef = cfg.pop("prior_ce_coef", 1.0)
-        self.prior_reg_coef = cfg.pop("prior_reg_coef", 1e-5)
+        cfg.pop("prior_reg_coef", None)  # unused in VQ-VAE
         self.posterior_dropout = cfg.pop("posterior_dropout", 0.5)
 
         self.latent_dim = latent_dim
@@ -394,7 +394,6 @@ class StudentVQVAEBFMTracker(nn.Module):
             self._save_dict = {
                 "commit_loss": commit_loss,
                 "prior_ce": prior_ce,
-                "h_prior": h_prior,
                 "logits": logits,
                 "vq_indices": vq_indices,
             }
@@ -420,9 +419,6 @@ class StudentVQVAEBFMTracker(nn.Module):
 
         loss_dict["prior_ce"] = d["prior_ce"] * self.prior_ce_coef
         log_dict["prior_ce"] = d["prior_ce"].item()
-
-        if self.prior_reg_coef > 0:
-            loss_dict["prior_reg"] = d["h_prior"].pow(2).mean() * self.prior_reg_coef
 
         # Logging: add zero-weight entries to loss_dict so the runner iterates them,
         # then value_dict provides the actual scalar values
