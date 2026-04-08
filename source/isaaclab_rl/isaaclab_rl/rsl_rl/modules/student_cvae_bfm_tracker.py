@@ -138,6 +138,9 @@ class StudentCVAEBFMTracker(nn.Module):
         # Loss coefficients
         self.corr_kl_coef = cfg.pop("corr_kl_coef", 1e-3)
         self.prior_reg_coef = cfg.pop("prior_reg_coef", 1e-5)
+        # Posterior dropout: fraction of training samples where c_t=0
+        # Forces decoder to work without posterior correction (matches rollout)
+        self.posterior_dropout = cfg.pop("posterior_dropout", 0.5)
 
         self.latent_dim = latent_dim
         self.num_actions = num_actions
@@ -466,6 +469,12 @@ class StudentCVAEBFMTracker(nn.Module):
         if self.compute_latent_loss and r_t.shape[-1] > 0:
             c_t, mu_post, logvar_post = self._compute_posterior(r_t, masked_frames, delta_t, frame_mask)
             corr_kl = self._kl_standard_normal(mu_post, logvar_post)
+
+            # Posterior dropout: randomly zero c_t for some samples
+            # so decoder learns to work without posterior (matches rollout)
+            if self.posterior_dropout > 0:
+                drop_mask = torch.rand(B, device=c_t.device) < self.posterior_dropout
+                c_t = c_t * (~drop_mask).float().unsqueeze(-1)
 
             self._save_dict = {
                 "corr_kl": corr_kl,
