@@ -300,5 +300,5 @@ class VQBFMPrior(nn.Module):
         for layer in self.layers:
             tokens = layer(tokens, tok_frames, frame_mask)
 
-        # Output from o_t token (index 1)
-        return self.logit_head(tokens[:, 1])
+        # Output from prev_e_q token (index 0) — predicts next code from previous
+        return self.logit_head(tokens[:, 0])
