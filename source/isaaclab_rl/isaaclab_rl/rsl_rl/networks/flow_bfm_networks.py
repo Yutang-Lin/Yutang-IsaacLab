@@ -81,12 +81,14 @@ class FlowBFMEncoder(nn.Module):
 
 
 class FlowBFMDecoder(nn.Module):
-    """Cross-attention flow decoder: noised action token attends to context.
+    """Cross-attention flow decoder with AdaLN-Zero time conditioning.
 
-    Single action token with (a_t, t) input cross-attends to encoder context,
-    then predicts action-space velocity v(a_t, t).
+    Action token cross-attends to encoder context. Flow time t modulates
+    each sub-layer via adaptive layer norm with zero-initialized gates:
+        x = x + gate * sublayer(scale * norm(x) + shift)
 
-    Supports KV caching for efficient multi-step ODE integration at rollout.
+    At init, gates=0 → each layer is identity → stable training start.
+    Supports KV caching for efficient multi-step ODE integration.
     """
 
     def __init__(self, num_actions: int, d_model: int,
@@ -102,49 +104,68 @@ class FlowBFMDecoder(nn.Module):
         self.head_dim = d_model // num_heads
         self.num_layers = num_layers
 
-        # Action token: project (a_t, t) to d_model
+        # Action token projection (no t — t goes through AdaLN)
         self.action_proj = nn.Sequential(
-            nn.Linear(num_actions + 1, d_model),  # +1 for t
+            nn.Linear(num_actions, d_model),
             activation,
             nn.Linear(d_model, d_model),
         )
 
-        # Cross-attention layers (one per layer)
+        # Time embedding: t → d_model
+        self.time_embed = nn.Sequential(
+            nn.Linear(1, d_model),
+            activation,
+            nn.Linear(d_model, d_model),
+        )
+
+        # Per-layer: cross-attention + FFN + AdaLN-Zero params
         self.cross_attn_layers = nn.ModuleList()
+        self.adaln_layers = nn.ModuleList()
         for _ in range(num_layers):
             self.cross_attn_layers.append(nn.ModuleDict({
                 'q_proj': nn.Linear(d_model, d_model),
                 'k_proj': nn.Linear(d_model, d_model),
                 'v_proj': nn.Linear(d_model, d_model),
                 'out_proj': nn.Linear(d_model, d_model),
-                'norm1': nn.LayerNorm(d_model),
-                'norm2': nn.LayerNorm(d_model),
+                'norm1': nn.LayerNorm(d_model, elementwise_affine=False),
+                'norm2': nn.LayerNorm(d_model, elementwise_affine=False),
                 'ffn': nn.Sequential(
                     nn.Linear(d_model, hidden_dim), activation, nn.Linear(hidden_dim, d_model),
                 ),
             }))
+            # AdaLN-Zero: time_embed → (scale1, shift1, gate1, scale2, shift2, gate2)
+            adaln = nn.Linear(d_model, 6 * d_model)
+            nn.init.zeros_(adaln.weight)
+            nn.init.zeros_(adaln.bias)
+            self.adaln_layers.append(adaln)
 
+        # Final norm + velocity head
+        self.final_norm = nn.LayerNorm(d_model, elementwise_affine=False)
+        self.adaln_final = nn.Linear(d_model, 2 * d_model)  # scale, shift for final
+        nn.init.zeros_(self.adaln_final.weight)
+        nn.init.zeros_(self.adaln_final.bias)
         self.velocity_head = nn.Linear(d_model, num_actions)
 
-    def _cross_attn(self, layer, q_tok, k, v, ctx_mask):
-        """Single cross-attention + FFN layer.
+    def _get_adaln_params(self, t_embed, layer_idx):
+        """Compute AdaLN-Zero params for a layer from time embedding."""
+        params = self.adaln_layers[layer_idx](t_embed)  # [B, 6*d]
+        return params.chunk(6, dim=-1)  # scale1, shift1, gate1, scale2, shift2, gate2
 
-        Args:
-            layer: nn.ModuleDict with projections
-            q_tok: [B, d] action token
-            k: [B, S, d] context keys
-            v: [B, S, d] context values
-            ctx_mask: [B, S] bool
+    def _adaln_modulate(self, x, norm, scale, shift):
+        """Apply adaptive layer norm: scale * norm(x) + shift."""
+        return scale * norm(x) + shift
 
-        Returns:
-            q_tok: [B, d] updated action token
-        """
+    def _cross_attn_adaln(self, layer, layer_idx, q_tok, k, v, ctx_mask, t_embed):
+        """Cross-attention + FFN with AdaLN-Zero conditioning."""
         B, S, _ = k.shape
         H, hd = self.num_heads, self.head_dim
+        s1, sh1, g1, s2, sh2, g2 = self._get_adaln_params(t_embed, layer_idx)
 
-        q = layer['q_proj'](q_tok).view(B, 1, H, hd).transpose(1, 2)  # [B, H, 1, hd]
-        k_ = layer['k_proj'](k).view(B, S, H, hd).transpose(1, 2)  # [B, H, S, hd]
-        v_ = layer['v_proj'](v).view(B, S, H, hd).transpose(1, 2)  # [B, H, S, hd]
+        # AdaLN on pre-attn norm
+        q_normed = self._adaln_modulate(q_tok, layer['norm1'], 1 + s1, sh1)
+        q = layer['q_proj'](q_normed).view(B, 1, H, hd).transpose(1, 2)
+        k_ = layer['k_proj'](k).view(B, S, H, hd).transpose(1, 2)
+        v_ = layer['v_proj'](v).view(B, S, H, hd).transpose(1, 2)
 
         attn = (q @ k_.transpose(-2, -1)) * (hd ** -0.5)
         mask = ctx_mask[:, None, None, :].expand(-1, H, 1, -1)
@@ -153,14 +174,22 @@ class FlowBFMDecoder(nn.Module):
         out = (attn @ v_).transpose(1, 2).reshape(B, self.d_model)
         out = layer['out_proj'](out)
 
-        q_tok = layer['norm1'](q_tok + out)
-        q_tok = layer['norm2'](q_tok + layer['ffn'](q_tok))
+        # Gate1: zero-init → identity at start
+        q_tok = q_tok + g1 * out
+
+        # AdaLN on pre-FFN norm
+        ffn_in = self._adaln_modulate(q_tok, layer['norm2'], 1 + s2, sh2)
+        q_tok = q_tok + g2 * layer['ffn'](ffn_in)
+
         return q_tok
 
-    def _cross_attn_cached(self, layer, q_tok, k_cached, v_cached, ctx_mask):
-        """Cross-attention using pre-computed K, V caches."""
+    def _cross_attn_cached_adaln(self, layer, layer_idx, q_tok, k_cached, v_cached, ctx_mask, t_embed):
+        """Cross-attention with KV cache + AdaLN-Zero."""
         B, H, S, hd = k_cached.shape
-        q = layer['q_proj'](q_tok).view(B, 1, H, hd).transpose(1, 2)
+        s1, sh1, g1, s2, sh2, g2 = self._get_adaln_params(t_embed, layer_idx)
+
+        q_normed = self._adaln_modulate(q_tok, layer['norm1'], 1 + s1, sh1)
+        q = layer['q_proj'](q_normed).view(B, 1, H, hd).transpose(1, 2)
 
         attn = (q @ k_cached.transpose(-2, -1)) * (hd ** -0.5)
         mask = ctx_mask[:, None, None, :].expand(-1, H, 1, -1)
@@ -169,40 +198,30 @@ class FlowBFMDecoder(nn.Module):
         out = (attn @ v_cached).transpose(1, 2).reshape(B, self.d_model)
         out = layer['out_proj'](out)
 
-        q_tok = layer['norm1'](q_tok + out)
-        q_tok = layer['norm2'](q_tok + layer['ffn'](q_tok))
+        q_tok = q_tok + g1 * out
+
+        ffn_in = self._adaln_modulate(q_tok, layer['norm2'], 1 + s2, sh2)
+        q_tok = q_tok + g2 * layer['ffn'](ffn_in)
+
         return q_tok
 
     def forward(self, a_t, t, context, ctx_mask):
-        """Single denoising step.
-
-        Args:
-            a_t: [B, num_actions] noised action
-            t: [B] or [B, 1] flow time
-            context: [B, S, d] encoder context
-            ctx_mask: [B, S] bool
-
-        Returns:
-            v: [B, num_actions] predicted velocity
-        """
+        """Single denoising step with AdaLN-Zero."""
         if t.dim() == 1:
             t = t.unsqueeze(-1)
-        tok = self.action_proj(torch.cat([a_t, t], dim=-1))  # [B, d]
+        tok = self.action_proj(a_t)
+        t_embed = self.time_embed(t)  # [B, d]
 
-        for layer in self.cross_attn_layers:
-            tok = self._cross_attn(layer, tok, context, context, ctx_mask)
+        for i, layer in enumerate(self.cross_attn_layers):
+            tok = self._cross_attn_adaln(layer, i, tok, context, context, ctx_mask, t_embed)
 
+        # Final AdaLN + velocity head
+        sf, shf = self.adaln_final(t_embed).chunk(2, dim=-1)
+        tok = self._adaln_modulate(tok, self.final_norm, 1 + sf, shf)
         return self.velocity_head(tok)
 
     def build_kv_cache(self, context, ctx_mask):
-        """Pre-compute K, V projections for all layers.
-
-        Returns:
-            kv_cache: list of (k_cached, v_cached) per layer
-                k_cached: [B, H, S, hd]
-                v_cached: [B, H, S, hd]
-            ctx_mask: [B, S] (passed through)
-        """
+        """Pre-compute K, V projections for all layers."""
         B, S, _ = context.shape
         H, hd = self.num_heads, self.head_dim
         cache = []
@@ -213,22 +232,15 @@ class FlowBFMDecoder(nn.Module):
         return cache, ctx_mask
 
     def forward_cached(self, a_t, t, kv_cache, ctx_mask):
-        """Denoising step using cached K, V (for ODE integration).
-
-        Args:
-            a_t: [B, num_actions]
-            t: [B] or [B, 1]
-            kv_cache: list of (k_cached, v_cached) per layer
-            ctx_mask: [B, S] bool
-
-        Returns:
-            v: [B, num_actions]
-        """
+        """Denoising step using cached K, V."""
         if t.dim() == 1:
             t = t.unsqueeze(-1)
-        tok = self.action_proj(torch.cat([a_t, t], dim=-1))
+        tok = self.action_proj(a_t)
+        t_embed = self.time_embed(t)
 
-        for layer, (k_cached, v_cached) in zip(self.cross_attn_layers, kv_cache):
-            tok = self._cross_attn_cached(layer, tok, k_cached, v_cached, ctx_mask)
+        for i, (layer, (k_cached, v_cached)) in enumerate(zip(self.cross_attn_layers, kv_cache)):
+            tok = self._cross_attn_cached_adaln(layer, i, tok, k_cached, v_cached, ctx_mask, t_embed)
 
+        sf, shf = self.adaln_final(t_embed).chunk(2, dim=-1)
+        tok = self._adaln_modulate(tok, self.final_norm, 1 + sf, shf)
         return self.velocity_head(tok)
