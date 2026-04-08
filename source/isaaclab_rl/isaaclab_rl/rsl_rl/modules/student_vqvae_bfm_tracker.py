@@ -424,16 +424,20 @@ class StudentVQVAEBFMTracker(nn.Module):
         if self.prior_reg_coef > 0:
             loss_dict["prior_reg"] = d["h_prior"].pow(2).mean() * self.prior_reg_coef
 
-        # Logging
+        # Logging: add zero-weight entries to loss_dict so the runner iterates them,
+        # then value_dict provides the actual scalar values
         with torch.no_grad():
-            # Codebook utilization: unique codes used in this batch
             unique_codes = d["vq_indices"].unique().numel()
             log_dict["codebook_usage"] = unique_codes / self.num_codes
-            # Prior accuracy: does prior predict the right code?
+            loss_dict["codebook_usage"] = torch.tensor(0.0, device=d["vq_indices"].device)
+
             prior_pred = d["logits"].argmax(dim=-1)
             log_dict["prior_accuracy"] = (prior_pred == d["vq_indices"]).float().mean().item()
-            # Dead codes
-            log_dict["dead_codes"] = (self.codebook._steps_since_used >= self.codebook.dead_code_threshold).sum().item()
+            loss_dict["prior_accuracy"] = torch.tensor(0.0, device=d["vq_indices"].device)
+
+            dead = (self.codebook._steps_since_used >= self.codebook.dead_code_threshold).sum().item()
+            log_dict["dead_codes"] = dead
+            loss_dict["dead_codes"] = torch.tensor(0.0, device=d["vq_indices"].device)
 
         self._save_dict = {}
         return dict(loss_dict), dict(log_dict)
