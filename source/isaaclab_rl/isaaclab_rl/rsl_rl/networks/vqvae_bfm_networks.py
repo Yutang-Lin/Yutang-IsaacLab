@@ -273,6 +273,8 @@ class VQBFMPrior(nn.Module):
             for _ in range(num_layers)
         ])
         self.logit_head = nn.Linear(d_model, num_codes)
+        # Normalize enriched tokens before passing to decoder (prevents NaN from unbounded values)
+        self.output_norm = nn.LayerNorm(d_model)
 
     def forward(self, o_t, h_prior, prev_e_q, frames_flat, delta_t, frame_mask):
         """
@@ -304,4 +306,5 @@ class VQBFMPrior(nn.Module):
         # tokens[:, 1] = enriched o_t (for decoder)
         # tokens[:, 2] = enriched h_prior (for decoder)
         logits = self.logit_head(tokens[:, 0])
-        return logits, tokens[:, 1], tokens[:, 2]
+        tokens_normed = self.output_norm(tokens)
+        return logits, tokens_normed[:, 1], tokens_normed[:, 2]

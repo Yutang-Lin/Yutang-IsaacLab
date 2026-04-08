@@ -351,8 +351,8 @@ class StudentVQVAEBFMTracker(nn.Module):
         with torch.inference_mode(False):
             self._prev_e_q = e_q.detach().clone()
 
-        # Decoder uses raw o_t and h_prior (not enriched) to avoid NaN from pre_encoded path
-        action_mean = self.action_decoder(o_t, h_prior, e_q, masked_frames, delta_t, cur_frame_mask)
+        # Decoder uses enriched o_t and h_prior from prior (LayerNorm'd, d_model-dim)
+        action_mean = self.action_decoder(o_t_enc, h_prior_enc, e_q, masked_frames, delta_t, cur_frame_mask, pre_encoded=True)
 
         std = self.std.expand_as(action_mean)
         self.distribution = Normal(action_mean, std)
@@ -420,8 +420,8 @@ class StudentVQVAEBFMTracker(nn.Module):
             indices = logits.argmax(dim=-1)
             e_q = self.codebook.embedding(indices)
 
-        # Decoder uses raw o_t and h_prior (not enriched)
-        action_mean = self.action_decoder(o_t, h_prior, e_q, masked_frames, delta_t, frame_mask)
+        # Decoder uses enriched o_t and h_prior from prior (LayerNorm'd, d_model-dim)
+        action_mean = self.action_decoder(o_t_enc, h_prior_enc, e_q, masked_frames, delta_t, frame_mask, pre_encoded=True)
         return action_mean
 
     def extra_loss(self, **kwargs):
