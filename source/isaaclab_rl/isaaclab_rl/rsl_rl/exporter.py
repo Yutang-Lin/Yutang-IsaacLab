@@ -124,8 +124,8 @@ class _BFMTrackerExporter(torch.nn.Module):
         # Encoder (Flow-BFM, LFM-BFM)
         self.encoder = copy.deepcopy(policy.encoder) if hasattr(policy, 'encoder') else None
 
-        # Action decoder
-        self.action_decoder = copy.deepcopy(policy.action_decoder)
+        # Action decoder (Flow-BFM has no action_decoder — uses self.decoder directly)
+        self.action_decoder = copy.deepcopy(policy.action_decoder) if hasattr(policy, 'action_decoder') else None
 
         # Flow/LFM specific
         self.latent_flow = copy.deepcopy(policy.latent_flow) if hasattr(policy, 'latent_flow') else None
@@ -138,6 +138,7 @@ class _BFMTrackerExporter(torch.nn.Module):
         self.frame_dim = getattr(policy, 'frame_dim', 55)
         self.num_keypoints = getattr(policy, 'num_keypoints', 6)
         self.dims_per_keypoint = getattr(policy, 'dims_per_keypoint', 9)
+        self.num_actions = getattr(policy, 'num_actions', 29)
 
         # VQ-VAE specific
         self.codebook = copy.deepcopy(policy.codebook) if hasattr(policy, 'codebook') else None
@@ -208,7 +209,7 @@ class _BFMTrackerExporter(torch.nn.Module):
             context, ctx_mask = self.encoder(h_prior, o_t, frames, delta_t, frame_mask)
             # Action ODE
             kv_cache, ctx_mask = self.decoder.build_kv_cache(context, ctx_mask)
-            a = torch.randn(B, self.action_decoder.action_head.out_features if hasattr(self.action_decoder, 'action_head') else 29, device=o_t.device)
+            a = torch.randn(B, self.num_actions, device=o_t.device)
             dt = 1.0 / self.ode_steps
             for k in range(self.ode_steps):
                 t_val = 1.0 - k * dt
