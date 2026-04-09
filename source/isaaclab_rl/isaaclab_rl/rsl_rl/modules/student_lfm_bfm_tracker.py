@@ -116,6 +116,8 @@ class StudentLFMBFMTracker(nn.Module):
         self.boundary_coef = cfg.pop("boundary_coef", 1.0)
         self.spread_coef = cfg.pop("spread_coef", 1e-2)
         self.grad_penalty_coef = cfg.pop("grad_penalty_coef", 0.0)
+        self.use_mean_flow = cfg.pop("use_mean_flow", False)
+        self.mf_propagation_ratio = cfg.pop("mf_propagation_ratio", 0.25)
         cfg.pop("posterior_dropout", None)  # unused
 
         self.latent_dim = latent_dim
@@ -379,10 +381,41 @@ class StudentLFMBFMTracker(nn.Module):
             t = torch.rand(B, device=frames.device)
             eps = torch.randn(B, self.latent_dim, device=frames.device)
             z_noised = (1 - t.unsqueeze(-1)) * z_t + t.unsqueeze(-1) * eps
-            v_target = eps - z_t
+            v_t = eps - z_t  # instantaneous velocity
 
-            v_pred = self.latent_flow(z_noised, t, context, ctx_mask)
-            flow_loss = F.mse_loss(v_pred, v_target)
+            if self.use_mean_flow:
+                # MeanFlow: sample r, compute JVP for self-consistency
+                from torch.func import jvp as func_jvp
+                from torch.nn.attention import sdpa_kernel, SDPBackend
+
+                prop_mask = torch.rand(B, device=frames.device) < self.mf_propagation_ratio
+                r = t.clone()
+                prop_idx = prop_mask.nonzero(as_tuple=True)[0]
+                if prop_idx.numel() > 0:
+                    r[prop_idx] = torch.rand(prop_idx.numel(), device=frames.device) * t[prop_idx]
+
+                v_pred = self.latent_flow(z_noised, t, context, ctx_mask)
+
+                # JVP only on propagation subset
+                du_dt = torch.zeros_like(v_pred)
+                if prop_idx.numel() > 0:
+                    def _flow_fn(z, t_):
+                        return self.latent_flow(z, t_, context[prop_idx], ctx_mask[prop_idx])
+                    with sdpa_kernel(SDPBackend.MATH):
+                        _, du_sub = func_jvp(
+                            _flow_fn,
+                            (z_noised[prop_idx], t[prop_idx]),
+                            (v_t[prop_idx], torch.ones(prop_idx.numel(), device=frames.device)),
+                        )
+                    du_dt[prop_idx] = du_sub
+
+                t_minus_r = (t - r).unsqueeze(-1)  # [B, 1]
+                u_target = v_t - t_minus_r * du_dt
+                flow_loss = F.mse_loss(v_pred, u_target.detach())
+            else:
+                # Standard flow matching
+                v_pred = self.latent_flow(z_noised, t, context, ctx_mask)
+                flow_loss = F.mse_loss(v_pred, v_t)
 
             # Add fixed noise for tolerance area
             z_posterior = z_t + self.posterior_sigma * torch.randn_like(z_t)
