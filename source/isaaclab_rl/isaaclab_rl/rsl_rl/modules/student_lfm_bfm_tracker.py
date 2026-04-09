@@ -366,14 +366,14 @@ class StudentLFMBFMTracker(nn.Module):
             v_pred = self.latent_flow(z_noised, t, context, ctx_mask)
             flow_loss = F.mse_loss(v_pred, v_target)
 
-            # Posterior dropout: use flow-generated z for some samples
+            # Posterior dropout: use full ODE-generated z for dropped samples
             if self.posterior_dropout > 0:
                 drop_mask = torch.rand(B, device=z_t.device) < self.posterior_dropout
                 if drop_mask.any():
-                    # 1-step flow estimate for dropped samples
                     with torch.no_grad():
-                        z_flow = eps[drop_mask] - v_pred[drop_mask].detach()
-                        z_flow = F.normalize(z_flow, dim=-1)
+                        z_flow = self._ode_sample_latent(
+                            context[drop_mask], ctx_mask[drop_mask],
+                            drop_mask.sum().item(), z_t.device)
                     z_t = z_t.clone()
                     z_t[drop_mask] = z_flow
 
