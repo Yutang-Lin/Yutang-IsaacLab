@@ -291,9 +291,14 @@ class StudentLFMBFMTracker(nn.Module):
         for k in range(self.ode_steps):
             t = 1.0 - k * dt
             t_tensor = torch.full((B,), t, device=device)
-            v = self.latent_flow.forward_cached(z, t_tensor, kv_cache, ctx_mask)
+            if self.use_mean_flow:
+                # MeanFlow: r = t - dt (model predicts average velocity over [r, t])
+                r_tensor = torch.full((B,), max(t - dt, 0.0), device=device)
+                v = self.latent_flow.forward_cached(z, t_tensor, kv_cache, ctx_mask, r=r_tensor)
+            else:
+                v = self.latent_flow.forward_cached(z, t_tensor, kv_cache, ctx_mask)
             z = z - dt * v
-        return z  # bounded by posterior reg loss, not hard-normalized
+        return z
 
     # -- Forward --
 
@@ -394,18 +399,19 @@ class StudentLFMBFMTracker(nn.Module):
                 if prop_idx.numel() > 0:
                     r[prop_idx] = torch.rand(prop_idx.numel(), device=frames.device) * t[prop_idx]
 
-                v_pred = self.latent_flow(z_noised, t, context, ctx_mask)
+                v_pred = self.latent_flow(z_noised, t, context, ctx_mask, r=r)
 
                 # JVP only on propagation subset
                 du_dt = torch.zeros_like(v_pred)
                 if prop_idx.numel() > 0:
-                    def _flow_fn(z, t_):
-                        return self.latent_flow(z, t_, context[prop_idx], ctx_mask[prop_idx])
+                    def _flow_fn(z, t_, r_):
+                        return self.latent_flow(z, t_, context[prop_idx], ctx_mask[prop_idx], r=r_)
                     with sdpa_kernel(SDPBackend.MATH):
                         _, du_sub = func_jvp(
                             _flow_fn,
-                            (z_noised[prop_idx], t[prop_idx]),
-                            (v_t[prop_idx], torch.ones(prop_idx.numel(), device=frames.device)),
+                            (z_noised[prop_idx], t[prop_idx], r[prop_idx]),
+                            (v_t[prop_idx], torch.ones(prop_idx.numel(), device=frames.device),
+                             torch.zeros(prop_idx.numel(), device=frames.device)),
                         )
                     du_dt[prop_idx] = du_sub
 
@@ -413,7 +419,7 @@ class StudentLFMBFMTracker(nn.Module):
                 u_target = v_t - t_minus_r * du_dt
                 flow_loss = F.mse_loss(v_pred, u_target.detach())
             else:
-                # Standard flow matching
+                # Standard flow matching (r=t, passed implicitly via default)
                 v_pred = self.latent_flow(z_noised, t, context, ctx_mask)
                 flow_loss = F.mse_loss(v_pred, v_t)
 

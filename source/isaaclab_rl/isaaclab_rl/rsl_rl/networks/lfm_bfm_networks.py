@@ -87,9 +87,9 @@ class LatentFlowDecoder(nn.Module):
             nn.Linear(latent_dim, d_model), activation, nn.Linear(d_model, d_model),
         )
 
-        # Time embedding
+        # Time embedding: takes (t, r) pair
         self.time_embed = nn.Sequential(
-            nn.Linear(1, d_model), activation, nn.Linear(d_model, d_model),
+            nn.Linear(2, d_model), activation, nn.Linear(d_model, d_model),
         )
 
         # Cross-attention layers with AdaLN-Zero
@@ -163,11 +163,15 @@ class LatentFlowDecoder(nn.Module):
         q_tok = q_tok + g2 * layer['ffn'](ffn_in)
         return q_tok
 
-    def forward(self, z_noised, t, context, ctx_mask):
+    def forward(self, z_noised, t, context, ctx_mask, r=None):
         if t.dim() == 1:
             t = t.unsqueeze(-1)
+        if r is None:
+            r = t  # default: r=t (standard flow matching)
+        elif r.dim() == 1:
+            r = r.unsqueeze(-1)
         tok = self.latent_proj(z_noised)
-        t_embed = self.time_embed(t)
+        t_embed = self.time_embed(torch.cat([t, r], dim=-1))
 
         for layer, adaln in zip(self.cross_attn_layers, self.adaln_layers):
             tok = self._cross_attn_adaln(layer, adaln, tok, context, ctx_mask, t_embed)
@@ -186,11 +190,15 @@ class LatentFlowDecoder(nn.Module):
             cache.append((k, v))
         return cache, ctx_mask
 
-    def forward_cached(self, z_noised, t, kv_cache, ctx_mask):
+    def forward_cached(self, z_noised, t, kv_cache, ctx_mask, r=None):
         if t.dim() == 1:
             t = t.unsqueeze(-1)
+        if r is None:
+            r = t
+        elif r.dim() == 1:
+            r = r.unsqueeze(-1)
         tok = self.latent_proj(z_noised)
-        t_embed = self.time_embed(t)
+        t_embed = self.time_embed(torch.cat([t, r], dim=-1))
 
         for (layer, adaln), (k_cached, v_cached) in zip(
                 zip(self.cross_attn_layers, self.adaln_layers), kv_cache):
