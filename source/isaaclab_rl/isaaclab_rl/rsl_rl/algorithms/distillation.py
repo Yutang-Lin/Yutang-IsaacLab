@@ -95,15 +95,17 @@ class Distillation:
         if infos is not None and 'teacher_residual' in infos:
             self.transition.privileged_actions = self.transition.privileged_actions + infos['teacher_residual']
 
-        # Teacher forcing: replace some envs' actions with teacher's + noise
+        # Teacher forcing: per-episode, some envs use teacher action + noise
         tf_ratio = getattr(self.policy, 'teacher_forcing_ratio', 0.0)
         if tf_ratio > 0:
             B = obs.shape[0]
-            tf_mask = torch.rand(B, device=obs.device) < tf_ratio
-            if tf_mask.any():
+            # Lazily init per-env episode mask
+            if not hasattr(self, '_tf_mask') or self._tf_mask.shape[0] != B:
+                self._tf_mask = torch.rand(B, device=obs.device) < tf_ratio
+            if self._tf_mask.any():
                 tf_noise_std = getattr(self.policy, 'teacher_forcing_noise', 0.1)
                 noise = torch.randn_like(self.transition.privileged_actions) * tf_noise_std
-                self.transition.actions[tf_mask] = (self.transition.privileged_actions[tf_mask] + noise[tf_mask]).detach()
+                self.transition.actions[self._tf_mask] = (self.transition.privileged_actions[self._tf_mask] + noise[self._tf_mask]).detach()
 
         # record the observations
         self.transition.observations = obs
@@ -111,6 +113,13 @@ class Distillation:
         return self.transition.actions
 
     def process_env_step(self, rewards, dones, infos):
+        # Resample teacher forcing mask for reset envs
+        tf_ratio = getattr(self.policy, 'teacher_forcing_ratio', 0.0)
+        if tf_ratio > 0 and hasattr(self, '_tf_mask'):
+            reset = dones.bool().flatten()
+            if reset.any():
+                self._tf_mask[reset] = torch.rand(reset.sum().item(), device=dones.device) < tf_ratio
+
         # record the rewards and dones
         self.transition.rewards = rewards
         self.transition.dones = dones
