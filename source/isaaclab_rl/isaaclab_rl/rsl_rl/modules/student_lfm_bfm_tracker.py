@@ -360,8 +360,20 @@ class StudentLFMBFMTracker(nn.Module):
         context, ctx_mask = self.encoder(h_prior, o_t, masked_frames, delta_t, frame_mask)
 
         if self.compute_latent_loss and r_t.shape[-1] > 0:
+            # Enable grad on r_t if gradient penalty is active (single posterior forward)
+            if self.grad_penalty_coef > 0:
+                r_t = r_t.detach().requires_grad_(True)
+
             # Posterior: z_t in [-1, 1] (soft bounded via boundary loss)
             z_t = self.posterior(r_t, masked_frames, delta_t, frame_mask)
+
+            # Gradient penalty: reuse the same z_t, no extra posterior forward
+            grad_penalty = None
+            if self.grad_penalty_coef > 0:
+                grads = torch.autograd.grad(
+                    z_t.sum(), r_t, create_graph=True, retain_graph=True
+                )[0]
+                grad_penalty = grads.pow(2).mean()
 
             # Flow loss: noise z_t, predict velocity in latent space
             t = torch.rand(B, device=frames.device)
@@ -374,7 +386,6 @@ class StudentLFMBFMTracker(nn.Module):
 
             # Add fixed noise for tolerance area
             z_posterior = z_t + self.posterior_sigma * torch.randn_like(z_t)
-            # no sphere normalization — posterior reg keeps values bounded
 
             # Boundary loss: penalize |z_t| > 1 per dimension
             boundary_loss = F.relu(z_t.abs() - 1.0).pow(2).mean()
@@ -385,17 +396,6 @@ class StudentLFMBFMTracker(nn.Module):
                 target_var = 1.0 / 3.0
                 per_dim_var = z_t.var(dim=0)
                 spread_loss = F.relu(target_var - per_dim_var).mean()
-
-            # Gradient penalty: penalize large dz/d(input) to encourage smooth mapping
-            grad_penalty = None
-            if self.grad_penalty_coef > 0:
-                # r_t needs grad for torch.autograd.grad
-                r_t_gp = r_t.detach().requires_grad_(True)
-                z_gp = self.posterior(r_t_gp, masked_frames, delta_t, frame_mask)
-                grads = torch.autograd.grad(
-                    z_gp.sum(), r_t_gp, create_graph=True, retain_graph=True
-                )[0]
-                grad_penalty = grads.pow(2).mean()
 
             self._save_dict = {
                 "flow_loss": flow_loss,
