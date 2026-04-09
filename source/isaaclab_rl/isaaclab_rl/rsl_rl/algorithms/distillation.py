@@ -112,20 +112,23 @@ class Distillation:
         return self.transition.actions
 
     def process_env_step(self, rewards, dones, infos):
-        # Teacher forcing: resample reset envs, cap total TF count at desired ratio
+        # Teacher forcing: maintain TF count at desired ratio
         tf_ratio = getattr(self.policy, 'teacher_forcing_ratio', 0.0)
         if tf_ratio > 0 and hasattr(self, '_tf_mask'):
             reset = dones.bool().flatten()
             if reset.any():
                 B = self._tf_mask.shape[0]
-                n_desired = int(B * tf_ratio)
+                # First: all reset envs lose TF status
+                self._tf_mask[reset] = False
+                # Then: if under desired count, promote some reset envs
                 n_current = self._tf_mask.sum().item()
-                # If already at or above ratio, reset envs become student (prob=0)
-                if n_current >= n_desired:
-                    self._tf_mask[reset] = False
-                else:
-                    # Under ratio — some reset envs can become TF
-                    self._tf_mask[reset] = torch.rand(reset.sum().item(), device=dones.device) < tf_ratio
+                n_desired = max(1, int(B * tf_ratio))
+                n_need = n_desired - int(n_current)
+                if n_need > 0:
+                    reset_ids = reset.nonzero(as_tuple=True)[0]
+                    n_promote = min(n_need, len(reset_ids))
+                    perm = torch.randperm(len(reset_ids), device=dones.device)[:n_promote]
+                    self._tf_mask[reset_ids[perm]] = True
 
         # record the rewards and dones
         self.transition.rewards = rewards
