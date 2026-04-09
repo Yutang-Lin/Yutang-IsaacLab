@@ -32,9 +32,9 @@ from .actor_critic_transformer_latent import ActorCriticTransformerLatent
 from .actor_critic_transformer_residual import ActorCriticTransformerResidual
 
 from isaaclab_rl.rsl_rl.networks.cvae_tracker_networks import _build_mlp
-from isaaclab_rl.rsl_rl.networks.cvae_bfm_networks import BFMFrameEncoder, CVAEBFMDecoder
+from isaaclab_rl.rsl_rl.networks.cvae_bfm_networks import BFMFrameEncoder
 from isaaclab_rl.rsl_rl.networks.flow_bfm_networks import FlowBFMEncoder
-from isaaclab_rl.rsl_rl.networks.lfm_bfm_networks import LFMPosterior, LatentFlowDecoder
+from isaaclab_rl.rsl_rl.networks.lfm_bfm_networks import LFMPosterior, LatentFlowDecoder, LFMActionDecoder
 
 
 class StudentLFMBFMTracker(nn.Module):
@@ -142,11 +142,10 @@ class StudentLFMBFMTracker(nn.Module):
             latent_dim, tf_d_model, tf_num_heads, tf_hidden_dim,
             flow_num_layers, tf_dropout, tf_activation)
 
-        # Action decoder: [proprio, h_prior, z_t, frames] → action
-        self.action_decoder = CVAEBFMDecoder(
-            current_proprio_dim, latent_dim, self.num_frames, tf_d_model,
-            self.frame_encoder, tf_num_heads, tf_hidden_dim, decoder_num_layers,
-            num_actions, tf_dropout, tf_activation)
+        # Action decoder: takes encoded context + z_t → action (1-layer)
+        self.action_decoder = LFMActionDecoder(
+            latent_dim, tf_d_model, tf_num_heads, tf_hidden_dim,
+            decoder_num_layers, num_actions, tf_dropout, tf_activation)
 
         # -- Teacher --
         teacher_ckpt = torch.load(teacher_policy_ckpt, map_location="cpu", weights_only=False)
@@ -318,7 +317,7 @@ class StudentLFMBFMTracker(nn.Module):
         # Latent ODE → z_t
         z_t = self._ode_sample_latent(context, ctx_mask, B, observations.device)
 
-        action_mean = self.action_decoder(o_t, h_prior, z_t, masked_frames, delta_t, cur_frame_mask)
+        action_mean = self.action_decoder(z_t, context, ctx_mask)
 
         std = self.std.expand_as(action_mean)
         self.distribution = Normal(action_mean, std)
@@ -377,12 +376,12 @@ class StudentLFMBFMTracker(nn.Module):
             }
 
             # Action from z_posterior
-            action_mean = self.action_decoder(o_t, h_prior, z_posterior, masked_frames, delta_t, frame_mask)
+            action_mean = self.action_decoder(z_posterior, context, ctx_mask)
             return action_mean
         else:
             # Inference: latent ODE
             z_t = self._ode_sample_latent(context, ctx_mask, B, frames.device)
-            action_mean = self.action_decoder(o_t, h_prior, z_t, masked_frames, delta_t, frame_mask)
+            action_mean = self.action_decoder(z_t, context, ctx_mask)
             return action_mean
 
     def extra_loss(self, **kwargs):

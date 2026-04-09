@@ -17,6 +17,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from isaaclab_rl.rsl_rl.networks.transformer import TransformerEncoder
 from isaaclab_rl.rsl_rl.networks.cvae_bfm_networks import BFMFrameEncoder, _build_frame_attn_mask
 
 
@@ -199,3 +200,58 @@ class LatentFlowDecoder(nn.Module):
         sf, shf = self.adaln_final(t_embed).chunk(2, dim=-1)
         tok = self._adaln_modulate(tok, self.final_norm, 1 + sf, shf)
         return self.velocity_head(tok)
+
+
+class LFMActionDecoder(nn.Module):
+    """1-layer self-attention decoder: encoded context + z_t → action.
+
+    Reuses encoder output tokens directly (no re-encoding).
+    Token layout: [z_t(0), h_prior_enc(1), o_t_enc(2), frame_0(3), ..., frame_{F-1}(F+2)]
+    Action from o_t_enc position (index 2).
+    """
+
+    def __init__(self, latent_dim: int, d_model: int,
+                 num_heads: int = 4, hidden_dim: int = 512,
+                 num_layers: int = 1, num_actions: int = 29,
+                 dropout: float = 0.0, activation: nn.Module | None = None):
+        super().__init__()
+        if activation is None:
+            activation = nn.GELU(approximate="tanh")
+
+        self.z_proj = nn.Linear(latent_dim, d_model)
+        self.z_embed = nn.Parameter(torch.randn(d_model) * 0.02)
+
+        self.transformer = TransformerEncoder(
+            d_model=d_model, num_heads=num_heads, hidden_dim=hidden_dim,
+            num_layers=num_layers, dropout=dropout, is_causal=False,
+            activation=activation, enable_sdpa=False,
+        )
+        self.action_head = nn.Linear(d_model, num_actions)
+
+    def forward(self, z_t, context, ctx_mask):
+        """
+        Args:
+            z_t: [B, latent_dim]
+            context: [B, 2+F, d_model] encoded [h_prior, o_t, frames]
+            ctx_mask: [B, 2+F] bool
+
+        Returns:
+            action: [B, num_actions]
+        """
+        B = z_t.shape[0]
+        nf = context.shape[1] - 2
+
+        tok_z = self.z_proj(z_t) + self.z_embed
+        tokens = torch.cat([tok_z.unsqueeze(1), context], dim=1)  # [B, 3+F, d]
+
+        # Attention mask: z_t + h_prior + o_t always valid, frames pad-masked
+        total = 3 + nf
+        attn_mask = torch.ones(B, total, total, dtype=torch.bool, device=z_t.device)
+        frame_mask = ctx_mask[:, 2:]
+        attn_mask[:, :, 3:] &= frame_mask.unsqueeze(1)
+        attn_mask[:, 3:, :] &= frame_mask.unsqueeze(2)
+        diag_idx = torch.arange(3, total, device=z_t.device)
+        attn_mask[:, diag_idx, diag_idx] = True
+
+        out = self.transformer(tokens, attn_mask=attn_mask)
+        return self.action_head(out[:, 2])  # o_t_enc position
