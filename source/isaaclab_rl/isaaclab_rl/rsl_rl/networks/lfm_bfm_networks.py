@@ -59,9 +59,8 @@ class LFMPosterior(nn.Module):
         for layer in self.layers:
             q = layer(q, tok_frames, frame_mask)
 
-        z_e = self.embed_head(q)
-        z_t = F.normalize(z_e, dim=-1)  # project to unit sphere
-        return z_t
+        z_t = self.embed_head(q)
+        return z_t  # unbounded, regularized via loss to stay in [-1, 1]
 
 
 class LatentFlowDecoder(nn.Module):

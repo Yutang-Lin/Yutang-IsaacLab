@@ -113,6 +113,7 @@ class StudentLFMBFMTracker(nn.Module):
         flow_num_layers = cfg.pop("flow_num_layers", 2)
         self.ode_steps = cfg.pop("ode_steps", 10)
         self.posterior_sigma = cfg.pop("posterior_sigma", 0.1)
+        self.boundary_coef = cfg.pop("boundary_coef", 1.0)
         cfg.pop("posterior_dropout", None)  # unused
 
         self.latent_dim = latent_dim
@@ -288,7 +289,7 @@ class StudentLFMBFMTracker(nn.Module):
             t_tensor = torch.full((B,), t, device=device)
             v = self.latent_flow.forward_cached(z, t_tensor, kv_cache, ctx_mask)
             z = z - dt * v
-        return F.normalize(z, dim=-1)  # project back to sphere
+        return z  # bounded by posterior reg loss, not hard-normalized
 
     # -- Forward --
 
@@ -357,7 +358,7 @@ class StudentLFMBFMTracker(nn.Module):
         context, ctx_mask = self.encoder(h_prior, o_t, masked_frames, delta_t, frame_mask)
 
         if self.compute_latent_loss and r_t.shape[-1] > 0:
-            # Posterior: z_t on sphere
+            # Posterior: z_t in [-1, 1] (soft bounded via boundary loss)
             z_t = self.posterior(r_t, masked_frames, delta_t, frame_mask)
 
             # Flow loss: noise z_t, predict velocity in latent space
@@ -371,10 +372,14 @@ class StudentLFMBFMTracker(nn.Module):
 
             # Add fixed noise for tolerance area
             z_posterior = z_t + self.posterior_sigma * torch.randn_like(z_t)
-            z_posterior = F.normalize(z_posterior, dim=-1)
+            # no sphere normalization — posterior reg keeps values bounded
+
+            # Boundary loss: penalize |z_t| > 1 per dimension
+            boundary_loss = F.relu(z_t.abs() - 1.0).pow(2).mean()
 
             self._save_dict = {
                 "flow_loss": flow_loss,
+                "boundary_loss": boundary_loss,
                 "context": context,
                 "ctx_mask": ctx_mask,
             }
@@ -398,6 +403,9 @@ class StudentLFMBFMTracker(nn.Module):
 
         loss_dict["flow"] = d["flow_loss"]
         log_dict["flow"] = d["flow_loss"].item()
+
+        loss_dict["boundary"] = d["boundary_loss"] * self.boundary_coef
+        log_dict["boundary"] = d["boundary_loss"].item()
 
         self._save_dict = {}
         return dict(loss_dict), dict(log_dict)
