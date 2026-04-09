@@ -749,6 +749,14 @@ class BaseRunner(OnPolicyRunner):
                 else:
                     self.writer.add_scalar("Episode/" + key, value, locs["it"])
                     ep_string += f"""{f'Mean episode {key}:':>{pad}} {value:.4f}\n"""
+                # All-rank reduced ep_info
+                if self.is_distributed:
+                    import torch.distributed as dist
+                    global_value = value.clone()
+                    dist.all_reduce(global_value, op=dist.ReduceOp.SUM)
+                    global_value = global_value / dist.get_world_size()
+                    tag = f"Global/{key}" if "/" in key else f"Global/Episode/{key}"
+                    self.writer.add_scalar(tag, global_value, locs["it"])
         
         if hasattr(self.alg.policy, "action_std"):
             mean_std = self.alg.policy.action_std
@@ -786,6 +794,22 @@ class BaseRunner(OnPolicyRunner):
             local_mean_ep_len = statistics.mean(locs["lenbuffer"])
             self.writer.add_scalar("Train/mean_reward", local_mean_reward, locs["it"])
             self.writer.add_scalar("Train/mean_episode_length", local_mean_ep_len, locs["it"])
+
+            # All-rank reduced metrics for distributed training
+            if self.is_distributed:
+                import torch.distributed as dist
+                reward_tensor = torch.tensor([local_mean_reward], device=self.device)
+                ep_len_tensor = torch.tensor([local_mean_ep_len], device=self.device)
+                count_tensor = torch.tensor([float(len(locs["rewbuffer"]))], device=self.device)
+                dist.all_reduce(reward_tensor, op=dist.ReduceOp.SUM)
+                dist.all_reduce(ep_len_tensor, op=dist.ReduceOp.SUM)
+                dist.all_reduce(count_tensor, op=dist.ReduceOp.SUM)
+                world_size = dist.get_world_size()
+                global_mean_reward = (reward_tensor / world_size).item()
+                global_mean_ep_len = (ep_len_tensor / world_size).item()
+                self.writer.add_scalar("Train/global_mean_reward", global_mean_reward, locs["it"])
+                self.writer.add_scalar("Train/global_mean_episode_length", global_mean_ep_len, locs["it"])
+
             if self.logger_type != "wandb":  # wandb does not support non-integer x-axis logging
                 self.writer.add_scalar("Train/mean_reward/time", local_mean_reward, self.tot_time)
                 self.writer.add_scalar(
