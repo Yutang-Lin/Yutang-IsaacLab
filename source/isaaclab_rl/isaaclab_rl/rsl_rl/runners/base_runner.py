@@ -690,6 +690,24 @@ class BaseRunner(OnPolicyRunner):
             stop = time.time()
             learn_time = stop - start
             self.current_learning_iteration = it
+
+            # All-rank reduced metrics (all ranks must participate in all_reduce)
+            if self.is_distributed:
+                import torch.distributed as dist
+                has_data = len(rewbuffer) > 0
+                local_reward = statistics.mean(rewbuffer) if has_data else 0.0
+                local_ep_len = statistics.mean(lenbuffer) if has_data else 0.0
+                local_count = float(len(rewbuffer))
+                reward_t = torch.tensor([local_reward * local_count], device=self.device)
+                ep_len_t = torch.tensor([local_ep_len * local_count], device=self.device)
+                count_t = torch.tensor([local_count], device=self.device)
+                dist.all_reduce(reward_t)
+                dist.all_reduce(ep_len_t)
+                dist.all_reduce(count_t)
+                if count_t.item() > 0 and not self.disable_logs:
+                    self.writer.add_scalar("Train/global_mean_reward", (reward_t / count_t).item(), it)
+                    self.writer.add_scalar("Train/global_mean_episode_length", (ep_len_t / count_t).item(), it)
+
             # log info
             if self.log_dir is not None and not self.disable_logs:
                 # Log information
@@ -793,23 +811,6 @@ class BaseRunner(OnPolicyRunner):
                 self.writer.add_scalar(
                     "Train/mean_episode_length/time", local_mean_ep_len, self.tot_time
                 )
-
-        # All-rank reduced metrics (unconditional — all ranks must participate)
-        if self.is_distributed:
-            import torch.distributed as dist
-            has_data = len(locs["rewbuffer"]) > 0
-            local_reward = statistics.mean(locs["rewbuffer"]) if has_data else 0.0
-            local_ep_len = statistics.mean(locs["lenbuffer"]) if has_data else 0.0
-            local_count = float(len(locs["rewbuffer"]))
-            reward_t = torch.tensor([local_reward * local_count], device=self.device)
-            ep_len_t = torch.tensor([local_ep_len * local_count], device=self.device)
-            count_t = torch.tensor([local_count], device=self.device)
-            dist.all_reduce(reward_t)
-            dist.all_reduce(ep_len_t)
-            dist.all_reduce(count_t)
-            if count_t.item() > 0:
-                self.writer.add_scalar("Train/global_mean_reward", (reward_t / count_t).item(), locs["it"])
-                self.writer.add_scalar("Train/global_mean_episode_length", (ep_len_t / count_t).item(), locs["it"])
 
         str = f" \033[1m Learning iteration {locs['it']}/{locs['tot_iter']} \033[0m "
 
