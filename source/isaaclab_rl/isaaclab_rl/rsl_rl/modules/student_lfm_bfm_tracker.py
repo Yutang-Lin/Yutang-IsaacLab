@@ -114,7 +114,7 @@ class StudentLFMBFMTracker(nn.Module):
         self.ode_steps = cfg.pop("ode_steps", 10)
         self.posterior_sigma = cfg.pop("posterior_sigma", 0.1)
         self.boundary_coef = cfg.pop("boundary_coef", 1.0)
-        self.spread_coef = cfg.pop("spread_coef", 1.0)
+        self.spread_coef = cfg.pop("spread_coef", 1e-2)
         cfg.pop("posterior_dropout", None)  # unused
 
         self.latent_dim = latent_dim
