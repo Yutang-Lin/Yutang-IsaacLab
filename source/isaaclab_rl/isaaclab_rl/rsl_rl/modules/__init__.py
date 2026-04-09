@@ -30,6 +30,7 @@ from .student_codit_mf_tracker import StudentCoDiTMFTracker
 from .student_cvae_bfm_tracker import StudentCVAEBFMTracker
 from .student_vqvae_bfm_tracker import StudentVQVAEBFMTracker
 from .student_flow_bfm_tracker import StudentFlowBFMTracker
+from .student_lfm_bfm_tracker import StudentLFMBFMTracker
 
 import torch
 from typing import Callable
@@ -117,4 +118,5 @@ __all__ = [
     "StudentCVAEBFMTracker",
     "StudentVQVAEBFMTracker",
     "StudentFlowBFMTracker",
+    "StudentLFMBFMTracker",
 ]

@@ -106,6 +106,14 @@ class RslRlDistillationStudentFlowBFMTrackerCfg(RslRlDistillationStudentTeacherC
     """The policy class name. Default is StudentFlowBFMTracker."""
 
 
+@configclass
+class RslRlDistillationStudentLFMBFMTrackerCfg(RslRlDistillationStudentTeacherCfg):
+    """Configuration for LFM-BFM (Latent Flow Matching) distillation policy."""
+
+    class_name: str = "StudentLFMBFMTracker"
+    """The policy class name. Default is StudentLFMBFMTracker."""
+
+
 ############################
 # Algorithm configurations #
 ############################
