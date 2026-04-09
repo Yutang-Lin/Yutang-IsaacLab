@@ -114,6 +114,7 @@ class StudentLFMBFMTracker(nn.Module):
         self.ode_steps = cfg.pop("ode_steps", 10)
         self.posterior_sigma = cfg.pop("posterior_sigma", 0.1)
         self.boundary_coef = cfg.pop("boundary_coef", 1.0)
+        self.spread_coef = cfg.pop("spread_coef", 1.0)
         cfg.pop("posterior_dropout", None)  # unused
 
         self.latent_dim = latent_dim
@@ -377,9 +378,16 @@ class StudentLFMBFMTracker(nn.Module):
             # Boundary loss: penalize |z_t| > 1 per dimension
             boundary_loss = F.relu(z_t.abs() - 1.0).pow(2).mean()
 
+            # Spread loss: push per-dim variance toward U(-1,1) variance (1/3)
+            # Only penalize if variance is below target (don't penalize high variance)
+            target_var = 1.0 / 3.0  # variance of U(-1, 1)
+            per_dim_var = z_t.var(dim=0)  # [latent_dim]
+            spread_loss = F.relu(target_var - per_dim_var).mean()
+
             self._save_dict = {
                 "flow_loss": flow_loss,
                 "boundary_loss": boundary_loss,
+                "spread_loss": spread_loss,
                 "context": context,
                 "ctx_mask": ctx_mask,
             }
@@ -406,6 +414,9 @@ class StudentLFMBFMTracker(nn.Module):
 
         loss_dict["boundary"] = d["boundary_loss"] * self.boundary_coef
         log_dict["boundary"] = d["boundary_loss"].item()
+
+        loss_dict["spread"] = d["spread_loss"] * self.spread_coef
+        log_dict["spread"] = d["spread_loss"].item()
 
         self._save_dict = {}
         return dict(loss_dict), dict(log_dict)
