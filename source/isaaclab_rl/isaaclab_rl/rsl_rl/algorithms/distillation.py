@@ -95,13 +95,15 @@ class Distillation:
         if infos is not None and 'teacher_residual' in infos:
             self.transition.privileged_actions = self.transition.privileged_actions + infos['teacher_residual']
 
-        # Teacher forcing: per-episode, some envs use teacher action + noise
+        # Teacher forcing: maintain exactly tf_ratio fraction of envs as teacher-forced
         tf_ratio = getattr(self.policy, 'teacher_forcing_ratio', 0.0)
         if tf_ratio > 0:
             B = obs.shape[0]
-            # Lazily init per-env episode mask
             if not hasattr(self, '_tf_mask') or self._tf_mask.shape[0] != B:
-                self._tf_mask = torch.rand(B, device=obs.device) < tf_ratio
+                self._tf_mask = torch.zeros(B, dtype=torch.bool, device=obs.device)
+                n_tf = max(1, int(B * tf_ratio))
+                perm = torch.randperm(B, device=obs.device)[:n_tf]
+                self._tf_mask[perm] = True
             if self._tf_mask.any():
                 tf_noise_std = getattr(self.policy, 'teacher_forcing_noise', 0.1)
                 noise = torch.randn_like(self.transition.privileged_actions) * tf_noise_std
@@ -113,12 +115,17 @@ class Distillation:
         return self.transition.actions
 
     def process_env_step(self, rewards, dones, infos):
-        # Resample teacher forcing mask for reset envs
+        # Teacher forcing: when any env resets, reshuffle which envs are TF
+        # to maintain exactly tf_ratio fraction
         tf_ratio = getattr(self.policy, 'teacher_forcing_ratio', 0.0)
         if tf_ratio > 0 and hasattr(self, '_tf_mask'):
             reset = dones.bool().flatten()
             if reset.any():
-                self._tf_mask[reset] = torch.rand(reset.sum().item(), device=dones.device) < tf_ratio
+                B = self._tf_mask.shape[0]
+                n_tf = max(1, int(B * tf_ratio))
+                self._tf_mask.zero_()
+                perm = torch.randperm(B, device=dones.device)[:n_tf]
+                self._tf_mask[perm] = True
 
         # record the rewards and dones
         self.transition.rewards = rewards
