@@ -118,6 +118,10 @@ class StudentLFMBFMTracker(nn.Module):
         self.latent_dim = latent_dim
         self.num_actions = num_actions
 
+        # Teacher forcing: fraction of rollout envs that use teacher action + noise
+        self.teacher_forcing_ratio = cfg.pop("teacher_forcing_ratio", 0.0)
+        self.teacher_forcing_noise = cfg.pop("teacher_forcing_noise", 0.1)
+
         if cfg:
             print(f"StudentLFMBFMTracker: unused keys: {list(cfg.keys())}")
 

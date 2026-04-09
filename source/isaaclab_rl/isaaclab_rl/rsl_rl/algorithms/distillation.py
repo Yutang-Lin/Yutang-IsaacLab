@@ -94,6 +94,17 @@ class Distillation:
         self.transition.privileged_actions = self.policy.evaluate(teacher_obs).detach()
         if infos is not None and 'teacher_residual' in infos:
             self.transition.privileged_actions = self.transition.privileged_actions + infos['teacher_residual']
+
+        # Teacher forcing: replace some envs' actions with teacher's + noise
+        tf_ratio = getattr(self.policy, 'teacher_forcing_ratio', 0.0)
+        if tf_ratio > 0:
+            B = obs.shape[0]
+            tf_mask = torch.rand(B, device=obs.device) < tf_ratio
+            if tf_mask.any():
+                tf_noise_std = getattr(self.policy, 'teacher_forcing_noise', 0.1)
+                noise = torch.randn_like(self.transition.privileged_actions) * tf_noise_std
+                self.transition.actions[tf_mask] = (self.transition.privileged_actions[tf_mask] + noise[tf_mask]).detach()
+
         # record the observations
         self.transition.observations = obs
         self.transition.privileged_observations = teacher_obs
