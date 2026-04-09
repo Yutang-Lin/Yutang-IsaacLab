@@ -113,7 +113,7 @@ class StudentLFMBFMTracker(nn.Module):
         flow_num_layers = cfg.pop("flow_num_layers", 2)
         self.ode_steps = cfg.pop("ode_steps", 10)
         self.posterior_sigma = cfg.pop("posterior_sigma", 0.1)
-        self.posterior_dropout = cfg.pop("posterior_dropout", 0.5)
+        cfg.pop("posterior_dropout", None)  # unused
 
         self.latent_dim = latent_dim
         self.num_actions = num_actions
@@ -365,17 +365,6 @@ class StudentLFMBFMTracker(nn.Module):
 
             v_pred = self.latent_flow(z_noised, t, context, ctx_mask)
             flow_loss = F.mse_loss(v_pred, v_target)
-
-            # Posterior dropout: use full ODE-generated z for dropped samples
-            if self.posterior_dropout > 0:
-                drop_mask = torch.rand(B, device=z_t.device) < self.posterior_dropout
-                if drop_mask.any():
-                    with torch.no_grad():
-                        z_flow = self._ode_sample_latent(
-                            context[drop_mask], ctx_mask[drop_mask],
-                            drop_mask.sum().item(), z_t.device)
-                    z_t = z_t.clone()
-                    z_t[drop_mask] = z_flow
 
             # Add fixed noise for tolerance area
             z_posterior = z_t + self.posterior_sigma * torch.randn_like(z_t)
