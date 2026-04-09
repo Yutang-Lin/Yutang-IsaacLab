@@ -18,10 +18,35 @@ def export_policy_as_jit(policy: object, normalizer: object | None, path: str, f
         path: The path to the saving directory.
         filename: The name of exported JIT file. Defaults to "policy.pt".
     """
-    # StudentCVAETracker has no separate actor — use dedicated exporter
     from isaaclab_rl.rsl_rl.modules.student_cvae_tracker import StudentCVAETracker
     target = policy.student if hasattr(policy, "student") else policy
-    if isinstance(target, StudentCVAETracker):
+
+    # BFM family: CVAE-BFM, LFM-BFM, Flow-BFM, VQ-VAE BFM
+    bfm_classes = []
+    try:
+        from isaaclab_rl.rsl_rl.modules.student_cvae_bfm_tracker import StudentCVAEBFMTracker
+        bfm_classes.append(StudentCVAEBFMTracker)
+    except ImportError:
+        pass
+    try:
+        from isaaclab_rl.rsl_rl.modules.student_lfm_bfm_tracker import StudentLFMBFMTracker
+        bfm_classes.append(StudentLFMBFMTracker)
+    except ImportError:
+        pass
+    try:
+        from isaaclab_rl.rsl_rl.modules.student_flow_bfm_tracker import StudentFlowBFMTracker
+        bfm_classes.append(StudentFlowBFMTracker)
+    except ImportError:
+        pass
+    try:
+        from isaaclab_rl.rsl_rl.modules.student_vqvae_bfm_tracker import StudentVQVAEBFMTracker
+        bfm_classes.append(StudentVQVAEBFMTracker)
+    except ImportError:
+        pass
+
+    if bfm_classes and isinstance(target, tuple(bfm_classes)):
+        policy_exporter = _BFMTrackerExporter(target, normalizer)
+    elif isinstance(target, StudentCVAETracker):
         policy_exporter = _CVAETrackerExporter(target, normalizer)
     else:
         policy_exporter = _TorchPolicyExporter(policy, normalizer)
@@ -44,6 +69,20 @@ def export_policy_as_onnx(
         os.makedirs(path, exist_ok=True)
     from isaaclab_rl.rsl_rl.modules.student_cvae_tracker import StudentCVAETracker
     target = policy.student if hasattr(policy, "student") else policy
+
+    # BFM family
+    bfm_classes = []
+    for cls_name in ['StudentCVAEBFMTracker', 'StudentLFMBFMTracker', 'StudentFlowBFMTracker', 'StudentVQVAEBFMTracker']:
+        try:
+            cls = getattr(__import__('isaaclab_rl.rsl_rl.modules', fromlist=[cls_name]), cls_name)
+            bfm_classes.append(cls)
+        except (ImportError, AttributeError):
+            pass
+
+    if bfm_classes and isinstance(target, tuple(bfm_classes)):
+        policy_exporter = _BFMTrackerExporter(target, normalizer)
+        policy_exporter.export_onnx(path, filename)
+        return
     if isinstance(target, StudentCVAETracker):
         policy_exporter = _CVAETrackerExporter(target, normalizer)
         policy_exporter.export_onnx(path, filename)
@@ -55,6 +94,180 @@ def export_policy_as_onnx(
 """
 Helper Classes - Private.
 """
+
+
+class _BFMTrackerExporter(torch.nn.Module):
+    """Exporter for BFM family (CVAE-BFM, LFM-BFM, Flow-BFM, VQ-VAE BFM).
+
+    Takes pre-split inputs: (history_proprio, current_proprio, condition).
+    Internally runs the inference path (prior, encoder, decoder; ODE for flow variants).
+    Excludes frozen teacher.
+
+    Exported model signature::
+
+        actions = model(history_proprio, current_proprio, condition)
+    """
+
+    def __init__(self, policy, normalizer=None):
+        super().__init__()
+
+        # Store dims
+        self.hp_dim = policy.history_proprio_ids.shape[0]
+        self.o_dim = policy.current_proprio_ids.shape[0]
+        self.y_dim = policy.condition_ids.shape[0]
+
+        # Copy inference components (no teacher)
+        self.history_prior = copy.deepcopy(policy.history_prior) if hasattr(policy, 'history_prior') else None
+        self.history_encoder = copy.deepcopy(policy.history_encoder) if hasattr(policy, 'history_encoder') else None
+        self.prior = copy.deepcopy(policy.prior) if hasattr(policy, 'prior') else None
+
+        # Encoder (Flow-BFM, LFM-BFM)
+        self.encoder = copy.deepcopy(policy.encoder) if hasattr(policy, 'encoder') else None
+
+        # Action decoder
+        self.action_decoder = copy.deepcopy(policy.action_decoder)
+
+        # Flow/LFM specific
+        self.latent_flow = copy.deepcopy(policy.latent_flow) if hasattr(policy, 'latent_flow') else None
+        self.decoder = copy.deepcopy(policy.decoder) if hasattr(policy, 'decoder') else None
+        self.ode_steps = getattr(policy, 'ode_steps', 0)
+        self.latent_dim = getattr(policy, 'latent_dim', 64)
+        self.use_mean_flow = getattr(policy, 'use_mean_flow', False)
+        self.step_dt = getattr(policy, 'step_dt', 0.02)
+        self.num_frames = getattr(policy, 'num_frames', 10)
+        self.frame_dim = getattr(policy, 'frame_dim', 55)
+        self.num_keypoints = getattr(policy, 'num_keypoints', 6)
+        self.dims_per_keypoint = getattr(policy, 'dims_per_keypoint', 9)
+
+        # VQ-VAE specific
+        self.codebook = copy.deepcopy(policy.codebook) if hasattr(policy, 'codebook') else None
+        self.prior_predictor = copy.deepcopy(policy.prior_predictor) if hasattr(policy, 'prior_predictor') else None
+
+        # Detect variant
+        self.variant = "cvae_bfm"
+        if self.latent_flow is not None:
+            self.variant = "lfm_bfm"
+        elif self.decoder is not None:
+            self.variant = "flow_bfm"
+        elif self.codebook is not None:
+            self.variant = "vqvae_bfm"
+
+        # Split normalizer
+        if isinstance(normalizer, EmpiricalNormalization):
+            self.hp_normalizer = normalizer.split(policy.history_proprio_ids)
+            self.o_normalizer = normalizer.split(policy.current_proprio_ids)
+            self.y_normalizer = normalizer.split(policy.condition_ids)
+        else:
+            self.hp_normalizer = torch.nn.Identity()
+            self.o_normalizer = torch.nn.Identity()
+            self.y_normalizer = torch.nn.Identity()
+
+    def _parse_condition(self, y_flat):
+        B = y_flat.shape[0]
+        y = y_flat.view(B, self.num_frames, self.frame_dim)
+        return y[:, :, :-1], y[:, :, -1]
+
+    def forward(self, history_proprio: torch.Tensor,
+                current_proprio: torch.Tensor,
+                condition: torch.Tensor) -> torch.Tensor:
+        hp_t = self.hp_normalizer(history_proprio)
+        o_t = self.o_normalizer(current_proprio)
+        y_flat = self.y_normalizer(condition)
+
+        frames, delta_t = self._parse_condition(y_flat)
+        B = frames.shape[0]
+        nf = self.num_frames
+        frame_mask = torch.ones(B, nf, dtype=torch.bool, device=o_t.device)
+
+        if self.variant == "cvae_bfm":
+            h_prior = self.history_prior(hp_t) if self.history_prior is not None else self.prior(hp_t)
+            if self.history_prior is not None:
+                prior_out = self.prior(h_prior) if self.prior is not None else h_prior
+                mu_prior, _ = prior_out.chunk(2, dim=-1)
+            else:
+                mu_prior = h_prior
+            c_t = torch.zeros(B, self.latent_dim, device=o_t.device)
+            return self.action_decoder(o_t, mu_prior, c_t, frames, delta_t, frame_mask)
+
+        elif self.variant == "lfm_bfm":
+            h_prior = self.history_prior(hp_t)
+            context, ctx_mask = self.encoder(h_prior, o_t, frames, delta_t, frame_mask)
+            # Latent ODE
+            kv_cache, ctx_mask = self.latent_flow.build_kv_cache(context, ctx_mask)
+            z = torch.randn(B, self.latent_dim, device=o_t.device)
+            dt = 1.0 / self.ode_steps
+            for k in range(self.ode_steps):
+                t_val = 1.0 - k * dt
+                t_tensor = torch.full((B,), t_val, device=o_t.device)
+                v = self.latent_flow.forward_cached(z, t_tensor, kv_cache, ctx_mask)
+                z = z - dt * v
+            return self.action_decoder(z, context, ctx_mask)
+
+        elif self.variant == "flow_bfm":
+            h_prior = self.history_prior(hp_t)
+            context, ctx_mask = self.encoder(h_prior, o_t, frames, delta_t, frame_mask)
+            # Action ODE
+            kv_cache, ctx_mask = self.decoder.build_kv_cache(context, ctx_mask)
+            a = torch.randn(B, self.action_decoder.action_head.out_features if hasattr(self.action_decoder, 'action_head') else 29, device=o_t.device)
+            dt = 1.0 / self.ode_steps
+            for k in range(self.ode_steps):
+                t_val = 1.0 - k * dt
+                t_tensor = torch.full((B,), t_val, device=o_t.device)
+                v = self.decoder.forward_cached(a, t_tensor, kv_cache, ctx_mask)
+                a = a - dt * v
+            return a
+
+        elif self.variant == "vqvae_bfm":
+            h_prior = self.history_prior(hp_t)
+            prev_e_q = torch.zeros(B, self.latent_dim, device=o_t.device)
+            logits, o_t_enc, h_prior_enc = self.prior_predictor(o_t, h_prior, prev_e_q, frames, delta_t, frame_mask)
+            indices = logits.argmax(dim=-1)
+            e_q = self.codebook.embedding(indices)
+            return self.action_decoder(o_t_enc, h_prior_enc, e_q, frames, delta_t, frame_mask, pre_encoded=True)
+
+        return torch.zeros(B, 29, device=o_t.device)
+
+    def export(self, path, filename):
+        os.makedirs(path, exist_ok=True)
+        filepath = os.path.join(path, filename)
+        self.to("cpu")
+        self.eval()
+        dummy_hp = torch.zeros(1, self.hp_dim)
+        dummy_o = torch.zeros(1, self.o_dim)
+        dummy_y = torch.zeros(1, self.y_dim)
+        try:
+            traced = torch.jit.trace(self, (dummy_hp, dummy_o, dummy_y))
+            traced.save(filepath)
+            print(f"[INFO] Exported BFM ({self.variant}) via JIT trace to {filepath}")
+        except Exception as e:
+            print(f"[WARNING] JIT trace failed for {self.variant}: {e}")
+            # Save as plain state dict fallback
+            torch.save({
+                "model_state_dict": self.state_dict(),
+                "variant": self.variant,
+                "hp_dim": self.hp_dim, "o_dim": self.o_dim, "y_dim": self.y_dim,
+            }, filepath)
+            print(f"[INFO] Saved state dict fallback to {filepath}")
+
+    def export_onnx(self, path, filename):
+        os.makedirs(path, exist_ok=True)
+        filepath = os.path.join(path, filename)
+        self.to("cpu")
+        self.eval()
+        dummy_hp = torch.zeros(1, self.hp_dim)
+        dummy_o = torch.zeros(1, self.o_dim)
+        dummy_y = torch.zeros(1, self.y_dim)
+        try:
+            torch.onnx.export(
+                self, (dummy_hp, dummy_o, dummy_y), filepath,
+                export_params=True, opset_version=14,
+                input_names=["history_proprio", "current_proprio", "condition"],
+                output_names=["actions"],
+                dynamic_axes={},
+            )
+            print(f"[INFO] Exported BFM ({self.variant}) via ONNX to {filepath}")
+        except Exception as e:
+            print(f"[WARNING] ONNX export failed for {self.variant}: {e}")
 
 
 class _CVAETrackerExporter(torch.nn.Module):
