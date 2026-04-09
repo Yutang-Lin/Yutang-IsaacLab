@@ -115,6 +115,7 @@ class StudentLFMBFMTracker(nn.Module):
         self.posterior_sigma = cfg.pop("posterior_sigma", 0.1)
         self.boundary_coef = cfg.pop("boundary_coef", 1.0)
         self.spread_coef = cfg.pop("spread_coef", 1e-2)
+        self.grad_penalty_coef = cfg.pop("grad_penalty_coef", 0.0)
         cfg.pop("posterior_dropout", None)  # unused
 
         self.latent_dim = latent_dim
@@ -379,15 +380,28 @@ class StudentLFMBFMTracker(nn.Module):
             boundary_loss = F.relu(z_t.abs() - 1.0).pow(2).mean()
 
             # Spread loss: push per-dim variance toward U(-1,1) variance (1/3)
-            # Only penalize if variance is below target (don't penalize high variance)
-            target_var = 1.0 / 3.0  # variance of U(-1, 1)
-            per_dim_var = z_t.var(dim=0)  # [latent_dim]
-            spread_loss = F.relu(target_var - per_dim_var).mean()
+            spread_loss = None
+            if self.spread_coef > 0:
+                target_var = 1.0 / 3.0
+                per_dim_var = z_t.var(dim=0)
+                spread_loss = F.relu(target_var - per_dim_var).mean()
+
+            # Gradient penalty: penalize large dz/d(input) to encourage smooth mapping
+            grad_penalty = None
+            if self.grad_penalty_coef > 0:
+                # r_t needs grad for torch.autograd.grad
+                r_t_gp = r_t.detach().requires_grad_(True)
+                z_gp = self.posterior(r_t_gp, masked_frames, delta_t, frame_mask)
+                grads = torch.autograd.grad(
+                    z_gp.sum(), r_t_gp, create_graph=True, retain_graph=True
+                )[0]
+                grad_penalty = grads.pow(2).mean()
 
             self._save_dict = {
                 "flow_loss": flow_loss,
                 "boundary_loss": boundary_loss,
                 "spread_loss": spread_loss,
+                "grad_penalty": grad_penalty,
                 "context": context,
                 "ctx_mask": ctx_mask,
             }
@@ -415,8 +429,13 @@ class StudentLFMBFMTracker(nn.Module):
         loss_dict["boundary"] = d["boundary_loss"] * self.boundary_coef
         log_dict["boundary"] = d["boundary_loss"].item()
 
-        loss_dict["spread"] = d["spread_loss"] * self.spread_coef
-        log_dict["spread"] = d["spread_loss"].item()
+        if d["spread_loss"] is not None:
+            loss_dict["spread"] = d["spread_loss"] * self.spread_coef
+            log_dict["spread"] = d["spread_loss"].item()
+
+        if d["grad_penalty"] is not None:
+            loss_dict["grad_penalty"] = d["grad_penalty"] * self.grad_penalty_coef
+            log_dict["grad_penalty"] = d["grad_penalty"].item()
 
         self._save_dict = {}
         return dict(loss_dict), dict(log_dict)
