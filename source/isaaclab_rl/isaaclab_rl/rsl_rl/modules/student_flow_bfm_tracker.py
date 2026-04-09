@@ -123,7 +123,7 @@ class StudentFlowBFMTracker(nn.Module):
 
         # Flow config
         self.ode_steps = cfg.pop("ode_steps", 10)
-        self.prior_reg_coef = cfg.pop("prior_reg_coef", 1e-5)
+        cfg.pop("prior_reg_coef", None)  # unused
 
         self.latent_dim = latent_dim
         self.num_actions = num_actions
@@ -411,7 +411,6 @@ class StudentFlowBFMTracker(nn.Module):
             # Return zeros detached — behavior_loss from distillation loop is disabled
             # (gradient blocked by detach, all training comes from flow_loss)
             self._save_dict = {
-                "h_prior": h_prior,
                 "context": context,
                 "ctx_mask": ctx_mask,
             }
@@ -452,8 +451,6 @@ class StudentFlowBFMTracker(nn.Module):
             loss_dict["flow"] = flow_loss
             log_dict["flow"] = flow_loss.item()
 
-        if self.prior_reg_coef > 0:
-            loss_dict["prior_reg"] = d["h_prior"].pow(2).mean() * self.prior_reg_coef
 
         self._save_dict = {}
         return dict(loss_dict), dict(log_dict)
