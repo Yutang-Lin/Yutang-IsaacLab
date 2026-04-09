@@ -140,9 +140,9 @@ class StudentLFMBFMTracker(nn.Module):
         self.frame_encoder = BFMFrameEncoder(
             self.num_keypoints, self.dims_per_keypoint, tf_d_model, tf_activation)
 
-        # Posterior: keybody + frames → z_t on sphere
+        # Posterior: keybody (Q) × encoded [h_prior, o_t] (KV) → z_t
         self.posterior = LFMPosterior(
-            keybody_dim, latent_dim, tf_d_model, self.frame_encoder,
+            keybody_dim, latent_dim, tf_d_model,
             tf_num_heads, tf_hidden_dim, num_layers=2, activation=tf_activation)
 
         # Context encoder: [h_prior, proprio, frames] → context tokens
@@ -380,8 +380,9 @@ class StudentLFMBFMTracker(nn.Module):
             if self.grad_penalty_coef > 0:
                 r_t = r_t.detach().requires_grad_(True)
 
-            # Posterior: z_t in [-1, 1] (soft bounded via boundary loss)
-            z_t = self.posterior(r_t, masked_frames, delta_t, frame_mask)
+            # Posterior: keybody (Q) × encoded [h_prior, o_t] (KV) → z_t in [-1, 1]
+            context_hp_ot = context[:, :2].detach()  # stop grad: posterior doesn't update encoder
+            z_t = self.posterior(r_t, context_hp_ot)
 
             # Gradient penalty: reuse the same z_t, no extra posterior forward
             grad_penalty = None

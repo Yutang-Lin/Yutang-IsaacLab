@@ -22,20 +22,20 @@ from isaaclab_rl.rsl_rl.networks.cvae_bfm_networks import BFMFrameEncoder, _buil
 
 
 class LFMPosterior(nn.Module):
-    """Cross-attention posterior → L2-normalized latent on unit sphere.
+    """Cross-attention posterior: keybody (Q) × encoded [h_prior, o_t] (KV) → latent.
 
-    Keybody queries, frames KV. Output is L2-normalized z_t on hypersphere.
+    By cross-attending to encoder outputs instead of raw frames, the posterior's
+    latent space stays grounded in the same representations the flow decoder sees
+    at rollout, reducing train-rollout distribution shift.
     """
 
     def __init__(self, keybody_dim: int, latent_dim: int, d_model: int,
-                 frame_encoder: BFMFrameEncoder,
                  num_heads: int = 4, hidden_dim: int = 512,
                  num_layers: int = 2, activation: nn.Module | None = None):
         super().__init__()
         if activation is None:
             activation = nn.GELU(approximate="tanh")
 
-        self.frame_encoder = frame_encoder
         self.keybody_proj = nn.Linear(keybody_dim, d_model)
         self.keybody_embed = nn.Parameter(torch.randn(d_model) * 0.02)
 
@@ -47,20 +47,26 @@ class LFMPosterior(nn.Module):
         ])
         self.embed_head = nn.Linear(d_model, latent_dim)
 
-    def forward(self, r_t, frames_flat, delta_t, frame_mask):
+    def forward(self, r_t, context_hp_ot):
         """
+        Args:
+            r_t: [B, keybody_dim] full body state
+            context_hp_ot: [B, 2, d_model] encoded h_prior and o_t from encoder
+
         Returns:
-            z_t: [B, latent_dim] L2-normalized on unit sphere
+            z_t: [B, latent_dim] unbounded, regularized via loss to stay in [-1, 1]
         """
         tok_kb = self.keybody_proj(r_t) + self.keybody_embed
-        tok_frames = self.frame_encoder(frames_flat, delta_t)
+
+        # KV mask: both tokens always valid
+        kv_mask = None
 
         q = tok_kb
         for layer in self.layers:
-            q = layer(q, tok_frames, frame_mask)
+            q = layer(q, context_hp_ot, kv_mask)
 
         z_t = self.embed_head(q)
-        return z_t  # unbounded, regularized via loss to stay in [-1, 1]
+        return z_t
 
 
 class LatentFlowDecoder(nn.Module):
