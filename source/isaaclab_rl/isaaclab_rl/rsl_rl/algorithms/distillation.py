@@ -100,10 +100,7 @@ class Distillation:
         if tf_ratio > 0:
             B = obs.shape[0]
             if not hasattr(self, '_tf_mask') or self._tf_mask.shape[0] != B:
-                self._tf_mask = torch.zeros(B, dtype=torch.bool, device=obs.device)
-                n_tf = max(1, int(B * tf_ratio))
-                perm = torch.randperm(B, device=obs.device)[:n_tf]
-                self._tf_mask[perm] = True
+                self._tf_mask = torch.rand(B, device=obs.device) < tf_ratio
             if self._tf_mask.any():
                 tf_noise_std = getattr(self.policy, 'teacher_forcing_noise', 0.1)
                 noise = torch.randn_like(self.transition.privileged_actions) * tf_noise_std
@@ -115,17 +112,20 @@ class Distillation:
         return self.transition.actions
 
     def process_env_step(self, rewards, dones, infos):
-        # Teacher forcing: when any env resets, reshuffle which envs are TF
-        # to maintain exactly tf_ratio fraction
+        # Teacher forcing: resample reset envs, cap total TF count at desired ratio
         tf_ratio = getattr(self.policy, 'teacher_forcing_ratio', 0.0)
         if tf_ratio > 0 and hasattr(self, '_tf_mask'):
             reset = dones.bool().flatten()
             if reset.any():
                 B = self._tf_mask.shape[0]
-                n_tf = max(1, int(B * tf_ratio))
-                self._tf_mask.zero_()
-                perm = torch.randperm(B, device=dones.device)[:n_tf]
-                self._tf_mask[perm] = True
+                n_desired = int(B * tf_ratio)
+                n_current = self._tf_mask.sum().item()
+                # If already at or above ratio, reset envs become student (prob=0)
+                if n_current >= n_desired:
+                    self._tf_mask[reset] = False
+                else:
+                    # Under ratio — some reset envs can become TF
+                    self._tf_mask[reset] = torch.rand(reset.sum().item(), device=dones.device) < tf_ratio
 
         # record the rewards and dones
         self.transition.rewards = rewards
