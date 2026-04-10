@@ -22,11 +22,10 @@ from isaaclab_rl.rsl_rl.networks.cvae_bfm_networks import BFMFrameEncoder, _buil
 
 
 class LFMPosterior(nn.Module):
-    """Cross-attention posterior: keybody (Q) × encoded [h_prior, o_t] (KV) → latent.
+    """Cross-attention posterior: keybody (Q) × encoded context (KV) → latent.
 
-    By cross-attending to encoder outputs instead of raw frames, the posterior's
-    latent space stays grounded in the same representations the flow decoder sees
-    at rollout, reducing train-rollout distribution shift.
+    Cross-attends to full encoder output [h_prior, o_t, frames] so the
+    posterior sees the same representations as the flow decoder and action decoder.
     """
 
     def __init__(self, keybody_dim: int, latent_dim: int, d_model: int,
@@ -58,23 +57,21 @@ class LFMPosterior(nn.Module):
         else:
             self.embed_head = nn.Linear(d_model, latent_dim)
 
-    def forward(self, r_t, context_hp_ot):
+    def forward(self, r_t, context, ctx_mask):
         """
         Args:
             r_t: [B, keybody_dim] full body state
-            context_hp_ot: [B, 2, d_model] encoded h_prior and o_t from encoder
+            context: [B, 2+F, d_model] encoded [h_prior, o_t, frames]
+            ctx_mask: [B, 2+F] bool (True=valid)
 
         Returns:
             z_t: [B, latent_dim] unbounded, regularized via loss to stay in [-1, 1]
         """
         tok_kb = self.keybody_proj(r_t) + self.keybody_embed
 
-        # KV mask: both tokens always valid
-        kv_mask = None
-
         q = tok_kb
         for layer in self.layers:
-            q = layer(q, context_hp_ot, kv_mask)
+            q = layer(q, context, ctx_mask)
 
         z_t = self.embed_head(q)
         return z_t
@@ -229,22 +226,22 @@ class LatentFlowDecoder(nn.Module):
 
 
 class LFMActionDecoder(nn.Module):
-    """Action decoder: [z_t, o_t_enc] → action from z_t position.
+    """Action decoder: z_t + context → action.
 
-    Only z_t and o_t_enc tokens — h_prior and frames are dropped since
-    o_t_enc already absorbed them in the encoder. Action is read from
-    the z_t position to force the decoder to route through the latent.
+    full_context=True:  [z_t, h_prior, o_t, frames] with frame masking, read from o_t (idx 2).
+    full_context=False: [z_t, o_t] only, read from z_t (idx 0).
     """
 
     def __init__(self, latent_dim: int, d_model: int,
                  num_heads: int = 4, hidden_dim: int = 512,
                  num_layers: int = 1, num_actions: int = 29,
                  dropout: float = 0.0, activation: nn.Module | None = None,
-                 use_proj_norm: bool = False):
+                 use_proj_norm: bool = False, full_context: bool = False):
         super().__init__()
         if activation is None:
             activation = nn.GELU(approximate="tanh")
 
+        self.full_context = full_context
         if use_proj_norm:
             self.z_proj = nn.Sequential(nn.Linear(latent_dim, d_model), nn.LayerNorm(d_model))
         else:
@@ -263,14 +260,30 @@ class LFMActionDecoder(nn.Module):
         Args:
             z_t: [B, latent_dim]
             context: [B, 2+F, d_model] encoded [h_prior, o_t, frames]
-            ctx_mask: [B, 2+F] bool (unused, kept for interface compat)
+            ctx_mask: [B, 2+F] bool
 
         Returns:
             action: [B, num_actions]
         """
         tok_z = self.z_proj(z_t) + self.z_embed
-        tok_ot = context[:, 1]  # o_t_enc (index 1, already enriched by encoder)
 
-        tokens = torch.stack([tok_z, tok_ot], dim=1)  # [B, 2, d]
-        out = self.transformer(tokens)
-        return self.action_head(out[:, 0])  # z_t position
+        if self.full_context:
+            B = z_t.shape[0]
+            nf = context.shape[1] - 2
+            tokens = torch.cat([tok_z.unsqueeze(1), context], dim=1)  # [B, 3+F, d]
+
+            total = 3 + nf
+            attn_mask = torch.ones(B, total, total, dtype=torch.bool, device=z_t.device)
+            frame_mask = ctx_mask[:, 2:]
+            attn_mask[:, :, 3:] &= frame_mask.unsqueeze(1)
+            attn_mask[:, 3:, :] &= frame_mask.unsqueeze(2)
+            diag_idx = torch.arange(3, total, device=z_t.device)
+            attn_mask[:, diag_idx, diag_idx] = True
+
+            out = self.transformer(tokens, attn_mask=attn_mask)
+            return self.action_head(out[:, 2])  # o_t_enc position
+        else:
+            tok_ot = context[:, 1]
+            tokens = torch.stack([tok_z, tok_ot], dim=1)  # [B, 2, d]
+            out = self.transformer(tokens)
+            return self.action_head(out[:, 0])  # z_t position

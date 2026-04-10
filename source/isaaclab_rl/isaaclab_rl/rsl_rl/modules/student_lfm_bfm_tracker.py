@@ -124,6 +124,7 @@ class StudentLFMBFMTracker(nn.Module):
         self.use_mean_flow = cfg.pop("use_mean_flow", False)
         self.mf_propagation_ratio = cfg.pop("mf_propagation_ratio", 0.25)
         use_proj_norm = cfg.pop("use_proj_norm", False)
+        self.full_context = cfg.pop("full_context", False)
         cfg.pop("posterior_dropout", None)  # unused
 
         self.latent_dim = latent_dim
@@ -167,7 +168,7 @@ class StudentLFMBFMTracker(nn.Module):
         self.action_decoder = LFMActionDecoder(
             latent_dim, tf_d_model, tf_num_heads, tf_hidden_dim,
             decoder_num_layers, num_actions, tf_dropout, tf_activation,
-            use_proj_norm=use_proj_norm)
+            use_proj_norm=use_proj_norm, full_context=self.full_context)
 
         # -- Teacher --
         teacher_ckpt = torch.load(teacher_policy_ckpt, map_location="cpu", weights_only=False)
@@ -403,8 +404,11 @@ class StudentLFMBFMTracker(nn.Module):
             if self.grad_penalty_coef > 0:
                 r_t = r_t.detach().requires_grad_(True)
 
-            # Posterior: keybody (Q) × encoded [h_prior, o_t] (KV) → z_t in [-1, 1]
-            z_t = self.posterior(r_t, context[:, :2])
+            # Posterior: keybody (Q) × encoded context (KV) → z_t in [-1, 1]
+            if self.full_context:
+                z_t = self.posterior(r_t, context, ctx_mask)
+            else:
+                z_t = self.posterior(r_t, context[:, :2], None)
 
             # Gradient penalty: reuse the same z_t, no extra posterior forward
             grad_penalty = None
