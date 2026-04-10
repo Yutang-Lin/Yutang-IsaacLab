@@ -449,7 +449,7 @@ class StudentLFMBFMTracker(nn.Module):
             # Spread loss: push per-dim variance toward U(-1,1) variance (1/3)
             spread_loss = None
             if self.spread_coef > 0:
-                target_var = 1.0 / 3.0
+                target_var = 0.1
                 per_dim_var = z_t.var(dim=0)
                 spread_loss = F.relu(target_var - per_dim_var).mean()
 
