@@ -31,6 +31,7 @@ class BFMFrameEncoder(nn.Module):
         self.proj = nn.Sequential(
             nn.Linear(frame_input_dim, d_model), activation, nn.Linear(d_model, d_model),
         )
+        self.output_norm = None
         half_d = d_model // 2
         freq = torch.exp(-torch.arange(half_d, dtype=torch.float32) * (math.log(10000.0) / half_d))
         self.register_buffer("_sin_freq", freq)
@@ -50,6 +51,8 @@ class BFMFrameEncoder(nn.Module):
         # Sinusoidal time embedding
         angles = delta_t.unsqueeze(-1) * self._sin_freq
         tok = tok + torch.cat([angles.sin(), angles.cos()], dim=-1)
+        if self.output_norm is not None:
+            tok = self.output_norm(tok)
         return tok
 
 

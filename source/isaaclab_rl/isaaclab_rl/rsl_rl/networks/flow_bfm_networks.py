@@ -38,6 +38,7 @@ class FlowBFMEncoder(nn.Module):
         self.proprio_proj = nn.Linear(proprio_dim, d_model)
         self.prior_embed = nn.Parameter(torch.randn(d_model) * 0.02)
         self.proprio_embed = nn.Parameter(torch.randn(d_model) * 0.02)
+        self.input_norm = None
 
         self.transformer = TransformerEncoder(
             d_model=d_model, num_heads=num_heads, hidden_dim=hidden_dim,
@@ -62,6 +63,9 @@ class FlowBFMEncoder(nn.Module):
 
         tok_prior = self.prior_proj(h_prior) + self.prior_embed
         tok_proprio = self.proprio_proj(o_t) + self.proprio_embed
+        if self.input_norm is not None:
+            tok_prior = self.input_norm(tok_prior)
+            tok_proprio = self.input_norm(tok_proprio)
         tok_frames = self.frame_encoder(frames_flat, delta_t)
 
         tokens = torch.cat([

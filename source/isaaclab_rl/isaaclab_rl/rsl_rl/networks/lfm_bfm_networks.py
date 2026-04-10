@@ -31,12 +31,18 @@ class LFMPosterior(nn.Module):
 
     def __init__(self, keybody_dim: int, latent_dim: int, d_model: int,
                  num_heads: int = 4, hidden_dim: int = 512,
-                 num_layers: int = 2, activation: nn.Module | None = None):
+                 num_layers: int = 2, activation: nn.Module | None = None,
+                 use_proj_norm: bool = False):
         super().__init__()
         if activation is None:
             activation = nn.GELU(approximate="tanh")
 
-        self.keybody_proj = nn.Linear(keybody_dim, d_model)
+        if use_proj_norm:
+            self.keybody_proj = nn.Sequential(
+                nn.Linear(keybody_dim, d_model), nn.LayerNorm(d_model),
+            )
+        else:
+            self.keybody_proj = nn.Linear(keybody_dim, d_model)
         self.keybody_embed = nn.Parameter(torch.randn(d_model) * 0.02)
 
         # Reuse _CrossAttnLayer pattern
@@ -45,7 +51,12 @@ class LFMPosterior(nn.Module):
             _CrossAttnLayer(d_model, num_heads, hidden_dim, activation)
             for _ in range(num_layers)
         ])
-        self.embed_head = nn.Linear(d_model, latent_dim)
+        if use_proj_norm:
+            self.embed_head = nn.Sequential(
+                nn.LayerNorm(d_model), nn.Linear(d_model, latent_dim),
+            )
+        else:
+            self.embed_head = nn.Linear(d_model, latent_dim)
 
     def forward(self, r_t, context_hp_ot):
         """
@@ -79,7 +90,8 @@ class LatentFlowDecoder(nn.Module):
     def __init__(self, latent_dim: int, d_model: int,
                  num_heads: int = 4, hidden_dim: int = 512,
                  num_layers: int = 2, dropout: float = 0.0,
-                 activation: nn.Module | None = None):
+                 activation: nn.Module | None = None,
+                 use_proj_norm: bool = False):
         super().__init__()
         if activation is None:
             activation = nn.GELU(approximate="tanh")
@@ -89,9 +101,10 @@ class LatentFlowDecoder(nn.Module):
         self.head_dim = d_model // num_heads
 
         # Latent token projection (no t — t goes through AdaLN)
-        self.latent_proj = nn.Sequential(
-            nn.Linear(latent_dim, d_model), activation, nn.Linear(d_model, d_model),
-        )
+        layers = [nn.Linear(latent_dim, d_model), activation, nn.Linear(d_model, d_model)]
+        if use_proj_norm:
+            layers.append(nn.LayerNorm(d_model))
+        self.latent_proj = nn.Sequential(*layers)
 
         # Time embedding: takes (t, r) pair
         self.time_embed = nn.Sequential(
@@ -226,12 +239,16 @@ class LFMActionDecoder(nn.Module):
     def __init__(self, latent_dim: int, d_model: int,
                  num_heads: int = 4, hidden_dim: int = 512,
                  num_layers: int = 1, num_actions: int = 29,
-                 dropout: float = 0.0, activation: nn.Module | None = None):
+                 dropout: float = 0.0, activation: nn.Module | None = None,
+                 use_proj_norm: bool = False):
         super().__init__()
         if activation is None:
             activation = nn.GELU(approximate="tanh")
 
-        self.z_proj = nn.Linear(latent_dim, d_model)
+        if use_proj_norm:
+            self.z_proj = nn.Sequential(nn.Linear(latent_dim, d_model), nn.LayerNorm(d_model))
+        else:
+            self.z_proj = nn.Linear(latent_dim, d_model)
         self.z_embed = nn.Parameter(torch.randn(d_model) * 0.02)
 
         self.transformer = TransformerEncoder(
