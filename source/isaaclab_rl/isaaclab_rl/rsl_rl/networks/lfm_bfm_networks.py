@@ -229,11 +229,11 @@ class LatentFlowDecoder(nn.Module):
 
 
 class LFMActionDecoder(nn.Module):
-    """1-layer self-attention decoder: encoded context + z_t → action.
+    """Action decoder: [z_t, o_t_enc] → action from z_t position.
 
-    Reuses encoder output tokens directly (no re-encoding).
-    Token layout: [z_t(0), h_prior_enc(1), o_t_enc(2), frame_0(3), ..., frame_{F-1}(F+2)]
-    Action from o_t_enc position (index 2).
+    Only z_t and o_t_enc tokens — h_prior and frames are dropped since
+    o_t_enc already absorbed them in the encoder. Action is read from
+    the z_t position to force the decoder to route through the latent.
     """
 
     def __init__(self, latent_dim: int, d_model: int,
@@ -263,25 +263,14 @@ class LFMActionDecoder(nn.Module):
         Args:
             z_t: [B, latent_dim]
             context: [B, 2+F, d_model] encoded [h_prior, o_t, frames]
-            ctx_mask: [B, 2+F] bool
+            ctx_mask: [B, 2+F] bool (unused, kept for interface compat)
 
         Returns:
             action: [B, num_actions]
         """
-        B = z_t.shape[0]
-        nf = context.shape[1] - 2
-
         tok_z = self.z_proj(z_t) + self.z_embed
-        tokens = torch.cat([tok_z.unsqueeze(1), context], dim=1)  # [B, 3+F, d]
+        tok_ot = context[:, 1]  # o_t_enc (index 1, already enriched by encoder)
 
-        # Attention mask: z_t + h_prior + o_t always valid, frames pad-masked
-        total = 3 + nf
-        attn_mask = torch.ones(B, total, total, dtype=torch.bool, device=z_t.device)
-        frame_mask = ctx_mask[:, 2:]
-        attn_mask[:, :, 3:] &= frame_mask.unsqueeze(1)
-        attn_mask[:, 3:, :] &= frame_mask.unsqueeze(2)
-        diag_idx = torch.arange(3, total, device=z_t.device)
-        attn_mask[:, diag_idx, diag_idx] = True
-
-        out = self.transformer(tokens, attn_mask=attn_mask)
-        return self.action_head(out[:, 2])  # o_t_enc position
+        tokens = torch.stack([tok_z, tok_ot], dim=1)  # [B, 2, d]
+        out = self.transformer(tokens)
+        return self.action_head(out[:, 0])  # z_t position
