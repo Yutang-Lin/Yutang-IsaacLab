@@ -459,11 +459,13 @@ class StudentLFMBFMTracker(nn.Module):
                 v_pred = self.latent_flow(z_noised, t, context, ctx_mask)
                 flow_loss = F.mse_loss(v_pred, v_t)
 
-            # Add fixed noise for tolerance area
-            z_posterior = z_t + self.posterior_sigma * torch.randn_like(z_t)
-
             # Boundary loss: penalize |z_t| > 1 per dimension
             boundary_loss = F.relu(z_t.abs() - 1.0).pow(2).mean()
+            # Hard clamp after boundary loss is computed (grad still flows through boundary_loss)
+            z_t = z_t.clamp(-1.0, 1.0)
+
+            # Add fixed noise for tolerance area
+            z_posterior = z_t + self.posterior_sigma * torch.randn_like(z_t)
 
             # Spread loss: push per-dim variance toward U(-1,1) variance (1/3)
             spread_loss = None
