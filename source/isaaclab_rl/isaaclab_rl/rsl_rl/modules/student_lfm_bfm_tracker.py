@@ -195,6 +195,7 @@ class StudentLFMBFMTracker(nn.Module):
         self._ep_kp_mask = None
         self._ep_frame_offsets = None
         self._env_ref = None
+        self._ep_ode_noise = None  # per-env fixed ODE starting noise, resampled on reset
 
     @property
     def student(self):
@@ -307,15 +308,20 @@ class StudentLFMBFMTracker(nn.Module):
             env._bfm_delta_t[env_ids] = self._ep_frame_offsets[env_ids]
 
     def _ode_sample_latent(self, context, ctx_mask, B, device):
-        """K-step Euler ODE in latent space with KV cache."""
+        """K-step Euler ODE in latent space with KV cache.
+
+        Each env uses a fixed per-episode noise as ODE starting point.
+        This keeps each env in a consistent mode throughout its episode.
+        """
         kv_cache, ctx_mask = self.latent_flow.build_kv_cache(context, ctx_mask)
-        z = torch.randn(B, self.latent_dim, device=device)
+        if self._ep_ode_noise is None or self._ep_ode_noise.shape[0] != B:
+            self._ep_ode_noise = torch.randn(B, self.latent_dim, device=device)
+        z = self._ep_ode_noise[:B].clone()
         dt = 1.0 / self.ode_steps
         for k in range(self.ode_steps):
             t = 1.0 - k * dt
             t_tensor = torch.full((B,), t, device=device)
             if self.use_mean_flow:
-                # MeanFlow: r = t - dt (model predicts average velocity over [r, t])
                 r_tensor = torch.full((B,), max(t - dt, 0.0), device=device)
                 v = self.latent_flow.forward_cached(z, t_tensor, kv_cache, ctx_mask, r=r_tensor)
             else:
@@ -340,6 +346,7 @@ class StudentLFMBFMTracker(nn.Module):
                 self._ep_frame_mask = torch.ones(B, nf, dtype=torch.bool, device=observations.device)
                 self._ep_kp_mask = torch.ones(B, K, dtype=torch.bool, device=observations.device) if K > 0 else None
                 self._ep_frame_offsets = torch.zeros(B, nf, device=observations.device)
+                self._ep_ode_noise = torch.randn(B, self.latent_dim, device=observations.device)
                 self._sample_initial_offsets(torch.arange(B, device=observations.device), observations.device)
         else:
             with torch.inference_mode(False):
@@ -514,9 +521,12 @@ class StudentLFMBFMTracker(nn.Module):
     def reset(self, dones=None, hidden_states=None):
         if dones is not None and dones.any():
             env_ids = dones.bool().flatten().nonzero(as_tuple=False).squeeze(-1)
-            if env_ids.numel() > 0 and self._ep_frame_mask is not None:
-                with torch.inference_mode(False):
-                    self._sample_initial_offsets(env_ids, self._ep_frame_mask.device)
+            if env_ids.numel() > 0:
+                if self._ep_frame_mask is not None:
+                    with torch.inference_mode(False):
+                        self._sample_initial_offsets(env_ids, self._ep_frame_mask.device)
+                if self._ep_ode_noise is not None:
+                    self._ep_ode_noise[env_ids] = torch.randn(env_ids.shape[0], self.latent_dim, device=self._ep_ode_noise.device)
 
     def get_hidden_states(self):
         return None
