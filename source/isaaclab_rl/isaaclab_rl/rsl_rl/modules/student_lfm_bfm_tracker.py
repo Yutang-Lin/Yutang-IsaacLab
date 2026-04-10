@@ -99,8 +99,9 @@ class StudentLFMBFMTracker(nn.Module):
         self.rollout_mask_p_clean_range = tuple(cfg.pop("rollout_mask_p_clean_range", [0.2, 1.0]))
 
         # Dedicated RNG for mask/offset sampling (deterministic across variants for fair comparison)
-        self._mask_rng = torch.Generator()
-        self._mask_rng.manual_seed(cfg.pop("mask_rng_seed", 42))
+        # Lazily moved to GPU on first use to avoid CPU→GPU transfers every step.
+        self._mask_rng_seed = cfg.pop("mask_rng_seed", 42)
+        self._mask_rng = None  # initialized lazily in _get_rng(device)
 
         tf_d_model = cfg.pop("tf_d_model", 256)
         tf_num_heads = cfg.pop("tf_num_heads", 4)
@@ -227,6 +228,13 @@ class StudentLFMBFMTracker(nn.Module):
         y = y_flat.view(B, self.num_frames, self.frame_dim)
         return y[:, :, :-1], y[:, :, -1]
 
+    def _get_rng(self, device):
+        """Return a torch.Generator on the given device, lazily created."""
+        if self._mask_rng is None or self._mask_rng.device != device:
+            self._mask_rng = torch.Generator(device=device)
+            self._mask_rng.manual_seed(self._mask_rng_seed)
+        return self._mask_rng
+
     def _apply_masks(self, frames, frame_mask=None, kp_mask=None):
         B, nf, KD = frames.shape
         K, D = self.rollout_mask_num_keypoints, self.dims_per_keypoint
@@ -241,46 +249,46 @@ class StudentLFMBFMTracker(nn.Module):
     def _sample_initial_offsets(self, env_ids, device):
         n = env_ids.shape[0]
         nf, K = self.num_frames, self.rollout_mask_num_keypoints
-        gen = self._mask_rng
-        offsets = torch.empty(n, nf).uniform_(self.min_frame_delta, self.max_frame_delta, generator=gen)
+        gen = self._get_rng(device)
+        offsets = torch.empty(n, nf, device=device).uniform_(self.min_frame_delta, self.max_frame_delta, generator=gen)
         offsets = (offsets / self.step_dt).round() * self.step_dt
         offsets = offsets.clamp(min=self.step_dt)
         offsets = offsets.sort(dim=1).values
         for i in range(1, nf):
             offsets[:, i] = torch.max(offsets[:, i], offsets[:, i - 1] + self.step_dt)
-        self._ep_frame_offsets[env_ids] = offsets.to(device)
-        p_active = torch.empty(n).uniform_(*self.frame_p_active_range, generator=gen)
-        fm = torch.rand(n, nf, generator=gen) < p_active[:, None]
+        self._ep_frame_offsets[env_ids] = offsets
+        p_active = torch.empty(n, device=device).uniform_(*self.frame_p_active_range, generator=gen)
+        fm = torch.rand(n, nf, device=device, generator=gen) < p_active[:, None]
         all_off = ~fm.any(dim=1)
         if all_off.any():
-            fm[all_off, torch.randint(0, nf, (all_off.sum(),), generator=gen)] = True
-        self._ep_frame_mask[env_ids] = fm.to(device)
+            fm[all_off, torch.randint(0, nf, (all_off.sum(),), device=device, generator=gen)] = True
+        self._ep_frame_mask[env_ids] = fm
         if K > 0:
-            p_clean = torch.empty(n).uniform_(*self.rollout_mask_p_clean_range, generator=gen)
-            self._ep_kp_mask[env_ids] = (torch.rand(n, K, generator=gen) < p_clean[:, None]).to(device)
+            p_clean = torch.empty(n, device=device).uniform_(*self.rollout_mask_p_clean_range, generator=gen)
+            self._ep_kp_mask[env_ids] = torch.rand(n, K, device=device, generator=gen) < p_clean[:, None]
         self._push_offsets_to_env(env_ids)
 
     def _step_offsets(self):
         offsets, mask = self._ep_frame_offsets, self._ep_frame_mask
-        gen = self._mask_rng
         dev = offsets.device
+        gen = self._get_rng(dev)
         offsets -= self.step_dt
         consumed = offsets[:, 0] <= 0
         if consumed.any():
             offsets[consumed, :-1] = offsets[consumed, 1:].clone()
             mask[consumed, :-1] = mask[consumed, 1:].clone()
             n = consumed.sum()
-            gap = torch.empty(n).uniform_(self.min_frame_delta, self.max_frame_delta, generator=gen)
+            gap = torch.empty(n, device=dev).uniform_(self.min_frame_delta, self.max_frame_delta, generator=gen)
             gap = (gap / self.step_dt).round() * self.step_dt
             gap = gap.clamp(min=self.step_dt)
-            offsets[consumed, -1] = offsets[consumed, -2] + gap.to(dev)
-            p = torch.empty(n).uniform_(*self.frame_p_active_range, generator=gen)
-            mask[consumed, -1] = (torch.rand(n, generator=gen) < p).to(dev)
+            offsets[consumed, -1] = offsets[consumed, -2] + gap
+            p = torch.empty(n, device=dev).uniform_(*self.frame_p_active_range, generator=gen)
+            mask[consumed, -1] = torch.rand(n, device=dev, generator=gen) < p
         # Ensure at least 1 active
         all_off = ~mask.any(dim=1)
         if all_off.any():
             nf = mask.shape[1]
-            mask[all_off, torch.randint(0, nf, (all_off.sum(),), generator=gen)] = True
+            mask[all_off, torch.randint(0, nf, (all_off.sum(),), device=dev, generator=gen)] = True
         self._push_offsets_to_env()
 
     def _push_offsets_to_env(self, env_ids=None):
@@ -364,17 +372,17 @@ class StudentLFMBFMTracker(nn.Module):
         nf, K = self.num_frames, self.rollout_mask_num_keypoints
 
         if self.compute_latent_loss:
-            gen = self._mask_rng
             dev = frames.device
-            p_active = torch.empty(B).uniform_(*self.frame_p_active_range, generator=gen)
-            frame_mask = (torch.rand(B, nf, generator=gen) < p_active[:, None]).to(dev)
+            gen = self._get_rng(dev)
+            p_active = torch.empty(B, device=dev).uniform_(*self.frame_p_active_range, generator=gen)
+            frame_mask = torch.rand(B, nf, device=dev, generator=gen) < p_active[:, None]
             all_off = ~frame_mask.any(dim=1)
             if all_off.any():
-                frame_mask[all_off, torch.randint(0, nf, (all_off.sum(),), generator=gen)] = True
+                frame_mask[all_off, torch.randint(0, nf, (all_off.sum(),), device=dev, generator=gen)] = True
             kp_mask = None
             if K > 0:
-                p_clean = torch.empty(B).uniform_(*self.rollout_mask_p_clean_range, generator=gen)
-                kp_mask = (torch.rand(B, K, generator=gen) < p_clean[:, None]).to(dev)
+                p_clean = torch.empty(B, device=dev).uniform_(*self.rollout_mask_p_clean_range, generator=gen)
+                kp_mask = torch.rand(B, K, device=dev, generator=gen) < p_clean[:, None]
         else:
             frame_mask = torch.ones(B, nf, dtype=torch.bool, device=frames.device)
             kp_mask = None
