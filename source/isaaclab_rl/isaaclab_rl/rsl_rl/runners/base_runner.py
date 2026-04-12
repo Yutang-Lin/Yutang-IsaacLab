@@ -1028,9 +1028,15 @@ class BaseRunner(OnPolicyRunner):
             if resumed_training:
                 # if a previous training is resumed, the actor/student normalizer is loaded for the actor/student
                 # and the critic/teacher normalizer is loaded for the critic/teacher
-                self.obs_normalizer.load_state_dict(loaded_dict["obs_norm_state_dict"])
+                try:
+                    self.obs_normalizer.load_state_dict(loaded_dict["obs_norm_state_dict"])
+                except (KeyError, RuntimeError) as e:
+                    print(f"[WARNING]: Failed to load obs normalizer (likely dim change): {e}. Reinitializing.")
                 if not self.load_actor_only:
-                    self.privileged_obs_normalizer.load_state_dict(loaded_dict["privileged_obs_norm_state_dict"])
+                    try:
+                        self.privileged_obs_normalizer.load_state_dict(loaded_dict["privileged_obs_norm_state_dict"])
+                    except (KeyError, RuntimeError) as e:
+                        print(f"[WARNING]: Failed to load privileged obs normalizer: {e}. Reinitializing.")
             else:
                 # if the training is not resumed but a model is loaded, this run must be distillation training following
                 # an rl training. Thus the actor normalizer is loaded for the teacher model. The student's normalizer
