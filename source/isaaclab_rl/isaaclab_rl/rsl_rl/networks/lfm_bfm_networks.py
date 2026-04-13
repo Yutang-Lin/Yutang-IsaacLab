@@ -88,7 +88,8 @@ class LatentFlowDecoder(nn.Module):
                  num_heads: int = 4, hidden_dim: int = 512,
                  num_layers: int = 2, dropout: float = 0.0,
                  activation: nn.Module | None = None,
-                 use_proj_norm: bool = False):
+                 use_proj_norm: bool = False,
+                 use_prev_z: bool = False):
         super().__init__()
         if activation is None:
             activation = nn.GELU(approximate="tanh")
@@ -96,9 +97,11 @@ class LatentFlowDecoder(nn.Module):
         self.d_model = d_model
         self.num_heads = num_heads
         self.head_dim = d_model // num_heads
+        self.use_prev_z = use_prev_z
 
         # Latent token projection (no t — t goes through AdaLN)
-        layers = [nn.Linear(latent_dim, d_model), activation, nn.Linear(d_model, d_model)]
+        latent_proj_input_dim = 2 * latent_dim if use_prev_z else latent_dim
+        layers = [nn.Linear(latent_proj_input_dim, d_model), activation, nn.Linear(d_model, d_model)]
         if use_proj_norm:
             layers.append(nn.LayerNorm(d_model))
         self.latent_proj = nn.Sequential(*layers)
@@ -179,14 +182,19 @@ class LatentFlowDecoder(nn.Module):
         q_tok = q_tok + g2 * layer['ffn'](ffn_in)
         return q_tok
 
-    def forward(self, z_noised, t, context, ctx_mask, r=None):
+    def forward(self, z_noised, t, context, ctx_mask, r=None, z_prev=None):
         if t.dim() == 1:
             t = t.unsqueeze(-1)
         if r is None:
             r = t  # default: r=t (standard flow matching)
         elif r.dim() == 1:
             r = r.unsqueeze(-1)
-        tok = self.latent_proj(z_noised)
+        if self.use_prev_z:
+            if z_prev is None:
+                z_prev = torch.zeros_like(z_noised)
+            tok = self.latent_proj(torch.cat([z_noised, z_prev], dim=-1))
+        else:
+            tok = self.latent_proj(z_noised)
         t_embed = self.time_embed(torch.cat([t, r], dim=-1))
 
         for layer, adaln in zip(self.cross_attn_layers, self.adaln_layers):
@@ -206,14 +214,19 @@ class LatentFlowDecoder(nn.Module):
             cache.append((k, v))
         return cache, ctx_mask
 
-    def forward_cached(self, z_noised, t, kv_cache, ctx_mask, r=None):
+    def forward_cached(self, z_noised, t, kv_cache, ctx_mask, r=None, z_prev=None):
         if t.dim() == 1:
             t = t.unsqueeze(-1)
         if r is None:
             r = t
         elif r.dim() == 1:
             r = r.unsqueeze(-1)
-        tok = self.latent_proj(z_noised)
+        if self.use_prev_z:
+            if z_prev is None:
+                z_prev = torch.zeros_like(z_noised)
+            tok = self.latent_proj(torch.cat([z_noised, z_prev], dim=-1))
+        else:
+            tok = self.latent_proj(z_noised)
         t_embed = self.time_embed(torch.cat([t, r], dim=-1))
 
         for (layer, adaln), (k_cached, v_cached) in zip(
@@ -223,6 +236,24 @@ class LatentFlowDecoder(nn.Module):
         sf, shf = self.adaln_final(t_embed).chunk(2, dim=-1)
         tok = self._adaln_modulate(tok, self.final_norm, 1 + sf, shf)
         return self.velocity_head(tok)
+
+
+class LFMReconDecoder(nn.Module):
+    """Reconstruction decoder: z_t -> posterior condition (1 future frame)."""
+
+    def __init__(self, latent_dim: int, output_dim: int,
+                 hidden_dims: list[int] | None = None,
+                 activation: nn.Module | None = None):
+        super().__init__()
+        if hidden_dims is None:
+            hidden_dims = [256, 256]
+        if activation is None:
+            activation = nn.GELU(approximate="tanh")
+        from isaaclab_rl.rsl_rl.networks.cvae_tracker_networks import _build_mlp
+        self.mlp = _build_mlp(latent_dim, hidden_dims, output_dim, activation)
+
+    def forward(self, z_t):
+        return self.mlp(z_t)
 
 
 class LFMActionDecoder(nn.Module):

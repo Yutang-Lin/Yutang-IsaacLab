@@ -34,7 +34,7 @@ from .actor_critic_transformer_residual import ActorCriticTransformerResidual
 from isaaclab_rl.rsl_rl.networks.cvae_tracker_networks import _build_mlp
 from isaaclab_rl.rsl_rl.networks.cvae_bfm_networks import BFMFrameEncoder
 from isaaclab_rl.rsl_rl.networks.flow_bfm_networks import FlowBFMEncoder
-from isaaclab_rl.rsl_rl.networks.lfm_bfm_networks import LFMPosterior, LatentFlowDecoder, LFMActionDecoder
+from isaaclab_rl.rsl_rl.networks.lfm_bfm_networks import LFMPosterior, LatentFlowDecoder, LFMActionDecoder, LFMReconDecoder
 
 
 class StudentLFMBFMTracker(nn.Module):
@@ -134,6 +134,13 @@ class StudentLFMBFMTracker(nn.Module):
         self.teacher_forcing_ratio = cfg.pop("teacher_forcing_ratio", 0.0)
         self.teacher_forcing_noise = cfg.pop("teacher_forcing_noise", 0.1)
 
+        # z_prev: pass previous step's z_t to the flow decoder
+        self.use_prev_z = cfg.pop("use_prev_z", False)
+
+        # Reconstruction decoder: z_t → posterior condition
+        self.recon_coef = cfg.pop("recon_coef", 0.0)
+        recon_hidden_dims = cfg.pop("recon_hidden_dims", [256, 256])
+
         if cfg:
             print(f"StudentLFMBFMTracker: unused keys: {list(cfg.keys())}")
 
@@ -162,13 +169,20 @@ class StudentLFMBFMTracker(nn.Module):
         self.latent_flow = LatentFlowDecoder(
             latent_dim, tf_d_model, tf_num_heads, tf_hidden_dim,
             flow_num_layers, tf_dropout, tf_activation,
-            use_proj_norm=use_proj_norm)
+            use_proj_norm=use_proj_norm,
+            use_prev_z=self.use_prev_z)
 
         # Action decoder: takes encoded context + z_t → action (1-layer)
         self.action_decoder = LFMActionDecoder(
             latent_dim, tf_d_model, tf_num_heads, tf_hidden_dim,
             decoder_num_layers, num_actions, tf_dropout, tf_activation,
             use_proj_norm=use_proj_norm, full_context=self.full_context)
+
+        # Reconstruction decoder: z_t → posterior condition (optional)
+        self.recon_decoder = None
+        if self.recon_coef > 0:
+            self.recon_decoder = LFMReconDecoder(
+                latent_dim, keybody_dim, recon_hidden_dims, tf_activation)
 
         # -- Teacher --
         teacher_ckpt = torch.load(teacher_policy_ckpt, map_location="cpu", weights_only=False)
@@ -197,6 +211,7 @@ class StudentLFMBFMTracker(nn.Module):
         self._ep_frame_offsets = None
         self._env_ref = None
         self._ep_ode_noise = None  # per-env fixed ODE starting noise, resampled on reset
+        self._ep_prev_z = None  # per-env previous step's latent z_t (for use_prev_z)
 
     @property
     def student(self):
@@ -308,7 +323,7 @@ class StudentLFMBFMTracker(nn.Module):
             env._bfm_future_offsets[env_ids] = self._ep_frame_offsets[env_ids]
             env._bfm_delta_t[env_ids] = self._ep_frame_offsets[env_ids]
 
-    def _ode_sample_latent(self, context, ctx_mask, B, device):
+    def _ode_sample_latent(self, context, ctx_mask, B, device, z_prev=None):
         """K-step Euler ODE in latent space with KV cache.
 
         Each env uses a fixed per-episode noise as ODE starting point.
@@ -324,9 +339,9 @@ class StudentLFMBFMTracker(nn.Module):
             t_tensor = torch.full((B,), t, device=device)
             if self.use_mean_flow:
                 r_tensor = torch.full((B,), max(t - dt, 0.0), device=device)
-                v = self.latent_flow.forward_cached(z, t_tensor, kv_cache, ctx_mask, r=r_tensor)
+                v = self.latent_flow.forward_cached(z, t_tensor, kv_cache, ctx_mask, r=r_tensor, z_prev=z_prev)
             else:
-                v = self.latent_flow.forward_cached(z, t_tensor, kv_cache, ctx_mask)
+                v = self.latent_flow.forward_cached(z, t_tensor, kv_cache, ctx_mask, z_prev=z_prev)
             z = z - dt * v
         return z
 
@@ -348,6 +363,7 @@ class StudentLFMBFMTracker(nn.Module):
                 self._ep_kp_mask = torch.ones(B, K, dtype=torch.bool, device=observations.device) if K > 0 else None
                 self._ep_frame_offsets = torch.zeros(B, nf, device=observations.device)
                 self._ep_ode_noise = torch.randn(B, self.latent_dim, device=observations.device)
+                self._ep_prev_z = torch.zeros(B, self.latent_dim, device=observations.device)
                 self._sample_initial_offsets(torch.arange(B, device=observations.device), observations.device)
         else:
             with torch.inference_mode(False):
@@ -359,8 +375,13 @@ class StudentLFMBFMTracker(nn.Module):
         h_prior = self.history_prior(hp_t)
         context, ctx_mask = self.encoder(h_prior, o_t, masked_frames, delta_t, cur_frame_mask)
 
-        # Latent ODE → z_t
-        z_t = self._ode_sample_latent(context, ctx_mask, B, observations.device)
+        # Latent ODE → z_t (pass z_prev for use_prev_z)
+        z_prev = self._ep_prev_z[:B] if self.use_prev_z else None
+        z_t = self._ode_sample_latent(context, ctx_mask, B, observations.device, z_prev=z_prev)
+
+        # Store z_t as prev_z for next step
+        if self.use_prev_z:
+            self._ep_prev_z[:B] = z_t.detach()
 
         action_mean = self.action_decoder(z_t, context, ctx_mask)
 
@@ -435,13 +456,13 @@ class StudentLFMBFMTracker(nn.Module):
                 if prop_idx.numel() > 0:
                     r[prop_idx] = torch.rand(prop_idx.numel(), device=frames.device) * t[prop_idx]
 
-                v_pred = self.latent_flow(z_noised, t, context, ctx_mask, r=r)
+                v_pred = self.latent_flow(z_noised, t, context, ctx_mask, r=r, z_prev=None)
 
                 # JVP only on propagation subset
                 du_dt = torch.zeros_like(v_pred)
                 if prop_idx.numel() > 0:
                     def _flow_fn(z, t_, r_):
-                        return self.latent_flow(z, t_, context[prop_idx], ctx_mask[prop_idx], r=r_)
+                        return self.latent_flow(z, t_, context[prop_idx], ctx_mask[prop_idx], r=r_, z_prev=None)
                     with sdpa_kernel(SDPBackend.MATH):
                         _, du_sub = func_jvp(
                             _flow_fn,
@@ -456,8 +477,14 @@ class StudentLFMBFMTracker(nn.Module):
                 flow_loss = F.mse_loss(v_pred, u_target.detach())
             else:
                 # Standard flow matching (r=t, passed implicitly via default)
-                v_pred = self.latent_flow(z_noised, t, context, ctx_mask)
+                v_pred = self.latent_flow(z_noised, t, context, ctx_mask, z_prev=None)
                 flow_loss = F.mse_loss(v_pred, v_t)
+
+            # Reconstruction loss: z_t → posterior condition
+            recon_loss = None
+            if self.recon_decoder is not None:
+                recon_pred = self.recon_decoder(z_t)
+                recon_loss = F.mse_loss(recon_pred, r_t.detach())
 
             # Boundary loss: penalize |z_t| > 1 per dimension
             boundary_loss = F.relu(z_t.abs() - 1.0).pow(2).mean()
@@ -479,6 +506,7 @@ class StudentLFMBFMTracker(nn.Module):
                 "boundary_loss": boundary_loss,
                 "spread_loss": spread_loss,
                 "grad_penalty": grad_penalty,
+                "recon_loss": recon_loss,
                 "context": context,
                 "ctx_mask": ctx_mask,
             }
@@ -514,6 +542,10 @@ class StudentLFMBFMTracker(nn.Module):
             loss_dict["grad_penalty"] = d["grad_penalty"] * self.grad_penalty_coef
             log_dict["grad_penalty"] = d["grad_penalty"].item()
 
+        if d["recon_loss"] is not None:
+            loss_dict["recon"] = d["recon_loss"] * self.recon_coef
+            log_dict["recon"] = d["recon_loss"].item()
+
         self._save_dict = {}
         return dict(loss_dict), dict(log_dict)
 
@@ -533,6 +565,8 @@ class StudentLFMBFMTracker(nn.Module):
                         self._sample_initial_offsets(env_ids, self._ep_frame_mask.device)
                 if self._ep_ode_noise is not None:
                     self._ep_ode_noise[env_ids] = torch.randn(env_ids.shape[0], self.latent_dim, device=self._ep_ode_noise.device)
+                if self._ep_prev_z is not None:
+                    self._ep_prev_z[env_ids] = 0.0
 
     def get_hidden_states(self):
         return None
