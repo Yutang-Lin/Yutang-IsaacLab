@@ -100,11 +100,16 @@ class LatentFlowDecoder(nn.Module):
         self.use_prev_z = use_prev_z
 
         # Latent token projection (no t — t goes through AdaLN)
-        latent_proj_input_dim = 2 * latent_dim if use_prev_z else latent_dim
-        layers = [nn.Linear(latent_proj_input_dim, d_model), activation, nn.Linear(d_model, d_model)]
+        layers = [nn.Linear(latent_dim, d_model), activation, nn.Linear(d_model, d_model)]
         if use_proj_norm:
             layers.append(nn.LayerNorm(d_model))
         self.latent_proj = nn.Sequential(*layers)
+
+        # z_prev projection: previous step's z → context token for cross-attention
+        if use_prev_z:
+            self.prev_z_proj = nn.Sequential(
+                nn.Linear(latent_dim, d_model), activation, nn.Linear(d_model, d_model),
+            )
 
         # Time embedding: takes (t, r) pair
         self.time_embed = nn.Sequential(
@@ -182,6 +187,18 @@ class LatentFlowDecoder(nn.Module):
         q_tok = q_tok + g2 * layer['ffn'](ffn_in)
         return q_tok
 
+    def _append_prev_z(self, context, ctx_mask, z_prev, z_noised):
+        """Append z_prev as an extra context token for cross-attention."""
+        if not self.use_prev_z:
+            return context, ctx_mask
+        if z_prev is None:
+            z_prev = torch.zeros_like(z_noised)
+        tok_prev = self.prev_z_proj(z_prev).unsqueeze(1)  # [B, 1, d_model]
+        context = torch.cat([context, tok_prev], dim=1)    # [B, S+1, d_model]
+        prev_mask = torch.ones(ctx_mask.shape[0], 1, dtype=torch.bool, device=ctx_mask.device)
+        ctx_mask = torch.cat([ctx_mask, prev_mask], dim=1) # [B, S+1]
+        return context, ctx_mask
+
     def forward(self, z_noised, t, context, ctx_mask, r=None, z_prev=None):
         if t.dim() == 1:
             t = t.unsqueeze(-1)
@@ -189,12 +206,8 @@ class LatentFlowDecoder(nn.Module):
             r = t  # default: r=t (standard flow matching)
         elif r.dim() == 1:
             r = r.unsqueeze(-1)
-        if self.use_prev_z:
-            if z_prev is None:
-                z_prev = torch.zeros_like(z_noised)
-            tok = self.latent_proj(torch.cat([z_noised, z_prev], dim=-1))
-        else:
-            tok = self.latent_proj(z_noised)
+        context, ctx_mask = self._append_prev_z(context, ctx_mask, z_prev, z_noised)
+        tok = self.latent_proj(z_noised)
         t_embed = self.time_embed(torch.cat([t, r], dim=-1))
 
         for layer, adaln in zip(self.cross_attn_layers, self.adaln_layers):
@@ -204,7 +217,17 @@ class LatentFlowDecoder(nn.Module):
         tok = self._adaln_modulate(tok, self.final_norm, 1 + sf, shf)
         return self.velocity_head(tok)
 
-    def build_kv_cache(self, context, ctx_mask):
+    def build_kv_cache(self, context, ctx_mask, z_prev=None, z_noised_like=None):
+        """Build KV cache. If use_prev_z, appends z_prev token to context first."""
+        if self.use_prev_z:
+            if z_prev is None:
+                z_prev = torch.zeros(context.shape[0], context.shape[2], device=context.device)
+                if z_noised_like is not None:
+                    z_prev = torch.zeros_like(z_noised_like)
+            tok_prev = self.prev_z_proj(z_prev).unsqueeze(1)
+            context = torch.cat([context, tok_prev], dim=1)
+            prev_mask = torch.ones(ctx_mask.shape[0], 1, dtype=torch.bool, device=ctx_mask.device)
+            ctx_mask = torch.cat([ctx_mask, prev_mask], dim=1)
         B, S, _ = context.shape
         H, hd = self.num_heads, self.head_dim
         cache = []
@@ -221,12 +244,7 @@ class LatentFlowDecoder(nn.Module):
             r = t
         elif r.dim() == 1:
             r = r.unsqueeze(-1)
-        if self.use_prev_z:
-            if z_prev is None:
-                z_prev = torch.zeros_like(z_noised)
-            tok = self.latent_proj(torch.cat([z_noised, z_prev], dim=-1))
-        else:
-            tok = self.latent_proj(z_noised)
+        tok = self.latent_proj(z_noised)
         t_embed = self.time_embed(torch.cat([t, r], dim=-1))
 
         for (layer, adaln), (k_cached, v_cached) in zip(
@@ -257,22 +275,17 @@ class LFMReconDecoder(nn.Module):
 
 
 class LFMActionDecoder(nn.Module):
-    """Action decoder: z_t + context → action.
-
-    full_context=True:  [z_t, h_prior, o_t, frames] with frame masking, read from o_t (idx 2).
-    full_context=False: [z_t, o_t] only, read from z_t (idx 0).
-    """
+    """Action decoder: [z_t, o_t_enc] → action from z_t position."""
 
     def __init__(self, latent_dim: int, d_model: int,
                  num_heads: int = 4, hidden_dim: int = 512,
                  num_layers: int = 1, num_actions: int = 29,
                  dropout: float = 0.0, activation: nn.Module | None = None,
-                 use_proj_norm: bool = False, full_context: bool = False):
+                 use_proj_norm: bool = False):
         super().__init__()
         if activation is None:
             activation = nn.GELU(approximate="tanh")
 
-        self.full_context = full_context
         if use_proj_norm:
             self.z_proj = nn.Sequential(nn.Linear(latent_dim, d_model), nn.LayerNorm(d_model))
         else:
@@ -286,35 +299,16 @@ class LFMActionDecoder(nn.Module):
         )
         self.action_head = nn.Linear(d_model, num_actions)
 
-    def forward(self, z_t, context, ctx_mask):
+    def forward(self, z_t, o_t_enc):
         """
         Args:
             z_t: [B, latent_dim]
-            context: [B, 2+F, d_model] encoded [h_prior, o_t, frames]
-            ctx_mask: [B, 2+F] bool
+            o_t_enc: [B, d_model] encoded proprio
 
         Returns:
             action: [B, num_actions]
         """
         tok_z = self.z_proj(z_t) + self.z_embed
-
-        if self.full_context:
-            B = z_t.shape[0]
-            nf = context.shape[1] - 2
-            tokens = torch.cat([tok_z.unsqueeze(1), context], dim=1)  # [B, 3+F, d]
-
-            total = 3 + nf
-            attn_mask = torch.ones(B, total, total, dtype=torch.bool, device=z_t.device)
-            frame_mask = ctx_mask[:, 2:]
-            attn_mask[:, :, 3:] &= frame_mask.unsqueeze(1)
-            attn_mask[:, 3:, :] &= frame_mask.unsqueeze(2)
-            diag_idx = torch.arange(3, total, device=z_t.device)
-            attn_mask[:, diag_idx, diag_idx] = True
-
-            out = self.transformer(tokens, attn_mask=attn_mask)
-            return self.action_head(out[:, 2])  # o_t_enc position
-        else:
-            tok_ot = context[:, 1]
-            tokens = torch.stack([tok_z, tok_ot], dim=1)  # [B, 2, d]
-            out = self.transformer(tokens)
-            return self.action_head(out[:, 0])  # z_t position
+        tokens = torch.stack([tok_z, o_t_enc], dim=1)  # [B, 2, d]
+        out = self.transformer(tokens)
+        return self.action_head(out[:, 0])  # z_t position
