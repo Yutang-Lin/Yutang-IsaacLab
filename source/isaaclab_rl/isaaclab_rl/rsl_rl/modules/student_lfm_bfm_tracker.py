@@ -387,7 +387,7 @@ class StudentLFMBFMTracker(nn.Module):
 
         if self._stage == 1:
             # Stage 1: rollout with posterior z (privileged, no ODE)
-            z_t = self.posterior(r_t).clamp(-1.0, 1.0)
+            z_t = self.posterior(r_t)
         else:
             # Stage 0 or 2: rollout with flow ODE
             h_enc = self.history_encoder(hp_t)                        # [B, d_model]
@@ -398,7 +398,7 @@ class StudentLFMBFMTracker(nn.Module):
             z_t = self._ode_sample_latent(flow_context, flow_mask, B, observations.device, z_prev=z_prev)
 
         # Store z_t as prev_z for next step
-        if self.use_prev_z:
+        if self.use_prev_z and self._ep_prev_z is not None:
             self._ep_prev_z[:B] = z_t.detach()
             self._rollout_z_list.append(z_t.detach().clone())
 
@@ -519,8 +519,6 @@ class StudentLFMBFMTracker(nn.Module):
 
             # Boundary loss: penalize |z_t| > 1 per dimension
             boundary_loss = F.relu(z_t.abs() - 1.0).pow(2).mean()
-            # Hard clamp after boundary loss is computed (grad still flows through boundary_loss)
-            z_t = z_t.clamp(-1.0, 1.0)
 
             # Add fixed noise for tolerance area
             z_posterior = z_t + self.posterior_sigma * torch.randn_like(z_t)
