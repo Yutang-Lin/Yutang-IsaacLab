@@ -160,6 +160,12 @@ class StudentCVAEBFMTracker(nn.Module):
         self.prior = CVAEBFMPriorV2(
             tf_d_model, latent_dim, tf_num_heads, tf_hidden_dim,
             prior_num_layers, tf_dropout, tf_activation)
+        # Initialize prior heads near zero for stable KL at init
+        with torch.no_grad():
+            self.prior.mu_head.weight.mul_(0.01)
+            self.prior.mu_head.bias.zero_()
+            self.prior.logvar_head.weight.mul_(0.01)
+            self.prior.logvar_head.bias.zero_()
 
         # Residual posterior
         self.posterior = CVAEBFMPosteriorV2(
@@ -168,6 +174,10 @@ class StudentCVAEBFMTracker(nn.Module):
         # MLP decoder
         self.action_decoder = CVAEBFMDecoderV2(
             latent_dim, tf_d_model, decoder_hidden_dims, num_actions, tf_activation)
+        # Initialize last layer near zero for stable first rollout
+        with torch.no_grad():
+            self.action_decoder.mlp[-1].weight.mul_(0.01)
+            self.action_decoder.mlp[-1].bias.zero_()
 
         # -- Teacher --
         teacher_ckpt = torch.load(teacher_policy_ckpt, map_location="cpu", weights_only=False)
