@@ -138,7 +138,9 @@ class StudentLFMBFMTracker(nn.Module):
         self.num_actions = num_actions
 
         # Teacher forcing: fraction of rollout envs that use teacher action + noise
-        self.teacher_forcing_ratio = cfg.pop("teacher_forcing_ratio", 0.0)
+        self.teacher_forcing_ratio_stage1 = cfg.pop("teacher_forcing_ratio_stage1", cfg.pop("teacher_forcing_ratio", 0.0))
+        self.teacher_forcing_ratio_stage2 = cfg.pop("teacher_forcing_ratio_stage2", self.teacher_forcing_ratio_stage1)
+        self.teacher_forcing_ratio = self.teacher_forcing_ratio_stage1
         self.teacher_forcing_noise = cfg.pop("teacher_forcing_noise", 0.1)
 
         # z_prev: pass previous step's z_t to the flow decoder
@@ -147,6 +149,11 @@ class StudentLFMBFMTracker(nn.Module):
         # Legacy args (kept for checkpoint compat, no longer used)
         cfg.pop("history_dropout_prob", None)
         cfg.pop("history_sigma", None)
+
+        # Classifier-Free Guidance: drop all condition tokens with this prob during training
+        self.cfg_drop_prob = cfg.pop("cfg_drop_prob", 0.1)
+        # CFG weight at inference (1.0 = no guidance, >1.0 = stronger conditioning)
+        self.cfg_weight = cfg.pop("cfg_weight", 1.0)
 
         # Reconstruction decoder: z_t → posterior condition
         self.recon_coef = cfg.pop("recon_coef", 0.0)
@@ -370,22 +377,46 @@ class StudentLFMBFMTracker(nn.Module):
         """K-step Euler ODE in latent space with KV cache.
 
         Each env uses a fixed per-episode noise as ODE starting point.
-        This keeps each env in a consistent mode throughout its episode.
+        Supports batched classifier-free guidance when cfg_weight > 1.0:
+        concatenates conditional + unconditional into a single 2B batch.
         """
         if self._ep_ode_noise is None or self._ep_ode_noise.shape[0] != B:
             self._ep_ode_noise = torch.randn(B, self.latent_dim, device=device)
         z = self._ep_ode_noise[:B].clone()
-        # z_prev is baked into the KV cache as an extra context token
-        kv_cache, ctx_mask = self.latent_flow.build_kv_cache(context, ctx_mask, z_prev=z_prev, z_noised_like=z)
+
+        use_cfg = self.cfg_weight > 1.0 and not self.training
+        if use_cfg:
+            # Batch: [cond; uncond] along dim 0
+            uncond_mask = torch.zeros_like(ctx_mask)
+            ctx_2b = torch.cat([context, context], dim=0)        # [2B, S, d]
+            mask_2b = torch.cat([ctx_mask, uncond_mask], dim=0)  # [2B, S]
+            z_prev_2b = torch.cat([z_prev, z_prev], dim=0) if z_prev is not None else None
+            z_2b = torch.cat([z, z], dim=0)
+            kv_cache, mask_out = self.latent_flow.build_kv_cache(ctx_2b, mask_2b, z_prev=z_prev_2b, z_noised_like=z_2b)
+        else:
+            kv_cache, mask_out = self.latent_flow.build_kv_cache(context, ctx_mask, z_prev=z_prev, z_noised_like=z)
+
         dt = 1.0 / self.ode_steps
         for k in range(self.ode_steps):
-            t = 1.0 - k * dt
-            t_tensor = torch.full((B,), t, device=device)
-            if self.use_mean_flow:
-                r_tensor = torch.full((B,), max(t - dt, 0.0), device=device)
-                v = self.latent_flow.forward_cached(z, t_tensor, kv_cache, ctx_mask, r=r_tensor)
+            t_val = 1.0 - k * dt
+            if use_cfg:
+                z_2b = torch.cat([z, z], dim=0)
+                t_tensor = torch.full((2 * B,), t_val, device=device)
+                if self.use_mean_flow:
+                    r_tensor = torch.full((2 * B,), max(t_val - dt, 0.0), device=device)
+                    v_2b = self.latent_flow.forward_cached(z_2b, t_tensor, kv_cache, mask_out, r=r_tensor)
+                else:
+                    v_2b = self.latent_flow.forward_cached(z_2b, t_tensor, kv_cache, mask_out)
+                v_cond, v_uncond = v_2b[:B], v_2b[B:]
+                v = v_uncond + self.cfg_weight * (v_cond - v_uncond)
             else:
-                v = self.latent_flow.forward_cached(z, t_tensor, kv_cache, ctx_mask)
+                t_tensor = torch.full((B,), t_val, device=device)
+                if self.use_mean_flow:
+                    r_tensor = torch.full((B,), max(t_val - dt, 0.0), device=device)
+                    v = self.latent_flow.forward_cached(z, t_tensor, kv_cache, mask_out, r=r_tensor)
+                else:
+                    v = self.latent_flow.forward_cached(z, t_tensor, kv_cache, mask_out)
+
             z = z - dt * v
         return z
 
@@ -487,6 +518,13 @@ class StudentLFMBFMTracker(nn.Module):
                 masked_frames = self._apply_masks(frames, frame_mask, kp_mask)
                 frame_tokens = self.frame_encoder(masked_frames, delta_t)
                 flow_context, flow_mask = self._build_flow_context(o_t_enc, h_enc, frame_tokens, frame_mask)
+
+                # CFG: randomly drop ALL condition tokens for some samples
+                # (unconditional training — flow learns to denoise without any context)
+                if self.cfg_drop_prob > 0:
+                    cfg_drop = torch.rand(B, device=dev, generator=gen) < self.cfg_drop_prob
+                    if cfg_drop.any():
+                        flow_mask[cfg_drop] = False  # mask out all context tokens
 
                 z_prev_train = None
                 if self.use_prev_z and self._rollout_z_buffer is not None:
@@ -630,7 +668,8 @@ class StudentLFMBFMTracker(nn.Module):
             for m in [self.latent_flow, self.frame_encoder]:
                 for p in m.parameters():
                     p.requires_grad = False
-            print(f"[INFO] LFM-BFM: entering stage 1 (o_t+posterior+history+action, flow/frames frozen)")
+            self.teacher_forcing_ratio = self.teacher_forcing_ratio_stage1
+            print(f"[INFO] LFM-BFM: entering stage 1 (o_t+posterior+history+action, flow/frames frozen, tf={self.teacher_forcing_ratio:.2f})")
         elif stage == 2:
             # Stage 2: train latent_flow, frame_encoder
             # Freeze: o_t_encoder, posterior, history_encoder, action_decoder, recon
@@ -644,7 +683,8 @@ class StudentLFMBFMTracker(nn.Module):
                 for p in self.recon_decoder.parameters():
                     p.requires_grad = False
             self.std.requires_grad = False
-            print(f"[INFO] LFM-BFM: entering stage 2 (flow+frames, o_t+posterior+history+action frozen)")
+            self.teacher_forcing_ratio = self.teacher_forcing_ratio_stage2
+            print(f"[INFO] LFM-BFM: entering stage 2 (flow+frames, o_t+posterior+history+action frozen, tf={self.teacher_forcing_ratio:.2f})")
 
     def pre_train(self):
         self.compute_latent_loss = True
