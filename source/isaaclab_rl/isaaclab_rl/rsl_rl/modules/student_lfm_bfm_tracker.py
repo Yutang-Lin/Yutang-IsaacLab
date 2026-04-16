@@ -147,6 +147,9 @@ class StudentLFMBFMTracker(nn.Module):
         # History dropout: probability of dropping history token during flow training
         self.history_dropout_prob = cfg.pop("history_dropout_prob", 0.1)
 
+        # History encoding on unit sphere: L2-normalize + noise then re-normalize
+        self.history_sigma = cfg.pop("history_sigma", 0.1)
+
         # Reconstruction decoder: z_t → posterior condition
         self.recon_coef = cfg.pop("recon_coef", 0.0)
 
@@ -264,6 +267,14 @@ class StudentLFMBFMTracker(nn.Module):
             self._mask_rng = torch.Generator(device=device)
             self._mask_rng.manual_seed(self._mask_rng_seed)
         return self._mask_rng
+
+    def _normalize_history(self, h_enc, add_noise=False):
+        """L2-normalize history encoding onto unit sphere, optionally add noise and re-normalize."""
+        h_enc = F.normalize(h_enc, dim=-1)
+        if add_noise and self.history_sigma > 0:
+            h_enc = h_enc + self.history_sigma * torch.randn_like(h_enc)
+            h_enc = F.normalize(h_enc, dim=-1)
+        return h_enc
 
     def _build_flow_context(self, o_t_enc, h_enc, frame_tokens, frame_mask):
         """Build flow decoder context: [o_t_enc, h_enc, frame_0, ..., frame_F-1] with masking."""
@@ -417,7 +428,7 @@ class StudentLFMBFMTracker(nn.Module):
 
         # Encode inputs separately
         o_t_enc = self.o_t_encoder(o_t)  # [B, d_model]
-        h_enc = self.history_encoder(hp_t)  # [B, d_model] — used by both stages
+        h_enc = self._normalize_history(self.history_encoder(hp_t), add_noise=False)  # rollout: no noise
 
         if self._stage == 1:
             # Stage 1: rollout with posterior z (privileged, no ODE)
@@ -454,7 +465,9 @@ class StudentLFMBFMTracker(nn.Module):
 
         # Always encode o_t and history
         o_t_enc = self.o_t_encoder(o_t)    # [B, d_model]
-        h_enc = self.history_encoder(hp_t)  # [B, d_model]
+        h_enc = self._normalize_history(
+            self.history_encoder(hp_t),
+            add_noise=self.compute_latent_loss)  # training: add noise to sphere
 
         if self.compute_latent_loss and r_t.shape[-1] > 0:
             # Enable grad on r_t if gradient penalty is active
