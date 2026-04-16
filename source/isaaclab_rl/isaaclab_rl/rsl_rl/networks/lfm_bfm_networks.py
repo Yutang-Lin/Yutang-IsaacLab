@@ -78,10 +78,19 @@ class LFMPosterior(nn.Module):
 
 
 class LatentFlowDecoder(nn.Module):
-    """AdaLN-Zero cross-attention decoder for latent flow matching.
+    """Self-attention + cross-attention decoder for latent flow matching.
 
-    Noised latent z cross-attends to context, predicts velocity in latent space.
-    Same architecture as FlowBFMDecoder but operates on latent_dim instead of num_actions.
+    Latent trajectory [prev_z_1, ..., prev_z_L, z_current] forms L+1 self-attention
+    tokens. These cross-attend to condition context [o_t_enc, h_enc, frames].
+
+    Training modes:
+      - With prob `noise_all_prob`: add independent noise to ALL L+1 tokens,
+        denoise all (each token can have different noise level).
+      - Otherwise: only z_current is noised, prev_z's are clean.
+
+    Rollout: prev_z's always clean.
+
+    Each token type has its own positional embedding.
     """
 
     def __init__(self, latent_dim: int, d_model: int,
@@ -89,7 +98,8 @@ class LatentFlowDecoder(nn.Module):
                  num_layers: int = 2, dropout: float = 0.0,
                  activation: nn.Module | None = None,
                  use_proj_norm: bool = False,
-                 use_prev_z: bool = False):
+                 use_prev_z: bool = False,
+                 max_prev_z: int = 8):
         super().__init__()
         if activation is None:
             activation = nn.GELU(approximate="tanh")
@@ -99,28 +109,43 @@ class LatentFlowDecoder(nn.Module):
         self.num_heads = num_heads
         self.head_dim = d_model // num_heads
         self.use_prev_z = use_prev_z
+        self.max_prev_z = max_prev_z
 
-        # Latent token projection (no t — t goes through AdaLN)
+        # Shared z projection: latent_dim → d_model (for both prev_z and z_current)
         layers = [nn.Linear(latent_dim, d_model), activation, nn.Linear(d_model, d_model)]
         if use_proj_norm:
             layers.append(nn.LayerNorm(d_model))
         self.latent_proj = nn.Sequential(*layers)
 
-        # z_prev projection: previous step's z → context token for cross-attention
-        if use_prev_z:
-            self.prev_z_proj = nn.Sequential(
-                nn.Linear(latent_dim, d_model), activation, nn.Linear(d_model, d_model),
-            )
+        # Positional embeddings for latent sequence [prev_0, prev_1, ..., prev_L-1, current]
+        self.z_pos_embed = nn.Parameter(torch.randn(max_prev_z + 1, d_model) * 0.02)
+
+        # Positional embeddings for cross-attn context types
+        self.ctx_type_embed = nn.ParameterDict({
+            'o_t': nn.Parameter(torch.randn(d_model) * 0.02),
+            'h_enc': nn.Parameter(torch.randn(d_model) * 0.02),
+            'frame': nn.Parameter(torch.randn(d_model) * 0.02),
+        })
 
         # Time embedding: takes (t, r) pair
         self.time_embed = nn.Sequential(
             nn.Linear(2, d_model), activation, nn.Linear(d_model, d_model),
         )
 
-        # Cross-attention layers with AdaLN-Zero
+        # Self-attention + cross-attention layers with AdaLN-Zero
+        self.self_attn_layers = nn.ModuleList()
         self.cross_attn_layers = nn.ModuleList()
         self.adaln_layers = nn.ModuleList()
         for _ in range(num_layers):
+            # Self-attention over latent sequence
+            self.self_attn_layers.append(nn.ModuleDict({
+                'q_proj': nn.Linear(d_model, d_model),
+                'k_proj': nn.Linear(d_model, d_model),
+                'v_proj': nn.Linear(d_model, d_model),
+                'out_proj': nn.Linear(d_model, d_model),
+                'norm': nn.LayerNorm(d_model, elementwise_affine=False),
+            }))
+            # Cross-attention to condition context
             self.cross_attn_layers.append(nn.ModuleDict({
                 'q_proj': nn.Linear(d_model, d_model),
                 'k_proj': nn.Linear(d_model, d_model),
@@ -132,12 +157,13 @@ class LatentFlowDecoder(nn.Module):
                     nn.Linear(d_model, hidden_dim), activation, nn.Linear(hidden_dim, d_model),
                 ),
             }))
-            adaln = nn.Linear(d_model, 6 * d_model)
+            # AdaLN: self-attn (3: scale, shift, gate) + cross-attn (3) + FFN (3) = 9 * d_model
+            adaln = nn.Linear(d_model, 9 * d_model)
             nn.init.zeros_(adaln.weight)
             nn.init.zeros_(adaln.bias)
             self.adaln_layers.append(adaln)
 
-        # Final norm + velocity head
+        # Final norm + velocity head (per-token, but we only read the last token)
         self.final_norm = nn.LayerNorm(d_model, elementwise_affine=False)
         self.adaln_final = nn.Linear(d_model, 2 * d_model)
         nn.init.zeros_(self.adaln_final.weight)
@@ -147,90 +173,113 @@ class LatentFlowDecoder(nn.Module):
     def _adaln_modulate(self, x, norm, scale, shift):
         return scale * norm(x) + shift
 
-    def _cross_attn_adaln(self, layer, adaln, q_tok, context, ctx_mask, t_embed):
-        B, S, _ = context.shape
-        H, hd = self.num_heads, self.head_dim
-        s1, sh1, g1, s2, sh2, g2 = adaln(t_embed).chunk(6, dim=-1)
+    def _build_z_sequence(self, z_noised, z_prev=None, z_prev_mask=None):
+        """Build the latent self-attention sequence [prev_z_1, ..., prev_z_L, z_current].
 
-        q_normed = self._adaln_modulate(q_tok, layer['norm1'], 1 + s1, sh1)
-        q = layer['q_proj'](q_normed).view(B, 1, H, hd).transpose(1, 2)
-        k = layer['k_proj'](context).view(B, S, H, hd).transpose(1, 2)
-        v = layer['v_proj'](context).view(B, S, H, hd).transpose(1, 2)
+        Returns:
+            z_tokens: [B, L+1, d_model]
+            z_mask: [B, L+1] bool (True=valid)
+        """
+        B = z_noised.shape[0]
+        device = z_noised.device
 
-        attn = (q @ k.transpose(-2, -1)) * (hd ** -0.5)
-        mask = ctx_mask[:, None, None, :].expand(-1, H, 1, -1)
-        attn = attn.masked_fill(~mask, float('-inf'))
-        attn = attn.softmax(dim=-1)
-        out = (attn @ v).transpose(1, 2).reshape(B, self.d_model)
-        out = layer['out_proj'](out)
+        # Project current z
+        tok_current = self.latent_proj(z_noised).unsqueeze(1)  # [B, 1, d]
 
-        q_tok = q_tok + g1 * out
-        ffn_in = self._adaln_modulate(q_tok, layer['norm2'], 1 + s2, sh2)
-        q_tok = q_tok + g2 * layer['ffn'](ffn_in)
-        return q_tok
+        if self.use_prev_z and z_prev is not None:
+            if z_prev.dim() == 2:
+                z_prev = z_prev.unsqueeze(1)
+            L = z_prev.shape[1]
+            tok_prev = self.latent_proj(z_prev)  # [B, L, d] — shared projection
+            z_tokens = torch.cat([tok_prev, tok_current], dim=1)  # [B, L+1, d]
+            # Add positional embeddings (last L+1 positions from z_pos_embed)
+            pos_start = self.max_prev_z - L
+            z_tokens = z_tokens + self.z_pos_embed[pos_start:self.max_prev_z + 1].unsqueeze(0)
+            # Mask
+            if z_prev_mask is not None:
+                current_mask = torch.ones(B, 1, dtype=torch.bool, device=device)
+                z_mask = torch.cat([z_prev_mask, current_mask], dim=1)
+            else:
+                z_mask = torch.ones(B, L + 1, dtype=torch.bool, device=device)
+        else:
+            z_tokens = tok_current + self.z_pos_embed[self.max_prev_z:self.max_prev_z + 1].unsqueeze(0)
+            z_mask = torch.ones(B, 1, dtype=torch.bool, device=device)
 
-    def _cross_attn_cached_adaln(self, layer, adaln, q_tok, k_cached, v_cached, ctx_mask, t_embed):
-        B, H, S, hd = k_cached.shape
-        s1, sh1, g1, s2, sh2, g2 = adaln(t_embed).chunk(6, dim=-1)
+        return z_tokens, z_mask
 
-        q_normed = self._adaln_modulate(q_tok, layer['norm1'], 1 + s1, sh1)
-        q = layer['q_proj'](q_normed).view(B, 1, H, hd).transpose(1, 2)
+    def _add_ctx_type_embeds(self, context):
+        """Add per-type positional embeddings to context tokens.
 
-        attn = (q @ k_cached.transpose(-2, -1)) * (hd ** -0.5)
-        mask = ctx_mask[:, None, None, :].expand(-1, H, 1, -1)
-        attn = attn.masked_fill(~mask, float('-inf'))
-        attn = attn.softmax(dim=-1)
-        out = (attn @ v_cached).transpose(1, 2).reshape(B, self.d_model)
-        out = layer['out_proj'](out)
+        Context layout: [o_t_enc(1), h_enc(1), frames(F)]
+        """
+        context = context.clone()
+        context[:, 0] = context[:, 0] + self.ctx_type_embed['o_t']
+        context[:, 1] = context[:, 1] + self.ctx_type_embed['h_enc']
+        context[:, 2:] = context[:, 2:] + self.ctx_type_embed['frame']
+        return context
 
-        q_tok = q_tok + g1 * out
-        ffn_in = self._adaln_modulate(q_tok, layer['norm2'], 1 + s2, sh2)
-        q_tok = q_tok + g2 * layer['ffn'](ffn_in)
-        return q_tok
-
-    def _append_prev_z(self, context, ctx_mask, z_prev, z_noised):
-        """Append z_prev as an extra context token for cross-attention."""
-        if not self.use_prev_z:
-            return context, ctx_mask
-        if z_prev is None:
-            z_prev = torch.zeros_like(z_noised)
-        tok_prev = self.prev_z_proj(z_prev).unsqueeze(1)  # [B, 1, d_model]
-        context = torch.cat([context, tok_prev], dim=1)    # [B, S+1, d_model]
-        prev_mask = torch.ones(ctx_mask.shape[0], 1, dtype=torch.bool, device=ctx_mask.device)
-        ctx_mask = torch.cat([ctx_mask, prev_mask], dim=1) # [B, S+1]
-        return context, ctx_mask
-
-    def forward(self, z_noised, t, context, ctx_mask, r=None, z_prev=None):
+    def forward(self, z_noised, t, context, ctx_mask, r=None,
+                z_prev=None, z_prev_mask=None):
+        """Training forward: self-attn over [prev_z, z_noised], cross-attn to context."""
+        B = z_noised.shape[0]
         if t.dim() == 1:
             t = t.unsqueeze(-1)
         if r is None:
-            r = t  # default: r=t (standard flow matching)
+            r = t
         elif r.dim() == 1:
             r = r.unsqueeze(-1)
-        context, ctx_mask = self._append_prev_z(context, ctx_mask, z_prev, z_noised)
-        tok = self.latent_proj(z_noised)
-        t_embed = self.time_embed(torch.cat([t, r], dim=-1))
 
-        for layer, adaln in zip(self.cross_attn_layers, self.adaln_layers):
-            tok = self._cross_attn_adaln(layer, adaln, tok, context, ctx_mask, t_embed)
+        z_tokens, z_mask = self._build_z_sequence(z_noised, z_prev, z_prev_mask)
+        context = self._add_ctx_type_embeds(context)
+        t_embed = self.time_embed(torch.cat([t, r], dim=-1))  # [B, d]
 
+        N = z_tokens.shape[1]  # L+1
+        S = context.shape[1]
+        H, hd = self.num_heads, self.head_dim
+
+        for sa_layer, ca_layer, adaln in zip(self.self_attn_layers, self.cross_attn_layers, self.adaln_layers):
+            # 9 AdaLN params: self-attn (s, sh, g) + cross-attn (s, sh, g) + FFN (s, sh, g)
+            sa_s, sa_sh, sa_g, ca_s, ca_sh, ca_g, ff_s, ff_sh, ff_g = adaln(t_embed).chunk(9, dim=-1)
+
+            # Self-attention over latent sequence
+            sa_normed = self._adaln_modulate(z_tokens, sa_layer['norm'], 1 + sa_s.unsqueeze(1), sa_sh.unsqueeze(1))
+            q = sa_layer['q_proj'](sa_normed).view(B, N, H, hd).transpose(1, 2)
+            k = sa_layer['k_proj'](sa_normed).view(B, N, H, hd).transpose(1, 2)
+            v = sa_layer['v_proj'](sa_normed).view(B, N, H, hd).transpose(1, 2)
+            sa_mask = z_mask[:, None, None, :].expand(-1, H, N, -1) & z_mask[:, None, :, None].expand(-1, H, -1, N)
+            attn = (q @ k.transpose(-2, -1)) * (hd ** -0.5)
+            attn = attn.masked_fill(~sa_mask, float('-inf'))
+            attn = attn.softmax(dim=-1).nan_to_num(0.0)  # masked tokens → zero attn
+            sa_out = (attn @ v).transpose(1, 2).reshape(B, N, self.d_model)
+            sa_out = sa_layer['out_proj'](sa_out)
+            z_tokens = z_tokens + sa_g.unsqueeze(1) * sa_out
+
+            # Cross-attention to condition context
+            ca_normed = self._adaln_modulate(z_tokens, ca_layer['norm1'], 1 + ca_s.unsqueeze(1), ca_sh.unsqueeze(1))
+            q = ca_layer['q_proj'](ca_normed).view(B, N, H, hd).transpose(1, 2)
+            k = ca_layer['k_proj'](context).view(B, S, H, hd).transpose(1, 2)
+            v = ca_layer['v_proj'](context).view(B, S, H, hd).transpose(1, 2)
+            ca_attn_mask = ctx_mask[:, None, None, :].expand(-1, H, N, -1)
+            attn = (q @ k.transpose(-2, -1)) * (hd ** -0.5)
+            attn = attn.masked_fill(~ca_attn_mask, float('-inf'))
+            attn = attn.softmax(dim=-1).nan_to_num(0.0)  # all-masked → zero attn
+            ca_out = (attn @ v).transpose(1, 2).reshape(B, N, self.d_model)
+            ca_out = ca_layer['out_proj'](ca_out)
+            z_tokens = z_tokens + ca_g.unsqueeze(1) * ca_out
+
+            # FFN
+            ffn_in = self._adaln_modulate(z_tokens, ca_layer['norm2'], 1 + ff_s.unsqueeze(1), ff_sh.unsqueeze(1))
+            z_tokens = z_tokens + ff_g.unsqueeze(1) * ca_layer['ffn'](ffn_in)
+
+        # Read the LAST token (z_current) for velocity prediction
+        tok_out = z_tokens[:, -1]  # [B, d]
         sf, shf = self.adaln_final(t_embed).chunk(2, dim=-1)
-        tok = self._adaln_modulate(tok, self.final_norm, 1 + sf, shf)
-        return self.velocity_head(tok)
+        tok_out = self._adaln_modulate(tok_out, self.final_norm, 1 + sf, shf)
+        return self.velocity_head(tok_out)
 
-    def build_kv_cache(self, context, ctx_mask, z_prev=None, z_noised_like=None):
-        """Build KV cache. If use_prev_z, appends z_prev token to context first."""
-        if self.use_prev_z:
-            if z_prev is None:
-                B = context.shape[0]
-                if z_noised_like is not None:
-                    z_prev = torch.zeros_like(z_noised_like)
-                else:
-                    z_prev = torch.zeros(B, self.latent_dim, device=context.device)
-            tok_prev = self.prev_z_proj(z_prev).unsqueeze(1)
-            context = torch.cat([context, tok_prev], dim=1)
-            prev_mask = torch.ones(ctx_mask.shape[0], 1, dtype=torch.bool, device=ctx_mask.device)
-            ctx_mask = torch.cat([ctx_mask, prev_mask], dim=1)
+    def build_kv_cache(self, context, ctx_mask, z_prev=None, z_prev_mask=None, z_noised_like=None):
+        """Build KV cache for cross-attention context (no prev_z in context anymore)."""
+        context = self._add_ctx_type_embeds(context)
         B, S, _ = context.shape
         H, hd = self.num_heads, self.head_dim
         cache = []
@@ -238,25 +287,67 @@ class LatentFlowDecoder(nn.Module):
             k = layer['k_proj'](context).view(B, S, H, hd).transpose(1, 2)
             v = layer['v_proj'](context).view(B, S, H, hd).transpose(1, 2)
             cache.append((k, v))
+        # Store z_prev info for forward_cached
+        self._cached_z_prev = z_prev
+        self._cached_z_prev_mask = z_prev_mask
         return cache, ctx_mask
 
     def forward_cached(self, z_noised, t, kv_cache, ctx_mask, r=None, z_prev=None):
+        """Cached forward for ODE inference. Uses stored z_prev from build_kv_cache."""
+        B = z_noised.shape[0]
         if t.dim() == 1:
             t = t.unsqueeze(-1)
         if r is None:
             r = t
         elif r.dim() == 1:
             r = r.unsqueeze(-1)
-        tok = self.latent_proj(z_noised)
+
+        z_prev_use = self._cached_z_prev
+        z_prev_mask_use = self._cached_z_prev_mask
+        z_tokens, z_mask = self._build_z_sequence(z_noised, z_prev_use, z_prev_mask_use)
         t_embed = self.time_embed(torch.cat([t, r], dim=-1))
 
-        for (layer, adaln), (k_cached, v_cached) in zip(
-                zip(self.cross_attn_layers, self.adaln_layers), kv_cache):
-            tok = self._cross_attn_cached_adaln(layer, adaln, tok, k_cached, v_cached, ctx_mask, t_embed)
+        N = z_tokens.shape[1]
+        H, hd = self.num_heads, self.head_dim
 
+        for sa_layer, (ca_layer, adaln), (k_cached, v_cached) in zip(
+                self.self_attn_layers,
+                zip(self.cross_attn_layers, self.adaln_layers),
+                kv_cache):
+            sa_s, sa_sh, sa_g, ca_s, ca_sh, ca_g, ff_s, ff_sh, ff_g = adaln(t_embed).chunk(9, dim=-1)
+
+            # Self-attention
+            sa_normed = self._adaln_modulate(z_tokens, sa_layer['norm'], 1 + sa_s.unsqueeze(1), sa_sh.unsqueeze(1))
+            q = sa_layer['q_proj'](sa_normed).view(B, N, H, hd).transpose(1, 2)
+            k = sa_layer['k_proj'](sa_normed).view(B, N, H, hd).transpose(1, 2)
+            v = sa_layer['v_proj'](sa_normed).view(B, N, H, hd).transpose(1, 2)
+            sa_mask = z_mask[:, None, None, :].expand(-1, H, N, -1) & z_mask[:, None, :, None].expand(-1, H, -1, N)
+            attn = (q @ k.transpose(-2, -1)) * (hd ** -0.5)
+            attn = attn.masked_fill(~sa_mask, float('-inf'))
+            attn = attn.softmax(dim=-1).nan_to_num(0.0)
+            sa_out = (attn @ v).transpose(1, 2).reshape(B, N, self.d_model)
+            sa_out = sa_layer['out_proj'](sa_out)
+            z_tokens = z_tokens + sa_g.unsqueeze(1) * sa_out
+
+            # Cross-attention (cached)
+            ca_normed = self._adaln_modulate(z_tokens, ca_layer['norm1'], 1 + ca_s.unsqueeze(1), ca_sh.unsqueeze(1))
+            q = ca_layer['q_proj'](ca_normed).view(B, N, H, hd).transpose(1, 2)
+            ca_attn_mask = ctx_mask[:, None, None, :].expand(-1, H, N, -1)
+            attn = (q @ k_cached.transpose(-2, -1)) * (hd ** -0.5)
+            attn = attn.masked_fill(~ca_attn_mask, float('-inf'))
+            attn = attn.softmax(dim=-1).nan_to_num(0.0)
+            ca_out = (attn @ v_cached).transpose(1, 2).reshape(B, N, self.d_model)
+            ca_out = ca_layer['out_proj'](ca_out)
+            z_tokens = z_tokens + ca_g.unsqueeze(1) * ca_out
+
+            # FFN
+            ffn_in = self._adaln_modulate(z_tokens, ca_layer['norm2'], 1 + ff_s.unsqueeze(1), ff_sh.unsqueeze(1))
+            z_tokens = z_tokens + ff_g.unsqueeze(1) * ca_layer['ffn'](ffn_in)
+
+        tok_out = z_tokens[:, -1]
         sf, shf = self.adaln_final(t_embed).chunk(2, dim=-1)
-        tok = self._adaln_modulate(tok, self.final_norm, 1 + sf, shf)
-        return self.velocity_head(tok)
+        tok_out = self._adaln_modulate(tok_out, self.final_norm, 1 + sf, shf)
+        return self.velocity_head(tok_out)
 
 
 class LFMReconDecoder(nn.Module):

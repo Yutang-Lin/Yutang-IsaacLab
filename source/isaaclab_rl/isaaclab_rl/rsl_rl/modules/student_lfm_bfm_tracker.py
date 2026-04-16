@@ -143,12 +143,16 @@ class StudentLFMBFMTracker(nn.Module):
         self.teacher_forcing_ratio = self.teacher_forcing_ratio_stage1
         self.teacher_forcing_noise = cfg.pop("teacher_forcing_noise", 0.1)
 
-        # z_prev: pass previous step's z_t to the flow decoder
+        # z_prev: pass previous L steps' z_t to the flow decoder as context tokens
         self.use_prev_z = cfg.pop("use_prev_z", False)
+        self.prev_z_buffer_len = cfg.pop("prev_z_buffer_len", 1)  # L: number of previous z's to keep
 
         # Legacy args (kept for checkpoint compat, no longer used)
         cfg.pop("history_dropout_prob", None)
         cfg.pop("history_sigma", None)
+
+        # Noise-all mode: probability of noising ALL L+1 latent tokens during training
+        self.noise_all_prob = cfg.pop("noise_all_prob", 0.2)
 
         # Classifier-Free Guidance: drop all condition tokens with this prob during training
         self.cfg_drop_prob = cfg.pop("cfg_drop_prob", 0.1)
@@ -229,7 +233,8 @@ class StudentLFMBFMTracker(nn.Module):
         self._ep_frame_offsets = None
         self._env_ref = None
         self._ep_ode_noise = None  # per-env fixed ODE starting noise, resampled on reset
-        self._ep_prev_z = None  # per-env previous step's latent z_t (for use_prev_z)
+        self._ep_prev_z_buf = None   # [B, L, latent_dim] ring buffer of previous z's
+        self._ep_prev_z_mask = None  # [B, L] bool — True if slot has valid z (not padding)
         self._rollout_z_list = []  # collects z_t per rollout step
         self._rollout_z_buffer = None  # [T, B, D] stacked rollout z for training
         self._train_step = 0  # current step index during training
@@ -373,7 +378,7 @@ class StudentLFMBFMTracker(nn.Module):
             env._bfm_future_offsets[env_ids] = self._ep_frame_offsets[env_ids]
             env._bfm_delta_t[env_ids] = self._ep_frame_offsets[env_ids]
 
-    def _ode_sample_latent(self, context, ctx_mask, B, device, z_prev=None):
+    def _ode_sample_latent(self, context, ctx_mask, B, device, z_prev=None, z_prev_mask=None):
         """K-step Euler ODE in latent space with KV cache.
 
         Each env uses a fixed per-episode noise as ODE starting point.
@@ -386,15 +391,15 @@ class StudentLFMBFMTracker(nn.Module):
 
         use_cfg = self.cfg_weight > 1.0 and not self.training
         if use_cfg:
-            # Batch: [cond; uncond] along dim 0
             uncond_mask = torch.zeros_like(ctx_mask)
-            ctx_2b = torch.cat([context, context], dim=0)        # [2B, S, d]
-            mask_2b = torch.cat([ctx_mask, uncond_mask], dim=0)  # [2B, S]
+            ctx_2b = torch.cat([context, context], dim=0)
+            mask_2b = torch.cat([ctx_mask, uncond_mask], dim=0)
             z_prev_2b = torch.cat([z_prev, z_prev], dim=0) if z_prev is not None else None
+            zpm_2b = torch.cat([z_prev_mask, z_prev_mask], dim=0) if z_prev_mask is not None else None
             z_2b = torch.cat([z, z], dim=0)
-            kv_cache, mask_out = self.latent_flow.build_kv_cache(ctx_2b, mask_2b, z_prev=z_prev_2b, z_noised_like=z_2b)
+            kv_cache, mask_out = self.latent_flow.build_kv_cache(ctx_2b, mask_2b, z_prev=z_prev_2b, z_prev_mask=zpm_2b, z_noised_like=z_2b)
         else:
-            kv_cache, mask_out = self.latent_flow.build_kv_cache(context, ctx_mask, z_prev=z_prev, z_noised_like=z)
+            kv_cache, mask_out = self.latent_flow.build_kv_cache(context, ctx_mask, z_prev=z_prev, z_prev_mask=z_prev_mask, z_noised_like=z)
 
         dt = 1.0 / self.ode_steps
         for k in range(self.ode_steps):
@@ -438,7 +443,9 @@ class StudentLFMBFMTracker(nn.Module):
                 self._ep_kp_mask = torch.ones(B, K, dtype=torch.bool, device=observations.device) if K > 0 else None
                 self._ep_frame_offsets = torch.zeros(B, nf, device=observations.device)
                 self._ep_ode_noise = torch.randn(B, self.latent_dim, device=observations.device)
-                self._ep_prev_z = torch.zeros(B, self.latent_dim, device=observations.device)
+                L = self.prev_z_buffer_len
+                self._ep_prev_z_buf = torch.zeros(B, L, self.latent_dim, device=observations.device)
+                self._ep_prev_z_mask = torch.zeros(B, L, dtype=torch.bool, device=observations.device)
                 self._sample_initial_offsets(torch.arange(B, device=observations.device), observations.device)
         else:
             with torch.inference_mode(False):
@@ -459,12 +466,17 @@ class StudentLFMBFMTracker(nn.Module):
             frame_tokens = self.frame_encoder(masked_frames, delta_t) # [B, F, d_model]
             flow_context, flow_mask = self._build_flow_context(
                 o_t_enc, h_enc, frame_tokens, cur_frame_mask)
-            z_prev = self._ep_prev_z[:B] if self.use_prev_z else None
-            z_t = self._ode_sample_latent(flow_context, flow_mask, B, observations.device, z_prev=z_prev)
+            z_prev = self._ep_prev_z_buf[:B] if self.use_prev_z else None  # [B, L, latent_dim]
+            z_prev_mask = self._ep_prev_z_mask[:B] if self.use_prev_z else None  # [B, L]
+            z_t = self._ode_sample_latent(flow_context, flow_mask, B, observations.device, z_prev=z_prev, z_prev_mask=z_prev_mask)
 
         # Store z_t as prev_z for next step
-        if self.use_prev_z and self._ep_prev_z is not None:
-            self._ep_prev_z[:B] = z_t.detach()
+        if self.use_prev_z and self._ep_prev_z_buf is not None:
+            # Shift buffer and mask left, append new z_t as valid
+            self._ep_prev_z_buf[:B, :-1] = self._ep_prev_z_buf[:B, 1:].clone()
+            self._ep_prev_z_buf[:B, -1] = z_t.detach()
+            self._ep_prev_z_mask[:B, :-1] = self._ep_prev_z_mask[:B, 1:].clone()
+            self._ep_prev_z_mask[:B, -1] = True
             self._rollout_z_list.append(z_t.detach().clone())
 
         action_mean = self.action_decoder(z_t, o_t_enc, h_enc)
@@ -522,19 +534,44 @@ class StudentLFMBFMTracker(nn.Module):
                 # CFG: randomly drop ALL condition tokens for some samples
                 # (unconditional training — flow learns to denoise without any context)
                 if self.cfg_drop_prob > 0:
-                    cfg_drop = torch.rand(B, device=dev, generator=gen) < self.cfg_drop_prob
-                    if cfg_drop.any():
-                        flow_mask[cfg_drop] = False  # mask out all context tokens
+                    cfg_ids = (torch.rand(B, device=dev, generator=gen) < self.cfg_drop_prob).nonzero(as_tuple=True)[0]
+                    if cfg_ids.numel() > 0:
+                        flow_mask[cfg_ids] = False  # mask out all context tokens
 
                 z_prev_train = None
+                z_prev_train_mask = None
                 if self.use_prev_z and self._rollout_z_buffer is not None:
-                    if self._train_step > 0:
-                        z_prev_train = self._rollout_z_buffer[self._train_step - 1]
+                    L = self.prev_z_buffer_len
+                    end = self._train_step
+                    start = max(0, end - L)
+                    if end > 0:
+                        z_slice = self._rollout_z_buffer[start:end]  # [<=L, B, D]
+                        z_prev_train = z_slice.permute(1, 0, 2)  # [B, <=L, D]
+                        n_valid = z_prev_train.shape[1]
+                        if n_valid < L:
+                            pad = torch.zeros(B, L - n_valid, self.latent_dim, device=dev)
+                            z_prev_train = torch.cat([pad, z_prev_train], dim=1)
+                        # Mask: padded slots = False, valid slots = True
+                        z_prev_train_mask = torch.zeros(B, L, dtype=torch.bool, device=dev)
+                        z_prev_train_mask[:, L - n_valid:] = True
 
                 t = torch.rand(B, device=dev)
                 eps = torch.randn(B, self.latent_dim, device=dev)
                 z_noised = (1 - t.unsqueeze(-1)) * z_t + t.unsqueeze(-1) * eps
                 v_t = eps - z_t
+
+                # Noise-all mode: also noise prev_z buffer with independent noise levels
+                if self.noise_all_prob > 0 and z_prev_train is not None:
+                    noise_ids = (torch.rand(B, device=dev, generator=gen) < self.noise_all_prob).nonzero(as_tuple=True)[0]
+                    if noise_ids.numel() > 0:
+                        n = noise_ids.numel()
+                        L = z_prev_train.shape[1]
+                        t_prev = torch.rand(n, L, device=dev)
+                        eps_prev = torch.randn(n, L, self.latent_dim, device=dev)
+                        z_prev_clean = z_prev_train[noise_ids]
+                        z_prev_noised = (1 - t_prev.unsqueeze(-1)) * z_prev_clean + t_prev.unsqueeze(-1) * eps_prev
+                        z_prev_train = z_prev_train.clone()
+                        z_prev_train[noise_ids] = z_prev_noised
 
                 if self.use_mean_flow:
                     from torch.func import jvp as func_jvp
@@ -546,13 +583,14 @@ class StudentLFMBFMTracker(nn.Module):
                     if prop_idx.numel() > 0:
                         r[prop_idx] = torch.rand(prop_idx.numel(), device=dev) * t[prop_idx]
 
-                    v_pred = self.latent_flow(z_noised, t, flow_context, flow_mask, r=r, z_prev=z_prev_train)
+                    v_pred = self.latent_flow(z_noised, t, flow_context, flow_mask, r=r, z_prev=z_prev_train, z_prev_mask=z_prev_train_mask)
 
                     du_dt = torch.zeros_like(v_pred)
                     if prop_idx.numel() > 0:
                         zp_sub = z_prev_train[prop_idx] if z_prev_train is not None else None
+                        zpm_sub = z_prev_train_mask[prop_idx] if z_prev_train_mask is not None else None
                         def _flow_fn(z, t_, r_):
-                            return self.latent_flow(z, t_, flow_context[prop_idx], flow_mask[prop_idx], r=r_, z_prev=zp_sub)
+                            return self.latent_flow(z, t_, flow_context[prop_idx], flow_mask[prop_idx], r=r_, z_prev=zp_sub, z_prev_mask=zpm_sub)
                         with sdpa_kernel(SDPBackend.MATH):
                             _, du_sub = func_jvp(
                                 _flow_fn,
@@ -566,7 +604,7 @@ class StudentLFMBFMTracker(nn.Module):
                     u_target = v_t - t_minus_r * du_dt
                     flow_loss = F.mse_loss(v_pred, u_target.detach())
                 else:
-                    v_pred = self.latent_flow(z_noised, t, flow_context, flow_mask, z_prev=z_prev_train)
+                    v_pred = self.latent_flow(z_noised, t, flow_context, flow_mask, z_prev=z_prev_train, z_prev_mask=z_prev_train_mask)
                     flow_loss = F.mse_loss(v_pred, v_t)
 
                 if self.use_prev_z and self._rollout_z_buffer is not None:
@@ -716,8 +754,9 @@ class StudentLFMBFMTracker(nn.Module):
                         self._sample_initial_offsets(env_ids, self._ep_frame_mask.device)
                 if self._ep_ode_noise is not None:
                     self._ep_ode_noise[env_ids] = torch.randn(env_ids.shape[0], self.latent_dim, device=self._ep_ode_noise.device)
-                if self._ep_prev_z is not None:
-                    self._ep_prev_z[env_ids] = 0.0
+                if self._ep_prev_z_buf is not None:
+                    self._ep_prev_z_buf[env_ids] = 0.0
+                    self._ep_prev_z_mask[env_ids] = False
 
     def get_hidden_states(self):
         return None
