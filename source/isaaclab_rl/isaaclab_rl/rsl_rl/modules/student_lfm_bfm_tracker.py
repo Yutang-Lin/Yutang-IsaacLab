@@ -285,6 +285,28 @@ class StudentLFMBFMTracker(nn.Module):
 
     # -- Offsets (same as other BFM variants) --
 
+    def _sample_count_mask(self, n, total, gen, device, min_active=0):
+        """Sample masks by first choosing a count from U(min_active, total), then randomly selecting which slots are active.
+
+        Args:
+            n: batch size
+            total: number of slots (frames or keypoints)
+            gen: torch.Generator
+            device: torch device
+            min_active: minimum number of active slots (0 allows all-masked)
+
+        Returns:
+            mask: [n, total] bool tensor
+        """
+        counts = torch.randint(min_active, total + 1, (n,), device=device, generator=gen)
+        mask = torch.zeros(n, total, dtype=torch.bool, device=device)
+        for i in range(n):
+            c = counts[i].item()
+            if c > 0:
+                perm = torch.randperm(total, device=device, generator=gen)[:c]
+                mask[i, perm] = True
+        return mask
+
     def _sample_initial_offsets(self, env_ids, device):
         n = env_ids.shape[0]
         nf, K = self.num_frames, self.rollout_mask_num_keypoints
@@ -296,15 +318,13 @@ class StudentLFMBFMTracker(nn.Module):
         for i in range(1, nf):
             offsets[:, i] = torch.max(offsets[:, i], offsets[:, i - 1] + self.step_dt)
         self._ep_frame_offsets[env_ids] = offsets
-        p_active = torch.empty(n, device=device).uniform_(*self.frame_p_active_range, generator=gen)
-        fm = torch.rand(n, nf, device=device, generator=gen) < p_active[:, None]
-        all_off = ~fm.any(dim=1)
-        if all_off.any():
-            fm[all_off, torch.randint(0, nf, (all_off.sum(),), device=device, generator=gen)] = True
-        self._ep_frame_mask[env_ids] = fm
+        # Frame mask: U(1, nf) count, random selection — rollout guarantees >= 1
+        self._ep_frame_mask[env_ids] = self._sample_count_mask(
+            n, nf, gen, device, min_active=1)
+        # Keypoint mask: U(1, K) count, random selection — rollout guarantees >= 1
         if K > 0:
-            p_clean = torch.empty(n, device=device).uniform_(*self.rollout_mask_p_clean_range, generator=gen)
-            self._ep_kp_mask[env_ids] = torch.rand(n, K, device=device, generator=gen) < p_clean[:, None]
+            self._ep_kp_mask[env_ids] = self._sample_count_mask(
+                n, K, gen, device, min_active=1)
         self._push_offsets_to_env(env_ids)
 
     def _step_offsets(self):
@@ -314,6 +334,8 @@ class StudentLFMBFMTracker(nn.Module):
         offsets -= self.step_dt
         consumed = offsets[:, 0] <= 0
         if consumed.any():
+            # Remember consumed frame's active status before shifting
+            consumed_was_active = mask[consumed, 0].clone()
             offsets[consumed, :-1] = offsets[consumed, 1:].clone()
             mask[consumed, :-1] = mask[consumed, 1:].clone()
             n = consumed.sum()
@@ -321,13 +343,8 @@ class StudentLFMBFMTracker(nn.Module):
             gap = (gap / self.step_dt).round() * self.step_dt
             gap = gap.clamp(min=self.step_dt)
             offsets[consumed, -1] = offsets[consumed, -2] + gap
-            p = torch.empty(n, device=dev).uniform_(*self.frame_p_active_range, generator=gen)
-            mask[consumed, -1] = torch.rand(n, device=dev, generator=gen) < p
-        # Ensure at least 1 active
-        all_off = ~mask.any(dim=1)
-        if all_off.any():
-            nf = mask.shape[1]
-            mask[all_off, torch.randint(0, nf, (all_off.sum(),), device=dev, generator=gen)] = True
+            # New frame inherits consumed frame's active status (preserves count)
+            mask[consumed, -1] = consumed_was_active
         self._push_offsets_to_env()
 
     def _push_offsets_to_env(self, env_ids=None):
@@ -457,15 +474,11 @@ class StudentLFMBFMTracker(nn.Module):
             if self._stage != 1:
                 dev = frames.device
                 gen = self._get_rng(dev)
-                p_active = torch.empty(B, device=dev).uniform_(*self.frame_p_active_range, generator=gen)
-                frame_mask = torch.rand(B, nf, device=dev, generator=gen) < p_active[:, None]
-                all_off = ~frame_mask.any(dim=1)
-                if all_off.any():
-                    frame_mask[all_off, torch.randint(0, nf, (all_off.sum(),), device=dev, generator=gen)] = True
+                # Training: U(0, nf) and U(0, K) — can be all-zero
+                frame_mask = self._sample_count_mask(B, nf, gen, dev, min_active=0)
                 kp_mask = None
                 if K > 0:
-                    p_clean = torch.empty(B, device=dev).uniform_(*self.rollout_mask_p_clean_range, generator=gen)
-                    kp_mask = torch.rand(B, K, device=dev, generator=gen) < p_clean[:, None]
+                    kp_mask = self._sample_count_mask(B, K, gen, dev, min_active=0)
 
                 masked_frames = self._apply_masks(frames, frame_mask, kp_mask)
                 frame_tokens = self.frame_encoder(masked_frames, delta_t)

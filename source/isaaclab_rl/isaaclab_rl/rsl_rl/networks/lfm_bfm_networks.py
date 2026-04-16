@@ -94,6 +94,7 @@ class LatentFlowDecoder(nn.Module):
         if activation is None:
             activation = nn.GELU(approximate="tanh")
 
+        self.latent_dim = latent_dim
         self.d_model = d_model
         self.num_heads = num_heads
         self.head_dim = d_model // num_heads
@@ -221,9 +222,11 @@ class LatentFlowDecoder(nn.Module):
         """Build KV cache. If use_prev_z, appends z_prev token to context first."""
         if self.use_prev_z:
             if z_prev is None:
-                z_prev = torch.zeros(context.shape[0], context.shape[2], device=context.device)
+                B = context.shape[0]
                 if z_noised_like is not None:
                     z_prev = torch.zeros_like(z_noised_like)
+                else:
+                    z_prev = torch.zeros(B, self.latent_dim, device=context.device)
             tok_prev = self.prev_z_proj(z_prev).unsqueeze(1)
             context = torch.cat([context, tok_prev], dim=1)
             prev_mask = torch.ones(ctx_mask.shape[0], 1, dtype=torch.bool, device=ctx_mask.device)
