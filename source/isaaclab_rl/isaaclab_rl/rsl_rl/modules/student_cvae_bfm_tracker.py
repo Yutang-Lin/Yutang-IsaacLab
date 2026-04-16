@@ -389,16 +389,16 @@ class StudentCVAEBFMTracker(nn.Module):
         logvar_prior = logvar_prior.clamp(*self._LOGVAR_CLAMP)
 
         if self.compute_latent_loss and r_t.shape[-1] > 0:
-            # History dropout for prior context
+            # History dropout: run prior once with dropout applied upfront
             if self.history_dropout_prob > 0:
-                # Re-run prior with h_enc masked for some samples
                 h_drop = torch.rand(B, device=dev, generator=gen) < self.history_dropout_prob
-                if h_drop.any():
-                    h_enc_dropped = h_enc.clone()
-                    h_enc_dropped[h_drop] = 0.0
-                    mu_prior_d, logvar_prior_d = self.prior(h_enc_dropped, o_t_enc, frame_tokens, frame_mask)
-                    mu_prior[h_drop] = mu_prior_d[h_drop]
-                    logvar_prior[h_drop] = logvar_prior_d[h_drop].clamp(*self._LOGVAR_CLAMP)
+                h_enc_prior = h_enc.clone()
+                h_enc_prior[h_drop] = 0.0
+            else:
+                h_enc_prior = h_enc
+            # Re-run prior with (possibly dropped) history for clean graph
+            mu_prior, logvar_prior = self.prior(h_enc_prior, o_t_enc, frame_tokens, frame_mask)
+            logvar_prior = logvar_prior.clamp(*self._LOGVAR_CLAMP)
 
             # Residual posterior
             delta_mu, delta_logvar = self.posterior(r_t, frame_tokens, frame_mask)
@@ -409,9 +409,10 @@ class StudentCVAEBFMTracker(nn.Module):
             std_post = (0.5 * logvar_post).exp()
             z = mu_post + std_post * torch.randn_like(std_post)
 
-            # KL(posterior || prior)
-            std_prior = (0.5 * logvar_prior).exp()
-            kl = (logvar_prior - logvar_post + (std_post.pow(2) + (mu_post - mu_prior).pow(2)) / (2 * std_prior.pow(2) + 1e-8) - 0.5).mean()
+            # KL(posterior || prior) — closed form for two Gaussians
+            var_prior = logvar_prior.exp().clamp(min=1e-6)
+            var_post = logvar_post.exp().clamp(min=1e-6)
+            kl = 0.5 * (var_post / var_prior + (mu_post - mu_prior).pow(2) / var_prior - 1 + logvar_prior - logvar_post).mean()
 
             # Posterior dropout: zero z for some samples (matches rollout prior-only)
             if self.posterior_dropout > 0:
