@@ -144,11 +144,9 @@ class StudentLFMBFMTracker(nn.Module):
         # z_prev: pass previous step's z_t to the flow decoder
         self.use_prev_z = cfg.pop("use_prev_z", False)
 
-        # History dropout: probability of dropping history token during flow training
-        self.history_dropout_prob = cfg.pop("history_dropout_prob", 0.1)
-
-        # History encoding on unit sphere: L2-normalize + noise then re-normalize
-        self.history_sigma = cfg.pop("history_sigma", 0.1)
+        # Legacy args (kept for checkpoint compat, no longer used)
+        cfg.pop("history_dropout_prob", None)
+        cfg.pop("history_sigma", None)
 
         # Reconstruction decoder: z_t → posterior condition
         self.recon_coef = cfg.pop("recon_coef", 0.0)
@@ -267,14 +265,6 @@ class StudentLFMBFMTracker(nn.Module):
             self._mask_rng = torch.Generator(device=device)
             self._mask_rng.manual_seed(self._mask_rng_seed)
         return self._mask_rng
-
-    def _normalize_history(self, h_enc, add_noise=False):
-        """L2-normalize history encoding onto unit sphere, optionally add noise and re-normalize."""
-        h_enc = F.normalize(h_enc, dim=-1)
-        if add_noise and self.history_sigma > 0:
-            h_enc = h_enc + self.history_sigma * torch.randn_like(h_enc)
-            h_enc = F.normalize(h_enc, dim=-1)
-        return h_enc
 
     def _build_flow_context(self, o_t_enc, h_enc, frame_tokens, frame_mask):
         """Build flow decoder context: [o_t_enc, h_enc, frame_0, ..., frame_F-1] with masking."""
@@ -428,7 +418,7 @@ class StudentLFMBFMTracker(nn.Module):
 
         # Encode inputs separately
         o_t_enc = self.o_t_encoder(o_t)  # [B, d_model]
-        h_enc = self._normalize_history(self.history_encoder(hp_t), add_noise=False)  # rollout: no noise
+        h_enc = self.history_encoder(hp_t)  # [B, d_model]
 
         if self._stage == 1:
             # Stage 1: rollout with posterior z (privileged, no ODE)
@@ -465,9 +455,7 @@ class StudentLFMBFMTracker(nn.Module):
 
         # Always encode o_t and history
         o_t_enc = self.o_t_encoder(o_t)    # [B, d_model]
-        h_enc = self._normalize_history(
-            self.history_encoder(hp_t),
-            add_noise=self.compute_latent_loss)  # training: add noise to sphere
+        h_enc = self.history_encoder(hp_t)  # [B, d_model]
 
         if self.compute_latent_loss and r_t.shape[-1] > 0:
             # Enable grad on r_t if gradient penalty is active
@@ -499,11 +487,6 @@ class StudentLFMBFMTracker(nn.Module):
                 masked_frames = self._apply_masks(frames, frame_mask, kp_mask)
                 frame_tokens = self.frame_encoder(masked_frames, delta_t)
                 flow_context, flow_mask = self._build_flow_context(o_t_enc, h_enc, frame_tokens, frame_mask)
-
-                # History token dropout: randomly mask h_enc in flow context
-                if self.history_dropout_prob > 0:
-                    h_drop = torch.rand(B, device=dev, generator=gen) < self.history_dropout_prob
-                    flow_mask[h_drop, 1] = False  # h_enc is at position 1
 
                 z_prev_train = None
                 if self.use_prev_z and self._rollout_z_buffer is not None:
