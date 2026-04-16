@@ -144,6 +144,9 @@ class StudentLFMBFMTracker(nn.Module):
         # z_prev: pass previous step's z_t to the flow decoder
         self.use_prev_z = cfg.pop("use_prev_z", False)
 
+        # History dropout: probability of dropping history token during flow training
+        self.history_dropout_prob = cfg.pop("history_dropout_prob", 0.1)
+
         # Reconstruction decoder: z_t → posterior condition
         self.recon_coef = cfg.pop("recon_coef", 0.0)
 
@@ -483,6 +486,11 @@ class StudentLFMBFMTracker(nn.Module):
                 masked_frames = self._apply_masks(frames, frame_mask, kp_mask)
                 frame_tokens = self.frame_encoder(masked_frames, delta_t)
                 flow_context, flow_mask = self._build_flow_context(o_t_enc, h_enc, frame_tokens, frame_mask)
+
+                # History token dropout: randomly mask h_enc in flow context
+                if self.history_dropout_prob > 0:
+                    h_drop = torch.rand(B, device=dev, generator=gen) < self.history_dropout_prob
+                    flow_mask[h_drop, 1] = False  # h_enc is at position 1
 
                 z_prev_train = None
                 if self.use_prev_z and self._rollout_z_buffer is not None:
