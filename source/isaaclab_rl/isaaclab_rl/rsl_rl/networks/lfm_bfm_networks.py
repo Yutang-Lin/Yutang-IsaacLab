@@ -275,40 +275,61 @@ class LFMReconDecoder(nn.Module):
 
 
 class LFMActionDecoder(nn.Module):
-    """Action decoder: [z_t, o_t_enc] → action from z_t position."""
+    """Action decoder: concat(z_t_proj, o_t_enc, h_enc) → MLP → action."""
 
     def __init__(self, latent_dim: int, d_model: int,
-                 num_heads: int = 4, hidden_dim: int = 512,
-                 num_layers: int = 1, num_actions: int = 29,
+                 hidden_dim: int = 512, num_layers: int = 1,
+                 hidden_dims: list[int] | None = None,
+                 num_actions: int = 29,
                  dropout: float = 0.0, activation: nn.Module | None = None,
-                 use_proj_norm: bool = False):
+                 **kwargs):
+        """
+        Args:
+            latent_dim: Latent z dimension.
+            d_model: Dimension of o_t_enc and h_enc tokens.
+            hidden_dim: MLP hidden size (used when hidden_dims is None).
+            num_layers: Number of MLP hidden layers (used when hidden_dims is None).
+            hidden_dims: Explicit list of MLP hidden dims. Overrides hidden_dim/num_layers.
+            num_actions: Output action dimension.
+            dropout: Dropout rate between MLP layers.
+            activation: Activation function.
+        """
         super().__init__()
         if activation is None:
             activation = nn.GELU(approximate="tanh")
 
-        if use_proj_norm:
-            self.z_proj = nn.Sequential(nn.Linear(latent_dim, d_model), nn.LayerNorm(d_model))
-        else:
-            self.z_proj = nn.Linear(latent_dim, d_model)
-        self.z_embed = nn.Parameter(torch.randn(d_model) * 0.02)
+        self.z_proj = nn.Linear(latent_dim, d_model)
 
-        self.transformer = TransformerEncoder(
-            d_model=d_model, num_heads=num_heads, hidden_dim=hidden_dim,
-            num_layers=num_layers, dropout=dropout, is_causal=False,
-            activation=activation, enable_sdpa=False,
-        )
-        self.action_head = nn.Linear(d_model, num_actions)
+        # Build hidden dims list
+        if hidden_dims is None:
+            hidden_dims = [hidden_dim] * num_layers
 
-    def forward(self, z_t, o_t_enc):
+        mlp_input_dim = 3 * d_model  # z_proj + o_t_enc + h_enc
+        layers = []
+        in_dim = mlp_input_dim
+        for h in hidden_dims:
+            layers.extend([nn.Linear(in_dim, h), activation])
+            if dropout > 0:
+                layers.append(nn.Dropout(dropout))
+            in_dim = h
+        layers.append(nn.Linear(in_dim, num_actions))
+        self.mlp = nn.Sequential(*layers)
+        self._d_model = d_model
+
+    def forward(self, z_t, o_t_enc, h_enc=None):
         """
         Args:
             z_t: [B, latent_dim]
             o_t_enc: [B, d_model] encoded proprio
+            h_enc: [B, d_model] encoded history (optional)
 
         Returns:
             action: [B, num_actions]
         """
-        tok_z = self.z_proj(z_t) + self.z_embed
-        tokens = torch.stack([tok_z, o_t_enc], dim=1)  # [B, 2, d]
-        out = self.transformer(tokens)
-        return self.action_head(out[:, 0])  # z_t position
+        tok_z = self.z_proj(z_t)
+        if h_enc is not None:
+            x = torch.cat([tok_z, o_t_enc, h_enc], dim=-1)  # [B, 3*d]
+        else:
+            # Pad with zeros for missing h_enc to keep MLP input dim fixed
+            x = torch.cat([tok_z, o_t_enc, torch.zeros_like(o_t_enc)], dim=-1)
+        return self.mlp(x)

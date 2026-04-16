@@ -75,14 +75,21 @@ class StudentLFMBFMTracker(nn.Module):
         # -- Config --
         cfg = dict(student_policy_cfg)
         cfg.pop("class_name", None)
-        activation_name = cfg.pop("activation", "elu")
-        activation = resolve_nn_activation(activation_name)
+        activation_name = cfg.pop("activation", "gelu")
+        if activation_name == "gelu":
+            activation = nn.GELU(approximate="tanh")
+        else:
+            activation = resolve_nn_activation(activation_name)
 
         latent_dim = cfg.pop("latent_dim", 64)
-        for k in ["corr_rank", "history_hidden_dims", "posterior_hidden_dims",
+        prior_hidden_dims = cfg.pop("prior_hidden_dims", [512, 256])
+        proprio_hidden_dims = cfg.pop("proprio_hidden_dims", [512, 256])
+        posterior_hidden_dims = cfg.pop("posterior_hidden_dims", [512, 256])
+        recon_hidden_dims = cfg.pop("recon_hidden_dims", [256, 256])
+        # Discard legacy CVAE keys
+        for k in ["corr_rank", "history_hidden_dims",
                    "corr_kl_coef", "latent_kl_coef", "prior_reg_coef"]:
             cfg.pop(k, None)
-        prior_hidden_dims = cfg.pop("prior_hidden_dims", [512, 256])
 
         self.num_keypoints = cfg.pop("num_keypoints", 6)
         self.dims_per_keypoint = cfg.pop("dims_per_keypoint", 9)
@@ -114,6 +121,7 @@ class StudentLFMBFMTracker(nn.Module):
 
         cfg.pop("encoder_num_layers", None)  # unused (no shared encoder)
         decoder_num_layers = cfg.pop("decoder_num_layers", 2)
+        decoder_hidden_dims = cfg.pop("decoder_hidden_dims", None)  # MLP hidden dims; None = use tf_hidden_dim
         flow_num_layers = cfg.pop("flow_num_layers", 2)
         self.ode_steps = cfg.pop("ode_steps", 10)
         self.posterior_sigma = cfg.pop("posterior_sigma", 0.1)
@@ -138,7 +146,6 @@ class StudentLFMBFMTracker(nn.Module):
 
         # Reconstruction decoder: z_t → posterior condition
         self.recon_coef = cfg.pop("recon_coef", 0.0)
-        recon_hidden_dims = cfg.pop("recon_hidden_dims", [256, 256])
 
         # Two-stage training: stage1 trains posterior/decoder, stage2 trains flow
         self.flow_start_step = cfg.pop("flow_start_step", 0)  # 0 = no staging, train all together
@@ -151,11 +158,11 @@ class StudentLFMBFMTracker(nn.Module):
         # -- Networks (separate encoders, no shared transformer) --
 
         # Stage 1 networks (trained in stage 1, frozen in stage 2):
-        self.o_t_encoder = _build_mlp(current_proprio_dim, [512, 256], tf_d_model, activation)
-        self.posterior = _build_mlp(keybody_dim, [512, 256], latent_dim, activation)
+        self.o_t_encoder = _build_mlp(current_proprio_dim, proprio_hidden_dims, tf_d_model, activation)
+        self.posterior = _build_mlp(keybody_dim, posterior_hidden_dims, latent_dim, activation)
+        self.history_encoder = _build_mlp(history_proprio_dim, prior_hidden_dims, tf_d_model, activation)
 
         # Stage 2 networks (frozen in stage 1, trained in stage 2):
-        self.history_encoder = _build_mlp(history_proprio_dim, prior_hidden_dims, tf_d_model, activation)
         self.frame_encoder = BFMFrameEncoder(
             self.num_keypoints, self.dims_per_keypoint, tf_d_model, tf_activation)
 
@@ -166,11 +173,17 @@ class StudentLFMBFMTracker(nn.Module):
             use_proj_norm=use_proj_norm,
             use_prev_z=self.use_prev_z)
 
-        # Action decoder: [z_t, o_t_enc] → action
-        self.action_decoder = LFMActionDecoder(
-            latent_dim, tf_d_model, tf_num_heads, tf_hidden_dim,
-            decoder_num_layers, num_actions, tf_dropout, tf_activation,
-            use_proj_norm=use_proj_norm)
+        # Action decoder: concat(z_proj, o_t_enc, h_enc) → MLP → action
+        if decoder_hidden_dims is not None:
+            # Use explicit hidden dims list for MLP layers
+            self.action_decoder = LFMActionDecoder(
+                latent_dim, tf_d_model, hidden_dims=decoder_hidden_dims,
+                num_actions=num_actions, activation=tf_activation)
+        else:
+            self.action_decoder = LFMActionDecoder(
+                latent_dim, tf_d_model, num_layers=decoder_num_layers,
+                hidden_dim=tf_hidden_dim, num_actions=num_actions,
+                activation=tf_activation)
 
         # Reconstruction decoder: z_t → posterior condition (optional)
         self.recon_decoder = None
@@ -384,13 +397,13 @@ class StudentLFMBFMTracker(nn.Module):
 
         # Encode inputs separately
         o_t_enc = self.o_t_encoder(o_t)  # [B, d_model]
+        h_enc = self.history_encoder(hp_t)  # [B, d_model] — used by both stages
 
         if self._stage == 1:
             # Stage 1: rollout with posterior z (privileged, no ODE)
             z_t = self.posterior(r_t)
         else:
             # Stage 0 or 2: rollout with flow ODE
-            h_enc = self.history_encoder(hp_t)                        # [B, d_model]
             frame_tokens = self.frame_encoder(masked_frames, delta_t) # [B, F, d_model]
             flow_context, flow_mask = self._build_flow_context(
                 o_t_enc, h_enc, frame_tokens, cur_frame_mask)
@@ -402,7 +415,7 @@ class StudentLFMBFMTracker(nn.Module):
             self._ep_prev_z[:B] = z_t.detach()
             self._rollout_z_list.append(z_t.detach().clone())
 
-        action_mean = self.action_decoder(z_t, o_t_enc)
+        action_mean = self.action_decoder(z_t, o_t_enc, h_enc)
 
         std = self.std.expand_as(action_mean)
         self.distribution = Normal(action_mean, std)
@@ -419,39 +432,19 @@ class StudentLFMBFMTracker(nn.Module):
         B = frames.shape[0]
         nf, K = self.num_frames, self.rollout_mask_num_keypoints
 
-        if self.compute_latent_loss:
-            dev = frames.device
-            gen = self._get_rng(dev)
-            p_active = torch.empty(B, device=dev).uniform_(*self.frame_p_active_range, generator=gen)
-            frame_mask = torch.rand(B, nf, device=dev, generator=gen) < p_active[:, None]
-            all_off = ~frame_mask.any(dim=1)
-            if all_off.any():
-                frame_mask[all_off, torch.randint(0, nf, (all_off.sum(),), device=dev, generator=gen)] = True
-            kp_mask = None
-            if K > 0:
-                p_clean = torch.empty(B, device=dev).uniform_(*self.rollout_mask_p_clean_range, generator=gen)
-                kp_mask = torch.rand(B, K, device=dev, generator=gen) < p_clean[:, None]
-        else:
-            frame_mask = torch.ones(B, nf, dtype=torch.bool, device=frames.device)
-            kp_mask = None
-
-        masked_frames = self._apply_masks(frames, frame_mask, kp_mask)
-
-        # Encode inputs separately
-        o_t_enc = self.o_t_encoder(o_t)                            # [B, d_model]
-        h_enc = self.history_encoder(hp_t)                         # [B, d_model]
-        frame_tokens = self.frame_encoder(masked_frames, delta_t)  # [B, F, d_model]
-        flow_context, flow_mask = self._build_flow_context(o_t_enc, h_enc, frame_tokens, frame_mask)
+        # Always encode o_t and history
+        o_t_enc = self.o_t_encoder(o_t)    # [B, d_model]
+        h_enc = self.history_encoder(hp_t)  # [B, d_model]
 
         if self.compute_latent_loss and r_t.shape[-1] > 0:
-            # Enable grad on r_t if gradient penalty is active (single posterior forward)
+            # Enable grad on r_t if gradient penalty is active
             if self.grad_penalty_coef > 0:
                 r_t = r_t.detach().requires_grad_(True)
 
-            # Posterior: MLP r_t → z_t in [-1, 1]
+            # Posterior: MLP r_t → z_t
             z_t = self.posterior(r_t)
 
-            # Gradient penalty: reuse the same z_t, no extra posterior forward
+            # Gradient penalty
             grad_penalty = None
             if self.grad_penalty_coef > 0:
                 grads = torch.autograd.grad(
@@ -459,71 +452,84 @@ class StudentLFMBFMTracker(nn.Module):
                 )[0]
                 grad_penalty = grads.pow(2).mean()
 
-            # z_prev for flow decoder: previous step's rollout z from buffer
-            z_prev_train = None
-            if self.use_prev_z and self._rollout_z_buffer is not None:
-                if self._train_step > 0:
-                    z_prev_train = self._rollout_z_buffer[self._train_step - 1]
+            # --- Flow loss: only in stage 2 (or stage 0 = joint) ---
+            flow_loss = None
+            if self._stage != 1:
+                dev = frames.device
+                gen = self._get_rng(dev)
+                p_active = torch.empty(B, device=dev).uniform_(*self.frame_p_active_range, generator=gen)
+                frame_mask = torch.rand(B, nf, device=dev, generator=gen) < p_active[:, None]
+                all_off = ~frame_mask.any(dim=1)
+                if all_off.any():
+                    frame_mask[all_off, torch.randint(0, nf, (all_off.sum(),), device=dev, generator=gen)] = True
+                kp_mask = None
+                if K > 0:
+                    p_clean = torch.empty(B, device=dev).uniform_(*self.rollout_mask_p_clean_range, generator=gen)
+                    kp_mask = torch.rand(B, K, device=dev, generator=gen) < p_clean[:, None]
 
-            # Flow loss: noise z_t, predict velocity in latent space
-            t = torch.rand(B, device=frames.device)
-            eps = torch.randn(B, self.latent_dim, device=frames.device)
-            z_noised = (1 - t.unsqueeze(-1)) * z_t + t.unsqueeze(-1) * eps
-            v_t = eps - z_t  # instantaneous velocity
+                masked_frames = self._apply_masks(frames, frame_mask, kp_mask)
+                frame_tokens = self.frame_encoder(masked_frames, delta_t)
+                flow_context, flow_mask = self._build_flow_context(o_t_enc, h_enc, frame_tokens, frame_mask)
 
-            if self.use_mean_flow:
-                # MeanFlow: sample r, compute JVP for self-consistency
-                from torch.func import jvp as func_jvp
-                from torch.nn.attention import sdpa_kernel, SDPBackend
+                z_prev_train = None
+                if self.use_prev_z and self._rollout_z_buffer is not None:
+                    if self._train_step > 0:
+                        z_prev_train = self._rollout_z_buffer[self._train_step - 1]
 
-                prop_mask = torch.rand(B, device=frames.device) < self.mf_propagation_ratio
-                r = t.clone()
-                prop_idx = prop_mask.nonzero(as_tuple=True)[0]
-                if prop_idx.numel() > 0:
-                    r[prop_idx] = torch.rand(prop_idx.numel(), device=frames.device) * t[prop_idx]
+                t = torch.rand(B, device=dev)
+                eps = torch.randn(B, self.latent_dim, device=dev)
+                z_noised = (1 - t.unsqueeze(-1)) * z_t + t.unsqueeze(-1) * eps
+                v_t = eps - z_t
 
-                v_pred = self.latent_flow(z_noised, t, flow_context, flow_mask, r=r, z_prev=z_prev_train)
+                if self.use_mean_flow:
+                    from torch.func import jvp as func_jvp
+                    from torch.nn.attention import sdpa_kernel, SDPBackend
 
-                # JVP only on propagation subset
-                du_dt = torch.zeros_like(v_pred)
-                if prop_idx.numel() > 0:
-                    zp_sub = z_prev_train[prop_idx] if z_prev_train is not None else None
-                    def _flow_fn(z, t_, r_):
-                        return self.latent_flow(z, t_, flow_context[prop_idx], flow_mask[prop_idx], r=r_, z_prev=zp_sub)
-                    with sdpa_kernel(SDPBackend.MATH):
-                        _, du_sub = func_jvp(
-                            _flow_fn,
-                            (z_noised[prop_idx], t[prop_idx], r[prop_idx]),
-                            (v_t[prop_idx], torch.ones(prop_idx.numel(), device=frames.device),
-                             torch.zeros(prop_idx.numel(), device=frames.device)),
-                        )
-                    du_dt[prop_idx] = du_sub
+                    prop_mask = torch.rand(B, device=dev) < self.mf_propagation_ratio
+                    r = t.clone()
+                    prop_idx = prop_mask.nonzero(as_tuple=True)[0]
+                    if prop_idx.numel() > 0:
+                        r[prop_idx] = torch.rand(prop_idx.numel(), device=dev) * t[prop_idx]
 
-                t_minus_r = (t - r).unsqueeze(-1)  # [B, 1]
-                u_target = v_t - t_minus_r * du_dt
-                flow_loss = F.mse_loss(v_pred, u_target.detach())
-            else:
-                # Standard flow matching (r=t, passed implicitly via default)
-                v_pred = self.latent_flow(z_noised, t, flow_context, flow_mask, z_prev=z_prev_train)
-                flow_loss = F.mse_loss(v_pred, v_t)
+                    v_pred = self.latent_flow(z_noised, t, flow_context, flow_mask, r=r, z_prev=z_prev_train)
 
-            # Advance training step counter (wraps per epoch)
-            if self.use_prev_z and self._rollout_z_buffer is not None:
-                self._train_step = (self._train_step + 1) % self._rollout_z_buffer.shape[0]
+                    du_dt = torch.zeros_like(v_pred)
+                    if prop_idx.numel() > 0:
+                        zp_sub = z_prev_train[prop_idx] if z_prev_train is not None else None
+                        def _flow_fn(z, t_, r_):
+                            return self.latent_flow(z, t_, flow_context[prop_idx], flow_mask[prop_idx], r=r_, z_prev=zp_sub)
+                        with sdpa_kernel(SDPBackend.MATH):
+                            _, du_sub = func_jvp(
+                                _flow_fn,
+                                (z_noised[prop_idx], t[prop_idx], r[prop_idx]),
+                                (v_t[prop_idx], torch.ones(prop_idx.numel(), device=dev),
+                                 torch.zeros(prop_idx.numel(), device=dev)),
+                            )
+                        du_dt[prop_idx] = du_sub
 
-            # Reconstruction loss: z_t → posterior condition
+                    t_minus_r = (t - r).unsqueeze(-1)
+                    u_target = v_t - t_minus_r * du_dt
+                    flow_loss = F.mse_loss(v_pred, u_target.detach())
+                else:
+                    v_pred = self.latent_flow(z_noised, t, flow_context, flow_mask, z_prev=z_prev_train)
+                    flow_loss = F.mse_loss(v_pred, v_t)
+
+                if self.use_prev_z and self._rollout_z_buffer is not None:
+                    self._train_step = (self._train_step + 1) % self._rollout_z_buffer.shape[0]
+
+            # --- Recon loss: only in stage 1 (or stage 0 = joint) ---
             recon_loss = None
-            if self.recon_decoder is not None:
+            if self._stage != 2 and self.recon_decoder is not None:
                 recon_pred = self.recon_decoder(z_t)
                 recon_loss = F.mse_loss(recon_pred, r_t.detach())
 
-            # Boundary loss: penalize |z_t| > 1 per dimension
+            # Boundary loss
             boundary_loss = F.relu(z_t.abs() - 1.0).pow(2).mean()
 
             # Add fixed noise for tolerance area
             z_posterior = z_t + self.posterior_sigma * torch.randn_like(z_t)
 
-            # Spread loss: push per-dim variance toward U(-1,1) variance (1/3)
+            # Spread loss
             spread_loss = None
             if self.spread_coef > 0:
                 target_var = 0.1
@@ -538,13 +544,16 @@ class StudentLFMBFMTracker(nn.Module):
                 "recon_loss": recon_loss,
             }
 
-            # Action from z_posterior
-            action_mean = self.action_decoder(z_posterior, o_t_enc)
+            action_mean = self.action_decoder(z_posterior, o_t_enc, h_enc)
             return action_mean
         else:
-            # Inference: latent ODE
+            # Inference: latent ODE (needs frame_encoder + flow)
+            frame_mask = torch.ones(B, nf, dtype=torch.bool, device=frames.device)
+            masked_frames = self._apply_masks(frames, frame_mask, None)
+            frame_tokens = self.frame_encoder(masked_frames, delta_t)
+            flow_context, flow_mask = self._build_flow_context(o_t_enc, h_enc, frame_tokens, frame_mask)
             z_t = self._ode_sample_latent(flow_context, flow_mask, B, frames.device)
-            action_mean = self.action_decoder(z_t, o_t_enc)
+            action_mean = self.action_decoder(z_t, o_t_enc, h_enc)
             return action_mean
 
     def extra_loss(self, **kwargs):
@@ -557,13 +566,13 @@ class StudentLFMBFMTracker(nn.Module):
 
         # Stage 1: log flow loss but don't backprop through it
         # Stage 2: only flow loss (posterior/decoder frozen)
-        if self._stage == 1:
-            log_dict["flow"] = d["flow_loss"].item()
-            # no flow in loss_dict — flow decoder is frozen anyway
-        else:
-            loss_dict["flow"] = d["flow_loss"]
+        # Flow loss: only computed in stage 2 (or stage 0 = joint)
+        if d["flow_loss"] is not None:
+            if self._stage == 2 or self._stage == 0:
+                loss_dict["flow"] = d["flow_loss"]
             log_dict["flow"] = d["flow_loss"].item()
 
+        # Stage 1 losses: boundary, spread, grad_penalty, recon
         if self._stage != 2:
             loss_dict["boundary"] = d["boundary_loss"] * self.boundary_coef
             log_dict["boundary"] = d["boundary_loss"].item()
@@ -580,12 +589,10 @@ class StudentLFMBFMTracker(nn.Module):
                 loss_dict["recon"] = d["recon_loss"] * self.recon_coef
                 log_dict["recon"] = d["recon_loss"].item()
         else:
-            # Stage 2: still log auxiliary losses for monitoring
+            # Stage 2: log auxiliary losses for monitoring (no backprop)
             log_dict["boundary"] = d["boundary_loss"].item()
             if d["spread_loss"] is not None:
                 log_dict["spread"] = d["spread_loss"].item()
-            if d["recon_loss"] is not None:
-                log_dict["recon"] = d["recon_loss"].item()
 
         self._save_dict = {}
         return dict(loss_dict), dict(log_dict)
@@ -594,33 +601,33 @@ class StudentLFMBFMTracker(nn.Module):
         """Freeze/unfreeze parameters for the given training stage."""
         self._stage = stage
         if stage == 1:
-            # Stage 1: train o_t_encoder, posterior, action_decoder, recon
-            # Freeze: latent_flow, history_encoder, frame_encoder
-            for m in [self.o_t_encoder, self.posterior, self.action_decoder]:
+            # Stage 1: train o_t_encoder, posterior, history_encoder, action_decoder, recon
+            # Freeze: latent_flow, frame_encoder
+            for m in [self.o_t_encoder, self.posterior, self.history_encoder, self.action_decoder]:
                 for p in m.parameters():
                     p.requires_grad = True
             if self.recon_decoder is not None:
                 for p in self.recon_decoder.parameters():
                     p.requires_grad = True
             self.std.requires_grad = True
-            for m in [self.latent_flow, self.history_encoder, self.frame_encoder]:
+            for m in [self.latent_flow, self.frame_encoder]:
                 for p in m.parameters():
                     p.requires_grad = False
-            print(f"[INFO] LFM-BFM: entering stage 1 (o_t+posterior+action, flow/history/frames frozen)")
+            print(f"[INFO] LFM-BFM: entering stage 1 (o_t+posterior+history+action, flow/frames frozen)")
         elif stage == 2:
-            # Stage 2: train latent_flow, history_encoder, frame_encoder
-            # Freeze: o_t_encoder, posterior, action_decoder, recon
-            for m in [self.latent_flow, self.history_encoder, self.frame_encoder]:
+            # Stage 2: train latent_flow, frame_encoder
+            # Freeze: o_t_encoder, posterior, history_encoder, action_decoder, recon
+            for m in [self.latent_flow, self.frame_encoder]:
                 for p in m.parameters():
                     p.requires_grad = True
-            for m in [self.o_t_encoder, self.posterior, self.action_decoder]:
+            for m in [self.o_t_encoder, self.posterior, self.history_encoder, self.action_decoder]:
                 for p in m.parameters():
                     p.requires_grad = False
             if self.recon_decoder is not None:
                 for p in self.recon_decoder.parameters():
                     p.requires_grad = False
             self.std.requires_grad = False
-            print(f"[INFO] LFM-BFM: entering stage 2 (flow+history+frames, o_t+posterior+action frozen)")
+            print(f"[INFO] LFM-BFM: entering stage 2 (flow+frames, o_t+posterior+history+action frozen)")
 
     def pre_train(self):
         self.compute_latent_loss = True
