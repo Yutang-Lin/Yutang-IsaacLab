@@ -230,3 +230,61 @@ class CVAEBFMDecoderV2(nn.Module):
         tok_z = self.z_proj(z)
         x = torch.cat([tok_z, o_t_enc], dim=-1)
         return self.mlp(x)
+
+
+# Legacy decoder kept for VQ-VAE BFM and other trackers that use the old interface
+class CVAEBFMDecoder(nn.Module):
+    """Transformer action decoder (legacy interface for VQ-VAE BFM).
+
+    Token layout: [proprio(0), prior(1), posterior(2), frame_0(3), ..., frame_{F-1}(F+2)]
+    """
+
+    def __init__(self, proprio_dim: int, latent_dim: int, max_frames: int,
+                 d_model: int, frame_encoder: BFMFrameEncoder,
+                 num_heads: int = 4, hidden_dim: int = 512, num_layers: int = 2,
+                 num_actions: int = 29, dropout: float = 0.0,
+                 activation: nn.Module | None = None):
+        super().__init__()
+        if activation is None:
+            activation = nn.GELU(approximate="tanh")
+
+        self.frame_encoder = frame_encoder
+
+        self.proprio_proj = nn.Linear(proprio_dim, d_model)
+        self.prior_proj = nn.Linear(latent_dim, d_model)
+        self.posterior_proj = nn.Linear(latent_dim, d_model)
+
+        self.proprio_embed = nn.Parameter(torch.randn(d_model) * 0.02)
+        self.prior_embed = nn.Parameter(torch.randn(d_model) * 0.02)
+        self.posterior_embed = nn.Parameter(torch.randn(d_model) * 0.02)
+
+        self.transformer = TransformerEncoder(
+            d_model=d_model, num_heads=num_heads, hidden_dim=hidden_dim,
+            num_layers=num_layers, dropout=dropout, is_causal=False,
+            activation=activation, enable_sdpa=False,
+        )
+        self.action_head = nn.Linear(d_model, num_actions)
+
+    def forward(self, o_t, h_prior, c_t, frames_flat, delta_t, frame_mask, pre_encoded=False):
+        B, F = frames_flat.shape[:2]
+        if pre_encoded:
+            tok_proprio = o_t + self.proprio_embed
+            tok_prior = h_prior + self.prior_embed
+        else:
+            tok_proprio = self.proprio_proj(o_t) + self.proprio_embed
+            tok_prior = self.prior_proj(h_prior) + self.prior_embed
+        tok_posterior = self.posterior_proj(c_t) + self.posterior_embed
+        tok_frames = self.frame_encoder(frames_flat, delta_t)
+
+        tokens = torch.cat([
+            tok_proprio.unsqueeze(1), tok_prior.unsqueeze(1),
+            tok_posterior.unsqueeze(1), tok_frames,
+        ], dim=1)
+
+        attn_mask = _build_frame_attn_mask(B, F, frame_mask, n_prefix=3, device=o_t.device)
+        out = self.transformer(tokens, attn_mask=attn_mask)
+        return self.action_head(out[:, 0])
+
+
+# Legacy alias
+CVAEBFMPosterior = CVAEBFMPosteriorV2
