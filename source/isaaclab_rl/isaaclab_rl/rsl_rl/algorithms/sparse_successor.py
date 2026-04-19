@@ -81,7 +81,21 @@ class SparseSuccessor:
         # the expert motion buffer's keypoint positions (BFM-style expert
         # rollout). 0 disables entirely — the replay buffer then contains no
         # expert-anchored rollout trajectories.
+        #
+        # **Deprecated**: kept for backward-compatibility only. The rollout
+        # source mixture now uses the 3-way ``rollout_{live,replay,expert}_fraction``
+        # knobs below. If any of those are set, ``expert_chunk_fraction`` is
+        # ignored.
         expert_chunk_fraction: float = 0.15,
+        # 3-way per-env source mixture for fresh rollout chunks. Normalised
+        # to sum to 1 at runtime; missing sources (e.g. no expert buffer,
+        # empty replay) fold their mass into the remaining ones.
+        #   - live:    env's current priv (single-frame, phase-1 leftover)
+        #   - replay:  per-atom future-grounded from replay's realized future
+        #   - expert:  per-atom future-grounded from expert motion buffer
+        rollout_live_fraction: float = 0.2,
+        rollout_replay_fraction: float = 0.3,
+        rollout_expert_fraction: float = 0.5,
         # Training-time C-space relabeling ratios.
         relabel_ratio_stored: float = 0.4,
         relabel_ratio_hindsight: float = 0.3,
@@ -177,6 +191,9 @@ class SparseSuccessor:
         self.constraint_dropout_prob = constraint_dropout_prob
         self.constraint_horizon = int(constraint_horizon)
         self.expert_chunk_fraction = float(expert_chunk_fraction)
+        self.rollout_live_fraction = float(rollout_live_fraction)
+        self.rollout_replay_fraction = float(rollout_replay_fraction)
+        self.rollout_expert_fraction = float(rollout_expert_fraction)
         # Normalise relabel ratios so they sum to 1.
         total_r = float(relabel_ratio_stored + relabel_ratio_hindsight + relabel_ratio_expert)
         if total_r <= 0.0:
@@ -431,31 +448,96 @@ class SparseSuccessor:
             needs_new = needs_new | reset_mask.to(self.device, dtype=torch.bool)
 
         if needs_new.any():
-            # Candidate source 1: sample from current priv (self-supervised).
+            # Per-env 3-way mixture for fresh rollout chunks:
+            #   - live/self (single-frame, phase-1 leftover): ``rollout_live_fraction``
+            #   - replay-future (per-atom, real future from storage):
+            #     ``rollout_replay_fraction``
+            #   - expert-future (per-atom, from the expert buffer):
+            #     ``rollout_expert_fraction``
+            # Goal: push the rollout-task distribution toward
+            # future-grounded sparse tracking. Live/self stays the smallest
+            # share so the actor can't collapse into "hold current pose."
             n_new = int(needs_new.sum().item())
+
+            # Initialise with a full live/self draw — we'll overlay replay
+            # and expert rows below. ``random_C`` has ``num_envs`` rows;
+            # we only mutate the rows under ``needs_new``.
             random_C = self.sample_constraint_set_vectorized(next_priv_obs, num_envs)
 
-            # Optional source 2: expert-anchored chunk for a random fraction.
-            # Per-atom future-grounded: we pull the expert's keypoint *future
-            # window* starting at some anchor frame, and each atomic query
-            # independently samples ``τ_i ∈ [1, tau_max]`` and draws its
-            # target from ``kp_window[τ_i]``.
-            if (
-                self.expert_buffer is not None
-                and self.expert_chunk_fraction > 0.0
-            ):
-                expert_mask_of_new = torch.rand(n_new, device=self.device) < self.expert_chunk_fraction
-                if expert_mask_of_new.any():
-                    n_expert = int(expert_mask_of_new.sum().item())
-                    expert_batch = self.expert_buffer.sample_with_future_window(
-                        n_expert, horizon=self.tau_max,
-                    )
-                    expert_window = expert_batch["kp_window"].to(self.device)  # [E, H+1, K, 3]
-                    expert_C = self._sample_constraints_from_keypoint_future(expert_window)
-                    new_env_ids = needs_new.nonzero(as_tuple=True)[0]
-                    expert_env_ids = new_env_ids[expert_mask_of_new]
-                    for key, ev in random_C.items():
-                        ev[expert_env_ids] = expert_C[key]
+            # Decide per-new-env source. Replay-future needs at least
+            # ``tau_max + 1`` steps of populated storage so the future
+            # window has room; until then its probability folds into the
+            # live/expert sources.
+            p_live = float(self.rollout_live_fraction)
+            replay_ready = (
+                self.storage is not None
+                and (
+                    self.storage._full
+                    or self.storage.step >= self.tau_max + 1
+                )
+            )
+            p_replay = float(self.rollout_replay_fraction) if replay_ready else 0.0
+            p_expert = float(self.rollout_expert_fraction) if self.expert_buffer is not None else 0.0
+            total_p = p_live + p_replay + p_expert
+            if total_p <= 0.0:
+                p_live, p_replay, p_expert = 1.0, 0.0, 0.0
+            else:
+                p_live, p_replay, p_expert = p_live / total_p, p_replay / total_p, p_expert / total_p
+            probs = torch.tensor([p_live, p_replay, p_expert], device=self.device)
+            source = torch.multinomial(probs, n_new, replacement=True)  # [n_new] in {0,1,2}
+
+            new_env_ids = needs_new.nonzero(as_tuple=True)[0]
+
+            # --- Replay-future source ---
+            replay_mask_of_new = source == 1
+            if replay_mask_of_new.any():
+                n_replay = int(replay_mask_of_new.sum().item())
+                sdev = self.storage.storage_device
+                max_t = (
+                    self.storage.num_transitions_per_env
+                    if self.storage._full else self.storage.step
+                )
+                # Anchor at a random (t, env) coordinate in the replay.
+                # Constrain t so t + tau_max fits in the populated region.
+                max_anchor = max(max_t - self.tau_max, 1)
+                t_anchor = torch.randint(0, max_anchor, (n_replay,), device=sdev)
+                env_anchor = torch.randint(0, self.storage.num_envs, (n_replay,), device=sdev)
+                priv_window, valid = self.storage.gather_next_priv_at(
+                    t_anchor, env_anchor, horizon=self.tau_max,
+                )
+                priv_window = priv_window.to(self.device)
+                valid = valid.to(self.device)
+                nk = self.policy.num_keypoints
+                td = self.policy.target_dim
+                priv_dim = priv_window.shape[-1]
+                kp_offset = priv_dim - nk * td
+                kp_window = priv_window[..., kp_offset:].reshape(
+                    priv_window.shape[0], priv_window.shape[1], nk, td,
+                )                                                         # [n_replay, H+1, K, 3]
+                replay_C = self._sample_constraints_from_keypoint_future(
+                    kp_window, valid_atom_mask=valid,
+                )
+                replay_env_ids = new_env_ids[replay_mask_of_new]
+                for key, rv in replay_C.items():
+                    random_C[key][replay_env_ids] = rv
+
+            # --- Expert-future source ---
+            expert_mask_of_new = source == 2
+            if expert_mask_of_new.any() and self.expert_buffer is not None:
+                n_expert = int(expert_mask_of_new.sum().item())
+                expert_batch = self.expert_buffer.sample_with_future_window(
+                    n_expert, horizon=self.tau_max,
+                )
+                expert_window = expert_batch["kp_window"].to(self.device)  # [E, H+1, K, 3]
+                expert_C = self._sample_constraints_from_keypoint_future(expert_window)
+                expert_env_ids = new_env_ids[expert_mask_of_new]
+                for key, ev in expert_C.items():
+                    random_C[key][expert_env_ids] = ev
+
+            # Record source mix for diagnostics.
+            self._diag_rollout_source_live = float((source == 0).float().mean().item())
+            self._diag_rollout_source_replay = float((source == 1).float().mean().item())
+            self._diag_rollout_source_expert = float((source == 2).float().mean().item())
 
             self._replace_constraints_for_envs(needs_new, random_C)
 
@@ -1565,6 +1647,20 @@ class SparseSuccessor:
                 capacity = self.storage.num_transitions_per_env * self.storage.num_envs
                 self._diag_add("Replay/size", float(size))
                 self._diag_add("Replay/fill_ratio", size / max(capacity, 1))
+
+            # Rollout chunk source mixture (recorded at the last
+            # ``_advance_chunk`` call with fresh envs). These scalars are
+            # per-env fractions, summing to ~1 across the three sources.
+            for key in (
+                "_diag_rollout_source_live",
+                "_diag_rollout_source_replay",
+                "_diag_rollout_source_expert",
+            ):
+                if hasattr(self, key):
+                    tag = "Rollout/" + key.replace("_diag_rollout_source_", "source_")
+                    self._diag_add(tag, getattr(self, key))
+            if hasattr(self, "_diag_rollout_fresh_frac"):
+                self._diag_add("Rollout/fresh_fraction", self._diag_rollout_fresh_frac)
 
             # Merge the full diagnostic dict (mean across mini-batches).
             loss_dict.update(self._diag)

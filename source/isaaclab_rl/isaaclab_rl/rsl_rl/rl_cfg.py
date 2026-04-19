@@ -982,10 +982,26 @@ class RslRlSparseSuccessorAlgorithmCfg:
     the legacy per-step resampling behaviour."""
 
     expert_chunk_fraction: float = 0.15
-    """Fraction of newly-sampled rollout chunks (at chunk boundaries) that
-    draw their constraint set from the expert motion buffer's keypoints
-    instead of the live privileged state. Small by design — the method is
-    meant to be self-supervised, not imitation-heavy."""
+    """**Deprecated** — kept for backward-compatibility. The rollout source
+    mixture now uses the three ``rollout_{live,replay,expert}_fraction``
+    knobs below. This field is retained only so older configs don't break."""
+
+    rollout_live_fraction: float = 0.2
+    """Per-env source share for fresh rollout chunks: sample the constraint
+    set from the env's CURRENT priv frame (single-frame, phase-1 leftover).
+    Kept small so the actor can't collapse into "hold your current pose"."""
+
+    rollout_replay_fraction: float = 0.3
+    """Per-env source share for fresh rollout chunks: sample a random
+    (t, env) anchor from the replay buffer and build a per-atom future-
+    grounded C from the env's REALIZED future priv over ``tau_max`` steps.
+    Atoms whose ``τ_i`` crosses a reset are masked out automatically."""
+
+    rollout_expert_fraction: float = 0.5
+    """Per-env source share for fresh rollout chunks: per-atom future-
+    grounded C from the expert motion buffer's keypoint window. Should be
+    the dominant source so the rollout task distribution is centred on
+    expert-reachable sparse goals."""
 
     relabel_ratio_stored: float = 0.4
     """Per-sample relabeling share: keep the constraint set that was actually
