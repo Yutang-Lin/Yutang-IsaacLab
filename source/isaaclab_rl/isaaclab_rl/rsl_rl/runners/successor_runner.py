@@ -494,12 +494,12 @@ class SuccessorRunner(BaseRunner):
                 dist.all_reduce(ep_len_t)
                 dist.all_reduce(count_t)
                 if count_t.item() > 0 and not self.disable_logs:
-                    # Use the already-updated env_steps total (log() hasn't
-                    # run yet so we add one collection-size worth here to
-                    # stay on the same axis as the panel it produces next).
-                    env_steps_for_log = int(self.tot_timesteps) + (
-                        self.num_steps_per_env * self.env.num_envs * self.gpu_world_size
-                    )
+                    # ``tot_timesteps`` has already been bumped for this
+                    # iter earlier in the loop, so no +collection_size
+                    # adjustment needed — log() and this block must agree
+                    # on the same step index or wandb rejects a write for
+                    # being out of order.
+                    env_steps_for_log = int(self.tot_timesteps)
                     self.writer.add_scalar(
                         "Train/global_mean_reward", (reward_t / count_t).item(), env_steps_for_log
                     )
