@@ -1035,6 +1035,16 @@ class RslRlSparseSuccessorAlgorithmCfg:
     num_steps_per_env=1. Transitions during seed are still written to the
     replay buffer."""
 
+    eval_interval_env_steps: int = 0
+    """Run the sparse-constraint tracking eval every this many env steps.
+    0 disables eval. The eval queries the replay buffer to report per-τ and
+    per-keypoint β-normalised position error. Cheap (a few hundred ms) —
+    safe to set to e.g. 500_000 or 1_000_000 env steps."""
+
+    eval_num_samples_per_bucket: int = 512
+    """Number of (time, env) anchor points sampled per τ bucket by
+    ``evaluate_tracking``."""
+
     num_updates_per_iter: int | None = None
     """Number of gradient updates (each = one full SAC-style update block:
     discriminator, successor critics, style critics, actor, soft target) per

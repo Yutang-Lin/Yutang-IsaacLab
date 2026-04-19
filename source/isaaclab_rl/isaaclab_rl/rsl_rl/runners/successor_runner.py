@@ -232,6 +232,11 @@ class SuccessorRunner(BaseRunner):
         # it here as self._env_steps_total so decisions based on the counter
         # are consistent within the learn() loop.
         self._env_steps_total = int(self.tot_timesteps)
+        # Initial-eval latch — forces an eval on the first iter where the
+        # replay has enough data, so the eval panels have an anchor at
+        # near-zero env_steps instead of only showing up at the first
+        # interval boundary.
+        self._did_initial_eval = False
 
         # Sample uniform-random actions in the actor's output range for the
         # warmup phase. The actor clamps to [action_low, action_high] anyway
@@ -352,6 +357,26 @@ class SuccessorRunner(BaseRunner):
             if hasattr(env_u, "consume_reset_stats"):
                 reset_stats = env_u.consume_reset_stats()
                 loss_dict.update(reset_stats)
+
+            # ---- Sparse-constraint tracking eval (Option A) ----
+            # Pure replay query; doesn't touch the live sim. Fires:
+            #   (a) the first time the replay has enough data (sanity check),
+            #   (b) every time ``env_steps_total`` crosses an integer multiple
+            #       of ``eval_interval_env_steps`` after that.
+            eval_interval = int(getattr(self.alg, "eval_interval_env_steps", 0))
+            if eval_interval > 0:
+                post_env_steps = self._env_steps_total + self.num_steps_per_env * self.env.num_envs * self.gpu_world_size
+                prev_bucket = self._env_steps_total // eval_interval
+                curr_bucket = post_env_steps // eval_interval
+                replay_ready = self.alg.storage is not None and self.alg.storage.size >= self.alg.mini_batch_size
+                first_eval = (not self._did_initial_eval) and replay_ready
+                interval_crossed = curr_bucket > prev_bucket and replay_ready
+                if first_eval or interval_crossed:
+                    eval_metrics = self.alg.evaluate_tracking(
+                        num_samples_per_bucket=self.alg.eval_num_samples_per_bucket,
+                    )
+                    loss_dict.update(eval_metrics)
+                    self._did_initial_eval = True
 
             if hasattr(self.env.unwrapped, "post_update"):
                 env_loss_dict = self.env.unwrapped.post_update()

@@ -101,6 +101,10 @@ class SparseSuccessor:
         # critic cold-start sees a reasonable state-action distribution when
         # learning kicks in. Counted in env transitions, not iterations.
         num_seed_steps: int = 0,
+        # Sparse-constraint tracking eval — runner-side frequency is in
+        # env steps. Set eval_interval_env_steps=0 to disable.
+        eval_interval_env_steps: int = 0,
+        eval_num_samples_per_bucket: int = 512,
         # Number of gradient updates per training iteration (SAC/TD3-style).
         # When ``None``, fall back to the legacy behaviour of one full shuffled
         # pass × num_learning_epochs through the buffer. With replay enabled,
@@ -182,6 +186,8 @@ class SparseSuccessor:
         self.replay_capacity_per_env = replay_capacity_per_env
         self.replay_device = replay_device if replay_device is not None else self.device
         self.num_seed_steps = int(num_seed_steps)
+        self.eval_interval_env_steps = int(eval_interval_env_steps)
+        self.eval_num_samples_per_bucket = int(eval_num_samples_per_bucket)
         self.num_updates_per_iter = num_updates_per_iter
         self.learning_rate = lr_actor
 
@@ -1386,6 +1392,159 @@ class SparseSuccessor:
         # Off-policy replay: do NOT clear storage — the circular buffer
         # keeps accumulating transitions so subsequent updates can reuse them.
         return loss_dict
+
+    # ------------------------------------------------------------------
+    # Evaluation — sparse-constraint tracking quality (Option A)
+    # ------------------------------------------------------------------
+
+    @torch.no_grad()
+    def evaluate_tracking(self, num_samples_per_bucket: int = 512) -> dict[str, float]:
+        """Measure how well the policy actually satisfied its stored constraints.
+
+        This is a **pure replay query**, not a separate rollout. For each
+        transition in the replay buffer, the stored constraint set recorded
+        what the policy was asked to achieve; stepping forward ``τ`` steps
+        in the same env's trajectory shows what the policy actually produced.
+
+        Per constraint ``q = (k, ξ, τ)`` anchored at replay time ``t0``:
+          - realized keypoint position at ``t0 + τ - 1`` is read from
+            ``next_priv_state`` of that transition (tail contains packed
+            keypoint positions by env-cfg convention).
+          - error = ``||realized − target||`` (Euclidean, per keypoint).
+          - "satisfaction" = ``exp(-error² / β(k)²)`` using per-keypoint
+            β — matches the training reward kernel.
+
+        Buckets τ into the same intervals used for query diagnostics, and
+        also aggregates per-keypoint. Samples that cross an env reset inside
+        the look-ahead window are skipped.
+
+        Returns a dict of ``Eval/*`` scalars suitable for merging into the
+        runner's ``loss_dict``.
+        """
+        out: dict[str, float] = {}
+        if self.storage is None or self.storage.size < self.mini_batch_size:
+            return out
+
+        # Resolve live-view buffers. We need targets + kid + τ + mask on the
+        # **current** side, and keypoint positions on the **future** side
+        # (next_priv_state from the transition τ-1 steps later).
+        max_t = (
+            self.storage.num_transitions_per_env
+            if self.storage._full
+            else self.storage.step
+        )
+        if max_t < 2:
+            return out
+
+        device = self.device
+        td = self.policy.target_dim
+        nk = self.policy.num_keypoints
+        N = self.storage.num_envs
+
+        # Load once (storage is on CPU; move here so all gathers stay on device).
+        # Keep this lean — only what the eval needs, batched per-bucket below.
+        # Shapes: [T, N, M] (or M, td for targets)
+        c_kid = self.storage.constraint_keypoint_ids[:max_t]
+        c_tgt = self.storage.constraint_targets[:max_t]
+        c_tau = self.storage.constraint_taus[:max_t]
+        c_mask = self.storage.constraint_mask[:max_t]
+        np_store = self.storage.next_privileged_observations  # [capacity, N, priv_dim]
+        dones = self.storage.dones[:max_t].squeeze(-1)
+
+        priv_dim = np_store.shape[-1]
+        kp_offset = priv_dim - nk * td
+        beta = self.beta.to(device)
+
+        per_bucket_err: dict[str, list[float]] = {}
+        per_kp_err: dict[int, list[float]] = {k: [] for k in range(nk)}
+        all_errs: list[float] = []
+
+        for (lo, hi) in self._tau_buckets:
+            errs_bucket: list[float] = []
+            # Sample ``num_samples_per_bucket`` random (time, env) anchors.
+            # Need room for the lookahead: t0 + (hi - 1) < max_t.
+            latest_valid = max_t - hi
+            if latest_valid <= 0:
+                continue
+
+            sdev = self.storage.storage_device
+            t0s = torch.randint(0, latest_valid, (num_samples_per_bucket,), device=sdev)
+            env_is = torch.randint(0, N, (num_samples_per_bucket,), device=sdev)
+
+            # Gather anchor-point slices, then move to training device.
+            c_kid_a = c_kid[t0s, env_is].to(device)       # [S, M]
+            c_tgt_a = c_tgt[t0s, env_is].to(device)       # [S, M, 3]
+            c_tau_a = c_tau[t0s, env_is].to(device)       # [S, M]
+            c_mask_a = c_mask[t0s, env_is].to(device)     # [S, M]
+
+            # For each anchor, we only consider queries whose τ lies in this bucket.
+            tau_in_bucket = (c_tau_a >= lo) & (c_tau_a <= hi) & (c_mask_a > 0)   # [S, M]
+            if not tau_in_bucket.any():
+                continue
+
+            # Compute per-query lookahead index t0 + τ - 1 (clipped to buffer),
+            # all on the storage device so the next gather stays local.
+            c_tau_a_s = c_tau[t0s, env_is].to(sdev)            # [S, M] on storage dev
+            tau_long_s = c_tau_a_s.long().clamp(min=1)
+            t_lookahead_s = (t0s.unsqueeze(-1) + tau_long_s - 1).clamp(max=max_t - 1)  # [S, M]
+
+            # Drop samples that cross a reset boundary in (t0, t_lookahead].
+            # Work on storage device (dones lives there by default).
+            dones_s = dones                                      # [T, N] on storage dev
+            cum_dones_s = dones_s.cumsum(dim=0).float()          # [T, N]
+            env_is_exp = env_is.unsqueeze(-1).expand(-1, c_tau_a.shape[-1])
+            cum_at_end = cum_dones_s[t_lookahead_s, env_is_exp]  # [S, M] on storage dev
+            cum_at_start = cum_dones_s[t0s, env_is].unsqueeze(-1)  # [S, 1]
+            crosses_reset_s = (cum_at_end - cum_at_start) > 0.5
+            valid_mask = tau_in_bucket & (~crosses_reset_s.to(device))
+            if not valid_mask.any():
+                continue
+
+            # Gather realized next_priv at the lookahead timesteps per env,
+            # then move the result to the training device for the error calc.
+            np_gathered_s = np_store[t_lookahead_s, env_is_exp]   # [S, M, priv_dim] on storage dev
+            np_gathered = np_gathered_s.to(device)
+            kp_block = np_gathered[..., kp_offset:].reshape(
+                *np_gathered.shape[:-1], nk, td
+            )                                                  # [S, M, nk, td]
+
+            # Gather realized keypoint per query.
+            kid_exp = c_kid_a.unsqueeze(-1).expand(-1, -1, td).clamp(0, nk - 1).long()
+            realized = torch.gather(kp_block, -2, kid_exp.unsqueeze(-2)).squeeze(-2)   # [S, M, td]
+
+            # Error (euclidean) per query, normalised by per-keypoint β so
+            # magnitudes align with the training satisfaction kernel.
+            diff = realized - c_tgt_a                          # [S, M, td]
+            err = diff.norm(dim=-1)                            # [S, M]
+            beta_q = beta[c_kid_a.clamp(0, nk - 1).long()]     # [S, M]
+            err_norm = err / beta_q                            # scale: 1.0 ≈ error of one β
+
+            # Select valid queries only.
+            err_valid = err_norm[valid_mask]
+            if err_valid.numel() == 0:
+                continue
+            errs_bucket.append(err_valid.mean().item())
+            all_errs.append(err_valid.mean().item())
+
+            # Per-keypoint — accumulate per-keypoint means within this bucket.
+            for k in range(nk):
+                kp_here = (c_kid_a == k) & valid_mask
+                if kp_here.any():
+                    per_kp_err[k].append(err_norm[kp_here].mean().item())
+
+            bucket_name = f"tau_{lo:02d}_{hi:02d}"
+            out[f"Eval/error_norm_{bucket_name}"] = float(
+                sum(errs_bucket) / max(len(errs_bucket), 1)
+            )
+
+        if all_errs:
+            out["Eval/error_norm_mean"] = float(sum(all_errs) / len(all_errs))
+
+        for k, lst in per_kp_err.items():
+            if lst:
+                out[f"Eval/error_norm_keypoint_{k:02d}"] = float(sum(lst) / len(lst))
+
+        return out
 
     @torch.no_grad()
     def _soft_update(self, target: nn.Module, source: nn.Module):
