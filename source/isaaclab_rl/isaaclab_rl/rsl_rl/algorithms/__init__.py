@@ -8,5 +8,6 @@ from .td3 import TD3
 from .double_ppo import DoublePPO
 from .ppo_ou import PPOOU
 from .rdppo import RDPPO
+from .sparse_successor import SparseSuccessor
 
-__all__ = ["PPO", "PPOKL", "Distillation", "HRPO", "AmpReward", "TD3", "DoublePPO", "PPOOU", "RDPPO", "FlowDAgger"]
+__all__ = ["PPO", "PPOKL", "Distillation", "HRPO", "AmpReward", "TD3", "DoublePPO", "PPOOU", "RDPPO", "FlowDAgger", "SparseSuccessor"]

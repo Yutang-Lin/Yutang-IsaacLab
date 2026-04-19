@@ -99,6 +99,8 @@ class BaseRunner(OnPolicyRunner):
             self.training_type = "rl"
         elif self.alg_cfg["class_name"] in ["Distillation", "FlowDAgger"]:
             self.training_type = "distillation"
+        elif self.alg_cfg["class_name"] == "SparseSuccessor":
+            self.training_type = "rl"
         else:
             print(f"Warning: Training type not found for algorithm {self.alg_cfg['class_name']}, using rl as default.")
             self.training_type = "rl"

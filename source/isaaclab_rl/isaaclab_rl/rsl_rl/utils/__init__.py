@@ -48,23 +48,22 @@ def reduce_gradients(network):
     """Collect gradients from all GPUs and average them.
 
     This function is called after the backward pass to synchronize the gradients across all GPUs.
+    Uses SUM + manual division so it's compatible with both NCCL and Gloo backends
+    (Gloo does not support ReduceOp.AVG).
     """
-    # Create a tensor to store the gradients
     grads = [param.grad.view(-1) for param in network.parameters() if param.grad is not None]
+    if len(grads) == 0:
+        return
     all_grads = torch.cat(grads)
 
-    # Average the gradients across all GPUs
-    torch.distributed.all_reduce(all_grads, op=torch.distributed.ReduceOp.AVG)
+    # Sum gradients across all ranks then divide by world_size for the average
+    torch.distributed.all_reduce(all_grads, op=torch.distributed.ReduceOp.SUM)
+    all_grads.div_(torch.distributed.get_world_size())
 
-    # Get all parameters
-    all_params = network.parameters()
-
-    # Update the gradients for all parameters with the reduced gradients
+    # Write averaged gradients back into each parameter's grad buffer
     offset = 0
-    for param in all_params:
+    for param in network.parameters():
         if param.grad is not None:
             numel = param.numel()
-            # copy data back from shared buffer
-            param.grad.data.copy_(all_grads[offset : offset + numel].view_as(param.grad.data))
-            # update the offset for the next parameter
+            param.grad.data.copy_(all_grads[offset: offset + numel].view_as(param.grad.data))
             offset += numel

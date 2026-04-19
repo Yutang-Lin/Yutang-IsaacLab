@@ -605,6 +605,96 @@ class RslRlPpoActorCriticTFRecurrentLatentCfg(RslRlPpoActorCriticTFRecurrentCfg)
     """The policy class name. Default is ActorCriticTFRecurrentLatent."""
 
 @configclass
+class RslRlSparseSuccessorPolicyCfg:
+    """Configuration for the sparse-constraint successor tracking policy."""
+
+    class_name: str = "SparseSuccessorPolicy"
+    """The policy class name."""
+
+    num_keypoints: int = MISSING
+    """Number of trackable keypoints on the robot body."""
+
+    target_dim: int = 3
+    """Dimensionality of each keypoint target (3 for position)."""
+
+    d_model: int = 128
+    """Latent dimension for query/constraint encodings."""
+
+    max_constraints: int = 16
+    """Maximum number of constraints in a padded set."""
+
+    actor_hidden_dims: list[int] = MISSING
+    """Hidden dimensions of the actor MLP."""
+
+    critic_hidden_dims: list[int] = MISSING
+    """Hidden dimensions of the successor and style critic MLPs."""
+
+    disc_hidden_dims: list[int] = MISSING
+    """Hidden dimensions of the style discriminator."""
+
+    activation: str = "elu"
+    """Activation function name."""
+
+    actor_fixed_std: float = 0.2
+    """Fixed exploration stddev of the TruncatedNormal action distribution
+    (BFM-style). No learnable noise; use ``actor_stddev_clip`` to bound the
+    noise magnitude."""
+
+    actor_stddev_clip: float = 0.3
+    """Hard clip on the noise term inside TruncatedNormal.sample()."""
+
+    action_low: float = -1.0
+    """Lower bound of the tanh-squashed action range."""
+
+    action_high: float = 1.0
+    """Upper bound of the tanh-squashed action range."""
+
+    snippet_length: int = 8
+    """Number of frames in a style snippet."""
+
+    project_constraint_latent: Literal["none", "unit_sphere", "clamp_radius"] = "unit_sphere"
+    """Projection applied to ``z_C`` right after ``ConstraintSetEncoder.post_mlp``.
+
+    - ``none``: identity. ``z_C`` magnitude is unconstrained — can drift during
+      training, which tends to destabilize the actor and discriminator.
+    - ``unit_sphere``: scale to fixed L2 norm ``sqrt(d_model)``. Mirrors
+      BFM-Zero's ``project_z`` and gives ``z_C`` bounded scale.
+    - ``clamp_radius``: shrink to radius ``constraint_latent_clamp_radius`` when
+      above, identity otherwise. Cheaper constraint than unit-sphere."""
+
+    constraint_latent_clamp_radius: float = 1.0
+    """Radius used when ``project_constraint_latent == 'clamp_radius'``."""
+
+    style_feature_dim: int | None = None
+    """Per-frame style feature dim. Should match the ExpertMotionBuffer. If
+    ``None``, the discriminator falls back to ``num_actor_obs`` per frame
+    (legacy path; only useful when running without an expert dataset)."""
+
+    snippet_dim: int | None = None
+    """Override the full snippet_dim (takes priority over style_feature_dim *
+    snippet_length). Leave ``None`` unless you know why."""
+
+    layer_norm: bool = False
+    """Whether to use layer normalization in networks (plain-MLP path only)."""
+
+    use_residual_arch: bool = True
+    """Use BFM-style residual architecture (LayerNorm → Linear → Mish + skip
+    connections) for the actor, successor critics, style critics, and aux
+    critics. When False, the sub-networks fall back to the plain-MLP path."""
+
+    residual_hidden_dim: int = 1024
+    """Residual body hidden dim (BFM default = 1024)."""
+
+    residual_hidden_layers: int = 1
+    """Number of residual blocks in each sub-network body (BFM default = 1)."""
+
+    residual_embedding_layers: int = 2
+    """Number of residual-embedding blocks per input branch (BFM default = 2).
+    The final block halves the dim to ``hidden_dim/2`` so that
+    ``concat(embed_a, embed_b)`` is the full hidden dim."""
+
+
+@configclass
 class RslRlTd3ActorCriticCfg:
     """Configuration for the TD3 actor-critic networks."""
 
@@ -797,6 +887,164 @@ class RslRlTd3AlgorithmCfg:
     in which case RND is not used.
     """
 
+
+@configclass
+class RslRlSparseSuccessorAlgorithmCfg:
+    """Configuration for the sparse-constraint successor tracking algorithm."""
+
+    class_name: str = "SparseSuccessor"
+    """The algorithm class name."""
+
+    lr_actor: float = 3e-4
+    """Learning rate for the actor."""
+
+    lr_critic: float = 3e-4
+    """Learning rate for successor and style critics."""
+
+    lr_query: float = 3e-4
+    """Learning rate for query and constraint encoders."""
+
+    lr_disc: float = 1e-4
+    """Learning rate for the style discriminator."""
+
+    gamma: float = 0.99
+    """Discount factor."""
+
+    target_tau: float = 0.005
+    """Soft target update rate."""
+
+    lambda_style: float = 0.1
+    """Weight of the style Q-value in the actor objective.
+
+    Default deliberately small because ``q_track`` is bounded roughly in
+    ``[0, 1/(1-gamma)]`` while ``q_style`` is logit-based and unbounded. Log
+    ``Scale/q_track_*`` vs ``Scale/q_style_*`` and retune after a short warmup."""
+
+    lambda_aux: float = 1.0
+    """Weight of the auxiliary-env-reward Q-value in the actor objective.
+
+    The aux reward is running-normalized before hitting the critic, so its Q
+    should be of order 1. Set ``0.0`` to disable the aux branch entirely
+    (env rewards will still be logged but not consumed by training)."""
+
+    critic_pessimism_penalty: float = 0.5
+    """Ensemble pessimism penalty used when computing the TD bootstrap for all
+    three critic families. ``Q = 0.5*(Q1+Q2) - penalty * |Q1 - Q2|``. 0.5
+    recovers standard min-Q double-Q; larger is more conservative."""
+
+    actor_pessimism_penalty: float = 0.5
+    """Ensemble pessimism penalty when the actor consumes Q-values for its
+    own policy-improvement loss. Often set equal to or slightly smaller than
+    ``critic_pessimism_penalty``."""
+
+    sigma_time: float = 2.0
+    """Gaussian kernel width for time proximity in successor critic."""
+
+    beta: float | list[float] = 0.1
+    """Gaussian kernel width for keypoint satisfaction.
+
+    If a ``float``, the same bandwidth is used for every keypoint.
+    If a ``list[float]`` of length ``num_keypoints`` (matching the agent
+    config's ``SPARSE_SUCCESSOR_KEYPOINTS`` order), each keypoint gets its
+    own bandwidth. Per-keypoint is recommended because end-effectors (wrists,
+    ankles) cover much wider positional ranges than the pelvis/torso."""
+
+    tau_max: int = 20
+    """Maximum future lag for queries."""
+
+    n_constraints_min: int = 1
+    """Minimum number of constraints sampled per set."""
+
+    n_constraints_max: int = 8
+    """Maximum number of constraints sampled per set."""
+
+    weight_range: tuple[float, float] = (0.5, 1.5)
+    """Range for random constraint importance weights."""
+
+    target_noise_std: float = 0.02
+    """Noise added to constraint target values during sampling."""
+
+    constraint_dropout_prob: float = 0.1
+    """Probability of dropping individual constraints."""
+
+    constraint_horizon: int = 16
+    """Chunk length (in env steps) over which the rollout-time constraint set
+    is held fixed. Only ``tau`` is decremented each step within a chunk; at
+    chunk boundary a fresh ``C`` is sampled. Setting this to 1 reproduces
+    the legacy per-step resampling behaviour."""
+
+    expert_chunk_fraction: float = 0.15
+    """Fraction of newly-sampled rollout chunks (at chunk boundaries) that
+    draw their constraint set from the expert motion buffer's keypoints
+    instead of the live privileged state. Small by design — the method is
+    meant to be self-supervised, not imitation-heavy."""
+
+    relabel_ratio_stored: float = 0.4
+    """Per-sample relabeling share: keep the constraint set that was actually
+    stored in replay with this transition."""
+
+    relabel_ratio_hindsight: float = 0.3
+    """Per-sample relabeling share: build a fresh constraint set from the
+    batch's ``next_priv`` keypoint positions (hindsight analogue)."""
+
+    relabel_ratio_expert: float = 0.3
+    """Per-sample relabeling share: build a fresh constraint set from the
+    expert motion buffer's keypoint positions. Folded back into ``stored``
+    when no expert buffer is present."""
+
+    snippet_length: int = 10
+    """Number of frames in a style snippet."""
+
+    num_learning_epochs: int = 1
+    """Number of passes over the rollout buffer per update."""
+
+    mini_batch_size: int = 512
+    """Mini-batch size for training."""
+
+    max_grad_norm: float = 1.0
+    """Maximum gradient norm for clipping."""
+
+    updates_per_step: int = 1
+    """Number of gradient updates per rollout collection."""
+
+    grad_penalty_weight: float = 10.0
+    """WGAN-GP coefficient for the style discriminator."""
+
+    replay_capacity_per_env: int | None = None
+    """Off-policy replay capacity per env. When ``None``, the replay buffer is
+    sized to the rollout length (pure on-policy behaviour — each transition is
+    used once and overwritten). Set this larger (e.g. 2048) to enable true
+    replay: the circular buffer will hold ``num_envs * capacity`` transitions
+    and update() will sample from the full buffer every iteration.
+
+    Recommended: large enough that each env's replay spans ~30-60 s of control
+    (BFM-Zero equivalent ≈ 100k frames per env). With ``num_envs=4096`` and
+    control dt ≈ 20 ms, 2048 capacity ≈ 40 s/env ≈ 8.4M total transitions.
+    Must be >= num_steps_per_env."""
+
+    replay_device: str | None = None
+    """Device that holds the replay tensors. Defaults to the training device.
+    Set to ``"cpu"`` (recommended) to keep a large replay off the GPU — BFM-Zero
+    calls this ``buffer_device``. Sampled batches are moved to the training
+    device with non-blocking pinned-memory transfers."""
+
+    num_updates_per_iter: int | None = None
+    """Number of gradient updates (each = one full SAC-style update block:
+    discriminator, successor critics, style critics, actor, soft target) per
+    training iteration. When ``None``, the legacy on-policy behaviour is used
+    (one shuffled pass × num_learning_epochs). For replay training, set this
+    explicitly — BFM-Zero uses 16."""
+
+    expert_dataset_path: str | None = None
+    """Path to a precomputed expert dataset (``.pt``) produced by
+    ``scripts/precompute_expert_dataset.py``. When ``None`` the style branch
+    (discriminator + style critics) is disabled."""
+
+    expert_dataset_device: str | None = None
+    """Device to hold the expert buffer on. Defaults to ``cpu``. Use ``cuda``
+    if the dataset fits comfortably in GPU memory and you want faster sampling."""
+
+
 #########################
 # Runner configurations #
 #########################
@@ -830,10 +1078,10 @@ class RslRlOnPolicyRunnerCfg:
     empirical_normalization: bool = MISSING
     """Whether to use empirical normalization."""
 
-    policy: RslRlPpoActorCriticCfg | RslRlDistillationStudentTeacherCfg = MISSING
+    policy: RslRlPpoActorCriticCfg | RslRlDistillationStudentTeacherCfg | RslRlSparseSuccessorPolicyCfg = MISSING
     """The policy configuration."""
 
-    algorithm: RslRlPpoAlgorithmCfg | RslRlDistillationAlgorithmCfg = MISSING
+    algorithm: RslRlPpoAlgorithmCfg | RslRlDistillationAlgorithmCfg | RslRlSparseSuccessorAlgorithmCfg = MISSING
     """The algorithm configuration."""
 
     clip_actions: float | None = None
