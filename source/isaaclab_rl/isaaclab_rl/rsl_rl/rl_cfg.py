@@ -908,7 +908,15 @@ class RslRlSparseSuccessorAlgorithmCfg:
     """Learning rate for the style discriminator."""
 
     gamma: float = 0.99
-    """Discount factor."""
+    """Discount factor (applied to the successor critic and the aux critic)."""
+
+    gamma_style: float | None = None
+    """Optional separate discount factor for the style critic. When ``None``
+    (default), ``gamma`` is used for style too. Setting this to a smaller
+    value (e.g. 0.98) halves the geometric fixed point of the log-odds style
+    reward and stops ``q_style_mean`` from drifting unboundedly negative
+    when the discriminator briefly wins. BFM-Zero effectively uses 0.98
+    here (matching its global discount)."""
 
     target_tau: float = 0.005
     """Soft target update rate."""

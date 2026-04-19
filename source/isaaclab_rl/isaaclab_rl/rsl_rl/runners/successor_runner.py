@@ -358,25 +358,50 @@ class SuccessorRunner(BaseRunner):
                 reset_stats = env_u.consume_reset_stats()
                 loss_dict.update(reset_stats)
 
-            # ---- Sparse-constraint tracking eval (Option A) ----
-            # Pure replay query; doesn't touch the live sim. Fires:
-            #   (a) the first time the replay has enough data (sanity check),
+            # ---- BFM-style independent tracking eval ----
+            # Live rollout with a frozen constraint set per env. The env +
+            # algorithm state are snapshotted before the rollout and restored
+            # afterwards so the training rollout is not disturbed. Fires:
+            #   (a) the first iter after warmup (anchors the eval panel near
+            #       env_steps ≈ num_seed_steps),
             #   (b) every time ``env_steps_total`` crosses an integer multiple
             #       of ``eval_interval_env_steps`` after that.
             eval_interval = int(getattr(self.alg, "eval_interval_env_steps", 0))
-            if eval_interval > 0:
+            if eval_interval > 0 and not warmup_active:
                 post_env_steps = self._env_steps_total + self.num_steps_per_env * self.env.num_envs * self.gpu_world_size
                 prev_bucket = self._env_steps_total // eval_interval
                 curr_bucket = post_env_steps // eval_interval
-                replay_ready = self.alg.storage is not None and self.alg.storage.size >= self.alg.mini_batch_size
-                first_eval = (not self._did_initial_eval) and replay_ready
-                interval_crossed = curr_bucket > prev_bucket and replay_ready
+                first_eval = not self._did_initial_eval
+                interval_crossed = curr_bucket > prev_bucket
                 if first_eval or interval_crossed:
-                    eval_metrics = self.alg.evaluate_tracking(
-                        num_samples_per_bucket=self.alg.eval_num_samples_per_bucket,
-                    )
-                    loss_dict.update(eval_metrics)
-                    self._did_initial_eval = True
+                    # Put the policy + normalizers in eval mode for the
+                    # duration: dropout/layernorm stay deterministic and
+                    # EmpiricalNormalization stops updating its running
+                    # stats on the eval frames.
+                    self.alg.policy.eval()
+                    prev_obs_norm_mode = self.obs_normalizer.training
+                    prev_priv_norm_mode = self.privileged_obs_normalizer.training
+                    self.obs_normalizer.eval()
+                    self.privileged_obs_normalizer.eval()
+                    try:
+                        eval_metrics = self.alg.evaluate_live_tracking(
+                            self.env,
+                            obs_normalizer=self.obs_normalizer,
+                            privileged_obs_normalizer=self.privileged_obs_normalizer,
+                            privileged_obs_type=self.privileged_obs_type,
+                            action_clip_range=self.action_clip_range,
+                        )
+                    finally:
+                        self.alg.policy.train()
+                        if prev_obs_norm_mode:
+                            self.obs_normalizer.train()
+                        if prev_priv_norm_mode:
+                            self.privileged_obs_normalizer.train()
+                    if eval_metrics:
+                        loss_dict.update(eval_metrics)
+                        self._did_initial_eval = True
+                    else:
+                        loss_dict["Eval/no_samples"] = 1.0
 
             if hasattr(self.env.unwrapped, "post_update"):
                 env_loss_dict = self.env.unwrapped.post_update()

@@ -43,6 +43,14 @@ class SparseSuccessor:
         lr_disc: float = 1e-4,
         # RL hyperparameters
         gamma: float = 0.99,
+        # Separate discount for the style critic. BFM-Zero uses 0.98 across the
+        # board; we keep γ=0.99 for the successor/aux critics (the satisfaction
+        # kernel is bounded in [0, 1], so a slightly higher discount is safe)
+        # but drop the *style* discount to 0.98 because the log-odds style
+        # reward ``log(D) − log(1−D)`` saturates at ±16 and a geometric
+        # fixed point of ±1600 at γ=0.99 drives q_style to diverge whenever
+        # the disc briefly wins. γ=0.98 halves the floor to ±800.
+        gamma_style: float | None = None,
         target_tau: float = 0.005,
         lambda_style: float = 0.1,
         lambda_aux: float = 1.0,
@@ -63,11 +71,12 @@ class SparseSuccessor:
         weight_range: tuple[float, float] = (0.5, 1.5),
         target_noise_std: float = 0.02,
         constraint_dropout_prob: float = 0.1,
-        # Chunk-level rollout: hold the constraint-set content fixed for this
-        # many env steps per env; only ``tau`` is decremented each step.
-        # A brand-new constraint set is sampled when the chunk ends or the env
-        # resets. 1 reproduces the legacy per-step resampling behaviour.
-        constraint_horizon: int = 16,
+        # Chunk-level rollout: hold the constraint-set content fixed until
+        # its longest τ has counted all the way down (``max τ_i == 0``), at
+        # which point a fresh C is sampled. ``constraint_horizon`` is an
+        # *upper cap* on the dwell time so degenerate τ distributions can't
+        # stall the actor on a dead set. Set to 0 to disable the cap.
+        constraint_horizon: int = 0,
         # Fraction of rollout chunks that draw their fresh constraint set from
         # the expert motion buffer's keypoint positions (BFM-style expert
         # rollout). 0 disables entirely — the replay buffer then contains no
@@ -141,6 +150,7 @@ class SparseSuccessor:
 
         # Hyperparameters
         self.gamma = gamma
+        self.gamma_style = float(gamma_style) if gamma_style is not None else float(gamma)
         self.target_tau = target_tau
         self.lambda_style = lambda_style
         self.lambda_aux = lambda_aux
@@ -208,7 +218,8 @@ class SparseSuccessor:
         # configurations; if ``tau_max`` changes, missing buckets will just
         # report zero occupancy.
         self._tau_buckets: list[tuple[int, int]] = [
-            (1, 3), (4, 6), (7, 10), (11, 15), (16, 20), (21, 30),
+            (1, 3), (4, 6), (7, 10), (11, 15), (16, 20),
+            (21, 30), (31, 40), (41, 50),
         ]
         if expert_dataset_path is not None:
             buf_device = expert_dataset_device if expert_dataset_device is not None else "cpu"
@@ -372,19 +383,50 @@ class SparseSuccessor:
     def _advance_chunk(self, next_priv_obs: torch.Tensor, reset_mask: torch.Tensor | None) -> None:
         """Per-step chunk bookkeeping. Called from ``set_next_obs``.
 
-        For each env:
-        - If the env reset OR its chunk counter has run out, sample a fresh
-          constraint set and reset the counter to ``constraint_horizon``.
-        - Otherwise, keep (k, ξ, w, m) and decrement τ by 1 (clamped at 1).
+        Per env we hold the sampled set ``(k, ξ, w)`` fixed and let every
+        query's τ count down one step per env-step. A query whose τ reaches
+        **0** is *expired*: its mask entry is cleared so it no longer
+        contributes to the pooled ``z_C`` or to the satisfaction kernel. The
+        whole set is resampled as soon as every active query has expired
+        (i.e. no queries remain with ``mask > 0``), or immediately on env
+        reset, or when the optional ``constraint_horizon`` cap trips.
+
+        This replaces the previous fixed-horizon behaviour — chunks now
+        live exactly as long as the latest-firing query asked for, which
+        lines up the constraint lifetime with the satisfaction kernel's
+        horizon expectations.
         """
         num_envs = next_priv_obs.shape[0]
 
-        # Decrement chunk counter first, so an env that's about to hit 0 rolls
-        # a new chunk on this same step.
-        self._chunk_steps_left = (self._chunk_steps_left - 1).clamp(min=0)
+        # --- 1) Decrement τ for every active query (mask>0). τ clamps at 0
+        #        on the way down; a 0-τ query counts as "expired" and is
+        #        masked out just below.
+        taus = self._env_constraints["taus"]
+        mask = self._env_constraints["mask"]
+        valid = mask > 0
+        if valid.any():
+            new_taus = taus.clone()
+            new_taus[valid] = (new_taus[valid] - 1).clamp(min=0.0)
+            # Expire queries whose τ just hit 0.
+            expired = valid & (new_taus == 0)
+            if expired.any():
+                mask = mask.clone()
+                mask[expired] = 0.0
+                self._env_constraints["mask"] = mask
+            taus = new_taus
+            self._env_constraints["taus"] = taus
 
-        # Envs that need a fresh chunk: counter is zero OR just reset.
-        needs_new = (self._chunk_steps_left == 0)
+        # Optional global cap — prevents a pathological set with very large
+        # τ from stalling the actor indefinitely.
+        if self.constraint_horizon > 0:
+            self._chunk_steps_left = (self._chunk_steps_left - 1).clamp(min=0)
+
+        # --- 2) Identify envs that need a fresh set: (a) every query has
+        #        expired, (b) global cap elapsed, (c) env reset.
+        active_any = (mask > 0).any(dim=-1)           # [N]
+        needs_new = ~active_any
+        if self.constraint_horizon > 0:
+            needs_new = needs_new | (self._chunk_steps_left == 0)
         if reset_mask is not None and reset_mask.any():
             needs_new = needs_new | reset_mask.to(self.device, dtype=torch.bool)
 
@@ -417,19 +459,18 @@ class SparseSuccessor:
                         ev[expert_env_ids] = expert_C[key]
 
             self._replace_constraints_for_envs(needs_new, random_C)
-            # Reset counter for those envs.
-            self._chunk_steps_left[needs_new] = self.constraint_horizon
 
-        # For envs whose chunk continues, decrement τ (clamped at 1) —
-        # keypoint_ids / targets / weights / mask stay as-is.
-        keep_mask = ~needs_new
-        if keep_mask.any():
-            taus = self._env_constraints["taus"]
-            # Only decrement where mask is valid; padded slots stay 0.
-            valid = self._env_constraints["mask"][keep_mask] > 0
-            new_taus = taus[keep_mask].clone()
-            new_taus[valid] = (new_taus[valid] - 1).clamp(min=1.0)
-            taus[keep_mask] = new_taus
+            # Reset the optional global cap. Pick ``constraint_horizon`` if
+            # configured, otherwise fall back to the longest sampled τ so
+            # the counter stays a meaningful upper bound.
+            if self.constraint_horizon > 0:
+                self._chunk_steps_left[needs_new] = self.constraint_horizon
+            else:
+                new_mask = self._env_constraints["mask"][needs_new] > 0
+                new_taus = self._env_constraints["taus"][needs_new]
+                effective_taus = new_taus * new_mask.float()
+                max_tau_per_env = effective_taus.amax(dim=-1).long()
+                self._chunk_steps_left[needs_new] = max_tau_per_env
 
         # Record a small diagnostic: fraction of envs entering a fresh chunk.
         if hasattr(self, "_diag"):
@@ -1162,7 +1203,7 @@ class SparseSuccessor:
                         self.policy.style_critic_2_target(next_obs, next_priv, next_action_style, z_C_next),
                         self.critic_pessimism_penalty,
                     )
-                    y_style = r_style + self.gamma * (1.0 - dones_flat) * q_style_next
+                    y_style = r_style + self.gamma_style * (1.0 - dones_flat) * q_style_next
 
                 pred_QS1 = self.policy.style_critic_1(obs, priv, actions, z_C.detach())
                 pred_QS2 = self.policy.style_critic_2(obs, priv, actions, z_C.detach())
@@ -1394,155 +1435,228 @@ class SparseSuccessor:
         return loss_dict
 
     # ------------------------------------------------------------------
-    # Evaluation — sparse-constraint tracking quality (Option A)
+    # Evaluation — BFM-style live tracking rollout
     # ------------------------------------------------------------------
 
-    @torch.no_grad()
-    def evaluate_tracking(self, num_samples_per_bucket: int = 512) -> dict[str, float]:
-        """Measure how well the policy actually satisfied its stored constraints.
+    def snapshot_state(self) -> dict:
+        """Save the parts of the algorithm state that an eval rollout disturbs.
 
-        This is a **pure replay query**, not a separate rollout. For each
-        transition in the replay buffer, the stored constraint set recorded
-        what the policy was asked to achieve; stepping forward ``τ`` steps
-        in the same env's trajectory shows what the policy actually produced.
+        Used in tandem with ``env.snapshot_state`` by
+        ``evaluate_live_tracking`` so the live training rollout is not
+        interrupted when the eval runs. Covers:
+          - constraint set per env + chunk-step counter (rollout constraints)
+          - snippet ring + fill counter + write pointer (style discriminator)
 
-        Per constraint ``q = (k, ξ, τ)`` anchored at replay time ``t0``:
-          - realized keypoint position at ``t0 + τ - 1`` is read from
-            ``next_priv_state`` of that transition (tail contains packed
-            keypoint positions by env-cfg convention).
-          - error = ``||realized − target||`` (Euclidean, per keypoint).
-          - "satisfaction" = ``exp(-error² / β(k)²)`` using per-keypoint
-            β — matches the training reward kernel.
+        The storage/replay is *not* snapshotted — eval doesn't add
+        transitions to it (we use ``clear_transition=True`` in the rollout).
+        The actor's aux reward normalizer is also left alone; it is only
+        touched during training updates, not during eval.
+        """
+        snap: dict = {}
+        if self._env_constraints is not None:
+            snap["env_constraints"] = {
+                k: v.clone() for k, v in self._env_constraints.items()
+            }
+            snap["chunk_steps_left"] = self._chunk_steps_left.clone()
+        if self._snippet_ring is not None:
+            snap["snippet_ring"] = self._snippet_ring.clone()
+            snap["snippet_write_ptr"] = int(self._snippet_write_ptr)
+            snap["snippet_fill"] = self._snippet_fill.clone()
+        return snap
 
-        Buckets τ into the same intervals used for query diagnostics, and
-        also aggregates per-keypoint. Samples that cross an env reset inside
-        the look-ahead window are skipped.
+    def restore_state(self, snap: dict) -> None:
+        """Restore the state captured by ``snapshot_state``."""
+        if "env_constraints" in snap and self._env_constraints is not None:
+            for k, v in snap["env_constraints"].items():
+                self._env_constraints[k].copy_(v)
+            self._chunk_steps_left.copy_(snap["chunk_steps_left"])
+        if "snippet_ring" in snap and self._snippet_ring is not None:
+            self._snippet_ring.copy_(snap["snippet_ring"])
+            self._snippet_write_ptr = int(snap["snippet_write_ptr"])
+            self._snippet_fill.copy_(snap["snippet_fill"])
 
-        Returns a dict of ``Eval/*`` scalars suitable for merging into the
-        runner's ``loss_dict``.
+    @torch.inference_mode()
+    def evaluate_live_tracking(
+        self,
+        env,
+        obs_normalizer=None,
+        privileged_obs_normalizer=None,
+        privileged_obs_type: str = "critic",
+        horizon: int | None = None,
+        action_clip_range: tuple[float, float] = (-1.0, 1.0),
+    ) -> dict[str, float]:
+        """BFM-style live eval rollout with save/restore around the env.
+
+        Protocol:
+          1. Snapshot the full env + algorithm state.
+          2. Reset all envs to get a clean starting point.
+          3. Sample one fresh constraint set per env and **freeze** it for
+             the whole horizon (no chunk re-sampling, no random dropouts
+             applied on top — the same C is used for every step).
+          4. Roll out deterministically (``actor.act_inference``) for at
+             most ``horizon = tau_max`` steps. At each query's ``τ = step+1``
+             we record the realized keypoint position from the next priv
+             observation and compare it against the target.
+          5. Restore the env + algorithm state before returning.
+
+        Returns a dict of ``Eval/*`` scalars: per-τ-bucket error, per-keypoint
+        error, and the global mean — all in β-normalised units so values
+        scale with the training satisfaction kernel.
         """
         out: dict[str, float] = {}
-        if self.storage is None or self.storage.size < self.mini_batch_size:
+        if self.policy is None:
             return out
 
-        # Resolve live-view buffers. We need targets + kid + τ + mask on the
-        # **current** side, and keypoint positions on the **future** side
-        # (next_priv_state from the transition τ-1 steps later).
-        max_t = (
-            self.storage.num_transitions_per_env
-            if self.storage._full
-            else self.storage.step
-        )
-        if max_t < 2:
+        env_u = env.unwrapped if hasattr(env, "unwrapped") else env
+        if not hasattr(env_u, "snapshot_state") or not hasattr(env_u, "restore_state"):
+            # Env hasn't implemented the snapshot API yet — skip with a diag.
+            out["Eval/no_snapshot_api"] = 1.0
             return out
 
         device = self.device
         td = self.policy.target_dim
         nk = self.policy.num_keypoints
-        N = self.storage.num_envs
+        num_envs = env.num_envs
 
-        # Load once (storage is on CPU; move here so all gathers stay on device).
-        # Keep this lean — only what the eval needs, batched per-bucket below.
-        # Shapes: [T, N, M] (or M, td for targets)
-        c_kid = self.storage.constraint_keypoint_ids[:max_t]
-        c_tgt = self.storage.constraint_targets[:max_t]
-        c_tau = self.storage.constraint_taus[:max_t]
-        c_mask = self.storage.constraint_mask[:max_t]
-        np_store = self.storage.next_privileged_observations  # [capacity, N, priv_dim]
-        dones = self.storage.dones[:max_t].squeeze(-1)
+        H = int(horizon) if horizon is not None else int(self.tau_max)
+        if H <= 0:
+            return out
 
-        priv_dim = np_store.shape[-1]
-        kp_offset = priv_dim - nk * td
-        beta = self.beta.to(device)
+        # 1. Snapshot both sides.
+        env_snap = env_u.snapshot_state()
+        alg_snap = self.snapshot_state()
 
-        per_bucket_err: dict[str, list[float]] = {}
-        per_kp_err: dict[int, list[float]] = {k: [] for k in range(nk)}
-        all_errs: list[float] = []
+        # Flag the env so eval-mode resets don't pollute the training reset
+        # statistics (consume_reset_stats).
+        if hasattr(env_u, "set_eval_mode"):
+            env_u.set_eval_mode(True)
 
-        for (lo, hi) in self._tau_buckets:
-            errs_bucket: list[float] = []
-            # Sample ``num_samples_per_bucket`` random (time, env) anchors.
-            # Need room for the lookahead: t0 + (hi - 1) < max_t.
-            latest_valid = max_t - hi
-            if latest_valid <= 0:
-                continue
+        try:
+            # 2. Clean reset.
+            obs, extras = env.reset()
+            obs = obs.to(device)
+            priv_obs = extras["observations"].get(privileged_obs_type, obs).to(device)
+            if obs_normalizer is not None:
+                obs = obs_normalizer(obs)
+            if privileged_obs_normalizer is not None:
+                priv_obs = privileged_obs_normalizer(priv_obs)
 
-            sdev = self.storage.storage_device
-            t0s = torch.randint(0, latest_valid, (num_samples_per_bucket,), device=sdev)
-            env_is = torch.randint(0, N, (num_samples_per_bucket,), device=sdev)
+            # 3. Freeze a fresh C per env, anchored on the post-reset priv.
+            C = self.sample_constraint_set_vectorized(priv_obs, num_envs)
+            # In eval we want the *declared* per-query τ to be respected
+            # exactly, so drop the random dropout that the sampler applies.
+            mask = (C["mask"] > 0).float()
+            C["mask"] = mask
 
-            # Gather anchor-point slices, then move to training device.
-            c_kid_a = c_kid[t0s, env_is].to(device)       # [S, M]
-            c_tgt_a = c_tgt[t0s, env_is].to(device)       # [S, M, 3]
-            c_tau_a = c_tau[t0s, env_is].to(device)       # [S, M]
-            c_mask_a = c_mask[t0s, env_is].to(device)     # [S, M]
+            kid = C["keypoint_ids"].long()        # [N, M]
+            tgt = C["targets"]                    # [N, M, td]
+            tau = C["taus"].long()                # [N, M]
+            mask_b = mask.bool()                  # [N, M]
 
-            # For each anchor, we only consider queries whose τ lies in this bucket.
-            tau_in_bucket = (c_tau_a >= lo) & (c_tau_a <= hi) & (c_mask_a > 0)   # [S, M]
-            if not tau_in_bucket.any():
-                continue
-
-            # Compute per-query lookahead index t0 + τ - 1 (clipped to buffer),
-            # all on the storage device so the next gather stays local.
-            c_tau_a_s = c_tau[t0s, env_is].to(sdev)            # [S, M] on storage dev
-            tau_long_s = c_tau_a_s.long().clamp(min=1)
-            t_lookahead_s = (t0s.unsqueeze(-1) + tau_long_s - 1).clamp(max=max_t - 1)  # [S, M]
-
-            # Drop samples that cross a reset boundary in (t0, t_lookahead].
-            # Work on storage device (dones lives there by default).
-            dones_s = dones                                      # [T, N] on storage dev
-            cum_dones_s = dones_s.cumsum(dim=0).float()          # [T, N]
-            env_is_exp = env_is.unsqueeze(-1).expand(-1, c_tau_a.shape[-1])
-            cum_at_end = cum_dones_s[t_lookahead_s, env_is_exp]  # [S, M] on storage dev
-            cum_at_start = cum_dones_s[t0s, env_is].unsqueeze(-1)  # [S, 1]
-            crosses_reset_s = (cum_at_end - cum_at_start) > 0.5
-            valid_mask = tau_in_bucket & (~crosses_reset_s.to(device))
-            if not valid_mask.any():
-                continue
-
-            # Gather realized next_priv at the lookahead timesteps per env,
-            # then move the result to the training device for the error calc.
-            np_gathered_s = np_store[t_lookahead_s, env_is_exp]   # [S, M, priv_dim] on storage dev
-            np_gathered = np_gathered_s.to(device)
-            kp_block = np_gathered[..., kp_offset:].reshape(
-                *np_gathered.shape[:-1], nk, td
-            )                                                  # [S, M, nk, td]
-
-            # Gather realized keypoint per query.
-            kid_exp = c_kid_a.unsqueeze(-1).expand(-1, -1, td).clamp(0, nk - 1).long()
-            realized = torch.gather(kp_block, -2, kid_exp.unsqueeze(-2)).squeeze(-2)   # [S, M, td]
-
-            # Error (euclidean) per query, normalised by per-keypoint β so
-            # magnitudes align with the training satisfaction kernel.
-            diff = realized - c_tgt_a                          # [S, M, td]
-            err = diff.norm(dim=-1)                            # [S, M]
-            beta_q = beta[c_kid_a.clamp(0, nk - 1).long()]     # [S, M]
-            err_norm = err / beta_q                            # scale: 1.0 ≈ error of one β
-
-            # Select valid queries only.
-            err_valid = err_norm[valid_mask]
-            if err_valid.numel() == 0:
-                continue
-            errs_bucket.append(err_valid.mean().item())
-            all_errs.append(err_valid.mean().item())
-
-            # Per-keypoint — accumulate per-keypoint means within this bucket.
-            for k in range(nk):
-                kp_here = (c_kid_a == k) & valid_mask
-                if kp_here.any():
-                    per_kp_err[k].append(err_norm[kp_here].mean().item())
-
-            bucket_name = f"tau_{lo:02d}_{hi:02d}"
-            out[f"Eval/error_norm_{bucket_name}"] = float(
-                sum(errs_bucket) / max(len(errs_bucket), 1)
+            # Encode z_C once — it's frozen for the whole horizon.
+            z_C = self.policy.encode_constraint_set(
+                C["keypoint_ids"], C["targets"], C["taus"], C["weights"], mask
             )
 
-        if all_errs:
-            out["Eval/error_norm_mean"] = float(sum(all_errs) / len(all_errs))
+            beta = self.beta.to(device)
 
-        for k, lst in per_kp_err.items():
-            if lst:
-                out[f"Eval/error_norm_keypoint_{k:02d}"] = float(sum(lst) / len(lst))
+            # Pre-allocate accumulators per bucket and per keypoint. We
+            # aggregate raw per-query (N, M, H) errors at the end rather
+            # than growing Python lists inside the loop.
+            err_hist = torch.zeros(num_envs, kid.shape[1], H, device=device)
+            seen_hist = torch.zeros(num_envs, kid.shape[1], H, device=device)
+
+            # Track per-env liveness: if an env resets mid-eval, exclude its
+            # remaining steps. BFM resets everything cleanly at the start so
+            # this is primarily defensive.
+            alive = torch.ones(num_envs, dtype=torch.bool, device=device)
+
+            for step in range(H):
+                actions = self.policy.actor.act_inference(obs, z_C)
+                actions = actions.clamp(*action_clip_range)
+
+                next_obs, _rewards, dones, infos = env.step(actions.to(env.device))
+                next_obs = next_obs.to(device)
+                dones = dones.to(device).bool()
+                priv_next = infos["observations"].get(privileged_obs_type, next_obs).to(device)
+                if obs_normalizer is not None:
+                    next_obs = obs_normalizer(next_obs)
+                if privileged_obs_normalizer is not None:
+                    priv_next = privileged_obs_normalizer(priv_next)
+
+                # Extract realized keypoint positions from the priv tail.
+                priv_dim = priv_next.shape[-1]
+                kp_offset = priv_dim - nk * td
+                kp_block = priv_next[:, kp_offset:].reshape(num_envs, nk, td)   # [N, nk, td]
+
+                # For every query q=(k, ξ, τ), if τ == step+1 *and* the env
+                # is still alive, record the realized keypoint for that q.
+                this_step = (tau == (step + 1)) & mask_b & alive.unsqueeze(-1)   # [N, M]
+                if this_step.any():
+                    # Gather realized keypoint per query.
+                    kid_exp = kid.unsqueeze(-1).expand(-1, -1, td).clamp(0, nk - 1)
+                    realized = torch.gather(
+                        kp_block.unsqueeze(1).expand(-1, kid.shape[1], -1, -1),
+                        -2,
+                        kid_exp.unsqueeze(-2),
+                    ).squeeze(-2)                                           # [N, M, td]
+                    err = (realized - tgt).norm(dim=-1)                     # [N, M]
+                    beta_q = beta[kid.clamp(0, nk - 1)]                     # [N, M]
+                    err_norm = err / beta_q
+                    err_hist[..., step][this_step] = err_norm[this_step]
+                    seen_hist[..., step][this_step] = 1.0
+
+                # Mark envs that reset this step as "not alive" going fwd.
+                if dones.any():
+                    alive = alive & (~dones)
+
+                obs = next_obs
+
+            # Aggregate per-τ-bucket and per-keypoint scalars. Each query
+            # contributes to *exactly one* τ (its declared value), which
+            # matches how the training kernel reasons about credit.
+            err_flat = err_hist.sum(dim=-1)          # [N, M]  (per-query error)
+            seen_flat = seen_hist.sum(dim=-1)        # [N, M]  (1 if recorded, else 0)
+            valid = seen_flat > 0.5
+            if valid.any():
+                # Global mean
+                out["Eval/error_norm_mean"] = float(err_flat[valid].mean().item())
+                out["Eval/satisfaction_mean"] = float(
+                    torch.exp(-err_flat[valid] ** 2).mean().item()
+                )
+
+                # Per τ bucket
+                taus_valid = tau[valid].float()
+                errs_valid = err_flat[valid]
+                for lo, hi in self._tau_buckets:
+                    in_b = (taus_valid >= lo) & (taus_valid <= hi)
+                    if in_b.any():
+                        name = f"tau_{lo:02d}_{hi:02d}"
+                        out[f"Eval/error_norm_{name}"] = float(errs_valid[in_b].mean().item())
+                        out[f"Eval/satisfaction_{name}"] = float(
+                            torch.exp(-errs_valid[in_b] ** 2).mean().item()
+                        )
+                        out[f"Eval/count_{name}"] = float(in_b.sum().item())
+
+                # Per keypoint
+                kid_valid = kid[valid]
+                for k in range(nk):
+                    in_k = kid_valid == k
+                    if in_k.any():
+                        out[f"Eval/error_norm_keypoint_{k:02d}"] = float(
+                            errs_valid[in_k].mean().item()
+                        )
+
+                out["Eval/num_scored_queries"] = float(valid.sum().item())
+            else:
+                out["Eval/num_scored_queries"] = 0.0
+
+        finally:
+            # 5. Always restore, even if the rollout raised.
+            self.restore_state(alg_snap)
+            env_u.restore_state(env_snap)
+            if hasattr(env_u, "set_eval_mode"):
+                env_u.set_eval_mode(False)
 
         return out
 
