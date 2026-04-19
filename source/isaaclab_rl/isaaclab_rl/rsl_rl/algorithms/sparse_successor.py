@@ -248,13 +248,12 @@ class SparseSuccessor:
             # set_expert_buffer checks keypoint/snippet consistency.
             self.set_expert_buffer(buf)
 
-        # Optimizers
+        # Optimizers. The ``ConstraintSetEncoder`` now does pure weighted
+        # linear aggregation of atomic embeddings — it has no learnable
+        # parameters beyond the ones owned by ``query_encoder``. So we
+        # optimize the query encoder directly; no separate ``opt_constraint``.
         self.opt_actor = optim.Adam(policy.actor.parameters(), lr=lr_actor)
         self.opt_query = optim.Adam(policy.query_encoder.parameters(), lr=lr_query)
-        self.opt_constraint = optim.Adam(
-            [p for p in policy.constraint_encoder.parameters() if p not in set(policy.query_encoder.parameters())],
-            lr=lr_query,
-        )
         self.opt_U1 = optim.Adam(policy.successor_critic_1.parameters(), lr=lr_critic)
         self.opt_U2 = optim.Adam(policy.successor_critic_2.parameters(), lr=lr_critic)
         self.opt_disc = optim.Adam(policy.style_discriminator.parameters(), lr=lr_disc)
@@ -1365,13 +1364,11 @@ class SparseSuccessor:
             loss_U = loss_U1 + loss_U2
 
             self.opt_query.zero_grad()
-            self.opt_constraint.zero_grad()
             self.opt_U1.zero_grad()
             self.opt_U2.zero_grad()
             loss_U.backward()
             if self._sync_grads:
                 reduce_gradients(self.policy.query_encoder)
-                reduce_gradients(self.policy.constraint_encoder.post_mlp)
                 reduce_gradients(self.policy.successor_critic_1)
                 reduce_gradients(self.policy.successor_critic_2)
             nn.utils.clip_grad_norm_(self.policy.successor_critic_1.parameters(), self.max_grad_norm)
@@ -1380,7 +1377,6 @@ class SparseSuccessor:
             self.opt_U1.step()
             self.opt_U2.step()
             self.opt_query.step()
-            self.opt_constraint.step()
 
             # Successor critic diagnostics (groups 3 & 4)
             with torch.no_grad():

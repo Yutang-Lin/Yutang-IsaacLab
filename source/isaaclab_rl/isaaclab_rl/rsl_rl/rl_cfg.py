@@ -653,7 +653,9 @@ class RslRlSparseSuccessorPolicyCfg:
     """Number of frames in a style snippet."""
 
     project_constraint_latent: Literal["none", "unit_sphere", "clamp_radius"] = "unit_sphere"
-    """Projection applied to ``z_C`` right after ``ConstraintSetEncoder.post_mlp``.
+    """Projection applied to ``z_C`` after the weighted linear aggregation
+    inside ``ConstraintSetEncoder`` (which has no learnable post-pool MLP
+    — the latent is a pure additive composition of per-atom embeddings).
 
     - ``none``: identity. ``z_C`` magnitude is unconstrained — can drift during
       training, which tends to destabilize the actor and discriminator.

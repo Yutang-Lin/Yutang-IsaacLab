@@ -57,14 +57,26 @@ class QueryEncoder(nn.Module):
 
 
 class ConstraintSetEncoder(nn.Module):
-    """Encodes a variable-size set C = [(q_i, w_i)] into z_C by weighted averaging.
+    """Encodes a variable-size set ``C = [(q_i, w_i)]`` into ``z_C`` by
+    **pure weighted linear aggregation** of per-atom embeddings.
 
-    Optionally projects the pooled latent onto a unit sphere or clamps its
-    magnitude (``project_mode``) so that ``z_C`` has bounded norm across
-    rollouts, expert batches, and relabeled batches. Unbounded ``z_C`` scale
-    tends to destabilize both the actor (conditioning input) and the
-    discriminator ((snippet, z_C) concat). BFM's native latent always lives
-    on a unit sphere — this knob lets us replicate that behaviour at will.
+    No learned post-pool MLP: the latent is explicitly additive in the
+    atomic embeddings, so a ``z_C`` cleanly represents the superposition
+    of its atoms:
+
+        z_C = Normalize( Σ_i  w_i · b_i )
+
+    where ``b_i = QueryEncoder(k_i, ξ_i, τ_i)``. Atoms are allowed to have
+    different ``τ_i`` (multi-time sparse constraint set); summation keeps
+    that structure transparent and lets the downstream actor/critic learn
+    to read additive contributions of each atom.
+
+    Optionally projects the aggregated latent onto a unit sphere or clamps
+    its magnitude (``project_mode``) so ``z_C`` has bounded norm across
+    rollouts, expert batches, and relabeled batches. Unbounded ``z_C``
+    scale tends to destabilise both the actor (conditioning input) and the
+    discriminator (snippet, z_C concat). BFM's native latent always lives
+    on a unit sphere — this knob replicates that behaviour.
     """
 
     def __init__(
@@ -77,11 +89,6 @@ class ConstraintSetEncoder(nn.Module):
         super().__init__()
         self.query_encoder = query_encoder
         self.d_model = d_model
-        self.post_mlp = nn.Sequential(
-            nn.Linear(d_model, d_model),
-            nn.ReLU(),
-            nn.Linear(d_model, d_model),
-        )
         if project_mode not in ("none", "unit_sphere", "clamp_radius"):
             raise ValueError(
                 f"Unknown project_mode={project_mode!r}; expected one of "
@@ -134,11 +141,14 @@ class ConstraintSetEncoder(nn.Module):
         flat_b = self.query_encoder(flat_k, flat_x, flat_t)
         b = flat_b.reshape(B, N, -1)
 
+        # Pure weighted linear aggregation — mean-like (normalised by the
+        # sum of active weights) so z_C has a stable scale regardless of
+        # how many atoms are active.
         w = weights * mask
         denom = w.sum(dim=1, keepdim=True).clamp(min=1e-6)
         z = (b * w.unsqueeze(-1)).sum(dim=1) / denom
 
-        return self._project(self.post_mlp(z))
+        return self._project(z)
 
 
 def _build_mlp(input_dim: int, hidden_dims: list[int], output_dim: int, activation: nn.Module, layer_norm: bool = False) -> nn.Sequential:
