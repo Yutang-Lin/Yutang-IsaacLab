@@ -95,6 +95,12 @@ class SparseSuccessor:
         # GPU memory. Sampled batches are moved to the training device with
         # pinned-memory non-blocking transfers.
         replay_device: str | None = None,
+        # Number of *total* env transitions collected with random actions
+        # before training updates begin. Mirrors BFM-Zero's ``num_seed_steps``.
+        # These transitions are still written to the replay buffer so the
+        # critic cold-start sees a reasonable state-action distribution when
+        # learning kicks in. Counted in env transitions, not iterations.
+        num_seed_steps: int = 0,
         # Number of gradient updates per training iteration (SAC/TD3-style).
         # When ``None``, fall back to the legacy behaviour of one full shuffled
         # pass × num_learning_epochs through the buffer. With replay enabled,
@@ -175,6 +181,7 @@ class SparseSuccessor:
         self.grad_penalty_weight = grad_penalty_weight
         self.replay_capacity_per_env = replay_capacity_per_env
         self.replay_device = replay_device if replay_device is not None else self.device
+        self.num_seed_steps = int(num_seed_steps)
         self.num_updates_per_iter = num_updates_per_iter
         self.learning_rate = lr_actor
 

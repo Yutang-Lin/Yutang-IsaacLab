@@ -50,40 +50,113 @@ class SuccessorRunner(BaseRunner):
             env_u.set_expert_buffer(alg_buffer)
 
     # ------------------------------------------------------------------
-    # Logging — duplicate every metric against a BFM-style env-step x-axis
+    # Logging — every scalar is keyed on cumulative env_step count.
     # ------------------------------------------------------------------
 
     def log(self, locs: dict, width: int = 80, pad: int = 35):
-        """BaseRunner.log logs everything against ``locs['it']``. Our ``num_steps_per_env``
-        (5) is much smaller than PPO-style configs (~24+), which makes the iteration
-        axis hard to compare to BFM-Zero's curves. We call the parent to keep all
-        existing iteration-indexed metrics, then re-emit the same series against the
-        cumulative env-step count (``Perf/env_steps_total``) so a user can switch the
-        x-axis to ``env_step`` in wandb/tensorboard.
+        """Full replacement for BaseRunner.log. Everything is written against
+        the cumulative env-step count (BFM-Zero convention), not the iteration
+        index. With ``num_steps_per_env=1`` the iteration axis advances much
+        faster than env_steps, which makes it useless as a training-progress
+        reference; keeping a single env-step axis across all metrics lets
+        curves stay comparable across ``num_envs`` / world-size settings.
         """
-        super().log(locs, width=width, pad=pad)
-        if self.writer is None or self.disable_logs:
-            return
-
-        it = locs["it"]
-        env_steps = int(self.tot_timesteps)  # updated inside super().log
-
-        # Emit the absolute env-step count every iter — this is the new x-axis.
-        self.writer.add_scalar("Perf/env_steps_total", env_steps, it)
-
-        # Duplicate all losses against env_steps (second series under "LossVsEnvStep/").
-        for key, value in locs["loss_dict"].items():
-            self.writer.add_scalar(f"LossVsEnvStep/{key}", value, env_steps)
-
-        # Training rewards keyed by env_steps for direct comparison with BFM curves.
         import statistics as _stats
+
+        # Accumulated counters. Done manually here since we no longer delegate
+        # to the parent log() that used to bump self.tot_timesteps.
+        collection_size = self.num_steps_per_env * self.env.num_envs * self.gpu_world_size
+        self.tot_timesteps += collection_size
+        self.tot_time += locs["collection_time"] + locs["learn_time"]
+        iteration_time = locs["collection_time"] + locs["learn_time"]
+        env_steps = int(self.tot_timesteps)
+
+        # Book-kept scalars used in the terminal printout.
+        if hasattr(self.alg.policy, "action_std"):
+            mean_std = self.alg.policy.action_std
+        else:
+            mean_std = 0.0
+        if isinstance(mean_std, torch.Tensor):
+            mean_std = mean_std.mean().item()
+        fps = int(collection_size / max(locs["collection_time"] + locs["learn_time"], 1e-6))
+
+        # ---- Tensorboard / wandb writes — ALL keyed on env_steps ----
+        if self.writer is not None and not self.disable_logs:
+            # Episode infos (from env)
+            ep_string = ""
+            if locs.get("ep_infos"):
+                for key in locs["ep_infos"][0]:
+                    infotensor = torch.tensor([], device=self.device)
+                    for ep_info in locs["ep_infos"]:
+                        if key not in ep_info:
+                            continue
+                        v = ep_info[key]
+                        if not isinstance(v, torch.Tensor):
+                            v = torch.tensor([v])
+                        if v.ndim == 0:
+                            v = v.unsqueeze(0)
+                        infotensor = torch.cat((infotensor, v.to(self.device)))
+                    value = torch.mean(infotensor)
+                    tag = key if "/" in key else f"Episode/{key}"
+                    self.writer.add_scalar(tag, value, env_steps)
+                    ep_string += f"""{f'Mean episode {key}:':>{pad}} {value:.4f}\n"""
+
+            # All algorithm-reported scalars — Loss/, Scale/, Critic/, QueryTau/,
+            # QueryKeypoint/, Disc/, Style/, Aux/, Action/, Replay/, Reset/, Relabel/
+            # — come through in the loss_dict. Each uses its own tag verbatim.
+            for tag, value in locs["loss_dict"].items():
+                self.writer.add_scalar(tag, value, env_steps)
+
+            # Learning-rate, policy-level telemetry, performance
+            self.writer.add_scalar("Loss/learning_rate", self.alg.learning_rate, env_steps)
+            self.writer.add_scalar("Policy/mean_noise_std", mean_std, env_steps)
+            self.writer.add_scalar("Perf/total_fps", fps, env_steps)
+            self.writer.add_scalar("Perf/collection_time", locs["collection_time"], env_steps)
+            self.writer.add_scalar("Perf/learning_time", locs["learn_time"], env_steps)
+            self.writer.add_scalar("Perf/env_steps_total", env_steps, env_steps)
+            self.writer.add_scalar("Perf/iteration", locs["it"], env_steps)
+
+            # Training-progress (per-env-buffer) rewards + episode lengths.
+            if len(locs["rewbuffer"]) > 0:
+                self.writer.add_scalar("Train/mean_reward", _stats.mean(locs["rewbuffer"]), env_steps)
+                self.writer.add_scalar("Train/mean_episode_length", _stats.mean(locs["lenbuffer"]), env_steps)
+        else:
+            ep_string = ""
+
+        # ---- Terminal printout (iteration number + env_steps) ----
+        header = f" \033[1m Iter {locs['it']}/{locs['tot_iter']}  env_steps={env_steps:,} \033[0m "
         if len(locs["rewbuffer"]) > 0:
-            self.writer.add_scalar(
-                "TrainVsEnvStep/mean_reward", _stats.mean(locs["rewbuffer"]), env_steps
+            log_string = (
+                f"""{'#' * width}\n"""
+                f"""{header.center(width, ' ')}\n\n"""
+                f"""{'Computation:':>{pad}} {fps:.0f} steps/s (collection: {locs['collection_time']:.3f}s,"""
+                f""" learning {locs['learn_time']:.3f}s)\n"""
+                f"""{'Mean action noise std:':>{pad}} {mean_std:.2f}\n"""
             )
-            self.writer.add_scalar(
-                "TrainVsEnvStep/mean_episode_length", _stats.mean(locs["lenbuffer"]), env_steps
+            for key, value in locs["loss_dict"].items():
+                log_string += f"""{f'{key}:':>{pad}} {value:.4f}\n"""
+            log_string += f"""{'Mean reward:':>{pad}} {_stats.mean(locs['rewbuffer']):.2f}\n"""
+            log_string += f"""{'Mean episode length:':>{pad}} {_stats.mean(locs['lenbuffer']):.2f}\n"""
+        else:
+            log_string = (
+                f"""{'#' * width}\n"""
+                f"""{header.center(width, ' ')}\n\n"""
+                f"""{'Computation:':>{pad}} {fps:.0f} steps/s (collection: {locs['collection_time']:.3f}s,"""
+                f""" learning {locs['learn_time']:.3f}s)\n"""
+                f"""{'Mean action noise std:':>{pad}} {mean_std:.2f}\n"""
             )
+            for key, value in locs["loss_dict"].items():
+                log_string += f"""{f'{key}:':>{pad}} {value:.4f}\n"""
+
+        log_string += ep_string
+        import time as _time
+        log_string += (
+            f"""{'-' * width}\n"""
+            f"""{'Total env_steps:':>{pad}} {env_steps:,}\n"""
+            f"""{'Iteration time:':>{pad}} {iteration_time:.2f}s\n"""
+            f"""{'Time elapsed:':>{pad}} {_time.strftime("%H:%M:%S", _time.gmtime(self.tot_time))}\n"""
+        )
+        print(log_string)
 
     def learn(self, num_learning_iterations: int, init_at_random_ep_len: bool = False):  # noqa: C901
         # Initialize writer (reuse parent's writer init logic)
@@ -148,18 +221,54 @@ class SuccessorRunner(BaseRunner):
         start_iter = self.current_learning_iteration
         tot_iter = start_iter + num_learning_iterations
 
+        # Total env transitions collected across all ranks. Updated each
+        # iteration. Used to decide whether we're still in the BFM-style
+        # warmup phase (random actions, no updates) and also as the x-axis
+        # for every metric that's logged — gives a device/rank-independent
+        # training-progress axis.
+        num_seed_steps = int(getattr(self.alg, "num_seed_steps", 0))
+        steps_per_iter_global = self.num_steps_per_env * self.env.num_envs * self.gpu_world_size
+        # ``tot_timesteps`` is maintained by BaseRunner.log via +=; we shadow
+        # it here as self._env_steps_total so decisions based on the counter
+        # are consistent within the learn() loop.
+        self._env_steps_total = int(self.tot_timesteps)
+
+        # Sample uniform-random actions in the actor's output range for the
+        # warmup phase. The actor clamps to [action_low, action_high] anyway
+        # so matching that range gives the critic the same input distribution
+        # it will see at test time.
+        action_low = getattr(self.alg.policy.actor, "action_low", -1.0)
+        action_high = getattr(self.alg.policy.actor, "action_high", 1.0)
+
         for it in range(start_iter, tot_iter):
             start = time.time()
 
             if hasattr(self.env.unwrapped, "pre_rollout"):
                 self.env.unwrapped.pre_rollout()
 
+            # BaseRunner.log() increments self.tot_timesteps at the end of
+            # each prior iter, so this stays in sync even across resumes.
+            self._env_steps_total = int(self.tot_timesteps)
+            warmup_active = self._env_steps_total < num_seed_steps
+
             # ---- Rollout ----
             with torch.inference_mode():
                 self.alg.policy.eval()
 
                 for _ in range(self.num_steps_per_env):
-                    actions = alg.act(obs, privileged_obs, infos=infos).clamp(*self.action_clip_range)
+                    if warmup_active:
+                        # Random actions in the actor's output range. We still
+                        # funnel through alg.act() first so the algorithm gets
+                        # to stash obs/priv/constraints into self.transition,
+                        # then overwrite the actions in-place.
+                        _ = alg.act(obs, privileged_obs, infos=infos)
+                        rand_actions = torch.empty(
+                            self.env.num_envs, self.env.num_actions, device=self.device,
+                        ).uniform_(action_low, action_high)
+                        alg.transition.actions = rand_actions.detach()
+                        actions = rand_actions.clamp(*self.action_clip_range)
+                    else:
+                        actions = alg.act(obs, privileged_obs, infos=infos).clamp(*self.action_clip_range)
 
                     # Step environment
                     next_obs, rewards, dones, infos = self.env.step(actions.to(self.env.device))  # type: ignore
@@ -229,8 +338,14 @@ class SuccessorRunner(BaseRunner):
                 _sync_normalizer(self.privileged_obs_normalizer, self.device)
 
             # ---- Train ----
-            self.alg.policy.train()
-            loss_dict = self.alg.update()
+            # Skip updates while we're still populating the replay with random
+            # actions (BFM-Zero's ``num_seed_steps`` behaviour).
+            if warmup_active:
+                loss_dict = {"Perf/warmup": 1.0}
+            else:
+                self.alg.policy.train()
+                loss_dict = self.alg.update()
+                loss_dict["Perf/warmup"] = 0.0
 
             # Reset-source breakdown (group 7 diag) — ask the env for RSI share.
             env_u = self.env.unwrapped
@@ -248,6 +363,8 @@ class SuccessorRunner(BaseRunner):
             self.current_learning_iteration = it
 
             # ---- Reduce metrics across distributed ranks ----
+            # Keyed on env_steps_total (to match our log()) so multi-rank
+            # curves overlay cleanly with single-rank baselines.
             if self.is_distributed:
                 import torch.distributed as dist
                 has_data = len(rewbuffer) > 0
@@ -261,8 +378,18 @@ class SuccessorRunner(BaseRunner):
                 dist.all_reduce(ep_len_t)
                 dist.all_reduce(count_t)
                 if count_t.item() > 0 and not self.disable_logs:
-                    self.writer.add_scalar("Train/global_mean_reward", (reward_t / count_t).item(), it)
-                    self.writer.add_scalar("Train/global_mean_episode_length", (ep_len_t / count_t).item(), it)
+                    # Use the already-updated env_steps total (log() hasn't
+                    # run yet so we add one collection-size worth here to
+                    # stay on the same axis as the panel it produces next).
+                    env_steps_for_log = int(self.tot_timesteps) + (
+                        self.num_steps_per_env * self.env.num_envs * self.gpu_world_size
+                    )
+                    self.writer.add_scalar(
+                        "Train/global_mean_reward", (reward_t / count_t).item(), env_steps_for_log
+                    )
+                    self.writer.add_scalar(
+                        "Train/global_mean_episode_length", (ep_len_t / count_t).item(), env_steps_for_log
+                    )
 
             # ---- Log ----
             if self.log_dir is not None and not self.disable_logs:

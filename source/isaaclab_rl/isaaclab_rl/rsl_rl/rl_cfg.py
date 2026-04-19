@@ -1028,6 +1028,13 @@ class RslRlSparseSuccessorAlgorithmCfg:
     calls this ``buffer_device``. Sampled batches are moved to the training
     device with non-blocking pinned-memory transfers."""
 
+    num_seed_steps: int = 0
+    """Total env transitions collected with random actions before updates
+    begin. Mirrors BFM's ``num_seed_steps=50_000``. Scales naturally with
+    ``num_envs`` — a seed of 50k means ~12 iters at num_envs=4096 with
+    num_steps_per_env=1. Transitions during seed are still written to the
+    replay buffer."""
+
     num_updates_per_iter: int | None = None
     """Number of gradient updates (each = one full SAC-style update block:
     discriminator, successor critics, style critics, actor, soft target) per
