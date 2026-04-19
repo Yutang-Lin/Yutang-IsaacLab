@@ -366,6 +366,12 @@ class SuccessorRunner(BaseRunner):
             #       env_steps ≈ num_seed_steps),
             #   (b) every time ``env_steps_total`` crosses an integer multiple
             #       of ``eval_interval_env_steps`` after that.
+            #
+            # Distributed correctness: the firing decision is taken locally
+            # but then all-reduced so every rank enters (and exits) the eval
+            # together. Without this, a single-rank drift would desync the
+            # next ``alg.update()`` collective and hang the job on
+            # ``reduce_gradients``.
             eval_interval = int(getattr(self.alg, "eval_interval_env_steps", 0))
             if eval_interval > 0 and not warmup_active:
                 post_env_steps = self._env_steps_total + self.num_steps_per_env * self.env.num_envs * self.gpu_world_size
@@ -373,7 +379,21 @@ class SuccessorRunner(BaseRunner):
                 curr_bucket = post_env_steps // eval_interval
                 first_eval = not self._did_initial_eval
                 interval_crossed = curr_bucket > prev_bucket
-                if first_eval or interval_crossed:
+                run_eval_local = first_eval or interval_crossed
+                # All-reduce the boolean so every rank reaches the same
+                # decision — if ANY rank wants to eval, they ALL eval. Keeps
+                # NCCL collectives downstream in lockstep.
+                if self.is_distributed:
+                    import torch.distributed as dist
+                    flag = torch.tensor(
+                        [1.0 if run_eval_local else 0.0], device=self.device,
+                    )
+                    dist.all_reduce(flag, op=dist.ReduceOp.MAX)
+                    run_eval = bool(flag.item() > 0.5)
+                else:
+                    run_eval = run_eval_local
+
+                if run_eval:
                     # Put the policy + normalizers in eval mode for the
                     # duration: dropout/layernorm stay deterministic and
                     # EmpiricalNormalization stops updating its running
@@ -397,6 +417,15 @@ class SuccessorRunner(BaseRunner):
                             self.obs_normalizer.train()
                         if prev_priv_norm_mode:
                             self.privileged_obs_normalizer.train()
+
+                    # Barrier so stragglers (slower sim init, slower snapshot
+                    # on nodes with bigger NUMA transfer cost, etc.) don't
+                    # drift into the next collective with different wall
+                    # clock positions.
+                    if self.is_distributed:
+                        import torch.distributed as dist
+                        dist.barrier()
+
                     if eval_metrics:
                         loss_dict.update(eval_metrics)
                         self._did_initial_eval = True
