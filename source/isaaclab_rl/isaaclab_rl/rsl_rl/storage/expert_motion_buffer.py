@@ -214,6 +214,98 @@ class ExpertMotionBuffer:
         return {"snippet": snippet, "keypoint_pos": keypoint_pos}
 
     # ------------------------------------------------------------------
+    # Future-grounded sampling (per-atom sparse constraint construction)
+    # ------------------------------------------------------------------
+
+    def _future_valid_starts(self, horizon: int) -> torch.Tensor:
+        """Valid start frames s.t. both snippet (L frames) *and* the future
+        window (H+1 frames from the anchor) stay inside one motion.
+
+        We cache the result per-``horizon`` so repeated sampler calls are O(1).
+        """
+        if not hasattr(self, "_future_valid_cache"):
+            self._future_valid_cache: dict[int, torch.Tensor] = {}
+        if horizon in self._future_valid_cache:
+            return self._future_valid_cache[horizon]
+
+        # ``valid_starts`` was computed in __init__ to guarantee the snippet
+        # window fits inside one motion. For future-grounded sampling we
+        # also need ``start + horizon < motion_end``. We recover motion
+        # boundaries by splitting ``valid_starts`` at the jumps (within a
+        # motion the starts are contiguous; a gap of >1 signals the next
+        # motion).
+        vs = self.valid_starts.tolist()
+        if len(vs) == 0:
+            self._future_valid_cache[horizon] = torch.as_tensor(
+                [], dtype=torch.long, device=self.device,
+            )
+            return self._future_valid_cache[horizon]
+
+        runs: list[tuple[int, int]] = []
+        run_start = vs[0]
+        run_prev = vs[0]
+        for s in vs[1:]:
+            if s == run_prev + 1:
+                run_prev = s
+                continue
+            runs.append((run_start, run_prev))
+            run_start = s
+            run_prev = s
+        runs.append((run_start, run_prev))
+
+        # Each run's last valid start implies ``motion_end = last + snippet_length``.
+        # For the future-window constraint we need ``start + horizon < motion_end``.
+        future_starts: list[int] = []
+        for (lo, hi) in runs:
+            motion_end = hi + self.snippet_length
+            last_future_valid = motion_end - (horizon + 1)
+            if last_future_valid >= lo:
+                future_starts.extend(range(lo, min(hi, last_future_valid) + 1))
+
+        tensor = torch.as_tensor(future_starts, dtype=torch.long, device=self.device)
+        self._future_valid_cache[horizon] = tensor
+        return tensor
+
+    def sample_with_future_window(
+        self, batch_size: int, horizon: int,
+    ) -> dict[str, torch.Tensor]:
+        """Sample a batch of snippets plus a per-sample future keypoint window.
+
+        Used by the per-atom future-grounded constraint constructor: each
+        atomic query samples its own ``τ_i ∈ [1, horizon]`` and pulls its
+        target from ``kp_window[b, τ_i, k_i]``. The whole ``z_C`` is then
+        a pooled encoding of a multi-time sparse constraint set.
+
+        Args:
+            batch_size: B
+            horizon: H — maximum τ (inclusive) the caller will sample.
+
+        Returns:
+            snippet:     [B, snippet_length * style_feature_dim]
+            kp_window:   [B, H+1, K, 3]  — index 0 is the anchor frame,
+                         index h>=1 is the keypoint pos at ``start + h``.
+        """
+        valid = self._future_valid_starts(horizon)
+        if valid.numel() == 0:
+            raise ValueError(
+                f"No expert motion is long enough for horizon={horizon} + "
+                f"snippet_length={self.snippet_length}."
+            )
+        idx = torch.randint(0, valid.shape[0], (batch_size,), device=self.device)
+        start_frames = valid[idx]   # [B]
+        snippet = self._stack_snippet(start_frames)
+
+        H = int(horizon)
+        offsets = torch.arange(H + 1, device=self.device).unsqueeze(0)   # [1, H+1]
+        frame_idx = start_frames.unsqueeze(1) + offsets                   # [B, H+1]
+        # Bounds: ``frame_idx`` is guaranteed valid by construction of
+        # future_valid_starts, so no clamp needed.
+        kp_window = self.kp_buffer[frame_idx.reshape(-1)].reshape(
+            batch_size, H + 1, self.num_keypoints, 3,
+        )                                                                # [B, H+1, K, 3]
+        return {"snippet": snippet, "kp_window": kp_window}
+
+    # ------------------------------------------------------------------
     # Reference-state initialization (BFM-style RSI)
     # ------------------------------------------------------------------
 

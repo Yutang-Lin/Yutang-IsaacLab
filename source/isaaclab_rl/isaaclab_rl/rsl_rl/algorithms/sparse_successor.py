@@ -436,25 +436,24 @@ class SparseSuccessor:
             random_C = self.sample_constraint_set_vectorized(next_priv_obs, num_envs)
 
             # Optional source 2: expert-anchored chunk for a random fraction.
+            # Per-atom future-grounded: we pull the expert's keypoint *future
+            # window* starting at some anchor frame, and each atomic query
+            # independently samples ``τ_i ∈ [1, tau_max]`` and draws its
+            # target from ``kp_window[τ_i]``.
             if (
                 self.expert_buffer is not None
                 and self.expert_chunk_fraction > 0.0
             ):
-                # For the envs that need a new chunk, pick an expert-anchored
-                # subset per configured fraction.
                 expert_mask_of_new = torch.rand(n_new, device=self.device) < self.expert_chunk_fraction
                 if expert_mask_of_new.any():
                     n_expert = int(expert_mask_of_new.sum().item())
-                    expert_batch = self.expert_buffer.sample_reset_states(n_expert)
-                    # ExpertMotionBuffer.sample() gives keypoint_pos too, but
-                    # sample_reset_states only hands back pose/velocity. Pull
-                    # keypoint_pos directly via a fresh sample().
-                    expert_kp = self.expert_buffer.sample(n_expert)["keypoint_pos"].to(self.device)
-                    expert_C = self._sample_constraints_from_keypoint_pos(expert_kp)
-                    # Map the per-expert subset back into per-env (needs_new) layout.
+                    expert_batch = self.expert_buffer.sample_with_future_window(
+                        n_expert, horizon=self.tau_max,
+                    )
+                    expert_window = expert_batch["kp_window"].to(self.device)  # [E, H+1, K, 3]
+                    expert_C = self._sample_constraints_from_keypoint_future(expert_window)
                     new_env_ids = needs_new.nonzero(as_tuple=True)[0]
                     expert_env_ids = new_env_ids[expert_mask_of_new]
-                    # Overlay expert-sampled constraints onto random_C at those envs.
                     for key, ev in random_C.items():
                         ev[expert_env_ids] = expert_C[key]
 
@@ -555,6 +554,8 @@ class SparseSuccessor:
         self,
         stored: dict[str, torch.Tensor],
         next_priv: torch.Tensor,
+        t_idx: torch.Tensor | None = None,
+        env_idx: torch.Tensor | None = None,
     ) -> tuple[dict[str, torch.Tensor], dict[str, int]]:
         """Build a C-space-relabeled constraint set for a training mini-batch.
 
@@ -563,13 +564,14 @@ class SparseSuccessor:
 
         - **stored**: use the constraint set that was actually stored with the
           transition (the same C used at rollout time for this (s, a, s') tuple).
-        - **hindsight**: sample a new constraint set from the batch's
-          ``next_priv`` keypoint positions. Interpreted as "queries that the
-          observed next state happens to satisfy at τ=1" — a natural
-          hindsight-relabeling analogue for our sparse setting.
-        - **expert**: sample a new constraint set from the expert buffer's
-          ``keypoint_pos``. Gives the critics exposure to constraint sets
-          anchored at expert motion frames.
+        - **hindsight** (per-atom future-grounded): gather the env's realized
+          future over the next ``tau_max`` steps from storage, then for each
+          atomic query independently sample ``τ_i ∈ [1, tau_max]`` and take
+          the target from the corresponding future frame. Atoms whose ``τ_i``
+          lands on a reset-crossed frame are masked out.
+        - **expert** (per-atom future-grounded): same per-atom semantics but
+          anchored in the expert buffer — each atom draws from
+          ``expert_kp_window[b, τ_i, k_i]``.
 
         Returns the relabeled constraint dict (same shape as ``stored``) plus
         counters for diagnostics.
@@ -589,6 +591,12 @@ class SparseSuccessor:
         if self.expert_buffer is None and probs[2] > 0.0:
             probs[0] = probs[0] + probs[2]
             probs[2] = 0.0
+        # If the storage can't give us (t, env) coordinates, disable hindsight
+        # (it would fall back to current-frame only, which is what we're
+        # trying to move away from).
+        if (t_idx is None or env_idx is None) and probs[1] > 0.0:
+            probs[0] = probs[0] + probs[1]
+            probs[1] = 0.0
         src = torch.multinomial(probs, B, replacement=True)  # [B] in {0,1,2}
 
         stored_mask = (src == 0)
@@ -598,26 +606,40 @@ class SparseSuccessor:
         # Start from stored — we overlay hindsight / expert per src.
         relabeled = {k: v.clone() for k, v in stored.items()}
 
-        # --- Hindsight source ---
-        if hind_mask.any():
-            # Use next_priv's tail as keypoint positions and sample a fresh
-            # constraint set from them. This is structurally the same as the
-            # rollout sampler but applied to the batch's next state.
+        # --- Hindsight source (per-atom future-grounded) ---
+        if hind_mask.any() and t_idx is not None and env_idx is not None:
             hind_count = int(hind_mask.sum().item())
-            hind_C = self.sample_constraint_set_vectorized(
-                next_priv[hind_mask], hind_count
-            )
-            # Scatter back into the relabeled dict.
             idxs = hind_mask.nonzero(as_tuple=True)[0]
+            # Gather the realized future priv window for these rows from
+            # replay. ``priv_window[:, 0]`` = next_priv at the anchor step;
+            # ``priv_window[:, h]`` = next_priv h steps after the anchor.
+            priv_window, valid = self.storage.gather_next_priv_at(
+                t_idx[idxs.to(t_idx.device)],
+                env_idx[idxs.to(env_idx.device)],
+                horizon=self.tau_max,
+            )
+            priv_window = priv_window.to(self.device)
+            valid = valid.to(self.device)
+            # Extract keypoint positions from the priv tail per frame.
+            priv_dim = priv_window.shape[-1]
+            kp_offset = priv_dim - nk * td
+            kp_window = priv_window[..., kp_offset:].reshape(
+                priv_window.shape[0], priv_window.shape[1], nk, td,
+            )                                                               # [E, H+1, K, 3]
+            hind_C = self._sample_constraints_from_keypoint_future(
+                kp_window, valid_atom_mask=valid,
+            )
             for key, val in hind_C.items():
                 relabeled[key][idxs] = val
 
-        # --- Expert source ---
+        # --- Expert source (per-atom future-grounded) ---
         if expert_mask.any() and self.expert_buffer is not None:
             expert_count = int(expert_mask.sum().item())
-            expert_batch = self.expert_buffer.sample(expert_count)
-            expert_kp = expert_batch["keypoint_pos"].to(self.device)     # [E, K, 3]
-            expert_C = self._sample_constraints_from_keypoint_pos(expert_kp)
+            expert_batch = self.expert_buffer.sample_with_future_window(
+                expert_count, horizon=self.tau_max,
+            )
+            expert_window = expert_batch["kp_window"].to(self.device)        # [E, H+1, K, 3]
+            expert_C = self._sample_constraints_from_keypoint_future(expert_window)
             idxs = expert_mask.nonzero(as_tuple=True)[0]
             for key, val in expert_C.items():
                 relabeled[key][idxs] = val
@@ -629,17 +651,106 @@ class SparseSuccessor:
         }
         return relabeled, counts
 
+    def _sample_constraints_from_keypoint_future(
+        self,
+        kp_window: torch.Tensor,
+        valid_atom_mask: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
+        """Per-atom future-grounded constraint sampling.
+
+        For each element b in the batch:
+          - for each atomic slot i in ``[0, M)``:
+              - sample ``k_i ∈ [0, K)``
+              - sample ``τ_i ∈ [1, H]``
+              - target ``ξ_i = kp_window[b, τ_i, k_i]``
+          - ``n_active`` atoms get ``mask=1``, the rest are padded.
+
+        This is the correct semantics for a sparse multi-time tracking
+        query: one anchor time ``t``, many atoms with independent ``τ_i``,
+        each atom pulling its target from the **corresponding future frame**
+        ``t + τ_i`` rather than from a shared single frame.
+
+        Args:
+            kp_window: [B, H+1, K, 3] — index 0 is the anchor, index h>=1 is
+                the keypoint position at ``t + h``. ``H`` must be >= ``tau_max``.
+            valid_atom_mask: optional [B, H+1] boolean mask. When provided,
+                any atom whose sampled ``τ_i`` lands on ``valid_atom_mask[b, τ_i] = 0``
+                (e.g. the frame crossed a reset in replay) is masked out.
+
+        Returns:
+            dict of padded [B, M, *] constraint set tensors.
+        """
+        B, Hp1, K, td = kp_window.shape
+        H = Hp1 - 1
+        M = self.policy.max_constraints
+        assert K == self.policy.num_keypoints, (
+            f"kp_window has {K} keypoints but policy expects {self.policy.num_keypoints}"
+        )
+        assert td == self.policy.target_dim
+        assert H >= 1, "future window must have at least one lookahead frame"
+
+        max_tau = min(self.tau_max, H)
+
+        # Number of active atoms per sample.
+        n_per = torch.randint(
+            self.n_constraints_min, min(self.n_constraints_max, M) + 1,
+            (B,), device=self.device,
+        )
+        arange = torch.arange(M, device=self.device).unsqueeze(0).expand(B, -1)
+        mask = (arange < n_per.unsqueeze(1)).float()
+
+        # Per-atom keypoint + τ. τ is sampled independently per atom.
+        keypoint_ids = torch.randint(0, K, (B, M), device=self.device)
+        taus = torch.randint(1, max_tau + 1, (B, M), device=self.device).float()
+
+        w_min, w_max = self.weight_range
+        weights = torch.empty(B, M, device=self.device).uniform_(w_min, w_max)
+
+        # Gather per-atom target from kp_window[b, τ_i, k_i].
+        # Build a [B, M] pair of (τ_index, k_index) and gather.
+        b_idx = torch.arange(B, device=self.device).unsqueeze(1).expand(B, M)  # [B, M]
+        tau_idx = taus.long().clamp(0, H)                                       # [B, M]
+        k_idx = keypoint_ids.clamp(0, K - 1).long()                             # [B, M]
+        targets = kp_window[b_idx, tau_idx, k_idx]                              # [B, M, 3]
+        targets = targets + torch.randn_like(targets) * self.target_noise_std
+
+        # Apply dropout.
+        dropout_mask = (torch.rand(B, M, device=self.device) > self.constraint_dropout_prob).float()
+        mask = mask * dropout_mask
+
+        # Mask atoms that landed on an invalid frame (e.g. reset crossing
+        # in hindsight).
+        if valid_atom_mask is not None:
+            # valid_atom_mask: [B, H+1], True where that lookahead frame is
+            # still on the same trajectory segment.
+            v = valid_atom_mask[b_idx, tau_idx].float()                         # [B, M]
+            mask = mask * v
+
+        return {
+            "keypoint_ids": keypoint_ids,
+            "targets": targets,
+            "taus": taus,
+            "weights": weights,
+            "mask": mask,
+        }
+
     def _sample_constraints_from_keypoint_pos(
         self,
         keypoint_pos: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
-        """Vectorized constraint sampling given explicit keypoint positions.
+        """Single-frame (non-future-grounded) constraint sampling.
 
-        Used for building expert z_C from ExpertMotionBuffer samples. The
-        keypoint positions already live in whatever frame the expert was
-        stored in (world frame, in our precompute script) — ``z_C`` is
-        rotation-invariant because ``target_value`` is consumed only through
-        MLP encoders.
+        **Kept for the rollout self-anchored branch only** (the 85% of
+        rollout chunks whose target is the env's current body state). At
+        rollout time the env's own future trajectory is not yet known, so
+        we approximate the multi-time future-grounded construction with a
+        single-frame anchor — every atom's target is drawn from the same
+        ``keypoint_pos`` frame.
+
+        All other paths (rollout expert-chunks, training-time hindsight /
+        expert relabeling, eval) use the future-grounded variant
+        :meth:`_sample_constraints_from_keypoint_future`. See the project
+        note "phase-1 future-grounded constraint refactor" for context.
 
         Args:
             keypoint_pos: [B, K, 3]
@@ -686,7 +797,25 @@ class SparseSuccessor:
         priv_state: torch.Tensor,
         num_envs: int,
     ) -> dict[str, torch.Tensor]:
-        """Vectorized constraint sampling — faster than per-env loop for large num_envs."""
+        """Single-frame rollout self-anchored constraint sampler.
+
+        **Not future-grounded** — every atom's target comes from the same
+        ``priv_state`` frame (the env's current body pose), with random
+        τ_i ∈ [1, tau_max]. This is the phase-1 leftover: at rollout time
+        we don't have the env's own future trajectory yet, so we can't
+        do proper per-atom future grounding here.
+
+        This path is invoked only for the rollout *self*-chunks (the 85%
+        of fresh chunks that anchor on the env's current priv). Rollout
+        *expert* chunks, training-time hindsight / expert relabeling, the
+        discriminator positive branch, and live-eval all use the proper
+        future-grounded :meth:`_sample_constraints_from_keypoint_future`.
+
+        A planned phase-2 fix is to maintain a per-env priv ring buffer
+        inside ``_advance_chunk`` and anchor new chunks ``tau_max`` steps
+        in the past so its "future window" is already known — see
+        project memory ``project_sparse_successor_phase1_future_grounded``.
+        """
         M = self.policy.max_constraints
         td = self.policy.target_dim
         nk = self.policy.num_keypoints
@@ -999,6 +1128,7 @@ class SparseSuccessor:
                 c_kid, c_tgt, c_tau, c_w, c_m,
                 nc_kid, nc_tgt, nc_tau, nc_w, nc_m,
                 snippets,
+                t_idx_batch, env_idx_batch,
             ) = mini_batch
 
             dones_flat = dones.squeeze(-1)  # [B]
@@ -1017,7 +1147,10 @@ class SparseSuccessor:
                 "weights": c_w,
                 "mask": c_m,
             }
-            relabeled, relabel_counts = self._relabel_constraint_sets(stored, next_priv)
+            relabeled, relabel_counts = self._relabel_constraint_sets(
+                stored, next_priv,
+                t_idx=t_idx_batch, env_idx=env_idx_batch,
+            )
             c_kid = relabeled["keypoint_ids"]
             c_tgt = relabeled["targets"]
             c_tau = relabeled["taus"]
@@ -1054,14 +1187,20 @@ class SparseSuccessor:
             disc_loss = None
             grad_penalty_val = 0.0
             if self.expert_buffer is not None:
-                expert_batch = self.expert_buffer.sample(snippets.shape[0])
-                # Move to training device (the buffer may live on CPU for RAM reasons).
-                expert_snippets = expert_batch["snippet"].to(self.device)           # [B, L*style_dim]
-                expert_kp_pos = expert_batch["keypoint_pos"].to(self.device)        # [B, K, 3]
-
-                # Sample constraints on the expert's start frame (same scheme
-                # as the policy rollout) and encode into z_C.
-                expert_constraints = self._sample_constraints_from_keypoint_pos(expert_kp_pos)
+                # Per-atom future-grounded expert z: snippet + kp_window, each
+                # atomic constraint samples its own τ_i from [1, tau_max] and
+                # draws its target from the corresponding future frame. Note
+                # scheme (B): we do NOT require the snippet horizon L to
+                # cover every τ_i — the disc only sees the snippet as
+                # evidence of style, while the z_C it's paired with carries
+                # multi-time query information that the snippet's 8-frame
+                # window cannot fully verify. This is the intended trade-off.
+                expert_batch = self.expert_buffer.sample_with_future_window(
+                    snippets.shape[0], horizon=self.tau_max,
+                )
+                expert_snippets = expert_batch["snippet"].to(self.device)    # [B, L*style_dim]
+                expert_window = expert_batch["kp_window"].to(self.device)    # [B, H+1, K, 3]
+                expert_constraints = self._sample_constraints_from_keypoint_future(expert_window)
                 with torch.no_grad():
                     expert_z = self.policy.encode_constraint_set(
                         expert_constraints["keypoint_ids"],
@@ -1541,8 +1680,21 @@ class SparseSuccessor:
             if privileged_obs_normalizer is not None:
                 priv_obs = privileged_obs_normalizer(priv_obs)
 
-            # 3. Freeze a fresh C per env, anchored on the post-reset priv.
-            C = self.sample_constraint_set_vectorized(priv_obs, num_envs)
+            # 3. Freeze a fresh C per env, per-atom future-grounded from
+            #    the expert buffer when available (closest match to how
+            #    a user would query the policy at test time). Without an
+            #    expert buffer, fall back to the single-frame self-priv
+            #    sampler — not future-grounded, but at least the eval can
+            #    still run. See phase-1 note on rollout self-source for
+            #    why we don't use the env's own future here either.
+            if self.expert_buffer is not None:
+                expert_batch = self.expert_buffer.sample_with_future_window(
+                    num_envs, horizon=self.tau_max,
+                )
+                kp_window = expert_batch["kp_window"].to(device)
+                C = self._sample_constraints_from_keypoint_future(kp_window)
+            else:
+                C = self.sample_constraint_set_vectorized(priv_obs, num_envs)
             # In eval we want the *declared* per-query τ to be respected
             # exactly, so drop the random dropout that the sampler applies.
             mask = (C["mask"] > 0).float()

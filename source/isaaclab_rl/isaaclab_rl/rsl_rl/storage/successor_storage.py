@@ -218,12 +218,20 @@ class SuccessorStorage:
         a handful of updates per iteration.
 
         Sampled tensors are moved to ``sample_device`` via a non-blocking copy;
-        with pinned-memory CPU storage this overlaps with GPU compute.
+        with pinned-memory CPU storage this overlaps with GPU compute. The
+        trailing two entries of the returned tuple are ``(t_idx, env_idx)``,
+        the raw (time, env) coordinates of each mini-batch row on the
+        **storage device** — they stay there so downstream helpers like
+        :meth:`gather_next_priv_at` can do zero-copy indexing into the
+        time-major buffers.
         """
         views, total = self._flatten_live_view()
         # Generate indices on the storage device so the gather reads contiguous
         # memory there; the gathered results are then transferred once.
         idx = torch.randint(0, total, (batch_size,), device=self.storage_device)
+        max_t = self.num_transitions_per_env if self._full else self.step
+        t_idx = idx // self.num_envs      # [B]  (on storage device)
+        env_idx = idx % self.num_envs
         gathered = (
             views["obs"][idx],
             views["priv"][idx],
@@ -244,7 +252,78 @@ class SuccessorStorage:
             views["nc_m"][idx],
             views["snip"][idx],
         )
-        return tuple(self._move_to_sample_device(t) for t in gathered)
+        moved = tuple(self._move_to_sample_device(t) for t in gathered)
+        # ``t_idx`` / ``env_idx`` stay on the storage device so downstream
+        # gathers read the circular buffer directly without a double hop.
+        return moved + (t_idx, env_idx)
+
+    def gather_next_priv_at(
+        self,
+        t_idx: torch.Tensor,
+        env_idx: torch.Tensor,
+        horizon: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Gather ``next_privileged_observations`` for a horizon of future
+        frames per (t, env) anchor, plus a mask marking frames that stay on
+        the same trajectory segment.
+
+        For hindsight relabeling the training loop needs the env's realized
+        future over the next ``horizon`` env-steps. We gather
+        ``next_priv[t + h − 1, env]`` for h ∈ [0, horizon]. A frame is
+        invalid if it is older than the anchor (circular overwrite) or if
+        any ``done`` appears in ``(t, t + h)`` (trajectory reset).
+
+        Args:
+            t_idx, env_idx: [B] anchor coordinates (on storage device).
+            horizon: H — how many future steps to gather.
+
+        Returns:
+            priv_window:  [B, H+1, priv_dim] on the sample device.
+                          Index 0 = ``next_priv[t, env]`` (one step after
+                          the anchor's action, i.e. the env's realized
+                          next state). Index h = ``next_priv[t + h, env]``.
+            valid_mask:   [B, H+1] bool on the sample device. True where
+                          the frame is usable (no reset crossing + within
+                          the populated circular region).
+        """
+        device = self.storage_device
+        max_t = self.num_transitions_per_env if self._full else self.step
+        H = int(horizon)
+        B = t_idx.shape[0]
+        priv_dim = self.next_privileged_observations.shape[-1]
+
+        offsets = torch.arange(H + 1, device=device).unsqueeze(0)   # [1, H+1]
+        frame = t_idx.unsqueeze(1) + offsets                         # [B, H+1]
+
+        # In-bounds mask (frame < max_t) — when the buffer is full we treat
+        # it as linear within [0, max_t) to avoid crossing the circular-write
+        # seam at ``self.step``.
+        in_bounds = frame < max_t                                    # [B, H+1]
+        # Reset-crossing mask: dones[t..t+h-1] for h>=1 must all be 0.
+        # Since dones lives per transition at storage index, cumsum along
+        # the time axis lets us test "no reset in (t, t+h]".
+        dones_flat = self.dones[:max_t].squeeze(-1)                  # [T, N]
+        # cumsum by time for each env — cheap to recompute per call (T is
+        # at most 2048 for the usual cfg).
+        cum = dones_flat.cumsum(dim=0)                               # [T, N]
+        # Clamp frame to a valid storage index for the gather; the mask
+        # below discards out-of-range rows.
+        frame_c = frame.clamp(max=max_t - 1)
+        env_exp = env_idx.unsqueeze(1).expand(B, H + 1)
+        cum_at_frame = cum[frame_c, env_exp]                         # [B, H+1]
+        cum_at_anchor = cum[t_idx, env_idx].unsqueeze(1)             # [B, 1]
+        # no_reset[b, h] = True iff zero resets occurred in (t, t+h].
+        no_reset = (cum_at_frame - cum_at_anchor) <= 0.5
+        # Anchor (h=0) is always "no reset" by definition.
+        no_reset[:, 0] = True
+        valid = in_bounds & no_reset                                 # [B, H+1]
+
+        priv = self.next_privileged_observations[:max_t]             # [T, N, D]
+        priv_window = priv[frame_c, env_exp]                         # [B, H+1, D]
+
+        priv_window = self._move_to_sample_device(priv_window)
+        valid = self._move_to_sample_device(valid)
+        return priv_window, valid
 
     def mini_batch_generator(self, batch_size: int, num_epochs: int = 1):
         """Yield one full shuffled pass over the populated region, repeated num_epochs times.
@@ -279,6 +358,8 @@ class SuccessorStorage:
             perm = torch.randperm(total, device=self.storage_device)
             for start in range(0, total - batch_size + 1, batch_size):
                 idx = perm[start: start + batch_size]
+                t_idx = idx // self.num_envs
+                env_idx = idx % self.num_envs
                 gathered = (
                     obs_flat[idx],
                     priv_flat[idx],
@@ -299,4 +380,7 @@ class SuccessorStorage:
                     nc_m_flat[idx],
                     snip_flat[idx],
                 )
-                yield tuple(self._move_to_sample_device(t) for t in gathered)
+                moved = tuple(self._move_to_sample_device(t) for t in gathered)
+                # ``t_idx`` / ``env_idx`` stay on the storage device so
+                # downstream gathers hit the circular buffer directly.
+                yield moved + (t_idx, env_idx)
