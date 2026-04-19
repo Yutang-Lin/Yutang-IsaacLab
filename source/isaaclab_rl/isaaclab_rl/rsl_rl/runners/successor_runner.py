@@ -63,11 +63,10 @@ class SuccessorRunner(BaseRunner):
         """
         import statistics as _stats
 
-        # Accumulated counters. Done manually here since we no longer delegate
-        # to the parent log() that used to bump self.tot_timesteps.
+        # Accumulated counters. Note these are now advanced by ``learn()``
+        # on every iter (not just logging iters) so log_interval throttling
+        # doesn't stall the env-step x-axis.
         collection_size = self.num_steps_per_env * self.env.num_envs * self.gpu_world_size
-        self.tot_timesteps += collection_size
-        self.tot_time += locs["collection_time"] + locs["learn_time"]
         iteration_time = locs["collection_time"] + locs["learn_time"]
         env_steps = int(self.tot_timesteps)
 
@@ -237,6 +236,20 @@ class SuccessorRunner(BaseRunner):
         # near-zero env_steps instead of only showing up at the first
         # interval boundary.
         self._did_initial_eval = False
+
+        # How often the logger actually flushes to tensorboard / wandb.
+        # With num_steps_per_env=1 we otherwise emit one flush per iter,
+        # and rank 0 chokes on log I/O while the other 63 ranks sail
+        # through the update — producing the iter-3 hang. ``log_interval``
+        # iters lets rank 0 amortise the write cost; iters containing
+        # Eval/* keys are always flushed regardless so we don't lose the
+        # sparse eval signal. Read from agent cfg, default to 10.
+        self._log_interval = max(
+            1,
+            int(getattr(self.alg, "log_interval_iters", 0))
+            or int(self.cfg.get("log_interval_iters", 0))
+            or 10,
+        )
 
         # Sample uniform-random actions in the actor's output range for the
         # warmup phase. The actor clamps to [action_low, action_high] anyway
@@ -441,10 +454,34 @@ class SuccessorRunner(BaseRunner):
             learn_time = stop - start
             self.current_learning_iteration = it
 
+            # Advance global counters every iter regardless of whether we
+            # flush logs — ``log()`` used to do this, but we now throttle
+            # it, so keep the env-step x-axis monotonic here.
+            self.tot_timesteps += self.num_steps_per_env * self.env.num_envs * self.gpu_world_size
+            self.tot_time += collection_time + learn_time
+
+            # ---- Log gate ----
+            # Always flush on (a) every ``log_interval``-th iter, (b) the
+            # first iter of the run so we anchor the x-axis, (c) any iter
+            # that carried Eval/* keys (these are sparse and must not be
+            # dropped), (d) any iter due for a checkpoint save. Otherwise
+            # skip the writer + the Train/global_* all-reduce so rank 0
+            # doesn't become the wall-clock bottleneck.
+            has_eval_metrics = any(str(k).startswith("Eval/") for k in loss_dict.keys())
+            due_save = (it % self.save_interval == 0)
+            should_log = (
+                (it % self._log_interval == 0)
+                or (it == start_iter)
+                or has_eval_metrics
+                or due_save
+            )
+
             # ---- Reduce metrics across distributed ranks ----
-            # Keyed on env_steps_total (to match our log()) so multi-rank
-            # curves overlay cleanly with single-rank baselines.
-            if self.is_distributed:
+            # Collective; every rank must participate or ranks desync. Gate
+            # on ``should_log`` so the cost only hits logging iters. All
+            # ranks compute the same ``should_log`` (same ``it``) so this
+            # is safe.
+            if self.is_distributed and should_log:
                 import torch.distributed as dist
                 has_data = len(rewbuffer) > 0
                 local_reward = statistics.mean(rewbuffer) if has_data else 0.0
@@ -471,15 +508,23 @@ class SuccessorRunner(BaseRunner):
                     )
 
             # ---- Log ----
-            if self.log_dir is not None and not self.disable_logs:
+            if self.log_dir is not None and not self.disable_logs and should_log:
                 self.log(locals())
-                if it % self.save_interval == 0:
+                if due_save:
                     if len(rewbuffer) > 0:
                         current_reward = statistics.mean(rewbuffer)
                         if current_reward > best_reward:
                             best_reward = current_reward
                             self.save(os.path.join(self.log_dir, f"model_best.pt"), remove_extras=False)
                     self.save(os.path.join(self.log_dir, f"model_{it}.pt"))
+            elif due_save and self.log_dir is not None and not self.disable_logs:
+                # Skipped the log flush but still owe a checkpoint this iter.
+                if len(rewbuffer) > 0:
+                    current_reward = statistics.mean(rewbuffer)
+                    if current_reward > best_reward:
+                        best_reward = current_reward
+                        self.save(os.path.join(self.log_dir, f"model_best.pt"), remove_extras=False)
+                self.save(os.path.join(self.log_dir, f"model_{it}.pt"))
 
             ep_infos.clear()
             if it == start_iter and not self.disable_logs:
