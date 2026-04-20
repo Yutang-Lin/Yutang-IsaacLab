@@ -198,9 +198,15 @@ class SuccessorRunner(BaseRunner):
         cur_reward_sum = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
         cur_episode_length = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
 
-        # Initialize constraints from first privileged obs
+        # Initialise constraints properly: allocate storage, run one
+        # fresh-chunk pass for every env so the first ``act()`` encodes
+        # a real anchored z_C (not a zero-mask placeholder). The env has
+        # just been reset so ``privileged_obs`` reflects the initial
+        # body pose — perfect anchor point.
         alg: SparseSuccessor = self.alg  # type: ignore
-        alg._env_constraints = alg.sample_constraint_set_vectorized(privileged_obs, self.env.num_envs)
+        if not hasattr(alg, "unwrapped_env"):
+            setattr(alg, "unwrapped_env", self.env.unwrapped)
+        alg.initialize_constraints(privileged_obs)
 
         if self.is_distributed:
             print(f"Synchronizing parameters for rank {self.gpu_global_rank}...")
@@ -212,9 +218,6 @@ class SuccessorRunner(BaseRunner):
 
         infos = dict(meta_tensors={})
         best_reward = -float("inf")
-
-        if not hasattr(self.alg, "unwrapped_env"):
-            setattr(self.alg, "unwrapped_env", self.env.unwrapped)
 
         start_iter = self.current_learning_iteration
         tot_iter = start_iter + num_learning_iterations

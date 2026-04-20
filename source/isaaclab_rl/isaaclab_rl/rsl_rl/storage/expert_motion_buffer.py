@@ -282,14 +282,27 @@ class ExpertMotionBuffer:
 
         Returns:
             snippet:     [B, snippet_length * style_feature_dim]
-            kp_window:   [B, H+1, K, 3]  — index 0 is the anchor frame,
-                         index h>=1 is the keypoint pos at ``start + h``.
+            kp_window:   [B, H+1, K, 3]  — world-frame keypoint positions.
+                         Index 0 is the anchor frame, index h>=1 is the
+                         position at ``start + h``.
+            anchor_root_pos:   [B, 3]    — expert root position at the
+                                           anchor frame (world frame).
+            anchor_root_quat:  [B, 4]    — expert root quaternion (wxyz)
+                                           at the anchor frame. Used by the
+                                           caller to build a de-yawed root
+                                           frame for ``ξ_ref``.
         """
         valid = self._future_valid_starts(horizon)
         if valid.numel() == 0:
             raise ValueError(
                 f"No expert motion is long enough for horizon={horizon} + "
                 f"snippet_length={self.snippet_length}."
+            )
+        if self.root_pos_buffer is None or self.root_quat_buffer is None:
+            raise RuntimeError(
+                "Expert dataset lacks per-frame root_pos/root_quat buffers. "
+                "Re-run scripts/precompute_expert_dataset.py so the anchored "
+                "sparse-constraint path has access to the expert's heading frame."
             )
         idx = torch.randint(0, valid.shape[0], (batch_size,), device=self.device)
         start_frames = valid[idx]   # [B]
@@ -303,7 +316,14 @@ class ExpertMotionBuffer:
         kp_window = self.kp_buffer[frame_idx.reshape(-1)].reshape(
             batch_size, H + 1, self.num_keypoints, 3,
         )                                                                # [B, H+1, K, 3]
-        return {"snippet": snippet, "kp_window": kp_window}
+        anchor_root_pos = self.root_pos_buffer[start_frames]              # [B, 3]
+        anchor_root_quat = self.root_quat_buffer[start_frames]            # [B, 4] wxyz
+        return {
+            "snippet": snippet,
+            "kp_window": kp_window,
+            "anchor_root_pos": anchor_root_pos,
+            "anchor_root_quat": anchor_root_quat,
+        }
 
     # ------------------------------------------------------------------
     # Reference-state initialization (BFM-style RSI)

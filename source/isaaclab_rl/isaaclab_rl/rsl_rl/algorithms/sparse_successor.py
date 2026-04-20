@@ -6,17 +6,78 @@
 from __future__ import annotations
 
 import math
-import random
 from copy import deepcopy
 
 import torch
 import torch.nn as nn
 import torch.optim as optim
 
+from isaaclab.utils.math import quat_apply, quat_apply_inverse, yaw_quat
+
 from isaaclab_rl.rsl_rl.modules.sparse_successor_policy import SparseSuccessorPolicy
 from isaaclab_rl.rsl_rl.storage.successor_storage import SuccessorStorage
 from isaaclab_rl.rsl_rl.storage.expert_motion_buffer import ExpertMotionBuffer
 from isaaclab_rl.rsl_rl.utils import reduce_gradients, zero_grads_if_nonfinite
+
+
+def _flatten_xy(pos: torch.Tensor) -> torch.Tensor:
+    """Return ``pos`` with its z component zeroed out.
+
+    Used to define a "heading-anchor" translation that ignores height — so
+    z stays absolute (ground-referenced) across the sample-time → world →
+    current-local round trip. Without this, a robot that fell while
+    sampling an expert motion would anchor the target near the ground
+    rather than at the motion's original height.
+    """
+    flat = pos.clone()
+    flat[..., 2] = 0.0
+    return flat
+
+
+def _ref_to_world(
+    ref_xyz: torch.Tensor,      # [..., 3]
+    anchor_pos: torch.Tensor,   # [..., 3]
+    anchor_heading_quat: torch.Tensor,  # [..., 4] wxyz, yaw-only
+) -> torch.Tensor:
+    """Lift a de-yawed-root-frame point at the anchor time into the world.
+
+    ``ref_xyz`` lives in the de-yawed root frame at the anchor moment (the
+    heading is already factored out). We rotate it by the anchor's yaw
+    quat and translate by the anchor's *xy* root position to get an
+    absolute world-frame point that stays fixed as the robot moves — z
+    is preserved as a ground-referenced height.
+    """
+    rotated = quat_apply(anchor_heading_quat, ref_xyz)
+    return rotated + _flatten_xy(anchor_pos)
+
+
+def _world_to_ref(
+    world_xyz: torch.Tensor,      # [..., 3]
+    anchor_pos: torch.Tensor,     # [..., 3]
+    anchor_heading_quat: torch.Tensor,  # [..., 4] wxyz, yaw-only
+) -> torch.Tensor:
+    """Express a world-frame point in the anchor's de-yawed root frame.
+
+    Inverse of :func:`_ref_to_world`: subtract only the anchor's xy (z
+    stays absolute), then de-yaw.
+    """
+    translated = world_xyz - _flatten_xy(anchor_pos)
+    return quat_apply_inverse(anchor_heading_quat, translated)
+
+
+def _world_to_local(
+    world_xyz: torch.Tensor,      # [..., 3]
+    current_pos: torch.Tensor,    # [..., 3]
+    current_heading_quat: torch.Tensor,  # [..., 4] wxyz, yaw-only
+) -> torch.Tensor:
+    """Express a world-frame point in the CURRENT de-yawed root frame.
+
+    Same as :func:`_world_to_ref` but with the *current* env pose instead
+    of the sample-time anchor. Called every step so the network sees a
+    target consistent with the current priv keypoint frame.
+    """
+    translated = world_xyz - _flatten_xy(current_pos)
+    return quat_apply_inverse(current_heading_quat, translated)
 
 
 class SparseSuccessor:
@@ -376,12 +437,87 @@ class SparseSuccessor:
                 f" algorithm snippet_length={self.snippet_length}."
             )
 
+    # ------------------------------------------------------------------
+    # Anchor-frame helpers
+    # ------------------------------------------------------------------
+
+    def _current_env_anchor(
+        self, env_mask: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Read the env's live root position + yaw quat.
+
+        Matches the exact frame that ``priv_keypoint_positions`` uses at
+        obs time: ``body_pos[:, 0]`` (pelvis world pos) and
+        ``yaw_quat(body_quat[:, 0])`` (pelvis heading). Consistency
+        between what the anchor pipeline writes (``ξ_local``) and what
+        the priv tail reads on the next step is what makes the reward
+        computation geometrically valid.
+        """
+        env = self.unwrapped_env
+        root_pos = env.body_pos[:, 0]                  # [N, 3]
+        heading = yaw_quat(env.body_quat[:, 0])        # [N, 4]
+        if env_mask is not None:
+            return root_pos[env_mask], heading[env_mask]
+        return root_pos, heading
+
+    @torch.no_grad()
+    def _refresh_local_targets(self) -> None:
+        """Re-express every live atom's world-anchored target into the
+        env's current de-yawed root frame.
+
+        Called once per env step (from ``act``, before ``z_C`` is encoded)
+        so the network and the satisfaction kernel always see a target
+        expressed in the same frame as the current priv keypoint block.
+        The world anchor (``targets_world``) is what stays constant as
+        the body moves; ``targets`` is the view of that anchor from the
+        current root frame — what the network consumes.
+        """
+        if self._env_constraints is None:
+            return
+        current_pos, current_heading = self._current_env_anchor()
+        N, M = self._env_constraints["keypoint_ids"].shape
+        world = self._env_constraints["targets_world"]    # [N, M, 3]
+        # Broadcast the current anchor across the M atoms of each env.
+        cur_pos = current_pos.unsqueeze(1).expand(N, M, 3)
+        cur_heading = current_heading.unsqueeze(1).expand(N, M, 4)
+        local = _world_to_local(world, cur_pos, cur_heading)
+        self._env_constraints["targets"] = local
+
+    @torch.no_grad()
+    def initialize_constraints(self, priv_obs: torch.Tensor) -> None:
+        """Allocate ``_env_constraints`` and draw a fresh set for every env.
+
+        Called once by the runner right after the initial reset, before
+        the first ``act()``. Equivalent to doing one ``_advance_chunk``
+        pass where every env is in the "needs_new" branch. This makes
+        sure the first step's ``z_C`` is encoded against a real
+        anchored constraint set, not a zero-mask placeholder.
+        """
+        num_envs = priv_obs.shape[0]
+        if self._env_constraints is None or self._env_constraints["mask"].shape[0] != num_envs:
+            self._init_constraints(num_envs)
+        all_envs = torch.ones(num_envs, dtype=torch.bool, device=self.device)
+        # Feed a reset_mask of all-True so every env is marked needs_new.
+        self._advance_chunk(priv_obs, all_envs)
+        self._refresh_local_targets()
+
     def _init_constraints(self, num_envs: int):
         M = self.policy.max_constraints
         td = self.policy.target_dim
         self._env_constraints = {
             "keypoint_ids": torch.zeros(num_envs, M, dtype=torch.long, device=self.device),
+            # ``targets`` holds the CURRENT-STEP local (de-yawed-root) view
+            # of the anchored world target. Recomputed every env step from
+            # ``targets_world`` below so the network + satisfaction kernel
+            # see a target expressed in the same frame as the priv
+            # keypoint positions. What the actor / critic consume.
             "targets": torch.zeros(num_envs, M, td, device=self.device),
+            # ``targets_world`` is the GLOBAL anchor: a fixed world-frame
+            # 3D point per atom, set at chunk sample time, NEVER modified
+            # until the atom expires. Re-expressed into the current
+            # de-yawed root frame each step (into ``targets``) before
+            # ``act`` / satisfaction reads it.
+            "targets_world": torch.zeros(num_envs, M, td, device=self.device),
             "taus": torch.zeros(num_envs, M, device=self.device),
             "weights": torch.zeros(num_envs, M, device=self.device),
             "mask": torch.zeros(num_envs, M, device=self.device),
@@ -396,12 +532,47 @@ class SparseSuccessor:
         env_mask: torch.Tensor,
         new_constraints: dict[str, torch.Tensor],
     ) -> None:
-        """Copy-in ``new_constraints`` only for envs where ``env_mask`` is True."""
+        """Copy-in ``new_constraints`` only for envs where ``env_mask`` is True.
+
+        ``new_constraints`` must provide full ``[num_envs, M, …]`` tensors
+        for keypoint_ids / taus / weights / mask, plus a ``targets_ref``
+        tensor of the same row count expressed in the de-yawed-root
+        frame at sample time. We lift ``targets_ref`` into a
+        world-anchored ``targets_world`` using the env's CURRENT root
+        pose (which is the sample-time anchor), and commit both that
+        and ``targets = targets_ref`` (the local view is ref at sample
+        instant) into the persistent per-env storage.
+
+        ``_refresh_local_targets`` then updates ``targets`` every step
+        by re-expressing ``targets_world`` in the new root frame.
+        """
         if not env_mask.any():
             return
-        for key, new_val in new_constraints.items():
-            dst = self._env_constraints[key]
-            dst[env_mask] = new_val[env_mask]
+        expected = {"keypoint_ids", "taus", "weights", "mask", "targets_ref"}
+        missing = expected - set(new_constraints.keys())
+        if missing:
+            raise KeyError(
+                f"new_constraints is missing required keys: {sorted(missing)}"
+            )
+
+        env = self.unwrapped_env
+        M = self.policy.max_constraints
+        # Full-size anchor tensors; only the rows under env_mask matter.
+        anchor_pos_full = env.body_pos[:, 0]                         # [N, 3]
+        anchor_heading_full = yaw_quat(env.body_quat[:, 0])          # [N, 4]
+        anchor_pos_m = anchor_pos_full.unsqueeze(1).expand(-1, M, 3)
+        anchor_heading_m = anchor_heading_full.unsqueeze(1).expand(-1, M, 4)
+
+        targets_ref_full = new_constraints["targets_ref"]            # [N, M, 3]
+        targets_world_full = _ref_to_world(
+            targets_ref_full, anchor_pos_m, anchor_heading_m,
+        )
+
+        # Apply to the selected rows only.
+        for key in ("keypoint_ids", "taus", "weights", "mask"):
+            self._env_constraints[key][env_mask] = new_constraints[key][env_mask]
+        self._env_constraints["targets"][env_mask] = targets_ref_full[env_mask]
+        self._env_constraints["targets_world"][env_mask] = targets_world_full[env_mask]
 
     @torch.no_grad()
     def _advance_chunk(self, next_priv_obs: torch.Tensor, reset_mask: torch.Tensor | None) -> None:
@@ -496,6 +667,13 @@ class SparseSuccessor:
             new_env_ids = needs_new.nonzero(as_tuple=True)[0]
 
             # --- Replay-future source ---
+            # The trajectory's "own" de-yawed-root anchor is the anchor
+            # transition's next_priv tail — the priv tail is ALREADY
+            # de-yawed around the body's own pelvis at that past step, so
+            # ``targets_ref`` is a direct gather (no further lift needed).
+            # We express this by passing zero translation + identity quat
+            # to the future sampler so its internal ``_world_to_ref``
+            # de-yaw is a no-op for the already-de-yawed window.
             replay_mask_of_new = source == 1
             if replay_mask_of_new.any():
                 n_replay = int(replay_mask_of_new.sum().item())
@@ -504,8 +682,6 @@ class SparseSuccessor:
                     self.storage.num_transitions_per_env
                     if self.storage._full else self.storage.step
                 )
-                # Anchor at a random (t, env) coordinate in the replay.
-                # Constrain t so t + tau_max fits in the populated region.
                 max_anchor = max(max_t - self.tau_max, 1)
                 t_anchor = torch.randint(0, max_anchor, (n_replay,), device=sdev)
                 env_anchor = torch.randint(0, self.storage.num_envs, (n_replay,), device=sdev)
@@ -521,22 +697,35 @@ class SparseSuccessor:
                 kp_window = priv_window[..., kp_offset:].reshape(
                     priv_window.shape[0], priv_window.shape[1], nk, td,
                 )                                                         # [n_replay, H+1, K, 3]
+                # Trajectory anchor = identity (priv tail already de-yawed).
+                traj_pos = torch.zeros(n_replay, 3, device=self.device)
+                traj_quat = torch.zeros(n_replay, 4, device=self.device)
+                traj_quat[:, 0] = 1.0
                 replay_C = self._sample_constraints_from_keypoint_future(
-                    kp_window, valid_atom_mask=valid,
+                    kp_window, traj_pos, traj_quat, valid_atom_mask=valid,
                 )
                 replay_env_ids = new_env_ids[replay_mask_of_new]
                 for key, rv in replay_C.items():
                     random_C[key][replay_env_ids] = rv
 
             # --- Expert-future source ---
+            # Expert keypoints live in the LAFAN world frame, so the
+            # trajectory's own anchor (expert's root pos + quat at its
+            # anchor frame) is the right reference — ``_world_to_ref``
+            # inside the sampler lifts world keypoints into the expert's
+            # de-yawed root frame at t0.
             expert_mask_of_new = source == 2
             if expert_mask_of_new.any() and self.expert_buffer is not None:
                 n_expert = int(expert_mask_of_new.sum().item())
                 expert_batch = self.expert_buffer.sample_with_future_window(
                     n_expert, horizon=self.tau_max,
                 )
-                expert_window = expert_batch["kp_window"].to(self.device)  # [E, H+1, K, 3]
-                expert_C = self._sample_constraints_from_keypoint_future(expert_window)
+                expert_window = expert_batch["kp_window"].to(self.device)           # [E, H+1, K, 3]
+                expert_anchor_pos = expert_batch["anchor_root_pos"].to(self.device)
+                expert_anchor_quat = expert_batch["anchor_root_quat"].to(self.device)
+                expert_C = self._sample_constraints_from_keypoint_future(
+                    expert_window, expert_anchor_pos, expert_anchor_quat,
+                )
                 expert_env_ids = new_env_ids[expert_mask_of_new]
                 for key, ev in expert_C.items():
                     random_C[key][expert_env_ids] = ev
@@ -583,60 +772,6 @@ class SparseSuccessor:
         start = offset + keypoint_id * td
         end = start + td
         return priv_state[..., start:end]
-
-    def sample_constraint_set(
-        self,
-        priv_state: torch.Tensor,
-        num_envs: int,
-    ) -> dict[str, torch.Tensor]:
-        """Sample a random constraint set from the current privileged state (used as proxy for reference motion).
-
-        Args:
-            priv_state: [num_envs, priv_dim] current privileged observation (contains keypoint positions)
-            num_envs: number of environments
-
-        Returns:
-            dict with keypoint_ids, targets, taus, weights, mask tensors all [num_envs, M]
-        """
-        M = self.policy.max_constraints
-        td = self.policy.target_dim
-        nk = self.policy.num_keypoints
-
-        keypoint_ids = torch.zeros(num_envs, M, dtype=torch.long, device=self.device)
-        targets = torch.zeros(num_envs, M, td, device=self.device)
-        taus = torch.zeros(num_envs, M, device=self.device)
-        weights = torch.zeros(num_envs, M, device=self.device)
-        mask = torch.zeros(num_envs, M, device=self.device)
-
-        for env_i in range(num_envs):
-            n = random.randint(self.n_constraints_min, min(self.n_constraints_max, M))
-            for j in range(n):
-                k = random.randint(0, nk - 1)
-                tau = random.randint(1, self.tau_max)
-                xi = self._extract_keypoint_value(priv_state[env_i], k)
-                # add small noise to target
-                xi = xi + torch.randn_like(xi) * self.target_noise_std
-
-                w_min, w_max = self.weight_range
-                w = random.uniform(w_min, w_max)
-
-                # random dropout
-                if random.random() < self.constraint_dropout_prob:
-                    continue
-
-                keypoint_ids[env_i, j] = k
-                targets[env_i, j] = xi
-                taus[env_i, j] = tau
-                weights[env_i, j] = w
-                mask[env_i, j] = 1.0
-
-        return {
-            "keypoint_ids": keypoint_ids,
-            "targets": targets,
-            "taus": taus,
-            "weights": weights,
-            "mask": mask,
-        }
 
     @torch.no_grad()
     def _relabel_constraint_sets(
@@ -696,12 +831,16 @@ class SparseSuccessor:
         relabeled = {k: v.clone() for k, v in stored.items()}
 
         # --- Hindsight source (per-atom future-grounded) ---
+        # Each row's anchor = the transition's own (t_idx, env_idx).
+        # The priv tail at THAT step is in the stored step's de-yawed
+        # root frame, and the replay gather returns it de-yawed already
+        # (because each priv frame's tail is self-referential). So the
+        # trajectory anchor passed to the sampler is identity, and the
+        # resulting ``targets_ref`` lands in the stored step's root
+        # frame — same frame as the stored priv the critic will read.
         if hind_mask.any() and t_idx is not None and env_idx is not None:
-            hind_count = int(hind_mask.sum().item())
             idxs = hind_mask.nonzero(as_tuple=True)[0]
-            # Gather the realized future priv window for these rows from
-            # replay. ``priv_window[:, 0]`` = next_priv at the anchor step;
-            # ``priv_window[:, h]`` = next_priv h steps after the anchor.
+            n_hind = idxs.numel()
             priv_window, valid = self.storage.gather_next_priv_at(
                 t_idx[idxs.to(t_idx.device)],
                 env_idx[idxs.to(env_idx.device)],
@@ -709,29 +848,62 @@ class SparseSuccessor:
             )
             priv_window = priv_window.to(self.device)
             valid = valid.to(self.device)
-            # Extract keypoint positions from the priv tail per frame.
             priv_dim = priv_window.shape[-1]
             kp_offset = priv_dim - nk * td
             kp_window = priv_window[..., kp_offset:].reshape(
                 priv_window.shape[0], priv_window.shape[1], nk, td,
-            )                                                               # [E, H+1, K, 3]
+            )                                                               # [n_hind, H+1, K, 3]
+            # Identity anchor: each priv frame's keypoint tail is already
+            # de-yawed w.r.t. the body at that same frame. Passing a zero
+            # translation + identity quat makes ``_world_to_ref`` a no-op.
+            traj_pos = torch.zeros(n_hind, 3, device=self.device)
+            traj_quat = torch.zeros(n_hind, 4, device=self.device)
+            traj_quat[:, 0] = 1.0
             hind_C = self._sample_constraints_from_keypoint_future(
-                kp_window, valid_atom_mask=valid,
+                kp_window, traj_pos, traj_quat, valid_atom_mask=valid,
             )
-            for key, val in hind_C.items():
-                relabeled[key][idxs] = val
+            # ``targets_ref`` IS the local target in the stored step's
+            # root frame. ``relabeled["targets"]`` is what the critic
+            # will read, so we write targets_ref there directly (no
+            # world-lift at training time — the stored priv's frame is
+            # the relabel frame).
+            relabeled["keypoint_ids"][idxs] = hind_C["keypoint_ids"]
+            relabeled["targets"][idxs] = hind_C["targets_ref"]
+            relabeled["taus"][idxs] = hind_C["taus"]
+            relabeled["weights"][idxs] = hind_C["weights"]
+            relabeled["mask"][idxs] = hind_C["mask"]
 
         # --- Expert source (per-atom future-grounded) ---
+        # Expert keypoints are in the LAFAN world frame; the expert's
+        # own root pose at its anchor frame is the trajectory anchor.
+        # ``_world_to_ref`` expresses the future keypoints in the
+        # expert's de-yawed root frame at t0 → that IS the "local"
+        # frame a fresh chunk anchored on the expert would produce.
+        # For training relabel, the critic reads against the stored
+        # priv (which is in some env's past local frame) — not the
+        # expert's. The network learns to interpret the pair
+        # (obs_stored, z_C(expert_relabel)) as "what would the policy
+        # do if asked to reach these expert-relative targets" — valid
+        # as long as the target frame is self-consistent within one
+        # z_C. Since targets_ref all come from the same expert anchor,
+        # the z_C is internally consistent.
         if expert_mask.any() and self.expert_buffer is not None:
-            expert_count = int(expert_mask.sum().item())
-            expert_batch = self.expert_buffer.sample_with_future_window(
-                expert_count, horizon=self.tau_max,
-            )
-            expert_window = expert_batch["kp_window"].to(self.device)        # [E, H+1, K, 3]
-            expert_C = self._sample_constraints_from_keypoint_future(expert_window)
             idxs = expert_mask.nonzero(as_tuple=True)[0]
-            for key, val in expert_C.items():
-                relabeled[key][idxs] = val
+            n_exp = idxs.numel()
+            expert_batch = self.expert_buffer.sample_with_future_window(
+                n_exp, horizon=self.tau_max,
+            )
+            expert_window = expert_batch["kp_window"].to(self.device)
+            expert_anchor_pos = expert_batch["anchor_root_pos"].to(self.device)
+            expert_anchor_quat = expert_batch["anchor_root_quat"].to(self.device)
+            expert_C = self._sample_constraints_from_keypoint_future(
+                expert_window, expert_anchor_pos, expert_anchor_quat,
+            )
+            relabeled["keypoint_ids"][idxs] = expert_C["keypoint_ids"]
+            relabeled["targets"][idxs] = expert_C["targets_ref"]
+            relabeled["taus"][idxs] = expert_C["taus"]
+            relabeled["weights"][idxs] = expert_C["weights"]
+            relabeled["mask"][idxs] = expert_C["mask"]
 
         counts = {
             "stored": int(stored_mask.sum().item()),
@@ -743,40 +915,70 @@ class SparseSuccessor:
     def _sample_constraints_from_keypoint_future(
         self,
         kp_window: torch.Tensor,
+        traj_anchor_root_pos: torch.Tensor,
+        traj_anchor_root_quat: torch.Tensor,
         valid_atom_mask: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
-        """Per-atom future-grounded constraint sampling.
+        """Per-atom future-grounded constraint sampling, anchored in the
+        *trajectory's* de-yawed root frame.
 
         For each element b in the batch:
-          - for each atomic slot i in ``[0, M)``:
-              - sample ``k_i ∈ [0, K)``
-              - sample ``τ_i ∈ [1, H]``
-              - target ``ξ_i = kp_window[b, τ_i, k_i]``
-          - ``n_active`` atoms get ``mask=1``, the rest are padded.
+          - sample n_active atoms,
+          - for each atomic slot i: sample ``k_i``, ``τ_i``, ``w_i``,
+          - pick the keypoint's world position at ``t + τ_i``,
+          - express it in the trajectory's de-yawed root frame at ``t0``:
+              ξ_ref_i = R_yaw(traj_quat_t0)^-1 · (p_world − traj_pos_t0_xy)
+          (z is preserved as absolute / ground-referenced — not anchored
+           to the trajectory's pelvis height, so recovery poses from
+           lie-down starts stay consistent with the expert-stand target).
 
-        This is the correct semantics for a sparse multi-time tracking
-        query: one anchor time ``t``, many atoms with independent ``τ_i``,
-        each atom pulling its target from the **corresponding future frame**
-        ``t + τ_i`` rather than from a shared single frame.
+        The caller is responsible for lifting ``targets_ref`` into a
+        world-anchored ``targets_world`` using the **env's** sample-time
+        root pose, which is how we separate the trajectory source (which
+        describes relative motion) from the env instance (which decides
+        where in space the motion is grounded).
 
         Args:
-            kp_window: [B, H+1, K, 3] — index 0 is the anchor, index h>=1 is
-                the keypoint position at ``t + h``. ``H`` must be >= ``tau_max``.
-            valid_atom_mask: optional [B, H+1] boolean mask. When provided,
-                any atom whose sampled ``τ_i`` lands on ``valid_atom_mask[b, τ_i] = 0``
-                (e.g. the frame crossed a reset in replay) is masked out.
+            kp_window: [B, H+1, K, 3] world-frame keypoint positions.
+                Index 0 = anchor frame, index h>=1 = frame ``t + h``.
+            traj_anchor_root_pos: [B, 3] world-frame root pos at the
+                trajectory's own anchor frame.
+            traj_anchor_root_quat: [B, 4] world-frame root quat (wxyz)
+                at the trajectory's own anchor frame.
+            valid_atom_mask: optional [B, H+1] bool. When provided, atoms
+                landing on ``False`` frames (e.g. reset crossings in
+                replay hindsight) are masked out.
 
         Returns:
-            dict of padded [B, M, *] constraint set tensors.
+            dict with keypoint_ids / taus / weights / mask and
+            ``targets_ref`` [B, M, 3] — the de-yawed-root-frame target at
+            the trajectory's anchor time.
         """
         B, Hp1, K, td = kp_window.shape
         H = Hp1 - 1
         M = self.policy.max_constraints
-        assert K == self.policy.num_keypoints, (
-            f"kp_window has {K} keypoints but policy expects {self.policy.num_keypoints}"
-        )
-        assert td == self.policy.target_dim
-        assert H >= 1, "future window must have at least one lookahead frame"
+        if K != self.policy.num_keypoints:
+            raise ValueError(
+                f"kp_window has {K} keypoints but policy expects "
+                f"{self.policy.num_keypoints}"
+            )
+        if td != self.policy.target_dim:
+            raise ValueError(
+                f"kp_window target_dim {td} does not match policy target_dim"
+                f" {self.policy.target_dim}"
+            )
+        if H < 1:
+            raise ValueError("future window must have at least one lookahead frame")
+        if traj_anchor_root_pos.shape != (B, 3):
+            raise ValueError(
+                f"traj_anchor_root_pos shape {tuple(traj_anchor_root_pos.shape)}"
+                f" != ({B}, 3)"
+            )
+        if traj_anchor_root_quat.shape != (B, 4):
+            raise ValueError(
+                f"traj_anchor_root_quat shape {tuple(traj_anchor_root_quat.shape)}"
+                f" != ({B}, 4)"
+            )
 
         max_tau = min(self.tau_max, H)
 
@@ -795,29 +997,36 @@ class SparseSuccessor:
         w_min, w_max = self.weight_range
         weights = torch.empty(B, M, device=self.device).uniform_(w_min, w_max)
 
-        # Gather per-atom target from kp_window[b, τ_i, k_i].
-        # Build a [B, M] pair of (τ_index, k_index) and gather.
+        # Gather per-atom world-frame target at (b, τ_i, k_i).
         b_idx = torch.arange(B, device=self.device).unsqueeze(1).expand(B, M)  # [B, M]
         tau_idx = taus.long().clamp(0, H)                                       # [B, M]
         k_idx = keypoint_ids.clamp(0, K - 1).long()                             # [B, M]
-        targets = kp_window[b_idx, tau_idx, k_idx]                              # [B, M, 3]
-        targets = targets + torch.randn_like(targets) * self.target_noise_std
+        targets_world_local_traj = kp_window[b_idx, tau_idx, k_idx]             # [B, M, 3]
+
+        # Express each target in the TRAJECTORY'S de-yawed root frame at
+        # its anchor time. z is preserved as absolute via ``_world_to_ref``
+        # (which zeroes the anchor's z before the translation).
+        traj_yaw = yaw_quat(traj_anchor_root_quat)                              # [B, 4]
+        traj_yaw_m = traj_yaw.unsqueeze(1).expand(B, M, 4)
+        traj_pos_m = traj_anchor_root_pos.unsqueeze(1).expand(B, M, 3)
+        targets_ref = _world_to_ref(
+            targets_world_local_traj, traj_pos_m, traj_yaw_m,
+        )
+        targets_ref = targets_ref + torch.randn_like(targets_ref) * self.target_noise_std
 
         # Apply dropout.
         dropout_mask = (torch.rand(B, M, device=self.device) > self.constraint_dropout_prob).float()
         mask = mask * dropout_mask
 
         # Mask atoms that landed on an invalid frame (e.g. reset crossing
-        # in hindsight).
+        # in hindsight replay).
         if valid_atom_mask is not None:
-            # valid_atom_mask: [B, H+1], True where that lookahead frame is
-            # still on the same trajectory segment.
             v = valid_atom_mask[b_idx, tau_idx].float()                         # [B, M]
             mask = mask * v
 
         return {
             "keypoint_ids": keypoint_ids,
-            "targets": targets,
+            "targets_ref": targets_ref,
             "taus": taus,
             "weights": weights,
             "mask": mask,
@@ -829,31 +1038,38 @@ class SparseSuccessor:
     ) -> dict[str, torch.Tensor]:
         """Single-frame (non-future-grounded) constraint sampling.
 
-        **Kept for the rollout self-anchored branch only** (the 85% of
-        rollout chunks whose target is the env's current body state). At
-        rollout time the env's own future trajectory is not yet known, so
-        we approximate the multi-time future-grounded construction with a
-        single-frame anchor — every atom's target is drawn from the same
-        ``keypoint_pos`` frame.
-
-        All other paths (rollout expert-chunks, training-time hindsight /
-        expert relabeling, eval) use the future-grounded variant
-        :meth:`_sample_constraints_from_keypoint_future`. See the project
-        note "phase-1 future-grounded constraint refactor" for context.
+        **Single-frame, trajectory-anchor-free variant** kept for callers
+        that already have keypoint positions expressed in the desired
+        de-yawed root frame (i.e. the priv tail, which IS de-yawed). The
+        per-atom construction still samples an independent ``τ_i`` but
+        the spatial target is a shared current-frame keypoint — so
+        this sampler is **not** future-grounded; it's the pose-hold-style
+        live-self source. Per-atom future-grounded construction from a
+        trajectory window lives in
+        :meth:`_sample_constraints_from_keypoint_future`.
 
         Args:
-            keypoint_pos: [B, K, 3]
+            keypoint_pos: [B, K, 3] — keypoints already in the desired
+                de-yawed root frame (i.e. ``priv_keypoint_positions``).
         Returns:
-            dict of padded [B, M, *] constraint set tensors.
+            dict with keypoint_ids / taus / weights / mask and
+            ``targets_ref`` [B, M, 3] — de-yawed-root-frame target (the
+            caller lifts it to ``targets_world`` with the env's
+            sample-time anchor).
         """
         B, K, td = keypoint_pos.shape
         M = self.policy.max_constraints
-        assert K == self.policy.num_keypoints, (
-            f"keypoint_pos has {K} keypoints but policy expects {self.policy.num_keypoints}"
-        )
-        assert td == self.policy.target_dim
+        if K != self.policy.num_keypoints:
+            raise ValueError(
+                f"keypoint_pos has {K} keypoints but policy expects "
+                f"{self.policy.num_keypoints}"
+            )
+        if td != self.policy.target_dim:
+            raise ValueError(
+                f"keypoint_pos target_dim {td} does not match policy target_dim"
+                f" {self.policy.target_dim}"
+            )
 
-        # Number of constraints per sample
         n_per = torch.randint(
             self.n_constraints_min, min(self.n_constraints_max, M) + 1,
             (B,), device=self.device,
@@ -867,15 +1083,15 @@ class SparseSuccessor:
         weights = torch.empty(B, M, device=self.device).uniform_(w_min, w_max)
 
         kid_expanded = keypoint_ids.unsqueeze(-1).expand(-1, -1, td)
-        targets = torch.gather(keypoint_pos, 1, kid_expanded)
-        targets = targets + torch.randn_like(targets) * self.target_noise_std
+        targets_ref = torch.gather(keypoint_pos, 1, kid_expanded)
+        targets_ref = targets_ref + torch.randn_like(targets_ref) * self.target_noise_std
 
         dropout_mask = (torch.rand(B, M, device=self.device) > self.constraint_dropout_prob).float()
         mask = mask * dropout_mask
 
         return {
             "keypoint_ids": keypoint_ids,
-            "targets": targets,
+            "targets_ref": targets_ref,
             "taus": taus,
             "weights": weights,
             "mask": mask,
@@ -909,42 +1125,32 @@ class SparseSuccessor:
         td = self.policy.target_dim
         nk = self.policy.num_keypoints
 
-        # Sample number of constraints per env
         n_per_env = torch.randint(
             self.n_constraints_min, min(self.n_constraints_max, M) + 1,
             (num_envs,), device=self.device,
         )
-        # Build mask from n_per_env
         arange = torch.arange(M, device=self.device).unsqueeze(0).expand(num_envs, -1)
         mask = (arange < n_per_env.unsqueeze(1)).float()
 
-        # Random keypoint ids
         keypoint_ids = torch.randint(0, nk, (num_envs, M), device=self.device)
-        # Random taus
         taus = torch.randint(1, self.tau_max + 1, (num_envs, M), device=self.device).float()
-        # Random weights
         w_min, w_max = self.weight_range
         weights = torch.empty(num_envs, M, device=self.device).uniform_(w_min, w_max)
 
-        # Extract targets from priv_state based on keypoint_ids
-        nk_total = nk
-        offset = priv_state.shape[-1] - nk_total * td
-        # Gather keypoint values: [num_envs, M, td]
-        # Reshape priv to extract keypoint block
-        kp_block = priv_state[:, offset:].reshape(num_envs, nk_total, td)  # [N, nk, td]
-        # Gather using keypoint_ids
-        kid_expanded = keypoint_ids.unsqueeze(-1).expand(-1, -1, td)  # [N, M, td]
-        targets = torch.gather(kp_block, 1, kid_expanded.clamp(0, nk_total - 1))  # [N, M, td]
-        # Add noise
-        targets = targets + torch.randn_like(targets) * self.target_noise_std
+        # priv tail is already in the env's de-yawed root frame at the
+        # current step; we reuse it as ``targets_ref`` directly.
+        offset = priv_state.shape[-1] - nk * td
+        kp_block = priv_state[:, offset:].reshape(num_envs, nk, td)           # [N, nk, td]
+        kid_expanded = keypoint_ids.unsqueeze(-1).expand(-1, -1, td)          # [N, M, td]
+        targets_ref = torch.gather(kp_block, 1, kid_expanded.clamp(0, nk - 1))
+        targets_ref = targets_ref + torch.randn_like(targets_ref) * self.target_noise_std
 
-        # Apply dropout: randomly zero out some constraints
         dropout_mask = (torch.rand(num_envs, M, device=self.device) > self.constraint_dropout_prob).float()
         mask = mask * dropout_mask
 
         return {
             "keypoint_ids": keypoint_ids,
-            "targets": targets,
+            "targets_ref": targets_ref,
             "taus": taus,
             "weights": weights,
             "mask": mask,
@@ -1075,6 +1281,12 @@ class SparseSuccessor:
         if self._env_constraints is None or self._env_constraints["mask"].shape[0] != num_envs:
             self._init_constraints(num_envs)
 
+        # Re-express the world-anchored target into the env's CURRENT
+        # de-yawed root frame. ``targets`` must match the frame of the
+        # priv keypoint block at this exact step for the satisfaction
+        # kernel and the per-atom encoder to be geometrically valid.
+        self._refresh_local_targets()
+
         # Encode constraint set
         with torch.no_grad():
             z_C = self.policy.encode_constraint_set(
@@ -1162,7 +1374,13 @@ class SparseSuccessor:
             reset_mask = self.transition.dones > 0
 
         # Advance the chunk state in-place on self._env_constraints.
+        # Fresh chunks are sampled against the env's CURRENT root pose
+        # (which is the post-step state at t+1); for continuing chunks
+        # the world anchor is unchanged but the local view needs to be
+        # refreshed to the t+1 frame before being stored as
+        # ``next_constraint_targets``.
         self._advance_chunk(next_priv_obs, reset_mask)
+        self._refresh_local_targets()
 
         # Mirror the new _env_constraints into the transition's next-C fields.
         self.transition.next_constraint_keypoint_ids = self._env_constraints["keypoint_ids"].clone()
@@ -1291,11 +1509,19 @@ class SparseSuccessor:
                 )
                 expert_snippets = expert_batch["snippet"].to(self.device)    # [B, L*style_dim]
                 expert_window = expert_batch["kp_window"].to(self.device)    # [B, H+1, K, 3]
-                expert_constraints = self._sample_constraints_from_keypoint_future(expert_window)
+                expert_anchor_pos = expert_batch["anchor_root_pos"].to(self.device)
+                expert_anchor_quat = expert_batch["anchor_root_quat"].to(self.device)
+                expert_constraints = self._sample_constraints_from_keypoint_future(
+                    expert_window, expert_anchor_pos, expert_anchor_quat,
+                )
                 with torch.no_grad():
+                    # The expert_z is paired with the expert snippet — both
+                    # live in the expert's own de-yawed root frame at t0.
+                    # ``targets_ref`` IS the local view in that frame, so
+                    # it's what the encoder needs.
                     expert_z = self.policy.encode_constraint_set(
                         expert_constraints["keypoint_ids"],
-                        expert_constraints["targets"],
+                        expert_constraints["targets_ref"],
                         expert_constraints["taus"],
                         expert_constraints["weights"],
                         expert_constraints["mask"],
@@ -1849,33 +2075,56 @@ class SparseSuccessor:
                 priv_obs = privileged_obs_normalizer(priv_obs)
 
             # 3. Freeze a fresh C per env, per-atom future-grounded from
-            #    the expert buffer when available (closest match to how
-            #    a user would query the policy at test time). Without an
-            #    expert buffer, fall back to the single-frame self-priv
-            #    sampler — not future-grounded, but at least the eval can
-            #    still run. See phase-1 note on rollout self-source for
-            #    why we don't use the env's own future here either.
+            #    the expert buffer when available. Lift ``targets_ref``
+            #    (de-yawed-root at the expert's own t0) into world-anchored
+            #    ``targets_world`` using the env's post-reset root pose —
+            #    this is the sample-time anchor, mirroring what
+            #    ``_replace_constraints_for_envs`` does at rollout time.
+            #    When no expert buffer exists, fall back to the single-
+            #    frame self-priv sampler anchored the same way.
             if self.expert_buffer is not None:
                 expert_batch = self.expert_buffer.sample_with_future_window(
                     num_envs, horizon=self.tau_max,
                 )
                 kp_window = expert_batch["kp_window"].to(device)
-                C = self._sample_constraints_from_keypoint_future(kp_window)
+                expert_anchor_pos = expert_batch["anchor_root_pos"].to(device)
+                expert_anchor_quat = expert_batch["anchor_root_quat"].to(device)
+                C = self._sample_constraints_from_keypoint_future(
+                    kp_window, expert_anchor_pos, expert_anchor_quat,
+                )
             else:
                 C = self.sample_constraint_set_vectorized(priv_obs, num_envs)
+
             # In eval we want the *declared* per-query τ to be respected
             # exactly, so drop the random dropout that the sampler applies.
             mask = (C["mask"] > 0).float()
-            C["mask"] = mask
 
-            kid = C["keypoint_ids"].long()        # [N, M]
-            tgt = C["targets"]                    # [N, M, td]
-            tau = C["taus"].long()                # [N, M]
-            mask_b = mask.bool()                  # [N, M]
+            kid = C["keypoint_ids"].long()            # [N, M]
+            targets_ref = C["targets_ref"]            # [N, M, 3] de-yawed at traj t0
+            tau = C["taus"].long()                    # [N, M]
+            mask_b = mask.bool()                      # [N, M]
 
-            # Encode z_C once — it's frozen for the whole horizon.
+            # Lift into world frame using the env's CURRENT root pose
+            # (just reset, so this is the eval sample-time anchor).
+            env_u_local = env.unwrapped if hasattr(env, "unwrapped") else env
+            M = kid.shape[1]
+            env_anchor_pos = env_u_local.body_pos[:, 0]                   # [N, 3]
+            env_anchor_heading = yaw_quat(env_u_local.body_quat[:, 0])    # [N, 4]
+            env_anchor_pos_m = env_anchor_pos.unsqueeze(1).expand(-1, M, 3)
+            env_anchor_heading_m = env_anchor_heading.unsqueeze(1).expand(-1, M, 4)
+            targets_world = _ref_to_world(
+                targets_ref, env_anchor_pos_m, env_anchor_heading_m,
+            )
+            # At sample time, the local view == targets_ref by construction.
+            targets_local = targets_ref.clone()
+
+            # Encode z_C once at the start — the underlying world anchor
+            # is fixed, but the local view passed to the encoder must
+            # match the current root frame. We re-encode every step
+            # inside the rollout loop below; this initial encode is
+            # just so the first ``act_inference`` has a valid latent.
             z_C = self.policy.encode_constraint_set(
-                C["keypoint_ids"], C["targets"], C["taus"], C["weights"], mask
+                kid, targets_local, tau.float(), C["weights"], mask,
             )
 
             beta = self.beta.to(device)
@@ -1904,6 +2153,24 @@ class SparseSuccessor:
                 if privileged_obs_normalizer is not None:
                     priv_next = privileged_obs_normalizer(priv_next)
 
+                # Re-express the world-anchored target in the env's
+                # NEW de-yawed root frame — same frame the priv tail
+                # we're about to read is in. Without this the realized-
+                # vs-target comparison below would mix frames.
+                cur_pos = env_u_local.body_pos[:, 0]
+                cur_heading = yaw_quat(env_u_local.body_quat[:, 0])
+                cur_pos_m = cur_pos.unsqueeze(1).expand(-1, M, 3)
+                cur_heading_m = cur_heading.unsqueeze(1).expand(-1, M, 4)
+                targets_local = _world_to_local(
+                    targets_world, cur_pos_m, cur_heading_m,
+                )
+                # Re-encode z_C so the actor's next step sees the
+                # up-to-date local-frame target (the world target hasn't
+                # moved, but the local view of it has).
+                z_C = self.policy.encode_constraint_set(
+                    kid, targets_local, tau.float(), C["weights"], mask,
+                )
+
                 # Extract realized keypoint positions from the priv tail.
                 priv_dim = priv_next.shape[-1]
                 kp_offset = priv_dim - nk * td
@@ -1913,20 +2180,20 @@ class SparseSuccessor:
                 # is still alive, record the realized keypoint for that q.
                 this_step = (tau == (step + 1)) & mask_b & alive.unsqueeze(-1)   # [N, M]
                 if this_step.any():
-                    # Gather realized keypoint per query.
                     kid_exp = kid.unsqueeze(-1).expand(-1, -1, td).clamp(0, nk - 1)
                     realized = torch.gather(
-                        kp_block.unsqueeze(1).expand(-1, kid.shape[1], -1, -1),
+                        kp_block.unsqueeze(1).expand(-1, M, -1, -1),
                         -2,
                         kid_exp.unsqueeze(-2),
                     ).squeeze(-2)                                           # [N, M, td]
-                    err = (realized - tgt).norm(dim=-1)                     # [N, M]
-                    beta_q = beta[kid.clamp(0, nk - 1)]                     # [N, M]
+                    # Both realized and targets_local are in the current
+                    # env de-yawed root frame — valid to subtract.
+                    err = (realized - targets_local).norm(dim=-1)
+                    beta_q = beta[kid.clamp(0, nk - 1)]
                     err_norm = err / beta_q
                     err_hist[..., step][this_step] = err_norm[this_step]
                     seen_hist[..., step][this_step] = 1.0
 
-                # Mark envs that reset this step as "not alive" going fwd.
                 if dones.any():
                     alive = alive & (~dones)
 
