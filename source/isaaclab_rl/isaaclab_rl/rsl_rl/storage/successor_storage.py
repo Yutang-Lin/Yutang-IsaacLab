@@ -346,12 +346,19 @@ class SuccessorStorage:
         phase = getattr(self, "_episode_phase_offset", 0)
 
         if L is not None and L > H:
-            # Aligned-block path: a slot is safe iff it lies in the
-            # first ``L - H`` positions of its episode block AND it's
-            # within the populated region.
+            # Aligned-block path: a slot is safe iff its horizon window
+            # ``[t, t + H]`` stays strictly within one episode block.
+            # In each L-step block, the last step (position ``L - 1``)
+            # carries ``done=1`` for every env (hard timeout). We want
+            # no step in the window to land on that boundary, so the
+            # safe region is ``(t mod L) <= L - H - 2`` — equivalently
+            # ``(t mod L) < L - H - 1``.
+            if L - H - 1 <= 0:
+                return None
+            limit = L - H - 1
             if self._full:
                 t_all = torch.arange(N, device=dev)                  # [N]
-                within_block = ((t_all - phase).remainder(L)) < (L - H)
+                within_block = ((t_all - phase).remainder(L)) < limit
                 # Circular in-bounds check (distance to seam >= H).
                 write_ptr = int(self.step % N)
                 dist = (write_ptr - 1 - t_all).remainder(N)
@@ -359,7 +366,7 @@ class SuccessorStorage:
                 safe_t = within_block & in_bounds                    # [N]
             else:
                 t_all = torch.arange(max_t, device=dev)
-                within_block = ((t_all - phase).remainder(L)) < (L - H)
+                within_block = ((t_all - phase).remainder(L)) < limit
                 in_bounds = (t_all + H) < max_t
                 safe_t = within_block & in_bounds                    # [max_t]
 

@@ -176,10 +176,21 @@ class SuccessorRunner(BaseRunner):
             else:
                 raise ValueError("Logger type not found.")
 
+        # SparseSuccessor requires lock-step episode resets so the
+        # ``sample_safe_future_anchors`` aligned-block fast path can
+        # treat the buffer as a regular pattern of same-episode blocks.
+        # ``train.py`` passes ``init_at_random_ep_len=True`` by default
+        # for on-policy PPO decorrelation; we hard-override it here
+        # because randomised per-env phases would break the anchor
+        # guarantees ``gather_next_priv_at`` relies on when combined
+        # with the aligned-block sampler.
         if init_at_random_ep_len:
-            self.env.episode_length_buf = torch.randint_like(
-                self.env.episode_length_buf, high=int(self.env.max_episode_length)
+            print(
+                "[SuccessorRunner] Ignoring init_at_random_ep_len=True — "
+                "SparseSuccessor needs lock-step episode resets. Every env "
+                "starts episode 0 at step 0."
             )
+            init_at_random_ep_len = False
 
         obs, extras = self.env.get_observations()
         privileged_obs = extras["observations"].get(self.privileged_obs_type, obs)

@@ -301,9 +301,14 @@ class SparseSuccessor:
         # Diagnostic accumulator — reset at the start of every update() call
         # and flushed into the returned loss_dict. See ``update()`` for the
         # full list of tracked scalars (Loss/*, Scale/*, Critic/*, QueryTau/*,
-        # QueryKeypoint/*, Disc/*, Aux/*, Action/*).
-        self._diag: dict[str, float] = {}
-        self._diag_count: int = 0
+        # QueryKeypoint/*, Disc/*, Aux/*, Action/*). Two parallel dicts are
+        # initialised lazily by ``_diag_reset`` at each update() entry:
+        # ``_diag_tensor`` (on-device sums/counts, only synced at flush)
+        # and ``_diag_scalar`` (plain-Python running mean for non-tensor
+        # inputs). See ``_diag_flush`` for the single-sync materialisation.
+        self._diag_tensor: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+        self._diag_scalar: dict[str, float] = {}
+        self._diag_scalar_count: int = 0
 
         # τ buckets used for per-query diagnostics. List of inclusive
         # (lo, hi) ranges covering [1, tau_max]. Buckets stay fixed across
@@ -504,10 +509,11 @@ class SparseSuccessor:
         if self._env_constraints is None or self._env_constraints["mask"].shape[0] != num_envs:
             self._init_constraints(num_envs)
 
-        # Inform the storage about the env's episode alignment (if any).
-        # The only envs we care about here timeout at a fixed length
-        # and never terminate early; surfacing that to the storage
-        # turns the O(T·N) safe-anchor scan into a closed-form filter.
+        # Inform the storage about the env's episode alignment. Combined
+        # with the runner disabling ``init_at_random_ep_len`` (see
+        # ``SuccessorRunner.learn``), this lets the safe-anchor sampler
+        # use a closed-form filter on ``t mod L`` instead of scanning
+        # per-env dones every call.
         env = self.unwrapped_env
         episode_length = getattr(env, "max_episode_length", None)
         if self.storage is not None and episode_length is not None:
@@ -1548,8 +1554,8 @@ class SparseSuccessor:
             # disabled.
             with torch.no_grad():
                 z_norm = z_C.norm(dim=-1)
-                self._diag_add("Scale/z_C_norm_mean", z_norm.mean().item())
-                self._diag_add("Scale/z_C_norm_std", z_norm.std().item())
+                self._diag_add("Scale/z_C_norm_mean", z_norm.mean())
+                self._diag_add("Scale/z_C_norm_std", z_norm.std())
 
             # ----------------------------------------------------------
             # 1) Train discriminator
@@ -1596,7 +1602,7 @@ class SparseSuccessor:
                     )
                     # Track expert z_C norm so any rollout-vs-expert magnitude
                     # drift surfaces clearly.
-                    self._diag_add("Scale/expert_z_norm_mean", expert_z.norm(dim=-1).mean().item())
+                    self._diag_add("Scale/expert_z_norm_mean", expert_z.norm(dim=-1).mean())
 
                 pos_out = self.policy.style_discriminator(expert_snippets, expert_z)
                 neg_out = self.policy.style_discriminator(snippets, z_C.detach())
@@ -1639,11 +1645,14 @@ class SparseSuccessor:
 
                 # Discriminator diagnostics (group 5)
                 with torch.no_grad():
-                    self._diag_add("Disc/pos_mean", pos_out.mean().item())
-                    self._diag_add("Disc/pos_std", pos_out.std().item())
-                    self._diag_add("Disc/neg_mean", neg_out.mean().item())
-                    self._diag_add("Disc/neg_std", neg_out.std().item())
-                    self._diag_add("Disc/gap_mean", (pos_out.mean() - neg_out.mean()).item())
+                    self._diag_add("Disc/pos_mean", pos_out.mean())
+                    self._diag_add("Disc/pos_std", pos_out.std())
+                    self._diag_add("Disc/neg_mean", neg_out.mean())
+                    self._diag_add("Disc/neg_std", neg_out.std())
+                    self._diag_add("Disc/gap_mean", pos_out.mean() - neg_out.mean())
+                    # ``grad_penalty_val`` was already converted to a Python
+                    # scalar when the disc step closed out; stays on the
+                    # scalar fast path.
                     self._diag_add("Disc/grad_penalty", grad_penalty_val)
 
             # ----------------------------------------------------------
@@ -2013,8 +2022,9 @@ class SparseSuccessor:
             self._diag_bump()
 
         if num_updates > 0:
-            # Keep the top-level short names for the terminal printout — the
-            # full per-group detail is attached from self._diag below.
+            # Keep the top-level short names for the terminal printout —
+            # the full per-group detail is attached via ``_diag_flush``
+            # below.
             if self.expert_buffer is not None:
                 loss_dict["discriminator"] = total_disc_loss / num_updates
                 loss_dict["style_critic"] = total_QS_loss / num_updates
@@ -2049,7 +2059,11 @@ class SparseSuccessor:
                 self._diag_add("Rollout/fresh_fraction", self._diag_rollout_fresh_frac)
 
             # Merge the full diagnostic dict (mean across mini-batches).
-            loss_dict.update(self._diag)
+            # ``_diag_flush`` forces the single GPU→CPU sync that
+            # materialises all tensor-path accumulators at once — every
+            # per-inner-update ``_diag_add`` call stayed async up to
+            # this point.
+            loss_dict.update(self._diag_flush())
 
         # Off-policy replay: do NOT clear storage — the circular buffer
         # keeps accumulating transitions so subsequent updates can reuse them.
@@ -2345,27 +2359,94 @@ class SparseSuccessor:
     # ------------------------------------------------------------------
 
     def _diag_reset(self) -> None:
-        self._diag = {}
-        self._diag_count = 0
+        """Zero out the diag accumulators at the start of ``update()``.
 
-    def _diag_add(self, key: str, value: float) -> None:
-        """Add one scalar observation; mean is computed at flush time."""
+        We track two parallel dicts:
+          - ``_diag_tensor`` — per-key (sum, count) 0-d tensors on the
+            training device. Populated from in-graph tensor inputs; these
+            never hit Python/CPU until ``_diag_flush`` runs at the end.
+          - ``_diag_scalar`` — per-key running mean for inputs that are
+            already Python floats (e.g. ``NaN/*_skip`` markers, static
+            fractions). These incur no CPU sync so the fast path stays
+            cheap.
+        """
+        self._diag_tensor: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+        self._diag_scalar: dict[str, float] = {}
+        self._diag_scalar_count: int = 0
+
+    def _diag_add(self, key: str, value) -> None:
+        """Fold one observation into the running accumulators.
+
+        ``value`` may be:
+          - a 0-d ``torch.Tensor``: stays on-device; we accumulate
+            ``(sum, count)`` pairs lazily and compute the mean only at
+            flush time. This avoids a CPU sync per call.
+          - a Python ``float`` / ``int`` (or ``None``): processed with
+            the old running-mean scheme. NaN / Inf values are dropped.
+        """
         if value is None:
             return
-        v = float(value)
-        if math.isnan(v) or math.isinf(v):
+        if isinstance(value, torch.Tensor):
+            # Accept any shape; reduce to a scalar via mean so 0-d and
+            # [B,] inputs both work.
+            v = value.detach().mean().to(dtype=torch.float32)
+            entry = self._diag_tensor.get(key)
+            if entry is None:
+                # Initialise with a running sum + count on the same
+                # device as the incoming tensor. NaN/Inf checks are
+                # deferred to ``_diag_flush`` so we don't force a sync.
+                self._diag_tensor[key] = (
+                    v.clone(),
+                    torch.ones((), device=v.device, dtype=torch.float32),
+                )
+            else:
+                sum_t, count_t = entry
+                sum_t.add_(v)
+                count_t.add_(1.0)
             return
-        prev = self._diag.get(key)
+
+        # Scalar path: same behaviour as before.
+        f = float(value)
+        if math.isnan(f) or math.isinf(f):
+            return
+        prev = self._diag_scalar.get(key)
         if prev is None:
-            self._diag[key] = v
+            self._diag_scalar[key] = f
         else:
-            # Running mean across calls within the same update() invocation.
-            n = self._diag_count if self._diag_count > 0 else 1
-            self._diag[key] = prev + (v - prev) / (n + 1)
+            n = self._diag_scalar_count if self._diag_scalar_count > 0 else 1
+            self._diag_scalar[key] = prev + (f - prev) / (n + 1)
 
     def _diag_bump(self) -> None:
-        """Call once per mini-batch after all _diag_add calls for that batch."""
-        self._diag_count += 1
+        """Call once per mini-batch after all _diag_add calls for that batch.
+
+        Only relevant for the scalar-path running mean. Tensor-path
+        accumulators track their own (sum, count) per-key.
+        """
+        self._diag_scalar_count += 1
+
+    def _diag_flush(self) -> dict[str, float]:
+        """Materialise the running tensor accumulators into Python floats.
+
+        Runs exactly once at the end of ``update()``. This is the ONLY
+        point where we force a CPU sync on the accumulator tensors —
+        all per-inner-update ``_diag_add`` calls remain GPU-async.
+        """
+        out: dict[str, float] = {}
+        # Stack on-device sums and counts so the GPU→CPU transfer is
+        # one shot regardless of how many keys we logged.
+        if self._diag_tensor:
+            keys = list(self._diag_tensor.keys())
+            sums = torch.stack([self._diag_tensor[k][0] for k in keys])
+            counts = torch.stack([self._diag_tensor[k][1] for k in keys])
+            means = (sums / counts.clamp(min=1.0)).cpu().tolist()
+            for k, m in zip(keys, means):
+                # Drop NaN/Inf — matches the scalar-path filter.
+                if math.isnan(m) or math.isinf(m):
+                    continue
+                out[k] = float(m)
+        # Scalar path is already float-valued; copy through.
+        out.update(self._diag_scalar)
+        return out
 
     def _log_query_buckets(
         self,
@@ -2377,7 +2458,8 @@ class SparseSuccessor:
         kids: torch.Tensor,         # [B, N] long
         mask: torch.Tensor,         # [B, N] bool/float
     ) -> None:
-        """Populate per-τ-bucket and per-keypoint diagnostics in self._diag."""
+        """Populate per-τ-bucket and per-keypoint diagnostics in the
+        tensor-accumulator path (``_diag_tensor``)."""
         pred_flat = pred_U.reshape(-1)
         targ_flat = target_U.reshape(-1)
         imm_flat = immediate.reshape(-1)
