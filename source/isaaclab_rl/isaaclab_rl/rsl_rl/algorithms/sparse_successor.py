@@ -1264,7 +1264,8 @@ class SparseSuccessor:
             # (with z_C sampled from the expert's own keypoint positions so
             # the (snippet, z) pair is mutually consistent), negatives are
             # the rollout snippet / z_C pair for the same mini-batch.
-            eps = 1e-6
+            # Matches BFM's Discriminator.compute_reward default.
+            eps = 1e-7
             disc_loss = None
             grad_penalty_val = 0.0
             if self.expert_buffer is not None:
