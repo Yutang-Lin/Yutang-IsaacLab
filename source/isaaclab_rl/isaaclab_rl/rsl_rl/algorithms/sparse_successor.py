@@ -108,6 +108,13 @@ class SparseSuccessor:
         max_grad_norm: float = 1.0,
         updates_per_step: int = 1,
         grad_penalty_weight: float = 10.0,
+        # Weight of the z_C orthonormality regulariser added to the
+        # successor critic loss. Pushes ``z_C @ z_C.T`` toward the
+        # identity so different atomic-constraint sets don't collapse
+        # onto a low-dimensional subspace. BFM-Zero FB-CPR uses 100.0
+        # here (on B-map output); ours is analogous but applied to the
+        # sparse-constraint encoder's output. Set 0.0 to disable.
+        ortho_coef: float = 100.0,
         # Off-policy replay capacity per env. Decouples replay memory size from
         # the rollout length configured in the runner (``num_steps_per_env``).
         # When ``None``, replay equals rollout length (pure on-policy behaviour).
@@ -210,6 +217,7 @@ class SparseSuccessor:
         self.max_grad_norm = max_grad_norm
         self.updates_per_step = updates_per_step
         self.grad_penalty_weight = grad_penalty_weight
+        self.ortho_coef = float(ortho_coef)
         self.replay_capacity_per_env = replay_capacity_per_env
         self.replay_device = replay_device if replay_device is not None else self.device
         self.num_seed_steps = int(num_seed_steps)
@@ -1363,6 +1371,34 @@ class SparseSuccessor:
             loss_U1 = (((pred_U1 - y_U) ** 2) * weights * mask_float).sum() / mask_sum
             loss_U2 = (((pred_U2 - y_U) ** 2) * weights * mask_float).sum() / mask_sum
             loss_U = loss_U1 + loss_U2
+
+            # z_C orthonormality regulariser (BFM's ``ortho_coef`` applied to
+            # B(obs).BT). Push the Gram matrix of the batch z_C rows toward
+            # the identity:
+            #   diag  → 1      (unit norm per row — redundant under the
+            #                   unit-sphere projection, but cheap and keeps
+            #                   parity with BFM's diag_term)
+            #   off   → 0      (decorrelate z_C across the batch to prevent
+            #                   collapse to a rank-1 subspace)
+            # Gradient flows through z_C into QueryEncoder (the only
+            # trainable component inside ``ConstraintSetEncoder`` now that
+            # ``post_mlp`` is removed), which is exactly what we want —
+            # this is the encoder-side regulariser analogous to BFM's.
+            if self.ortho_coef > 0.0:
+                # Normalise z_C per-row so diag_term isn't dominated by the
+                # unit-sphere scaling constant (||z|| = sqrt(d_model)).
+                z_normed = z_C / z_C.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+                cov = z_normed @ z_normed.transpose(0, 1)                      # [B, B]
+                B_size = cov.shape[0]
+                off_diag = 1.0 - torch.eye(B_size, device=cov.device)
+                off_diag_sum = off_diag.sum().clamp(min=1.0)
+                orth_loss_offdiag = 0.5 * (cov * off_diag).pow(2).sum() / off_diag_sum
+                orth_loss_diag = -cov.diag().mean()
+                orth_loss = orth_loss_offdiag + orth_loss_diag
+                loss_U = loss_U + self.ortho_coef * orth_loss
+                self._diag_add("Loss/z_C_ortho", float(orth_loss.item()))
+                self._diag_add("Loss/z_C_ortho_offdiag", float(orth_loss_offdiag.item()))
+                self._diag_add("Loss/z_C_ortho_diag", float(orth_loss_diag.item()))
 
             self.opt_query.zero_grad()
             self.opt_U1.zero_grad()

@@ -1036,6 +1036,13 @@ class RslRlSparseSuccessorAlgorithmCfg:
     grad_penalty_weight: float = 10.0
     """WGAN-GP coefficient for the style discriminator."""
 
+    ortho_coef: float = 100.0
+    """Weight of the z_C orthonormality regulariser added to the successor
+    critic loss. Pushes ``z_C @ z_C.T`` toward the identity so different
+    atomic-constraint sets don't collapse onto a low-dimensional subspace.
+    Matches BFM-Zero FB-CPR's ``ortho_coef=100`` on the BackwardMap output.
+    Set 0.0 to disable."""
+
     replay_capacity_per_env: int | None = None
     """Off-policy replay capacity per env. When ``None``, the replay buffer is
     sized to the rollout length (pure on-policy behaviour — each transition is
