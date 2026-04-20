@@ -315,13 +315,13 @@ class StudentLFMBFMTracker(nn.Module):
             mask: [n, total] bool tensor
         """
         counts = torch.randint(min_active, total + 1, (n,), device=device, generator=gen)
-        mask = torch.zeros(n, total, dtype=torch.bool, device=device)
-        for i in range(n):
-            c = counts[i].item()
-            if c > 0:
-                perm = torch.randperm(total, device=device, generator=gen)[:c]
-                mask[i, perm] = True
-        return mask
+        # Vectorized: argsort uniform scores per row = random permutation per row;
+        # the first `c` indices are active. Express as: rank-of-column < count.
+        scores = torch.rand(n, total, device=device, generator=gen)
+        perm = scores.argsort(dim=1)
+        ranks = torch.empty_like(perm)
+        ranks.scatter_(1, perm, torch.arange(total, device=device).unsqueeze(0).expand(n, total))
+        return ranks < counts.unsqueeze(1)
 
     def _sample_initial_offsets(self, env_ids, device):
         n = env_ids.shape[0]
