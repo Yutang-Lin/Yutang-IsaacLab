@@ -984,26 +984,20 @@ class RslRlSparseSuccessorAlgorithmCfg:
     the legacy per-step resampling behaviour."""
 
     expert_chunk_fraction: float = 0.15
-    """**Deprecated** — kept for backward-compatibility. The rollout source
-    mixture now uses the three ``rollout_{live,replay,expert}_fraction``
-    knobs below. This field is retained only so older configs don't break."""
+    """**Deprecated** — retained only so older configs import cleanly.
+    The rollout source mixture now lives in the two
+    ``rollout_{replay,expert}_fraction`` knobs below."""
 
-    rollout_live_fraction: float = 0.2
-    """Per-env source share for fresh rollout chunks: sample the constraint
-    set from the env's CURRENT priv frame (single-frame, phase-1 leftover).
-    Kept small so the actor can't collapse into "hold your current pose"."""
+    rollout_replay_fraction: float = 0.4
+    """Per-env source share for fresh rollout chunks: sample a safe
+    future anchor from the replay buffer (guaranteed populated + no
+    episode-boundary crossing) and build a per-atom future-grounded C
+    from the env's REALIZED future priv over ``tau_max`` steps."""
 
-    rollout_replay_fraction: float = 0.3
-    """Per-env source share for fresh rollout chunks: sample a random
-    (t, env) anchor from the replay buffer and build a per-atom future-
-    grounded C from the env's REALIZED future priv over ``tau_max`` steps.
-    Atoms whose ``τ_i`` crosses a reset are masked out automatically."""
-
-    rollout_expert_fraction: float = 0.5
+    rollout_expert_fraction: float = 0.6
     """Per-env source share for fresh rollout chunks: per-atom future-
-    grounded C from the expert motion buffer's keypoint window. Should be
-    the dominant source so the rollout task distribution is centred on
-    expert-reachable sparse goals."""
+    grounded C from the expert motion buffer's keypoint window. Paired
+    with the rollout_replay source — both are fully future-grounded."""
 
     relabel_ratio_stored: float = 0.4
     """Per-sample relabeling share: keep the constraint set that was actually

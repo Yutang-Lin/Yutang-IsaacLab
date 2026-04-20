@@ -148,15 +148,13 @@ class SparseSuccessor:
         # knobs below. If any of those are set, ``expert_chunk_fraction`` is
         # ignored.
         expert_chunk_fraction: float = 0.15,
-        # 3-way per-env source mixture for fresh rollout chunks. Normalised
-        # to sum to 1 at runtime; missing sources (e.g. no expert buffer,
-        # empty replay) fold their mass into the remaining ones.
-        #   - live:    env's current priv (single-frame, phase-1 leftover)
-        #   - replay:  per-atom future-grounded from replay's realized future
-        #   - expert:  per-atom future-grounded from expert motion buffer
-        rollout_live_fraction: float = 0.2,
-        rollout_replay_fraction: float = 0.3,
-        rollout_expert_fraction: float = 0.5,
+        # 2-way per-env source mixture for fresh rollout chunks.
+        # Normalised to sum to 1 at runtime; missing sources (e.g. no
+        # expert buffer, empty replay) fold their mass into the remaining
+        # one. Both are per-atom future-grounded — no pose-hold-style
+        # "live self" source any more.
+        rollout_replay_fraction: float = 0.4,
+        rollout_expert_fraction: float = 0.6,
         # Training-time C-space relabeling ratios.
         relabel_ratio_stored: float = 0.4,
         relabel_ratio_hindsight: float = 0.3,
@@ -259,7 +257,6 @@ class SparseSuccessor:
         self.constraint_dropout_prob = constraint_dropout_prob
         self.constraint_horizon = int(constraint_horizon)
         self.expert_chunk_fraction = float(expert_chunk_fraction)
-        self.rollout_live_fraction = float(rollout_live_fraction)
         self.rollout_replay_fraction = float(rollout_replay_fraction)
         self.rollout_expert_fraction = float(rollout_expert_fraction)
         # Normalise relabel ratios so they sum to 1.
@@ -488,14 +485,27 @@ class SparseSuccessor:
         """Allocate ``_env_constraints`` and draw a fresh set for every env.
 
         Called once by the runner right after the initial reset, before
-        the first ``act()``. Equivalent to doing one ``_advance_chunk``
-        pass where every env is in the "needs_new" branch. This makes
-        sure the first step's ``z_C`` is encoded against a real
-        anchored constraint set, not a zero-mask placeholder.
+        the first ``act()``. Also hands the storage a known fixed
+        episode length when the env exposes one — the sparse-successor
+        env has a hard 500-step timeout with no early termination, so
+        every env resets in lock-step and the safe-anchor sampler can
+        use that structural property instead of a per-env done scan.
         """
         num_envs = priv_obs.shape[0]
         if self._env_constraints is None or self._env_constraints["mask"].shape[0] != num_envs:
             self._init_constraints(num_envs)
+
+        # Inform the storage about the env's episode alignment (if any).
+        # The only envs we care about here timeout at a fixed length
+        # and never terminate early; surfacing that to the storage
+        # turns the O(T·N) safe-anchor scan into a closed-form filter.
+        env = self.unwrapped_env
+        episode_length = getattr(env, "max_episode_length", None)
+        if self.storage is not None and episode_length is not None:
+            self.storage.set_episode_alignment(
+                int(episode_length), phase_offset=0,
+            )
+
         all_envs = torch.ones(num_envs, dtype=torch.bool, device=self.device)
         # Feed a reset_mask of all-True so every env is marked needs_new.
         self._advance_chunk(priv_obs, all_envs)
@@ -626,27 +636,34 @@ class SparseSuccessor:
             needs_new = needs_new | reset_mask.to(self.device, dtype=torch.bool)
 
         if needs_new.any():
-            # Per-env 3-way mixture for fresh rollout chunks:
-            #   - live/self (single-frame, phase-1 leftover): ``rollout_live_fraction``
-            #   - replay-future (per-atom, real future from storage):
-            #     ``rollout_replay_fraction``
-            #   - expert-future (per-atom, from the expert buffer):
-            #     ``rollout_expert_fraction``
-            # Goal: push the rollout-task distribution toward
-            # future-grounded sparse tracking. Live/self stays the smallest
-            # share so the actor can't collapse into "hold current pose."
+            # Per-env 2-way mixture for fresh rollout chunks:
+            #   - replay-future (per-atom, real future from storage)
+            #   - expert-future (per-atom, from the expert buffer)
+            # Every atom is future-grounded; no "live/self" (pose-hold)
+            # source. If neither branch is viable for a given env (e.g.
+            # replay empty at warmup + no expert buffer), we preserve
+            # that env's existing C and skip resampling — which keeps
+            # the rollout pipeline running without ever producing a
+            # degenerate zero-mask chunk.
             n_new = int(needs_new.sum().item())
+            new_env_ids = needs_new.nonzero(as_tuple=True)[0]
 
-            # Initialise with a full live/self draw — we'll overlay replay
-            # and expert rows below. ``random_C`` has ``num_envs`` rows;
-            # we only mutate the rows under ``needs_new``.
-            random_C = self.sample_constraint_set_vectorized(next_priv_obs, num_envs)
+            # Pre-draw a fresh random_C placeholder of the right shape;
+            # we overwrite the rows per source. ``targets_ref`` is
+            # zero-filled + mask zero so any row that remains untouched
+            # (neither source viable) simply has mask=0 for every atom.
+            M = self.policy.max_constraints
+            td = self.policy.target_dim
+            random_C = {
+                "keypoint_ids": torch.zeros(num_envs, M, dtype=torch.long, device=self.device),
+                "targets_ref": torch.zeros(num_envs, M, td, device=self.device),
+                "taus": torch.ones(num_envs, M, device=self.device),
+                "weights": torch.ones(num_envs, M, device=self.device),
+                "mask": torch.zeros(num_envs, M, device=self.device),
+            }
 
-            # Decide per-new-env source. Replay-future needs at least
-            # ``tau_max + 1`` steps of populated storage so the future
-            # window has room; until then its probability folds into the
-            # live/expert sources.
-            p_live = float(self.rollout_live_fraction)
+            # Can we draw safe replay anchors? Requires enough populated
+            # transitions AND at least one safe-anchor position exists.
             replay_ready = (
                 self.storage is not None
                 and (
@@ -656,71 +673,77 @@ class SparseSuccessor:
             )
             p_replay = float(self.rollout_replay_fraction) if replay_ready else 0.0
             p_expert = float(self.rollout_expert_fraction) if self.expert_buffer is not None else 0.0
-            total_p = p_live + p_replay + p_expert
+            total_p = p_replay + p_expert
             if total_p <= 0.0:
-                p_live, p_replay, p_expert = 1.0, 0.0, 0.0
-            else:
-                p_live, p_replay, p_expert = p_live / total_p, p_replay / total_p, p_expert / total_p
-            probs = torch.tensor([p_live, p_replay, p_expert], device=self.device)
-            source = torch.multinomial(probs, n_new, replacement=True)  # [n_new] in {0,1,2}
+                # Neither source available — leave ``needs_new`` envs
+                # with their previous (possibly all-expired) constraint
+                # set; the next step will try again. Should only happen
+                # during the very first iters before warmup fills replay
+                # when there's also no expert buffer, which is an
+                # unsupported config but we fail gracefully.
+                self._diag_rollout_source_replay = 0.0
+                self._diag_rollout_source_expert = 0.0
+                self._diag_rollout_fresh_frac = float(needs_new.float().mean().item())
+                return
+            p_replay /= total_p
+            p_expert /= total_p
+            probs = torch.tensor([p_replay, p_expert], device=self.device)
+            source = torch.multinomial(probs, n_new, replacement=True)   # {0, 1}
 
-            new_env_ids = needs_new.nonzero(as_tuple=True)[0]
-
-            # --- Replay-future source ---
-            # The trajectory's "own" de-yawed-root anchor is the anchor
-            # transition's next_priv tail — the priv tail is ALREADY
-            # de-yawed around the body's own pelvis at that past step, so
-            # ``targets_ref`` is a direct gather (no further lift needed).
-            # We express this by passing zero translation + identity quat
-            # to the future sampler so its internal ``_world_to_ref``
-            # de-yaw is a no-op for the already-de-yawed window.
-            replay_mask_of_new = source == 1
+            # --- Replay-future source (per-atom, same-episode-only) ---
+            # ``sample_safe_future_anchors`` only returns (t, env) pairs
+            # whose full tau_max-window is populated AND reset-free.
+            # If it returns None (extreme edge case), fold replay mass
+            # into expert for this step.
+            replay_mask_of_new = source == 0
             if replay_mask_of_new.any():
                 n_replay = int(replay_mask_of_new.sum().item())
-                sdev = self.storage.storage_device
-                max_t = (
-                    self.storage.num_transitions_per_env
-                    if self.storage._full else self.storage.step
+                anchors = self.storage.sample_safe_future_anchors(
+                    n_replay, horizon=self.tau_max,
                 )
-                max_anchor = max(max_t - self.tau_max, 1)
-                t_anchor = torch.randint(0, max_anchor, (n_replay,), device=sdev)
-                env_anchor = torch.randint(0, self.storage.num_envs, (n_replay,), device=sdev)
-                priv_window, valid = self.storage.gather_next_priv_at(
-                    t_anchor, env_anchor, horizon=self.tau_max,
-                )
-                priv_window = priv_window.to(self.device)
-                valid = valid.to(self.device)
-                nk = self.policy.num_keypoints
-                td = self.policy.target_dim
-                priv_dim = priv_window.shape[-1]
-                kp_offset = priv_dim - nk * td
-                kp_window = priv_window[..., kp_offset:].reshape(
-                    priv_window.shape[0], priv_window.shape[1], nk, td,
-                )                                                         # [n_replay, H+1, K, 3]
-                # Trajectory anchor = identity (priv tail already de-yawed).
-                traj_pos = torch.zeros(n_replay, 3, device=self.device)
-                traj_quat = torch.zeros(n_replay, 4, device=self.device)
-                traj_quat[:, 0] = 1.0
-                replay_C = self._sample_constraints_from_keypoint_future(
-                    kp_window, traj_pos, traj_quat, valid_atom_mask=valid,
-                )
-                replay_env_ids = new_env_ids[replay_mask_of_new]
-                for key, rv in replay_C.items():
-                    random_C[key][replay_env_ids] = rv
+                if anchors is None:
+                    # No safe anchor exists in replay right now — fall
+                    # through: these envs will get the expert source if
+                    # available, else leave their row unmasked (no C).
+                    if p_expert > 0.0:
+                        source[replay_mask_of_new] = 1  # reroute to expert
+                        replay_mask_of_new = source == 0
+                    else:
+                        source[replay_mask_of_new] = -1  # dead; row keeps mask=0
+                        replay_mask_of_new = source == 0
+                else:
+                    t_anchor, env_anchor = anchors
+                    priv_window, valid = self.storage.gather_next_priv_at(
+                        t_anchor, env_anchor, horizon=self.tau_max,
+                    )
+                    priv_window = priv_window.to(self.device)
+                    valid = valid.to(self.device)
+                    nk = self.policy.num_keypoints
+                    priv_dim = priv_window.shape[-1]
+                    kp_offset = priv_dim - nk * td
+                    kp_window = priv_window[..., kp_offset:].reshape(
+                        priv_window.shape[0], priv_window.shape[1], nk, td,
+                    )                                                   # [n_replay, H+1, K, 3]
+                    # Priv tail is already de-yawed per its own frame →
+                    # trajectory anchor = identity.
+                    traj_pos = torch.zeros(n_replay, 3, device=self.device)
+                    traj_quat = torch.zeros(n_replay, 4, device=self.device)
+                    traj_quat[:, 0] = 1.0
+                    replay_C = self._sample_constraints_from_keypoint_future(
+                        kp_window, traj_pos, traj_quat, valid_atom_mask=valid,
+                    )
+                    replay_env_ids = new_env_ids[replay_mask_of_new]
+                    for key, rv in replay_C.items():
+                        random_C[key][replay_env_ids] = rv
 
             # --- Expert-future source ---
-            # Expert keypoints live in the LAFAN world frame, so the
-            # trajectory's own anchor (expert's root pos + quat at its
-            # anchor frame) is the right reference — ``_world_to_ref``
-            # inside the sampler lifts world keypoints into the expert's
-            # de-yawed root frame at t0.
-            expert_mask_of_new = source == 2
+            expert_mask_of_new = source == 1
             if expert_mask_of_new.any() and self.expert_buffer is not None:
                 n_expert = int(expert_mask_of_new.sum().item())
                 expert_batch = self.expert_buffer.sample_with_future_window(
                     n_expert, horizon=self.tau_max,
                 )
-                expert_window = expert_batch["kp_window"].to(self.device)           # [E, H+1, K, 3]
+                expert_window = expert_batch["kp_window"].to(self.device)
                 expert_anchor_pos = expert_batch["anchor_root_pos"].to(self.device)
                 expert_anchor_quat = expert_batch["anchor_root_quat"].to(self.device)
                 expert_C = self._sample_constraints_from_keypoint_future(
@@ -730,10 +753,12 @@ class SparseSuccessor:
                 for key, ev in expert_C.items():
                     random_C[key][expert_env_ids] = ev
 
-            # Record source mix for diagnostics.
-            self._diag_rollout_source_live = float((source == 0).float().mean().item())
-            self._diag_rollout_source_replay = float((source == 1).float().mean().item())
-            self._diag_rollout_source_expert = float((source == 2).float().mean().item())
+            # Diagnostic source fractions.
+            self._diag_rollout_source_replay = float((source == 0).float().mean().item())
+            self._diag_rollout_source_expert = float((source == 1).float().mean().item())
+            # Envs whose replay source aborted without an expert fallback
+            # show up as source == -1; we count them separately.
+            self._diag_rollout_source_dead = float((source == -1).float().mean().item())
 
             self._replace_constraints_for_envs(needs_new, random_C)
 
@@ -780,6 +805,8 @@ class SparseSuccessor:
         next_priv: torch.Tensor,
         t_idx: torch.Tensor | None = None,
         env_idx: torch.Tensor | None = None,
+        stored_root_pos: torch.Tensor | None = None,
+        stored_root_quat: torch.Tensor | None = None,
     ) -> tuple[dict[str, torch.Tensor], dict[str, int]]:
         """Build a C-space-relabeled constraint set for a training mini-batch.
 
@@ -873,21 +900,23 @@ class SparseSuccessor:
             relabeled["weights"][idxs] = hind_C["weights"]
             relabeled["mask"][idxs] = hind_C["mask"]
 
-        # --- Expert source (per-atom future-grounded) ---
-        # Expert keypoints are in the LAFAN world frame; the expert's
-        # own root pose at its anchor frame is the trajectory anchor.
-        # ``_world_to_ref`` expresses the future keypoints in the
-        # expert's de-yawed root frame at t0 → that IS the "local"
-        # frame a fresh chunk anchored on the expert would produce.
-        # For training relabel, the critic reads against the stored
-        # priv (which is in some env's past local frame) — not the
-        # expert's. The network learns to interpret the pair
-        # (obs_stored, z_C(expert_relabel)) as "what would the policy
-        # do if asked to reach these expert-relative targets" — valid
-        # as long as the target frame is self-consistent within one
-        # z_C. Since targets_ref all come from the same expert anchor,
-        # the z_C is internally consistent.
+        # --- Expert source (per-atom future-grounded, stored-frame-aligned) ---
+        # The sampler returns ``targets_ref`` in the EXPERT's de-yawed
+        # root frame at t0. But the critic reads the mini-batch's
+        # STORED priv — whose keypoint tail is in the STORED step's
+        # de-yawed root frame. To make the satisfaction kernel
+        # frame-consistent, we lift the expert ref into world using
+        # the expert's own anchor, then re-express in the stored
+        # step's anchor. This is the exact mirror of what
+        # ``_replace_constraints_for_envs`` does at rollout time, just
+        # applied post-hoc at the sampled mini-batch's timestamp.
         if expert_mask.any() and self.expert_buffer is not None:
+            if stored_root_pos is None or stored_root_quat is None:
+                raise RuntimeError(
+                    "expert-relabel requires stored_root_pos / stored_root_quat "
+                    "so the expert target frame can be aligned with the stored "
+                    "priv frame. The storage must populate these at rollout time."
+                )
             idxs = expert_mask.nonzero(as_tuple=True)[0]
             n_exp = idxs.numel()
             expert_batch = self.expert_buffer.sample_with_future_window(
@@ -899,8 +928,28 @@ class SparseSuccessor:
             expert_C = self._sample_constraints_from_keypoint_future(
                 expert_window, expert_anchor_pos, expert_anchor_quat,
             )
+            targets_ref_expert = expert_C["targets_ref"]             # [n_exp, M, 3]
+
+            # Lift expert-frame ref → world, using the expert's own
+            # yaw-only quat (so the ``_ref_to_world`` helper treats it
+            # as a heading anchor the way our per-env lifts do).
+            expert_yaw = yaw_quat(expert_anchor_quat)                # [n_exp, 4]
+            expert_yaw_m = expert_yaw.unsqueeze(1).expand(-1, M, 4)
+            expert_pos_m = expert_anchor_pos.unsqueeze(1).expand(-1, M, 3)
+            targets_world_expert = _ref_to_world(
+                targets_ref_expert, expert_pos_m, expert_yaw_m,
+            )
+            # Re-express in the stored step's de-yawed root frame.
+            stored_pos_sel = stored_root_pos[idxs]                   # [n_exp, 3]
+            stored_yaw_sel = yaw_quat(stored_root_quat[idxs])        # [n_exp, 4]
+            stored_pos_m = stored_pos_sel.unsqueeze(1).expand(-1, M, 3)
+            stored_yaw_m = stored_yaw_sel.unsqueeze(1).expand(-1, M, 4)
+            targets_local_stored = _world_to_local(
+                targets_world_expert, stored_pos_m, stored_yaw_m,
+            )
+
             relabeled["keypoint_ids"][idxs] = expert_C["keypoint_ids"]
-            relabeled["targets"][idxs] = expert_C["targets_ref"]
+            relabeled["targets"][idxs] = targets_local_stored
             relabeled["taus"][idxs] = expert_C["taus"]
             relabeled["weights"][idxs] = expert_C["weights"]
             relabeled["mask"][idxs] = expert_C["mask"]
@@ -1102,24 +1151,22 @@ class SparseSuccessor:
         priv_state: torch.Tensor,
         num_envs: int,
     ) -> dict[str, torch.Tensor]:
-        """Single-frame rollout self-anchored constraint sampler.
+        """Single-frame constraint sampler. Safety fallback only.
 
-        **Not future-grounded** — every atom's target comes from the same
-        ``priv_state`` frame (the env's current body pose), with random
-        τ_i ∈ [1, tau_max]. This is the phase-1 leftover: at rollout time
-        we don't have the env's own future trajectory yet, so we can't
-        do proper per-atom future grounding here.
+        Used solely by ``evaluate_live_tracking`` when the algorithm has
+        no expert buffer — in that case the eval can't produce a
+        per-atom future-grounded C and falls back to "target = current
+        body priv, per-atom random τ". The rollout chunk pipeline no
+        longer uses this path; all rollout fresh chunks come from
+        replay-future or expert-future sources, both per-atom
+        future-grounded via :meth:`_sample_constraints_from_keypoint_future`.
 
-        This path is invoked only for the rollout *self*-chunks (the 85%
-        of fresh chunks that anchor on the env's current priv). Rollout
-        *expert* chunks, training-time hindsight / expert relabeling, the
-        discriminator positive branch, and live-eval all use the proper
-        future-grounded :meth:`_sample_constraints_from_keypoint_future`.
-
-        A planned phase-2 fix is to maintain a per-env priv ring buffer
-        inside ``_advance_chunk`` and anchor new chunks ``tau_max`` steps
-        in the past so its "future window" is already known — see
-        project memory ``project_sparse_successor_phase1_future_grounded``.
+        ``targets_ref`` is the env's current priv tail — already
+        de-yawed w.r.t. the current body — so the caller's lift to
+        world via ``_ref_to_world`` produces a target at the env's
+        current pelvis, with no temporal separation. The "task" is
+        degenerate (hit where you already are), which is acceptable
+        for the tiny eval-no-expert-buffer corner case.
         """
         M = self.policy.max_constraints
         td = self.policy.target_dim
@@ -1309,6 +1356,15 @@ class SparseSuccessor:
         self.transition.constraint_weights = self._env_constraints["weights"].clone()
         self.transition.constraint_mask = self._env_constraints["mask"].clone()
 
+        # Persist the env's root pose at THIS step so training-time
+        # expert-relabel can re-express the expert's world-anchored
+        # target into this step's de-yawed root frame. Without this,
+        # relabeled targets land in a different frame than the stored
+        # priv and the satisfaction kernel becomes frame-inconsistent.
+        env = self.unwrapped_env
+        self.transition.root_pos = env.body_pos[:, 0].clone()
+        self.transition.root_quat = env.body_quat[:, 0].clone()
+
         return actions.detach()
 
     def process_env_step(
@@ -1435,6 +1491,7 @@ class SparseSuccessor:
                 c_kid, c_tgt, c_tau, c_w, c_m,
                 nc_kid, nc_tgt, nc_tau, nc_w, nc_m,
                 snippets,
+                stored_root_pos, stored_root_quat,
                 t_idx_batch, env_idx_batch,
             ) = mini_batch
 
@@ -1457,6 +1514,8 @@ class SparseSuccessor:
             relabeled, relabel_counts = self._relabel_constraint_sets(
                 stored, next_priv,
                 t_idx=t_idx_batch, env_idx=env_idx_batch,
+                stored_root_pos=stored_root_pos,
+                stored_root_quat=stored_root_quat,
             )
             c_kid = relabeled["keypoint_ids"]
             c_tgt = relabeled["targets"]
@@ -1947,12 +2006,16 @@ class SparseSuccessor:
                 self._diag_add("Replay/fill_ratio", size / max(capacity, 1))
 
             # Rollout chunk source mixture (recorded at the last
-            # ``_advance_chunk`` call with fresh envs). These scalars are
-            # per-env fractions, summing to ~1 across the three sources.
+            # ``_advance_chunk`` call with fresh envs). Fractions sum
+            # to ~1 across the two live sources (replay + expert). The
+            # ``dead`` counter is fresh envs that couldn't be assigned
+            # to any source that step — non-zero typically means replay
+            # has no safe anchors AND no expert buffer; those envs keep
+            # their previous C for one more step.
             for key in (
-                "_diag_rollout_source_live",
                 "_diag_rollout_source_replay",
                 "_diag_rollout_source_expert",
+                "_diag_rollout_source_dead",
             ):
                 if hasattr(self, key):
                     tag = "Rollout/" + key.replace("_diag_rollout_source_", "source_")

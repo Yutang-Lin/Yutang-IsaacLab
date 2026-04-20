@@ -37,6 +37,14 @@ class SuccessorStorage:
             self.next_constraint_taus: torch.Tensor = None  # type: ignore
             self.next_constraint_weights: torch.Tensor = None  # type: ignore
             self.next_constraint_mask: torch.Tensor = None  # type: ignore
+            # Per-env root pose at the transition's sample time. Needed
+            # by training-time expert-relabel: a target drawn in the
+            # expert's own de-yawed frame must be re-expressed in the
+            # stored step's frame before the critic reads it. Without
+            # this, the critic's target and priv live in different
+            # frames for relabeled rows.
+            self.root_pos: torch.Tensor = None        # type: ignore  [N, 3]
+            self.root_quat: torch.Tensor = None       # type: ignore  [N, 4]
             # snippet for discriminator
             self.snippet: torch.Tensor = None  # type: ignore
 
@@ -125,11 +133,21 @@ class SuccessorStorage:
         self.next_constraint_weights = _alloc(T, N, M)
         self.next_constraint_mask = _alloc(T, N, M)
 
+        # Per-transition root pose at sample time. Used by the training
+        # expert-relabel path to re-express the expert's world-anchored
+        # target into the stored step's de-yawed root frame. Without
+        # this, relabeled rows would feed the critic a target in a
+        # frame that doesn't match the stored priv.
+        self.root_pos = _alloc(T, N, 3)
+        self.root_quat = _alloc(T, N, 4)
+
         # Snippet for discriminator
         self.snippets = _alloc(T, N, snippet_dim)
 
         self.step = 0
         self._full = False
+        self._episode_length: int | None = None
+        self._episode_phase_offset: int = 0
 
     @property
     def size(self) -> int:
@@ -169,6 +187,16 @@ class SuccessorStorage:
 
         self.snippets[idx].copy_(transition.snippet, non_blocking=True)
 
+        if transition.root_pos is None or transition.root_quat is None:
+            raise RuntimeError(
+                "Transition missing root_pos / root_quat. The rollout path "
+                "must populate these from the env's live body pose so the "
+                "training expert-relabel can be frame-consistent with the "
+                "stored priv."
+            )
+        self.root_pos[idx].copy_(transition.root_pos, non_blocking=True)
+        self.root_quat[idx].copy_(transition.root_quat, non_blocking=True)
+
         self.step += 1
         if self.step >= self.num_transitions_per_env:
             self._full = True
@@ -187,6 +215,8 @@ class SuccessorStorage:
             priv=self.privileged_observations[:max_t].reshape(total, -1),
             act=self.actions[:max_t].reshape(total, -1),
             rew=self.rewards[:max_t].reshape(total, -1),
+            root_pos=self.root_pos[:max_t].reshape(total, -1),
+            root_quat=self.root_quat[:max_t].reshape(total, -1),
             done=self.dones[:max_t].reshape(total, -1),
             next_obs=self.next_observations[:max_t].reshape(total, -1),
             next_priv=self.next_privileged_observations[:max_t].reshape(total, -1),
@@ -251,11 +281,137 @@ class SuccessorStorage:
             views["nc_w"][idx],
             views["nc_m"][idx],
             views["snip"][idx],
+            views["root_pos"][idx],
+            views["root_quat"][idx],
         )
         moved = tuple(self._move_to_sample_device(t) for t in gathered)
         # ``t_idx`` / ``env_idx`` stay on the storage device so downstream
         # gathers read the circular buffer directly without a double hop.
         return moved + (t_idx, env_idx)
+
+    def set_episode_alignment(self, episode_length: int | None, phase_offset: int = 0) -> None:
+        """Inform the storage about a known fixed episode length.
+
+        When every env resets in lock-step every ``episode_length`` env
+        steps (as in the sparse-successor env — 500-step timeout, no
+        hard terminations), the "safe future anchor" set becomes a
+        trivial pattern:
+
+            t_idx ≡ (t_idx mod L) in [phase_offset, L - horizon + phase_offset)
+
+        where ``phase_offset`` is the offset (in buffer slots) of the
+        first transition of a fresh episode. Setting this lets
+        :meth:`sample_safe_future_anchors` skip a full O(T·N) done-scan
+        and sample directly from the safe region.
+
+        Args:
+            episode_length: ``L`` in env-steps. ``None`` disables alignment
+                and falls back to the general done-scan path.
+            phase_offset: buffer slot at which episode 0's first
+                transition was written. Usually 0 for a fresh run.
+        """
+        self._episode_length = int(episode_length) if episode_length is not None else None
+        self._episode_phase_offset = int(phase_offset) % self.num_transitions_per_env
+
+    def sample_safe_future_anchors(
+        self,
+        n: int,
+        horizon: int,
+        device: torch.device | str | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """Sample ``n`` anchor coordinates ``(t_idx, env_idx)`` whose full
+        ``horizon`` lookahead window is populated **and** doesn't cross
+        any episode boundary.
+
+        Uses the fast aligned-block path when ``set_episode_alignment``
+        has declared a fixed ``L`` (all envs reset in lock-step) —
+        direct arithmetic on ``t_idx mod L`` suffices. Otherwise falls
+        back to a per-(t, env) done-scan that works for general
+        termination schedules.
+
+        Returns ``None`` when no safe anchor exists (populated region
+        is smaller than ``horizon + 1``, or every window crosses a
+        reset). The caller treats ``None`` as "skip this source".
+        """
+        if not self._full and self.step < horizon + 1:
+            return None
+
+        H = int(horizon)
+        max_t = self.num_transitions_per_env if self._full else self.step
+        N = self.num_transitions_per_env
+        n_envs = self.num_envs
+        dev = self.storage_device
+
+        L = getattr(self, "_episode_length", None)
+        phase = getattr(self, "_episode_phase_offset", 0)
+
+        if L is not None and L > H:
+            # Aligned-block path: a slot is safe iff it lies in the
+            # first ``L - H`` positions of its episode block AND it's
+            # within the populated region.
+            if self._full:
+                t_all = torch.arange(N, device=dev)                  # [N]
+                within_block = ((t_all - phase).remainder(L)) < (L - H)
+                # Circular in-bounds check (distance to seam >= H).
+                write_ptr = int(self.step % N)
+                dist = (write_ptr - 1 - t_all).remainder(N)
+                in_bounds = dist >= H
+                safe_t = within_block & in_bounds                    # [N]
+            else:
+                t_all = torch.arange(max_t, device=dev)
+                within_block = ((t_all - phase).remainder(L)) < (L - H)
+                in_bounds = (t_all + H) < max_t
+                safe_t = within_block & in_bounds                    # [max_t]
+
+            safe_t_idx = safe_t.nonzero(as_tuple=False).squeeze(-1)
+            if safe_t_idx.numel() == 0:
+                return None
+            # Every env shares the same safe-t set (lock-step resets),
+            # so sample t and env independently.
+            pick_t = safe_t_idx[torch.randint(0, safe_t_idx.numel(), (n,), device=dev)]
+            pick_env = torch.randint(0, n_envs, (n,), device=dev)
+            if device is not None:
+                pick_t = pick_t.to(device)
+                pick_env = pick_env.to(device)
+            return pick_t, pick_env
+
+        # Fallback: general per-env done-scan. Works for any
+        # termination schedule but is O(T · N_env) per call.
+        dones_flat = self.dones[:max_t].squeeze(-1)                 # [max_t, N_env]
+        cum = dones_flat.cumsum(dim=0)                              # [max_t, N_env]
+
+        if self._full:
+            write_ptr = int(self.step % N)
+            t_all = torch.arange(N, device=dev)                      # [N]
+            dist = (write_ptr - 1 - t_all).remainder(N)              # [N]
+            in_bounds_per_t = dist >= H                              # [N]
+            frame_end = (t_all + H) % N                              # [N]
+            cum_end = cum[frame_end]                                 # [N, N_env]
+            cum_start = cum[t_all]                                   # [N, N_env]
+            no_reset_per_t = (cum_end - cum_start) <= 0.5            # [N, N_env]
+            safe = in_bounds_per_t.unsqueeze(1) & no_reset_per_t     # [N, N_env]
+        else:
+            t_all = torch.arange(max_t, device=dev)                  # [max_t]
+            in_bounds_per_t = (t_all + H) < max_t                    # [max_t]
+            frame_end = (t_all + H).clamp(max=max_t - 1)
+            cum_end = cum[frame_end]                                 # [max_t, N_env]
+            cum_start = cum[t_all]                                   # [max_t, N_env]
+            no_reset_per_t = (cum_end - cum_start) <= 0.5            # [max_t, N_env]
+            safe = in_bounds_per_t.unsqueeze(1) & no_reset_per_t     # [max_t, N_env]
+
+        flat_safe = safe.reshape(-1)
+        num_safe = int(flat_safe.sum().item())
+        if num_safe == 0:
+            return None
+        safe_idx = flat_safe.nonzero(as_tuple=False).squeeze(-1)
+        pick = torch.randint(0, num_safe, (n,), device=dev)
+        chosen = safe_idx[pick]
+        t_idx = chosen // n_envs
+        env_idx = chosen % n_envs
+        if device is not None:
+            t_idx = t_idx.to(device)
+            env_idx = env_idx.to(device)
+        return t_idx, env_idx
 
     def gather_next_priv_at(
         self,
@@ -372,6 +528,8 @@ class SuccessorStorage:
         nc_w_flat = views["nc_w"]
         nc_m_flat = views["nc_m"]
         snip_flat = views["snip"]
+        root_pos_flat = views["root_pos"]
+        root_quat_flat = views["root_quat"]
 
         for _ in range(num_epochs):
             perm = torch.randperm(total, device=self.storage_device)
@@ -398,6 +556,8 @@ class SuccessorStorage:
                     nc_w_flat[idx],
                     nc_m_flat[idx],
                     snip_flat[idx],
+                    root_pos_flat[idx],
+                    root_quat_flat[idx],
                 )
                 moved = tuple(self._move_to_sample_device(t) for t in gathered)
                 # ``t_idx`` / ``env_idx`` stay on the storage device so
