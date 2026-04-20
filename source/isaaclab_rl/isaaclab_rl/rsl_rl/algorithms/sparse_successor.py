@@ -113,8 +113,16 @@ class SparseSuccessor:
         # the disc briefly wins. γ=0.98 halves the floor to ±800.
         gamma_style: float | None = None,
         target_tau: float = 0.005,
-        lambda_style: float = 0.1,
-        lambda_aux: float = 1.0,
+        # Actor-loss Q weights. When ``scale_lambda_by_q_track`` is True
+        # (BFM-style adaptive scaling, default), the effective weight is
+        # ``λ × |q_track|.abs().mean().detach()`` — so the style / aux
+        # branches contribute on the same scale as the task Q no matter
+        # how large the satisfaction rewards become. When False, the
+        # λ's are absolute coefficients (legacy behaviour).
+        # BFM reference: reg_coeff=0.05 (style), reg_coeff_aux=0.02.
+        lambda_style: float = 0.05,
+        lambda_aux: float = 0.02,
+        scale_lambda_by_q_track: bool = True,
         # Pessimism penalties (BFM-style). With twin critics, uncertainty is
         # proxied by |Q1 - Q2|; ``Q_pessimistic = mean(Q) - penalty * uncertainty``.
         # Zero reduces to the standard ``min(Q1, Q2)`` double-Q approximation —
@@ -234,6 +242,7 @@ class SparseSuccessor:
         self.target_tau = target_tau
         self.lambda_style = lambda_style
         self.lambda_aux = lambda_aux
+        self.scale_lambda_by_q_track = bool(scale_lambda_by_q_track)
         self.critic_pessimism_penalty = float(critic_pessimism_penalty)
         self.actor_pessimism_penalty = float(actor_pessimism_penalty)
         self.sigma_time = sigma_time
@@ -1886,13 +1895,26 @@ class SparseSuccessor:
 
             q_total = q_track
 
+            # Adaptive Q-scale for style/aux branches (BFM-style
+            # ``scale_reg``). The ``|q_track|.abs().mean().detach()``
+            # factor keeps the style/aux contributions proportionate to
+            # the task Q no matter how the satisfaction-reward scale
+            # drifts during training. Detached so the actor-loss
+            # gradient doesn't try to shrink q_track just to down-weight
+            # style/aux. ``scale_lambda_by_q_track=False`` recovers the
+            # fixed-coefficient behaviour.
+            if self.scale_lambda_by_q_track:
+                lambda_scale = q_track.abs().mean().detach().clamp(min=1e-6)
+            else:
+                lambda_scale = torch.tensor(1.0, device=q_track.device)
+
             if self.expert_buffer is not None and self.lambda_style > 0.0:
                 q_style = self._pessimistic_q(
                     self.policy.style_critic_1(obs, priv, new_action, z_C_actor),
                     self.policy.style_critic_2(obs, priv, new_action, z_C_actor),
                     self.actor_pessimism_penalty,
                 )
-                q_total = q_total + self.lambda_style * q_style
+                q_total = q_total + self.lambda_style * lambda_scale * q_style
             else:
                 q_style = None
 
@@ -1902,9 +1924,12 @@ class SparseSuccessor:
                     self.policy.aux_critic_2(obs, priv, new_action, z_C_actor),
                     self.actor_pessimism_penalty,
                 )
-                q_total = q_total + self.lambda_aux * q_aux
+                q_total = q_total + self.lambda_aux * lambda_scale * q_aux
             else:
                 q_aux = None
+
+            # Record the effective adaptive weight for diagnostics.
+            self._diag_add("Scale/lambda_scale", float(lambda_scale.item()))
 
             loss_actor = -q_total.mean()
 
@@ -1918,14 +1943,14 @@ class SparseSuccessor:
                     self._diag_add("Scale/q_style_std", q_style.std().item())
                     self._diag_add(
                         "Scale/lambda_style_times_q_style_mean",
-                        (self.lambda_style * q_style).mean().item(),
+                        (self.lambda_style * lambda_scale * q_style).mean().item(),
                     )
                 if q_aux is not None:
                     self._diag_add("Scale/q_aux_mean", q_aux.mean().item())
                     self._diag_add("Scale/q_aux_std", q_aux.std().item())
                     self._diag_add(
                         "Scale/lambda_aux_times_q_aux_mean",
-                        (self.lambda_aux * q_aux).mean().item(),
+                        (self.lambda_aux * lambda_scale * q_aux).mean().item(),
                     )
 
                 # Action stats (group 8) — note new_action already went through

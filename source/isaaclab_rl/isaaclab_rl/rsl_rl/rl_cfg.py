@@ -923,19 +923,26 @@ class RslRlSparseSuccessorAlgorithmCfg:
     target_tau: float = 0.005
     """Soft target update rate."""
 
-    lambda_style: float = 0.1
-    """Weight of the style Q-value in the actor objective.
+    lambda_style: float = 0.05
+    """Weight of the style Q-value in the actor objective. BFM's
+    ``reg_coeff = 0.05``. When ``scale_lambda_by_q_track`` is enabled
+    (default), the effective per-step weight is
+    ``lambda_style × |q_track|.abs().mean()`` so the style branch
+    stays proportionate to the task Q as the satisfaction-reward scale
+    drifts during training."""
 
-    Default deliberately small because ``q_track`` is bounded roughly in
-    ``[0, 1/(1-gamma)]`` while ``q_style`` is logit-based and unbounded. Log
-    ``Scale/q_track_*`` vs ``Scale/q_style_*`` and retune after a short warmup."""
-
-    lambda_aux: float = 1.0
+    lambda_aux: float = 0.02
     """Weight of the auxiliary-env-reward Q-value in the actor objective.
-
-    The aux reward is running-normalized before hitting the critic, so its Q
-    should be of order 1. Set ``0.0`` to disable the aux branch entirely
+    BFM's ``reg_coeff_aux = 0.02``. Same adaptive scaling as
+    ``lambda_style``. Set to 0 to disable the aux branch entirely
     (env rewards will still be logged but not consumed by training)."""
+
+    scale_lambda_by_q_track: bool = True
+    """Adaptive BFM-style ``scale_reg``. When True, multiply
+    ``lambda_style`` / ``lambda_aux`` by the detached running mean of
+    ``|q_track|`` so the non-task branches never dominate the actor
+    gradient regardless of how the task Q magnitude evolves. When
+    False, ``lambda_*`` are absolute fixed coefficients (legacy)."""
 
     critic_pessimism_penalty: float = 0.5
     """Ensemble pessimism penalty used when computing the TD bootstrap for all
