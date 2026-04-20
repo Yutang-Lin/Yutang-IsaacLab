@@ -1500,8 +1500,19 @@ class SparseSuccessor:
             q_aux_for_actor = None
             if self.lambda_aux > 0.0:
                 rewards_flat = rewards_batch.squeeze(-1)  # [B]
-                # Update the running stats from this batch, then normalize.
+                # Update the running stats from this batch AND immediately
+                # merge across DDP ranks so r_env_norm below uses the global
+                # Welford statistics. Without this sync, each rank's 16
+                # inner updates would each normalize against its own drifting
+                # local stats — producing inconsistent TD targets that
+                # reduce_gradients then averages into a meaningless signal.
+                # This is the "every stat that touches a loss must be
+                # synced every inner step" invariant.
                 self.policy.aux_reward_normalizer.update(rewards_flat)
+                if self._sync_grads and hasattr(
+                    self.policy.aux_reward_normalizer, "sync_across_ranks"
+                ):
+                    self.policy.aux_reward_normalizer.sync_across_ranks(self.device)
                 r_env_norm = self.policy.aux_reward_normalizer.normalize(rewards_flat)
 
                 self._last_r_env_raw_mean = rewards_flat.mean().item()
