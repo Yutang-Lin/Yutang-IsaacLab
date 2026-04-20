@@ -1280,11 +1280,12 @@ class SparseSuccessor:
                 # Per-atom future-grounded expert z: snippet + kp_window, each
                 # atomic constraint samples its own τ_i from [1, tau_max] and
                 # draws its target from the corresponding future frame. Note
-                # scheme (B): we do NOT require the snippet horizon L to
-                # cover every τ_i — the disc only sees the snippet as
-                # evidence of style, while the z_C it's paired with carries
-                # multi-time query information that the snippet's 8-frame
-                # window cannot fully verify. This is the intended trade-off.
+                # scheme (B): we do NOT require the snippet window to cover
+                # every τ_i — the disc only sees the snippet as evidence of
+                # per-step style, while the z_C it's paired with carries
+                # multi-time query information the snippet cannot fully
+                # verify. With the current SNIPPET_LENGTH=1 config the
+                # disc is a per-frame judge, matching BFM-Zero.
                 expert_batch = self.expert_buffer.sample_with_future_window(
                     snippets.shape[0], horizon=self.tau_max,
                 )

@@ -288,31 +288,50 @@ class SuccessorStorage:
         """
         device = self.storage_device
         max_t = self.num_transitions_per_env if self._full else self.step
+        N = self.num_transitions_per_env
         H = int(horizon)
         B = t_idx.shape[0]
-        priv_dim = self.next_privileged_observations.shape[-1]
 
         offsets = torch.arange(H + 1, device=device).unsqueeze(0)   # [1, H+1]
-        frame = t_idx.unsqueeze(1) + offsets                         # [B, H+1]
 
-        # In-bounds mask (frame < max_t) — when the buffer is full we treat
-        # it as linear within [0, max_t) to avoid crossing the circular-write
-        # seam at ``self.step``.
-        in_bounds = frame < max_t                                    # [B, H+1]
-        # Reset-crossing mask: dones[t..t+h-1] for h>=1 must all be 0.
-        # Since dones lives per transition at storage index, cumsum along
-        # the time axis lets us test "no reset in (t, t+h]".
-        dones_flat = self.dones[:max_t].squeeze(-1)                  # [T, N]
-        # cumsum by time for each env — cheap to recompute per call (T is
-        # at most 2048 for the usual cfg).
-        cum = dones_flat.cumsum(dim=0)                               # [T, N]
-        # Clamp frame to a valid storage index for the gather; the mask
-        # below discards out-of-range rows.
+        if self._full:
+            # Circular buffer: the write pointer is the seam between
+            # newest and oldest. "Forward in time" wraps, but crossing
+            # the seam lands on much-older data. Mark all frames that
+            # cross the seam as invalid. ``write_ptr`` is where the next
+            # transition will be written; slot ``write_ptr - 1`` is the
+            # newest valid transition.
+            write_ptr = int(self.step % N)
+            # Distance forward (in ring steps) from anchor to seam:
+            #   dist = (write_ptr - 1 - t_idx) mod N
+            # Frames with offset > dist cross the seam.
+            dist_to_seam = (write_ptr - 1 - t_idx.long()).remainder(N)   # [B]
+            # Ring-advanced frame indices (wrapped).
+            frame = (t_idx.unsqueeze(1) + offsets).remainder(N)          # [B, H+1]
+            in_bounds = offsets <= dist_to_seam.unsqueeze(1)             # [B, H+1]
+        else:
+            # Linear write: simple [0, max_t) bounds check.
+            frame = t_idx.unsqueeze(1) + offsets                         # [B, H+1]
+            in_bounds = frame < max_t                                    # [B, H+1]
+
+        # Reset-crossing mask: dones in the (t, t+h] half-open window
+        # must all be zero. We compute per-env cumulative dones on the
+        # populated slice, then probe at frame indices. Indices are
+        # ring-wrapped when ``_full``; anchor gather uses the same
+        # wrapping.
+        dones_flat = self.dones[:max_t].squeeze(-1)                  # [max_t, N]
+        cum = dones_flat.cumsum(dim=0)                               # [max_t, N]
+        # Clamp frame to a valid storage index for the gather. Out-of-
+        # bounds rows (already masked by ``in_bounds``) get zero-ish
+        # values but never influence the final ``valid`` result.
         frame_c = frame.clamp(max=max_t - 1)
         env_exp = env_idx.unsqueeze(1).expand(B, H + 1)
         cum_at_frame = cum[frame_c, env_exp]                         # [B, H+1]
         cum_at_anchor = cum[t_idx, env_idx].unsqueeze(1)             # [B, 1]
-        # no_reset[b, h] = True iff zero resets occurred in (t, t+h].
+        # When _full: the ring semantics mean cum can *decrease* going
+        # forward if we cross the seam, but ``in_bounds`` already masks
+        # those rows out. Within a valid run, the anchor's cum is <= the
+        # frame's cum iff no reset was crossed.
         no_reset = (cum_at_frame - cum_at_anchor) <= 0.5
         # Anchor (h=0) is always "no reset" by definition.
         no_reset[:, 0] = True
