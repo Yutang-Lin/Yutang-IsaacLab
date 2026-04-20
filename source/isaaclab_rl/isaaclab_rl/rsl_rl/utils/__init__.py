@@ -67,3 +67,27 @@ def reduce_gradients(network):
             numel = param.numel()
             param.grad.data.copy_(all_grads[offset: offset + numel].view_as(param.grad.data))
             offset += numel
+
+
+def zero_grads_if_nonfinite(loss, *networks) -> bool:
+    """Zero the gradients of ``networks`` locally if ``loss`` is not finite.
+
+    Returns True when the zeroing happened. Designed for DDP + collective
+    gradient averaging: a rank whose backward produced NaN/Inf grads zeroes
+    its local contribution **but still calls ``reduce_gradients`` afterward**,
+    so the collective ``all_reduce`` doesn't deadlock. Averaged grad = sum
+    of finite ranks' grads + zeros from NaN ranks, then divided by
+    world_size — slightly down-weighted but never poisoned.
+
+    The alternative (global skip when anyone has NaN) discards all ranks'
+    valid work that step; this variant preserves it at the cost of a
+    slightly smaller effective batch on NaN iters.
+    """
+    import torch as _torch
+    if _torch.isfinite(loss).all():
+        return False
+    for net in networks:
+        for p in net.parameters():
+            if p.grad is not None:
+                p.grad.zero_()
+    return True

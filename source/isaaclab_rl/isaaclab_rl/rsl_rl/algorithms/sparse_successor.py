@@ -16,7 +16,7 @@ import torch.optim as optim
 from isaaclab_rl.rsl_rl.modules.sparse_successor_policy import SparseSuccessorPolicy
 from isaaclab_rl.rsl_rl.storage.successor_storage import SuccessorStorage
 from isaaclab_rl.rsl_rl.storage.expert_motion_buffer import ExpertMotionBuffer
-from isaaclab_rl.rsl_rl.utils import reduce_gradients
+from isaaclab_rl.rsl_rl.utils import reduce_gradients, zero_grads_if_nonfinite
 
 
 class SparseSuccessor:
@@ -1327,6 +1327,15 @@ class SparseSuccessor:
 
                 self.opt_disc.zero_grad()
                 disc_loss.backward()
+                # Local NaN/Inf guard — zero this rank's grads if the loss
+                # exploded, but STILL call reduce_gradients so the DDP
+                # collective never deadlocks. Other ranks' finite grads
+                # contribute; this rank contributes zero.
+                nan_disc = zero_grads_if_nonfinite(
+                    disc_loss, self.policy.style_discriminator,
+                )
+                if nan_disc:
+                    self._diag_add("NaN/disc_skip", 1.0)
                 if self._sync_grads:
                     reduce_gradients(self.policy.style_discriminator)
                 nn.utils.clip_grad_norm_(
@@ -1405,6 +1414,14 @@ class SparseSuccessor:
             self.opt_U1.zero_grad()
             self.opt_U2.zero_grad()
             loss_U.backward()
+            nan_U = zero_grads_if_nonfinite(
+                loss_U,
+                self.policy.query_encoder,
+                self.policy.successor_critic_1,
+                self.policy.successor_critic_2,
+            )
+            if nan_U:
+                self._diag_add("NaN/U_skip", 1.0)
             if self._sync_grads:
                 reduce_gradients(self.policy.query_encoder)
                 reduce_gradients(self.policy.successor_critic_1)
@@ -1468,6 +1485,8 @@ class SparseSuccessor:
 
                 self.opt_QS1.zero_grad()
                 loss_QS1.backward()
+                if zero_grads_if_nonfinite(loss_QS1, self.policy.style_critic_1):
+                    self._diag_add("NaN/QS1_skip", 1.0)
                 if self._sync_grads:
                     reduce_gradients(self.policy.style_critic_1)
                 nn.utils.clip_grad_norm_(self.policy.style_critic_1.parameters(), self.max_grad_norm)
@@ -1475,6 +1494,8 @@ class SparseSuccessor:
 
                 self.opt_QS2.zero_grad()
                 loss_QS2.backward()
+                if zero_grads_if_nonfinite(loss_QS2, self.policy.style_critic_2):
+                    self._diag_add("NaN/QS2_skip", 1.0)
                 if self._sync_grads:
                     reduce_gradients(self.policy.style_critic_2)
                 nn.utils.clip_grad_norm_(self.policy.style_critic_2.parameters(), self.max_grad_norm)
@@ -1535,6 +1556,8 @@ class SparseSuccessor:
 
                 self.opt_QA1.zero_grad()
                 loss_QA1.backward()
+                if zero_grads_if_nonfinite(loss_QA1, self.policy.aux_critic_1):
+                    self._diag_add("NaN/QA1_skip", 1.0)
                 if self._sync_grads:
                     reduce_gradients(self.policy.aux_critic_1)
                 nn.utils.clip_grad_norm_(self.policy.aux_critic_1.parameters(), self.max_grad_norm)
@@ -1542,6 +1565,8 @@ class SparseSuccessor:
 
                 self.opt_QA2.zero_grad()
                 loss_QA2.backward()
+                if zero_grads_if_nonfinite(loss_QA2, self.policy.aux_critic_2):
+                    self._diag_add("NaN/QA2_skip", 1.0)
                 if self._sync_grads:
                     reduce_gradients(self.policy.aux_critic_2)
                 nn.utils.clip_grad_norm_(self.policy.aux_critic_2.parameters(), self.max_grad_norm)
@@ -1637,6 +1662,8 @@ class SparseSuccessor:
 
             self.opt_actor.zero_grad()
             loss_actor.backward()
+            if zero_grads_if_nonfinite(loss_actor, self.policy.actor):
+                self._diag_add("NaN/actor_skip", 1.0)
             if self._sync_grads:
                 reduce_gradients(self.policy.actor)
             nn.utils.clip_grad_norm_(self.policy.actor.parameters(), self.max_grad_norm)
