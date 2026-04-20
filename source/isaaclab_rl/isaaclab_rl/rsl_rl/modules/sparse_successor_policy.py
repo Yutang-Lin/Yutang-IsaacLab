@@ -510,6 +510,60 @@ class RunningScalarNormalizer(nn.Module):
         s = self.std()
         return ((x - self.mean) / s).clamp(-self.clip, self.clip)
 
+    @torch.no_grad()
+    def sync_across_ranks(self, device: torch.device | None = None) -> None:
+        """Merge ``count / mean / M2`` across DDP ranks with parallel
+        Welford.
+
+        Each rank updates its own normalizer from its local mini-batches,
+        so without this call the running stats drift per rank. That makes
+        the ``r_env_norm`` seen by the aux critic different on every rank
+        → the TD target desynchronises even though gradients are averaged.
+        Call once per training iter from the runner after all updates.
+        """
+        try:
+            import torch.distributed as dist
+        except ImportError:
+            return
+        if not dist.is_available() or not dist.is_initialized():
+            return
+        world_size = dist.get_world_size()
+        if world_size <= 1:
+            return
+
+        dev = device if device is not None else self.count.device
+        count = self.count.to(dev)
+        mean = self.mean.to(dev)
+        M2 = self.M2.to(dev)
+
+        all_counts = [torch.zeros_like(count) for _ in range(world_size)]
+        all_means = [torch.zeros_like(mean) for _ in range(world_size)]
+        all_M2s = [torch.zeros_like(M2) for _ in range(world_size)]
+        dist.all_gather(all_counts, count)
+        dist.all_gather(all_means, mean)
+        dist.all_gather(all_M2s, M2)
+
+        total_count = all_counts[0].clone()
+        merged_mean = all_means[0].clone()
+        merged_M2 = all_M2s[0].clone()
+        for i in range(1, world_size):
+            n_a = total_count
+            n_b = all_counts[i]
+            n_ab = n_a + n_b
+            if n_ab.item() < 1:
+                continue
+            delta = all_means[i] - merged_mean
+            merged_M2 = (
+                merged_M2 + all_M2s[i]
+                + delta.pow(2) * (n_a * n_b / n_ab)
+            )
+            merged_mean = merged_mean + delta * (n_b / n_ab)
+            total_count = n_ab
+
+        self.count.copy_(total_count.to(self.count.device))
+        self.mean.copy_(merged_mean.to(self.mean.device))
+        self.M2.copy_(merged_M2.to(self.M2.device))
+
 
 class StyleDiscriminator(nn.Module):
     """D(snippet, z_C) -> probability in (0, 1)."""

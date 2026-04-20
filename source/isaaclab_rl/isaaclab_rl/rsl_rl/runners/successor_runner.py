@@ -350,6 +350,16 @@ class SuccessorRunner(BaseRunner):
                 loss_dict = self.alg.update()
                 loss_dict["Perf/warmup"] = 0.0
 
+            # Sync the aux-reward running normalizer across ranks. Each
+            # rank's update() folded its local mini-batch rewards into the
+            # Welford stats; without this merge, r_env_norm (and the aux
+            # TD target it feeds) diverges per rank even though gradients
+            # are averaged.
+            if self.is_distributed and not warmup_active:
+                aux_norm = getattr(self.alg.policy, "aux_reward_normalizer", None)
+                if aux_norm is not None and hasattr(aux_norm, "sync_across_ranks"):
+                    aux_norm.sync_across_ranks(self.device)
+
             # Reset-source breakdown (group 7 diag) — ask the env for RSI share.
             env_u = self.env.unwrapped
             if hasattr(env_u, "consume_reset_stats"):

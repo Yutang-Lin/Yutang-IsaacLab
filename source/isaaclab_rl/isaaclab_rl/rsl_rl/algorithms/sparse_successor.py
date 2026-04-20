@@ -2031,12 +2031,20 @@ class SparseSuccessor:
     # ------------------------------------------------------------------
 
     def broadcast_parameters(self):
-        """Broadcast all network parameters from rank 0 to every other rank.
+        """Broadcast the full policy ``state_dict()`` from rank 0 to every
+        other rank.
 
-        Called once at the start of training so all ranks begin with identical
-        weights. The entire policy state_dict is synced, covering encoders,
-        actor, twin successor critics + targets, twin style critics + targets,
-        and the style discriminator.
+        ``state_dict()`` includes every parameter AND every registered
+        buffer on the module tree, so this single call covers:
+          - encoders (query_encoder, constraint_encoder)
+          - actor + twin successor / style / aux critics (source + targets)
+          - style discriminator
+          - ``aux_reward_normalizer`` buffers (count / mean / M2)
+        Called once at the start of training so every rank begins with an
+        identical snapshot. Per-iter drift is then closed by
+        ``reduce_gradients`` on optimised weights and by the runner's
+        ``_sync_normalizer`` / ``aux_reward_normalizer.sync_across_ranks``
+        calls for the non-gradient running stats.
         """
         if not self.is_multi_gpu or self.gpu_world_size <= 1:
             return
