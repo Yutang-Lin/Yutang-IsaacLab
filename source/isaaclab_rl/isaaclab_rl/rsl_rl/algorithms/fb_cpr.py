@@ -493,6 +493,17 @@ class FBCprAux:
             return {k: v.to(self.device, non_blocking=True) for k, v in obs.items()}
         return obs.to(self.device, non_blocking=True)
 
+    @staticmethod
+    def _unwrap(net):
+        """Return the underlying module — strips DDP if wrapped.
+
+        DDP forwards ``__call__`` but NOT arbitrary attribute access
+        (e.g. ``.num_parallel``). Route attribute reads through
+        ``_unwrap(net)`` so the 5 DDP-wrapped nets and the unwrapped
+        discriminator behave identically from the algorithm's POV.
+        """
+        return net.module if hasattr(net, "module") else net
+
     # --- update surface ----------------------------------------------------- #
 
     def broadcast_parameters(self) -> None:
@@ -897,7 +908,7 @@ class FBCprAux:
         z: torch.Tensor,
     ) -> Tuple[Dict[str, torch.Tensor], Any]:
         p = self.policy
-        num_parallel = p._critic.num_parallel
+        num_parallel = self._unwrap(p._critic).num_parallel
         with torch.no_grad():
             reward = p._discriminator.compute_reward(obs, z)
             dist = p._actor(next_obs, z, p.actor_std)
@@ -942,7 +953,7 @@ class FBCprAux:
         z: torch.Tensor,
     ) -> Tuple[Dict[str, torch.Tensor], Any]:
         p = self.policy
-        num_parallel = p._aux_critic.num_parallel
+        num_parallel = self._unwrap(p._aux_critic).num_parallel
         with torch.no_grad():
             dist = p._actor(next_obs, z, p.actor_std)
             next_action = dist.sample(clip=self.cfg.stddev_clip)
