@@ -359,8 +359,12 @@ class FBCprRunner:
     # --- training loop ------------------------------------------------- #
 
     def learn(self, num_learning_iterations: int, init_at_random_ep_len: bool = False):
-        # Logger init
-        if self.log_dir is not None and self.writer is None:
+        # Only rank 0 logs / prints under DDP (avoid N-way wandb runs and
+        # duplicate stdout spam).
+        self._is_head = (not self.is_distributed) or (self.gpu_global_rank == 0)
+
+        # Logger init — head rank only.
+        if self.log_dir is not None and self.writer is None and self._is_head:
             logger_type = self.cfg.get("logger", "tensorboard").lower()
             if logger_type == "wandb":
                 from rsl_rl.utils.wandb_utils import WandbSummaryWriter
@@ -420,9 +424,10 @@ class FBCprRunner:
             and self.current_learning_iteration == 0
             and self.eval_rollout_length > 0
         ):
-            print(f"[FBCprRunner] running initial tracking eval (no priority update) ...", flush=True)
+            if self._is_head:
+                print(f"[FBCprRunner] running initial tracking eval (no priority update) ...", flush=True)
             eval0 = self._run_tracking_eval(update_priorities=False)
-            if eval0 is not None and self.log_dir is not None and self.writer is not None:
+            if self._is_head and eval0 is not None and self.log_dir is not None and self.writer is not None:
                 env_steps = int(self.tot_timesteps)
                 for k, v in eval0.items():
                     self.writer.add_scalar(f"{k}_initial", v, env_steps)
@@ -583,6 +588,10 @@ class FBCprRunner:
                             total_metrics[k] = total_metrics.get(k, torch.zeros_like(v.float())) + v.float().detach()
                         num_metrics_updates += 1
 
+                # Single running-stat sync per iter (was per-update = 16×).
+                if self.is_distributed:
+                    self.alg._sync_running_stats()
+
                 for k, v in total_metrics.items():
                     loss_dict[k] = float(v.mean().item()) / max(num_metrics_updates, 1)
                 total_metrics = None
@@ -610,8 +619,8 @@ class FBCprRunner:
             self.current_learning_iteration = it
             self.tot_time += collection_time + learn_time
 
-            # ----- log -----
-            if self.log_dir is not None and self.writer is not None:
+            # ----- log (head rank only) -----
+            if self._is_head and self.log_dir is not None and self.writer is not None:
                 self._log(it, tot_iter, collection_time, learn_time, loss_dict, rewbuffer, lenbuffer)
                 if it % self.save_interval == 0:
                     if len(rewbuffer) > 0:
@@ -621,12 +630,12 @@ class FBCprRunner:
                             self.save(os.path.join(self.log_dir, "model_best.pt"))
                     self.save(os.path.join(self.log_dir, f"model_{it}.pt"))
 
-            if it == start_iter and self.log_dir is not None:
+            if self._is_head and it == start_iter and self.log_dir is not None:
                 import rsl_rl
                 store_code_state(self.log_dir, [rsl_rl.__file__])
 
         self._local_timesteps = local_timesteps
-        if self.log_dir is not None:
+        if self._is_head and self.log_dir is not None:
             self.save(os.path.join(self.log_dir, f"model_{self.current_learning_iteration}.pt"))
 
     # --- tracking eval --------------------------------------------------- #

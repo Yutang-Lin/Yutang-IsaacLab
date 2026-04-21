@@ -153,11 +153,13 @@ class FBCprAux:
             torch.distributed.is_available() and torch.distributed.is_initialized()
         )
 
-        # DDP LR scaling: ``lr_*  *= sqrt(world_size)`` for the fast-moving
-        # branches (actor, critic, aux_critic, F). The slow branches (B,
-        # discriminator) stay at BFM's 1e-5 — BFM's design intent is that
-        # the z-encoder and style discriminator move slowly relative to
-        # the actor/critics, and this holds regardless of global batch size.
+        # DDP LR scaling: ``lr_*  *= sqrt(world_size)`` for EVERY branch.
+        # Under DDP each update step averages gradients across ranks, which
+        # reduces gradient noise by sqrt(world_size); the square-root rule
+        # keeps the effective step size per example unchanged. This applies
+        # uniformly — including the slow-moving B encoder and discriminator,
+        # since they see the same world_size × batch_size effective batch
+        # per update.
         if self.is_distributed:
             import math
             ws = int(torch.distributed.get_world_size())
@@ -166,10 +168,12 @@ class FBCprAux:
             cfg.lr_critic = float(cfg.lr_critic) * s
             cfg.lr_aux_critic = float(cfg.lr_aux_critic) * s
             cfg.lr_f = float(cfg.lr_f) * s
+            cfg.lr_b = float(cfg.lr_b) * s
+            cfg.lr_discriminator = float(cfg.lr_discriminator) * s
             print(f"[FBCprAux] DDP world_size={ws}, sqrt-scaled LRs: "
                   f"actor={cfg.lr_actor:.3g} critic={cfg.lr_critic:.3g} "
                   f"aux_critic={cfg.lr_aux_critic:.3g} F={cfg.lr_f:.3g} "
-                  f"(B={cfg.lr_b}, disc={cfg.lr_discriminator} unchanged)",
+                  f"B={cfg.lr_b:.3g} disc={cfg.lr_discriminator:.3g}",
                   flush=True)
 
         # Put the policy on device. The policy holds *all* networks, including
@@ -470,20 +474,39 @@ class FBCprAux:
         """Average BatchNorm + EMA running buffers across ranks.
 
         Called once per ``update()`` after all backward passes are done.
+        Fuses every float buffer into ONE all_reduce (was O(N_buffers)
+        small NCCL calls per update — ~15 buffers × 16 updates ≈ 240
+        kernel launches per iter, which dominated learn time on DDP).
         """
         if not self.is_distributed:
             return
         world = float(torch.distributed.get_world_size())
-        for buf in list(self.policy._obs_normalizer.buffers()) + list(self.policy._aux_reward_normalizer.buffers()):
-            if buf is None or buf.dtype == torch.long:
-                # Integer counters: take max (all ranks advanced together).
-                if buf is not None and buf.dtype == torch.long:
-                    b32 = buf.to(torch.float32)
-                    torch.distributed.all_reduce(b32, op=torch.distributed.ReduceOp.MAX)
-                    buf.copy_(b32.to(buf.dtype))
-                continue
-            torch.distributed.all_reduce(buf, op=torch.distributed.ReduceOp.SUM)
-            buf.div_(world)
+        all_bufs = list(self.policy._obs_normalizer.buffers()) + \
+                   list(self.policy._aux_reward_normalizer.buffers())
+
+        float_bufs = [b for b in all_bufs if b is not None and b.dtype != torch.long]
+        int_bufs = [b for b in all_bufs if b is not None and b.dtype == torch.long]
+
+        # Fused SUM-reduce for all float buffers, then /world.
+        if float_bufs:
+            flat = torch.cat([b.view(-1) for b in float_bufs])
+            torch.distributed.all_reduce(flat, op=torch.distributed.ReduceOp.SUM)
+            flat.div_(world)
+            offset = 0
+            for b in float_bufs:
+                n = b.numel()
+                b.view(-1).copy_(flat[offset: offset + n])
+                offset += n
+
+        # Fused MAX-reduce for integer counters (BatchNorm's num_batches_tracked).
+        if int_bufs:
+            flat = torch.cat([b.view(-1).to(torch.float32) for b in int_bufs])
+            torch.distributed.all_reduce(flat, op=torch.distributed.ReduceOp.MAX)
+            offset = 0
+            for b in int_bufs:
+                n = b.numel()
+                b.view(-1).copy_(flat[offset: offset + n].to(b.dtype))
+                offset += n
 
     def update(self, replay_buffer: Dict[str, Any], step: int) -> Dict[str, torch.Tensor]:
         """One full FB-CPR-Aux update step.
@@ -625,12 +648,10 @@ class FBCprAux:
                 self.cfg.critic_target_tau,
             )
 
-        # Sync running stats (BatchNorm running_mean/var, EMA moments) across
-        # ranks so every rank's ``_obs_normalizer`` and ``_aux_reward_normalizer``
-        # stay consistent. Cheap (just a handful of small buffers).
-        if self.is_distributed:
-            self._sync_running_stats()
-
+        # NOTE: running-stat sync across ranks is NOT done here. It happens
+        # once per learn-iter in ``FBCprRunner`` (after all num_agent_updates
+        # backward passes), so per-update drift inside one iter is acceptable
+        # and we save 15× the NCCL traffic.
 
         return metrics
 
