@@ -107,10 +107,12 @@ class FBCprRunner:
         if self.is_distributed and not torch.distributed.is_initialized():
             # Bind PyTorch's current device BEFORE init_process_group so NCCL's
             # lazy comm creation at the first collective lands on the rank-local
-            # GPU. Don't pass ``device_id=`` — torch 2.7 turns that into eager
-            # init, which has been observed to deadlock on multi-node cloud
-            # clusters (>1 subnet). Lazy init is fine here.
-            torch.cuda.set_device(self.gpu_local_rank)
+            # GPU. When CUDA_VISIBLE_DEVICES is masked to one GPU (our launch
+            # script sets it to $LOCAL_RANK), the rank-local GPU is index 0
+            # inside this process; otherwise fall back to local_rank.
+            cvd = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+            _dev_idx = 0 if (cvd and "," not in cvd) else self.gpu_local_rank
+            torch.cuda.set_device(_dev_idx)
             torch.distributed.init_process_group(
                 backend="nccl",
                 rank=self.gpu_global_rank,
@@ -152,12 +154,13 @@ class FBCprRunner:
         # --- Expert buffer ---------------------------------------------
         expert_path = self.alg_cfg.get("expert_dataset_path")
         expert_device = self.alg_cfg.get("expert_dataset_device", "cuda")
-        # Resolve bare "cuda" to the rank-local GPU so every rank doesn't load
-        # the full expert dataset onto cuda:0. torch.load(map_location="cuda")
-        # respects current device, but being explicit prevents any accidental
-        # cuda:0 allocation during subsequent ``.to()`` / sampling.
+        # Resolve bare "cuda" to the rank-local visible GPU. With
+        # CUDA_VISIBLE_DEVICES masked the rank-local GPU is index 0 inside
+        # this process; otherwise it's local_rank.
         if expert_device == "cuda":
-            expert_device = f"cuda:{self.gpu_local_rank}"
+            cvd = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+            _exp_idx = 0 if (cvd and "," not in cvd) else self.gpu_local_rank
+            expert_device = f"cuda:{_exp_idx}"
         self.expert_buffer = FBCprExpertBuffer(
             pt_path=expert_path,
             seq_length=net_cfg.seq_length,

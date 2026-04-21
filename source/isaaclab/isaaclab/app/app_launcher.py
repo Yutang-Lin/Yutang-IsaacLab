@@ -671,7 +671,16 @@ class AppLauncher:
             # global rank (GPU id) in multi-gpu multi-node mode
             self.global_rank = int(os.getenv("RANK", "0")) + int(os.getenv("JAX_RANK", "0"))
 
-            self.device_id = self.local_rank
+            # When the launcher script masked CUDA_VISIBLE_DEVICES to a single
+            # GPU (one-GPU-per-process isolation to stop Kit/NCCL from leaking
+            # primary contexts onto peer GPUs), Kit only sees device index 0
+            # regardless of the outer local_rank. Pin physics/render to 0 in
+            # that case; otherwise keep the legacy local_rank mapping.
+            cvd = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+            if cvd and "," not in cvd:
+                self.device_id = 0
+            else:
+                self.device_id = self.local_rank
             device = "cuda:" + str(self.device_id)
             launcher_args["multi_gpu"] = False
             # limit CPU threads to minimize thread context switching
