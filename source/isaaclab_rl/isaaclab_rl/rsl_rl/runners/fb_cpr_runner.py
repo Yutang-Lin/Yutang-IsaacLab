@@ -105,16 +105,16 @@ class FBCprRunner:
         # train.py relies on this happening inside the runner constructor, the
         # same contract OnPolicyRunner honours.
         if self.is_distributed and not torch.distributed.is_initialized():
-            # Bind PyTorch's current device BEFORE init_process_group. Torch 2.3+
-            # NCCL init is eager and will create a communicator per visible GPU
-            # if it can't resolve a unique device, leaking ~400 MiB ctx onto
-            # every peer GPU on the node.
+            # Bind PyTorch's current device BEFORE init_process_group so NCCL's
+            # lazy comm creation at the first collective lands on the rank-local
+            # GPU. Don't pass ``device_id=`` — torch 2.7 turns that into eager
+            # init, which has been observed to deadlock on multi-node cloud
+            # clusters (>1 subnet). Lazy init is fine here.
             torch.cuda.set_device(self.gpu_local_rank)
             torch.distributed.init_process_group(
                 backend="nccl",
                 rank=self.gpu_global_rank,
                 world_size=self.gpu_world_size,
-                device_id=torch.device(f"cuda:{self.gpu_local_rank}"),
             )
 
         # Seed everything (match BFM's ``set_seed_everywhere``). This fixes
