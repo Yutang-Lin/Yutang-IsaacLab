@@ -69,6 +69,51 @@ def reduce_gradients(network):
             offset += numel
 
 
+def reduce_gradients_async(network):
+    """Non-blocking variant of :func:`reduce_gradients`.
+
+    Fires a single ``all_reduce(async_op=True)`` over the concatenated
+    gradients of ``network`` and returns an opaque handle tuple. Call
+    :func:`finish_async_reduce` on the handle before reading / clipping /
+    stepping the gradients — that's when the collective actually
+    synchronises and the averaged grads get scattered back.
+
+    Pattern (pipelines reduce with the next block's compute):
+
+        h = reduce_gradients_async(net_A)
+        # ... other work (including net_B's backward) ...
+        finish_async_reduce(h)
+        optA.step()
+
+    Returns None when there are no grads to reduce OR when distributed
+    is not initialised (caller can treat ``if h is None: optA.step()``).
+    """
+    if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
+        return None
+    params_with_grad = [p for p in network.parameters() if p.grad is not None]
+    if not params_with_grad:
+        return None
+    flat = torch.cat([p.grad.view(-1) for p in params_with_grad])
+    handle = torch.distributed.all_reduce(
+        flat, op=torch.distributed.ReduceOp.SUM, async_op=True
+    )
+    return (handle, flat, params_with_grad)
+
+
+def finish_async_reduce(handle_tuple):
+    """Wait on an async all_reduce handle and scatter the averaged grads back."""
+    if handle_tuple is None:
+        return
+    handle, flat, params_with_grad = handle_tuple
+    handle.wait()
+    flat.div_(torch.distributed.get_world_size())
+    offset = 0
+    for p in params_with_grad:
+        n = p.grad.numel()
+        p.grad.data.copy_(flat[offset: offset + n].view_as(p.grad.data))
+        offset += n
+
+
 def zero_grads_if_nonfinite(loss, *networks) -> bool:
     """Zero the gradients of ``networks`` locally if ``loss`` is not finite.
 

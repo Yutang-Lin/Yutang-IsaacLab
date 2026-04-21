@@ -43,7 +43,7 @@ from ..modules.fb_cpr_policy import (
     eval_mode,
     weight_init,
 )
-from ..utils import reduce_gradients
+from ..utils import reduce_gradients, reduce_gradients_async, finish_async_reduce
 
 __all__ = [
     "FBCprAuxAlgorithmCfg",
@@ -185,6 +185,44 @@ class FBCprAux:
         self.policy.requires_grad_(True)
         self.policy.apply(weight_init)
         self.policy._prepare_for_train()
+
+        # DDP wrapping: wrap the 5 trainable online networks so backward
+        # fires bucketed async all_reduce during the backward pass (80%+
+        # overlap of reduce with compute, vs ~30% for post-backward async
+        # reduce). We do NOT wrap the discriminator — its WGAN-GP term
+        # uses ``autograd.grad(..., create_graph=True)`` which DDP's
+        # backward hook doesn't trap correctly; that network stays on
+        # manual async reduce.
+        #
+        # Target networks are never wrapped (no gradients — Polyak-only).
+        # The obs / aux reward normalizers are not wrapped either — their
+        # running stats are synced by ``_sync_running_stats`` once per
+        # learn-iter via a fused all_reduce.
+        self._is_ddp_wrapped = False
+        if self.is_distributed:
+            from torch.nn.parallel import DistributedDataParallel as DDP
+            local_rank = int(torch.distributed.get_rank()) if torch.distributed.is_initialized() else 0
+            try:
+                dev_idx = torch.device(self.device).index
+                if dev_idx is None:
+                    dev_idx = local_rank
+            except Exception:
+                dev_idx = local_rank
+            ddp_kwargs = dict(
+                device_ids=[dev_idx],
+                output_device=dev_idx,
+                broadcast_buffers=False,          # our normalizer buffers are synced manually
+                find_unused_parameters=False,
+                gradient_as_bucket_view=True,     # reuse bucket storage as .grad views
+            )
+            self.policy._forward_map = DDP(self.policy._forward_map, **ddp_kwargs)
+            self.policy._backward_map = DDP(self.policy._backward_map, **ddp_kwargs)
+            self.policy._actor = DDP(self.policy._actor, **ddp_kwargs)
+            self.policy._critic = DDP(self.policy._critic, **ddp_kwargs)
+            self.policy._aux_critic = DDP(self.policy._aux_critic, **ddp_kwargs)
+            self._is_ddp_wrapped = True
+            print(f"[FBCprAux] DDP-wrapped F/B/actor/critic/aux_critic "
+                  f"(disc kept on manual async reduce)", flush=True)
 
         # Optimizers.
         self._build_optimizers()
@@ -545,18 +583,8 @@ class FBCprAux:
         expert_z = self.encode_expert(next_obs=expert_next_obs)
         train_z = train_batch["z"].to(self.device, non_blocking=True)
 
-        # 1) Discriminator update
-        metrics = self.update_discriminator(
-            expert_obs=expert_obs,
-            expert_z=expert_z,
-            train_obs=train_obs,
-            train_z=train_z,
-            grad_penalty=self.cfg.grad_penalty_discriminator
-            if self.cfg.grad_penalty_discriminator > 0
-            else None,
-        )
-
-        # 2) Mixed-z sampling + optional relabel
+        # Mixed-z sampling + optional relabel. Needed before any backward
+        # since fb/critic/aux/actor all read train_z.
         z = self.sample_mixed_z(train_goal=train_next_obs, expert_encodings=expert_z).clone()
         self._zbuf_add(z)
         if self.cfg.relabel_ratio is not None:
@@ -568,62 +596,91 @@ class FBCprAux:
         q_loss_coef = self.cfg.q_loss_coef if self.cfg.q_loss_coef > 0 else None
         clip_grad_norm = self.cfg.clip_grad_norm if self.cfg.clip_grad_norm > 0 else None
 
-        # 3) F-B update
-        metrics.update(
-            self.update_fb(
-                obs=train_obs,
-                action=train_action,
-                discount=discount,
-                next_obs=train_next_obs,
-                goal=train_next_obs,
-                z=train_z,
-                q_loss_coef=q_loss_coef,
-                clip_grad_norm=clip_grad_norm,
-            )
-        )
-        # 4) Critic update
-        metrics.update(
-            self.update_critic(
-                obs=train_obs,
-                action=train_action,
-                discount=discount,
-                next_obs=train_next_obs,
-                z=train_z,
-            )
-        )
-        # 5) Aux-critic update: assemble scaled aux reward
+        # Assemble aux_reward up-front (needed for aux_critic backward in phase 1).
         aux_reward = torch.zeros(
             (self.cfg.batch_size, 1), device=self.device, dtype=torch.float32
         )
         aux_batch = train_batch.get("aux_rewards", None)
+        aux_rew_logs: Dict[str, torch.Tensor] = {}
         if aux_batch is not None and len(self.cfg.aux_rewards_scaling) > 0:
             for name, scale in self.cfg.aux_rewards_scaling.items():
                 if name not in aux_batch:
                     continue
                 vals = aux_batch[name].to(self.device, non_blocking=True).view(-1, 1)
-                metrics[f"aux_rew/{name}"] = vals.mean().detach()
+                aux_rew_logs[f"aux_rew/{name}"] = vals.mean().detach()
                 aux_reward = aux_reward + scale * vals
         # Pass through EMA reward normalizer (BFM's `RewardNormalizer(scale=True)`).
         aux_reward = self.policy._aux_reward_normalizer(aux_reward)
-        metrics.update(
-            self.update_aux_critic(
-                obs=train_obs,
-                action=train_action,
-                discount=discount,
-                aux_reward=aux_reward,
-                next_obs=train_next_obs,
-                z=train_z,
-            )
+
+        # =============================================================
+        # PHASE 1: disc + F/B + aux_critic all have NO data dependency
+        # on each other's updated weights — their backwards can be issued
+        # back-to-back so that each one's ``all_reduce(async_op=True)``
+        # overlaps with the next one's compute on the NCCL stream.
+        # =============================================================
+        disc_metrics, disc_handle = self.backward_discriminator(
+            expert_obs=expert_obs,
+            expert_z=expert_z,
+            train_obs=train_obs,
+            train_z=train_z,
+            grad_penalty=self.cfg.grad_penalty_discriminator
+            if self.cfg.grad_penalty_discriminator > 0
+            else None,
         )
-        # 6) Actor update
-        metrics.update(
-            self.update_actor(
-                obs=train_obs,
-                action=train_action,
-                z=train_z,
-                clip_grad_norm=clip_grad_norm,
-            )
+        fb_metrics, F_handle, B_handle = self.backward_fb(
+            obs=train_obs,
+            action=train_action,
+            discount=discount,
+            next_obs=train_next_obs,
+            goal=train_next_obs,
+            z=train_z,
+            q_loss_coef=q_loss_coef,
         )
+        aux_metrics, aux_handle = self.backward_aux_critic(
+            obs=train_obs,
+            action=train_action,
+            discount=discount,
+            aux_reward=aux_reward,
+            next_obs=train_next_obs,
+            z=train_z,
+        )
+        # Wait on phase-1 reduces and step (each wait is cheap — most of
+        # the NCCL cost already overlapped with the backwards above).
+        self.step_discriminator(disc_handle)
+        self.step_fb(F_handle, B_handle, clip_grad_norm)
+        self.step_aux_critic(aux_handle)
+
+        metrics = {}
+        metrics.update(disc_metrics)
+        metrics.update(fb_metrics)
+        metrics.update(aux_metrics)
+        metrics.update(aux_rew_logs)
+
+        # =============================================================
+        # PHASE 2: critic. Depends on NEW disc (for disc_reward), so
+        # must follow phase 1.
+        # =============================================================
+        critic_metrics, critic_handle = self.backward_critic(
+            obs=train_obs,
+            action=train_action,
+            discount=discount,
+            next_obs=train_next_obs,
+            z=train_z,
+        )
+        self.step_critic(critic_handle)
+        metrics.update(critic_metrics)
+
+        # =============================================================
+        # PHASE 3: actor. Depends on NEW critic / aux_critic / F for
+        # its Q targets.
+        # =============================================================
+        actor_metrics, actor_handle = self.backward_actor(
+            obs=train_obs,
+            action=train_action,
+            z=train_z,
+        )
+        self.step_actor(actor_handle, clip_grad_norm)
+        metrics.update(actor_metrics)
 
         # 7) Polyak soft updates
         with torch.no_grad():
@@ -657,14 +714,15 @@ class FBCprAux:
 
     # --- individual update blocks ------------------------------------------ #
 
-    def update_discriminator(
+    def backward_discriminator(
         self,
         expert_obs: torch.Tensor | dict[str, torch.Tensor],
         expert_z: torch.Tensor,
         train_obs: torch.Tensor | dict[str, torch.Tensor],
         train_z: torch.Tensor,
         grad_penalty: float | None,
-    ) -> Dict[str, torch.Tensor]:
+    ) -> Tuple[Dict[str, torch.Tensor], Any]:
+        """Compute disc loss, backward, fire async reduce. Returns (metrics, reduce_handle)."""
         disc = self.policy._discriminator
         expert_logits = disc.compute_logits(expert_obs, expert_z)
         unlabeled_logits = disc.compute_logits(train_obs, train_z)
@@ -679,9 +737,7 @@ class FBCprAux:
 
         self.discriminator_optimizer.zero_grad(set_to_none=True)
         loss.backward()
-        if self.is_distributed:
-            reduce_gradients(self.policy._discriminator)
-        self.discriminator_optimizer.step()
+        handle = reduce_gradients_async(self.policy._discriminator) if self.is_distributed else None
 
         with torch.no_grad():
             out = {
@@ -691,7 +747,11 @@ class FBCprAux:
             }
             if wgan_gp is not None:
                 out["disc_wgan_gp_loss"] = wgan_gp.detach()
-        return out
+        return out, handle
+
+    def step_discriminator(self, handle: Any) -> None:
+        finish_async_reduce(handle)
+        self.discriminator_optimizer.step()
 
     def _gradient_penalty_wgan(
         self,
@@ -737,7 +797,7 @@ class FBCprAux:
         cat_g = torch.cat(grads, dim=1)
         return ((cat_g.norm(2, dim=1) - 1) ** 2).mean()
 
-    def update_fb(
+    def backward_fb(
         self,
         obs: torch.Tensor | dict[str, torch.Tensor],
         action: torch.Tensor,
@@ -746,8 +806,11 @@ class FBCprAux:
         goal: torch.Tensor | dict[str, torch.Tensor],
         z: torch.Tensor,
         q_loss_coef: float | None,
-        clip_grad_norm: float | None,
-    ) -> Dict[str, torch.Tensor]:
+    ) -> Tuple[Dict[str, torch.Tensor], Any, Any]:
+        """Compute FB loss, backward, fire async reduces on F and B.
+
+        Returns ``(metrics, F_handle, B_handle)``.
+        """
         p = self.policy
         with torch.no_grad():
             # next_action via actor
@@ -791,14 +854,11 @@ class FBCprAux:
         self.forward_optimizer.zero_grad(set_to_none=True)
         self.backward_optimizer.zero_grad(set_to_none=True)
         fb_loss.backward()
-        if self.is_distributed:
-            reduce_gradients(p._forward_map)
-            reduce_gradients(p._backward_map)
-        if clip_grad_norm is not None:
-            torch.nn.utils.clip_grad_norm_(p._forward_map.parameters(), clip_grad_norm)
-            torch.nn.utils.clip_grad_norm_(p._backward_map.parameters(), clip_grad_norm)
-        self.forward_optimizer.step()
-        self.backward_optimizer.step()
+        # DDP on F / B already fired async all_reduce INSIDE backward via
+        # bucket hooks; nothing to fire here. Leave handles as None so
+        # ``step_fb`` becomes a plain opt.step().
+        F_handle = None
+        B_handle = None
 
         with torch.no_grad():
             out = {
@@ -816,16 +876,26 @@ class FBCprAux:
                 "orth_loss_offdiag": orth_loss_offdiag,
                 "q_loss": q_loss,
             }
-        return out
+        return out, F_handle, B_handle
 
-    def update_critic(
+    def step_fb(self, F_handle: Any, B_handle: Any, clip_grad_norm: float | None) -> None:
+        p = self.policy
+        finish_async_reduce(F_handle)
+        finish_async_reduce(B_handle)
+        if clip_grad_norm is not None:
+            torch.nn.utils.clip_grad_norm_(p._forward_map.parameters(), clip_grad_norm)
+            torch.nn.utils.clip_grad_norm_(p._backward_map.parameters(), clip_grad_norm)
+        self.forward_optimizer.step()
+        self.backward_optimizer.step()
+
+    def backward_critic(
         self,
         obs: torch.Tensor | dict[str, torch.Tensor],
         action: torch.Tensor,
         discount: torch.Tensor,
         next_obs: torch.Tensor | dict[str, torch.Tensor],
         z: torch.Tensor,
-    ) -> Dict[str, torch.Tensor]:
+    ) -> Tuple[Dict[str, torch.Tensor], Any]:
         p = self.policy
         num_parallel = p._critic.num_parallel
         with torch.no_grad():
@@ -844,9 +914,8 @@ class FBCprAux:
 
         self.critic_optimizer.zero_grad(set_to_none=True)
         critic_loss.backward()
-        if self.is_distributed:
-            reduce_gradients(p._critic)
-        self.critic_optimizer.step()
+        # DDP handled reduce inside backward.
+        handle = None
 
         with torch.no_grad():
             out = {
@@ -857,9 +926,13 @@ class FBCprAux:
                 "critic_loss": critic_loss.mean(),
                 "mean_disc_reward": reward.mean(),
             }
-        return out
+        return out, handle
 
-    def update_aux_critic(
+    def step_critic(self, handle: Any) -> None:
+        finish_async_reduce(handle)
+        self.critic_optimizer.step()
+
+    def backward_aux_critic(
         self,
         obs: torch.Tensor | dict[str, torch.Tensor],
         action: torch.Tensor,
@@ -867,7 +940,7 @@ class FBCprAux:
         aux_reward: torch.Tensor,
         next_obs: torch.Tensor | dict[str, torch.Tensor],
         z: torch.Tensor,
-    ) -> Dict[str, torch.Tensor]:
+    ) -> Tuple[Dict[str, torch.Tensor], Any]:
         p = self.policy
         num_parallel = p._aux_critic.num_parallel
         with torch.no_grad():
@@ -885,9 +958,8 @@ class FBCprAux:
 
         self.aux_critic_optimizer.zero_grad(set_to_none=True)
         aux_critic_loss.backward()
-        if self.is_distributed:
-            reduce_gradients(p._aux_critic)
-        self.aux_critic_optimizer.step()
+        # DDP handled reduce inside backward.
+        handle = None
 
         with torch.no_grad():
             out = {
@@ -898,15 +970,18 @@ class FBCprAux:
                 "aux_critic_loss": aux_critic_loss.mean(),
                 "mean_aux_reward": aux_reward.mean(),
             }
-        return out
+        return out, handle
 
-    def update_actor(
+    def step_aux_critic(self, handle: Any) -> None:
+        finish_async_reduce(handle)
+        self.aux_critic_optimizer.step()
+
+    def backward_actor(
         self,
         obs: torch.Tensor | dict[str, torch.Tensor],
         action: torch.Tensor,
         z: torch.Tensor,
-        clip_grad_norm: float | None,
-    ) -> Dict[str, torch.Tensor]:
+    ) -> Tuple[Dict[str, torch.Tensor], Any]:
         p = self.policy
         dist = p._actor(obs, z, p.actor_std)
         sampled_action = dist.sample(clip=self.cfg.stddev_clip)
@@ -933,11 +1008,8 @@ class FBCprAux:
 
         self.actor_optimizer.zero_grad(set_to_none=True)
         actor_loss.backward()
-        if self.is_distributed:
-            reduce_gradients(p._actor)
-        if clip_grad_norm is not None:
-            torch.nn.utils.clip_grad_norm_(p._actor.parameters(), clip_grad_norm)
-        self.actor_optimizer.step()
+        # DDP handled reduce inside backward.
+        handle = None
 
         with torch.no_grad():
             out = {
@@ -946,7 +1018,14 @@ class FBCprAux:
                 "Q_aux": Q_aux.mean(),
                 "Q_fb": Q_fb.mean(),
             }
-        return out
+        return out, handle
+
+    def step_actor(self, handle: Any, clip_grad_norm: float | None) -> None:
+        p = self.policy
+        finish_async_reduce(handle)
+        if clip_grad_norm is not None:
+            torch.nn.utils.clip_grad_norm_(p._actor.parameters(), clip_grad_norm)
+        self.actor_optimizer.step()
 
     # --- helper: pessimistic value (BFM's get_targets_uncertainty) --------- #
 
