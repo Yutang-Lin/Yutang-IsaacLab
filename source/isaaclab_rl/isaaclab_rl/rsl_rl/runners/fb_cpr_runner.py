@@ -95,10 +95,22 @@ class FBCprRunner:
         self.policy_cfg.pop("class_name", None)
         self.alg_cfg.pop("class_name", None)
 
-        # Multi-GPU bookkeeping
+        # Multi-GPU bookkeeping (matches rsl_rl OnPolicyRunner._configure_multi_gpu).
+        self.gpu_local_rank = int(os.environ.get("LOCAL_RANK", "0"))
         self.gpu_global_rank = int(os.environ.get("RANK", "0"))
         self.gpu_world_size = int(os.environ.get("WORLD_SIZE", "1"))
         self.is_distributed = self.gpu_world_size > 1
+        # Initialize the default process group so ``torch.distributed.barrier()``
+        # and our ``broadcast_parameters`` / ``reduce_gradients`` calls work.
+        # train.py relies on this happening inside the runner constructor, the
+        # same contract OnPolicyRunner honours.
+        if self.is_distributed and not torch.distributed.is_initialized():
+            torch.distributed.init_process_group(
+                backend="nccl",
+                rank=self.gpu_global_rank,
+                world_size=self.gpu_world_size,
+            )
+            torch.cuda.set_device(self.gpu_local_rank)
 
         # Seed everything (match BFM's ``set_seed_everywhere``). This fixes
         # the "NaN one run, clean the next" randomness we were seeing from
