@@ -1,6 +1,6 @@
 from .distillation import Distillation
 from .flow_dagger import FlowDAgger
-from .hrpo import HRPO  
+from .hrpo import HRPO
 from .ppo import PPO
 from .ppo_kl import PPOKL
 from .amp import AmpReward
@@ -9,5 +9,6 @@ from .double_ppo import DoublePPO
 from .ppo_ou import PPOOU
 from .rdppo import RDPPO
 from .sparse_successor import SparseSuccessor
+from .fb_cpr import FBCprAux
 
-__all__ = ["PPO", "PPOKL", "Distillation", "HRPO", "AmpReward", "TD3", "DoublePPO", "PPOOU", "RDPPO", "FlowDAgger", "SparseSuccessor"]
+__all__ = ["PPO", "PPOKL", "Distillation", "HRPO", "AmpReward", "TD3", "DoublePPO", "PPOOU", "RDPPO", "FlowDAgger", "SparseSuccessor", "FBCprAux"]

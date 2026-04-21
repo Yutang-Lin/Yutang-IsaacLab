@@ -1096,6 +1096,219 @@ class RslRlSparseSuccessorAlgorithmCfg:
     if the dataset fits comfortably in GPU memory and you want faster sampling."""
 
 
+@configclass
+class RslRlFBCprPolicyCfg:
+    """Configuration for BFM-Zero's FB-CPR-Aux policy networks.
+
+    Mirrors :class:`isaaclab_rl.rsl_rl.modules.fb_cpr_policy.FBCprNetworkCfg`
+    with our runner/configclass conventions. Defaults match BFM-Zero's
+    production ``train_bfm_zero()`` overrides (z_dim=256, residual arch,
+    6 hidden layers, hidden_dim=2048, num_parallel=2, etc.)."""
+
+    class_name: str = "FBCprAuxPolicy"
+
+    # Latent dimension
+    z_dim: int = 256
+    norm_z: bool = True
+
+    # Backward map (B)
+    backward_hidden_dim: int = 256
+    backward_hidden_layers: int = 1
+    backward_norm: bool = True
+    backward_input_keys: tuple[str, ...] = ("state", "privileged_state")
+
+    # Forward map (F)
+    forward_hidden_dim: int = 2048
+    forward_model: Literal["residual", "simple"] = "residual"
+    forward_hidden_layers: int = 6
+    forward_embedding_layers: int = 2
+    forward_num_parallel: int = 2
+    forward_input_keys: tuple[str, ...] = (
+        "state",
+        "privileged_state",
+        "last_action",
+        "history_actor",
+    )
+
+    # Actor
+    actor_hidden_dim: int = 2048
+    actor_model: Literal["residual", "simple"] = "residual"
+    actor_hidden_layers: int = 6
+    actor_embedding_layers: int = 2
+    actor_std: float = 0.05
+    actor_input_keys: tuple[str, ...] = (
+        "state",
+        "last_action",
+        "history_actor",
+    )
+
+    # Critic (twin Q for discriminator reward)
+    critic_hidden_dim: int = 2048
+    critic_model: Literal["residual", "simple"] = "residual"
+    critic_hidden_layers: int = 6
+    critic_embedding_layers: int = 2
+    critic_num_parallel: int = 2
+    critic_input_keys: tuple[str, ...] = (
+        "state",
+        "privileged_state",
+        "last_action",
+        "history_actor",
+    )
+
+    # Aux critic (twin Q for aux env reward)
+    aux_critic_hidden_dim: int = 2048
+    aux_critic_model: Literal["residual", "simple"] = "residual"
+    aux_critic_hidden_layers: int = 6
+    aux_critic_embedding_layers: int = 2
+    aux_critic_num_parallel: int = 2
+    aux_critic_input_keys: tuple[str, ...] = (
+        "state",
+        "privileged_state",
+        "last_action",
+        "history_actor",
+    )
+
+    # Discriminator
+    discriminator_hidden_dim: int = 1024
+    discriminator_hidden_layers: int = 3
+    discriminator_input_keys: tuple[str, ...] = (
+        "state",
+        "privileged_state",
+    )
+
+    # Obs normalizer: per-key BatchNorm1d (affine=False) momentums.
+    obs_normalizer_momentum: dict[str, float] = MISSING
+
+    obs_normalizer_allow_mismatching_keys: bool = True
+
+    # EMA aux-reward normalizer
+    aux_reward_normalizer_translate: bool = False
+    aux_reward_normalizer_scale: bool = True
+
+    # Sequence length for expert encoding mean
+    seq_length: int = 8
+
+
+@configclass
+class RslRlFBCprAlgorithmCfg:
+    """Configuration for BFM-Zero's FB-CPR-Aux algorithm.
+
+    Mirrors :class:`isaaclab_rl.rsl_rl.algorithms.fb_cpr.FBCprAuxAlgorithmCfg`.
+    Defaults match BFM-Zero's production ``train_bfm_zero()`` overrides."""
+
+    class_name: str = "FBCprAux"
+
+    # Learning rates
+    lr_f: float = 3e-4
+    lr_b: float = 1e-5
+    lr_actor: float = 3e-4
+    lr_critic: float = 3e-4
+    lr_aux_critic: float = 3e-4
+    lr_discriminator: float = 1e-5
+
+    # Optim
+    weight_decay: float = 0.0
+    weight_decay_discriminator: float = 0.0
+    clip_grad_norm: float = 0.0
+
+    # Target Polyak rates
+    fb_target_tau: float = 0.01
+    critic_target_tau: float = 0.005
+
+    # Pessimism penalties
+    fb_pessimism_penalty: float = 0.0
+    critic_pessimism_penalty: float = 0.5
+    aux_critic_pessimism_penalty: float = 0.5
+    actor_pessimism_penalty: float = 0.5
+
+    # TD3-style action-noise clip
+    stddev_clip: float = 0.3
+
+    # FB loss regularizers
+    ortho_coef: float = 100.0
+    q_loss_coef: float = 0.0
+
+    # Discriminator
+    grad_penalty_discriminator: float = 10.0
+
+    # Actor-objective coefficients
+    reg_coeff: float = 0.05
+    reg_coeff_aux: float = 0.02
+    scale_reg: bool = True
+
+    # Mixed-z sampling
+    batch_size: int = 1024
+    discount: float = 0.98
+    relabel_ratio: float | None = 0.8
+    train_goal_ratio: float = 0.2
+    expert_asm_ratio: float = 0.6
+
+    # Rollout context
+    update_z_every_step: int = 100
+    use_mix_rollout: bool = True
+    rollout_expert_trajectories: bool = True
+    rollout_expert_trajectories_length: int = 250
+    rollout_expert_trajectories_percentage: float = 0.5
+    z_buffer_size: int = 8192
+
+    # AMP (bf16)
+    amp: bool = False
+
+    # Aux rewards: name -> scaling coefficient. Default matches BFM-Zero.
+    aux_rewards_scaling: dict[str, float] = MISSING
+
+    # Replay / seed
+    replay_capacity: int = 5_120_000
+    """Total replay capacity across all envs (flat circular). BFM's 5.12M."""
+
+    replay_device: str = "cpu"
+    """Device to hold the replay buffer on."""
+
+    num_seed_steps: int = 10_240
+    """Total env transitions collected with random actions before updates
+    begin. Matches BFM's ``num_seed_steps=10240``."""
+
+    num_agent_updates: int = 16
+    """Number of gradient updates per rollout-collection trigger. BFM's 16."""
+
+    update_agent_every: int = 1024
+    """Env steps between update triggers. BFM's ``update_agent_every=1024``."""
+
+    # Expert dataset
+    expert_dataset_path: str = MISSING
+    """Path to a BFM-format expert dataset (``.pt``) produced by
+    ``scripts/precompute_bfm_expert_dataset.py``."""
+
+    expert_dataset_device: str = "cuda"
+    """Device to hold the expert buffer on."""
+
+    # BFM-style tracking eval (fires every ``eval_every_steps`` env-steps).
+    eval_every_steps: int = 9_600_000
+    """Env-step interval between tracking evals. BFM production: 9.6M.
+    Set to 0 to disable eval entirely. NO initial eval — the first eval
+    fires only after ``tot_timesteps >= eval_every_steps``."""
+
+    eval_rollout_length: int = 250
+    """Per-motion tracking rollout length (steps). BFM's default 250."""
+
+    eval_update_priorities: bool = True
+    """If True, feed tracking MPJPE back into the expert buffer's
+    sampling weights (prioritized RSI sampling). BFM production: True."""
+
+    eval_priority_min: float = 0.5
+    """Lower clamp for eval-based priority weights (BFM default 0.5)."""
+
+    eval_priority_max: float = 2.0
+    """Upper clamp for eval-based priority weights (BFM default 2.0)."""
+
+    eval_priority_scale: float = 2.0
+    """Scale applied to normalized MPJPE before ``exp``/``lin`` mapping
+    (BFM default 2.0)."""
+
+    eval_priority_mode: Literal["exp", "lin"] = "exp"
+    """How the clamped+scaled MPJPE maps to priority weight (BFM: ``exp``)."""
+
+
 #########################
 # Runner configurations #
 #########################
@@ -1129,10 +1342,10 @@ class RslRlOnPolicyRunnerCfg:
     empirical_normalization: bool = MISSING
     """Whether to use empirical normalization."""
 
-    policy: RslRlPpoActorCriticCfg | RslRlDistillationStudentTeacherCfg | RslRlSparseSuccessorPolicyCfg = MISSING
+    policy: RslRlPpoActorCriticCfg | RslRlDistillationStudentTeacherCfg | RslRlSparseSuccessorPolicyCfg | RslRlFBCprPolicyCfg = MISSING
     """The policy configuration."""
 
-    algorithm: RslRlPpoAlgorithmCfg | RslRlDistillationAlgorithmCfg | RslRlSparseSuccessorAlgorithmCfg = MISSING
+    algorithm: RslRlPpoAlgorithmCfg | RslRlDistillationAlgorithmCfg | RslRlSparseSuccessorAlgorithmCfg | RslRlFBCprAlgorithmCfg = MISSING
     """The algorithm configuration."""
 
     clip_actions: float | None = None
