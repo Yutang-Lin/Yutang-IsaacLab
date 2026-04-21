@@ -27,6 +27,7 @@ outer runner drives the rollout → replay → update loop.
 
 from __future__ import annotations
 
+import contextlib
 from dataclasses import field
 from typing import Any, Callable, Dict, Optional, Tuple
 
@@ -43,7 +44,13 @@ from ..modules.fb_cpr_policy import (
     eval_mode,
     weight_init,
 )
-from ..utils import reduce_gradients, reduce_gradients_async, finish_async_reduce
+from ..utils import (
+    finish_async_reduce,
+    finish_merged_async_reduce,
+    reduce_gradients,
+    reduce_gradients_async,
+    reduce_gradients_merged_async,
+)
 
 __all__ = [
     "FBCprAuxAlgorithmCfg",
@@ -625,41 +632,83 @@ class FBCprAux:
 
         # =============================================================
         # PHASE 1: disc + F/B + aux_critic all have NO data dependency
-        # on each other's updated weights — their backwards can be issued
-        # back-to-back so that each one's ``all_reduce(async_op=True)``
-        # overlaps with the next one's compute on the NCCL stream.
+        # on each other's updated weights. We collapse their 4 separate
+        # all_reduces into ONE merged all_reduce across the concatenated
+        # grads of all four networks. Saves 3× the per-call NCCL latency
+        # — material on cross-node fabrics (EFA, IB) where latency
+        # dominates over bandwidth for 10-100 MB messages.
+        #
+        # Implementation: wrap the DDP-wrapped backwards in ``no_sync()``
+        # so DDP's in-backward bucket hooks do NOT fire. The disc path
+        # is already manual (not DDP-wrapped); ``_merge_phase1_reduce``
+        # tells ``backward_discriminator`` to skip its manual reduce too.
+        # Then we fire a single merged reduce + scatter back.
         # =============================================================
-        disc_metrics, disc_handle = self.backward_discriminator(
-            expert_obs=expert_obs,
-            expert_z=expert_z,
-            train_obs=train_obs,
-            train_z=train_z,
-            grad_penalty=self.cfg.grad_penalty_discriminator
-            if self.cfg.grad_penalty_discriminator > 0
-            else None,
-        )
-        fb_metrics, F_handle, B_handle = self.backward_fb(
-            obs=train_obs,
-            action=train_action,
-            discount=discount,
-            next_obs=train_next_obs,
-            goal=train_next_obs,
-            z=train_z,
-            q_loss_coef=q_loss_coef,
-        )
-        aux_metrics, aux_handle = self.backward_aux_critic(
-            obs=train_obs,
-            action=train_action,
-            discount=discount,
-            aux_reward=aux_reward,
-            next_obs=train_next_obs,
-            z=train_z,
-        )
-        # Wait on phase-1 reduces and step (each wait is cheap — most of
-        # the NCCL cost already overlapped with the backwards above).
-        self.step_discriminator(disc_handle)
-        self.step_fb(F_handle, B_handle, clip_grad_norm)
-        self.step_aux_critic(aux_handle)
+        self._merge_phase1_reduce = bool(self.is_distributed and self._is_ddp_wrapped)
+
+        if self._merge_phase1_reduce:
+            phase1_ddp_nets = [
+                self.policy._forward_map,
+                self.policy._backward_map,
+                self.policy._aux_critic,
+            ]
+            phase1_ctx = contextlib.ExitStack()
+            for net in phase1_ddp_nets:
+                phase1_ctx.enter_context(net.no_sync())
+        else:
+            phase1_ctx = contextlib.nullcontext()
+
+        with phase1_ctx:
+            disc_metrics, _ = self.backward_discriminator(
+                expert_obs=expert_obs,
+                expert_z=expert_z,
+                train_obs=train_obs,
+                train_z=train_z,
+                grad_penalty=self.cfg.grad_penalty_discriminator
+                if self.cfg.grad_penalty_discriminator > 0
+                else None,
+            )
+            fb_metrics, _, _ = self.backward_fb(
+                obs=train_obs,
+                action=train_action,
+                discount=discount,
+                next_obs=train_next_obs,
+                goal=train_next_obs,
+                z=train_z,
+                q_loss_coef=q_loss_coef,
+            )
+            aux_metrics, _ = self.backward_aux_critic(
+                obs=train_obs,
+                action=train_action,
+                discount=discount,
+                aux_reward=aux_reward,
+                next_obs=train_next_obs,
+                z=train_z,
+            )
+
+        # One merged all_reduce across {disc, F, B, aux_critic} grads.
+        if self._merge_phase1_reduce:
+            merged_handle = reduce_gradients_merged_async([
+                self.policy._discriminator,  # not DDP-wrapped; use manually
+                # For DDP-wrapped nets iterate .module so we target the real
+                # parameters (grads live on the same tensors either way, but
+                # .module.parameters() is the clean path).
+                self._unwrap(self.policy._forward_map),
+                self._unwrap(self.policy._backward_map),
+                self._unwrap(self.policy._aux_critic),
+            ])
+            finish_merged_async_reduce(merged_handle)
+
+        # Step all three optimizers. Handles are no-ops when the merged
+        # reduce already ran (or when single-rank). ``step_fb`` still
+        # applies grad clipping before its optimizer.step().
+        self.step_discriminator(None)
+        self.step_fb(None, None, clip_grad_norm)
+        self.step_aux_critic(None)
+
+        # Clear the merge flag so nested / repeat calls (there shouldn't
+        # be any) don't carry stale state.
+        self._merge_phase1_reduce = False
 
         metrics = {}
         metrics.update(disc_metrics)
@@ -748,7 +797,14 @@ class FBCprAux:
 
         self.discriminator_optimizer.zero_grad(set_to_none=True)
         loss.backward()
-        handle = reduce_gradients_async(self.policy._discriminator) if self.is_distributed else None
+        # When ``_merge_phase1_reduce`` is set, the caller issues ONE merged
+        # all_reduce across disc + F + B + aux_critic grads, so skip the
+        # per-network reduce here. Otherwise fall back to the legacy
+        # manual async reduce.
+        if getattr(self, "_merge_phase1_reduce", False):
+            handle = None
+        else:
+            handle = reduce_gradients_async(self.policy._discriminator) if self.is_distributed else None
 
         with torch.no_grad():
             out = {

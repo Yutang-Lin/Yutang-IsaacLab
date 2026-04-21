@@ -114,6 +114,43 @@ def finish_async_reduce(handle_tuple):
         offset += n
 
 
+def reduce_gradients_merged_async(networks):
+    """Single async all_reduce across the grads of multiple networks.
+
+    Fires one ``all_reduce(async_op=True)`` over the concatenated grads of
+    every network in ``networks`` (accepts both DDP-wrapped and plain
+    ``nn.Module``). Pairs with :func:`finish_merged_async_reduce` which
+    scatters averaged grads back into each parameter in the same order.
+
+    This collapses 4-6 per-network allreduces into a single collective,
+    removing 3-5× the per-call NCCL latency each update. Intended for use
+    with ``DistributedDataParallel.no_sync()`` contexts — callers disable
+    DDP's bucketed in-backward reduce so this function does the only sync.
+
+    Returns None when distributed is not initialised or no grads exist;
+    callers should fall back to plain ``opt.step()`` in that case.
+    """
+    if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
+        return None
+    params_with_grad = []
+    for net in networks:
+        for p in net.parameters():
+            if p.grad is not None:
+                params_with_grad.append(p)
+    if not params_with_grad:
+        return None
+    flat = torch.cat([p.grad.view(-1) for p in params_with_grad])
+    handle = torch.distributed.all_reduce(
+        flat, op=torch.distributed.ReduceOp.SUM, async_op=True
+    )
+    return (handle, flat, params_with_grad)
+
+
+def finish_merged_async_reduce(handle_tuple):
+    """Wait on a merged async all_reduce and scatter averaged grads back."""
+    finish_async_reduce(handle_tuple)
+
+
 def zero_grads_if_nonfinite(loss, *networks) -> bool:
     """Zero the gradients of ``networks`` locally if ``loss`` is not finite.
 
