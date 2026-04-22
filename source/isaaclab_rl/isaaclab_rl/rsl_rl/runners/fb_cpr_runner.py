@@ -670,6 +670,16 @@ class FBCprRunner:
                     n_between = int(self.alg_cfg.get("save_replay_every_n", 10))
                     save_replay = n_between > 0 and ((it // self.save_interval) % n_between == 0)
                     self.save(save_iter_path, save_replay=save_replay)
+                    # Ring-buffer pruning: keep only the last
+                    # ``keep_last_n_checkpoints`` model_<iter>.pt files (and
+                    # their optional .replay.pt siblings). Each light ckpt
+                    # is ~3-7 GB and each replay ckpt adds ~20-40 GB, so
+                    # without pruning a long run fills the node's boot
+                    # disk — which kills the ray agent and puts the sky
+                    # cluster into INIT. ``model_best.pt`` is never pruned.
+                    keep_n = int(self.alg_cfg.get("keep_last_n_checkpoints", 10))
+                    if keep_n > 0:
+                        self._prune_old_checkpoints(keep_n)
 
             if self._is_head and it == start_iter and self.log_dir is not None:
                 import rsl_rl
@@ -1043,6 +1053,43 @@ class FBCprRunner:
             except Exception as e:
                 print(f"[FBCprRunner] WARN: failed to save replay to {replay_path}: {e}",
                       flush=True)
+
+    def _prune_old_checkpoints(self, keep_n: int) -> None:
+        """Keep only the ``keep_n`` newest ``model_<iter>.pt`` files (and their
+        ``.replay.pt`` siblings). Leaves ``model_best.pt`` alone. Called
+        right after each save; cheap glob + unlink, so no notable overhead.
+        """
+        import glob
+        import re
+        if self.log_dir is None:
+            return
+        pattern = os.path.join(self.log_dir, "model_*.pt")
+        paths = glob.glob(pattern)
+        # Skip model_best.pt and any *.replay.pt (siblings handled alongside).
+        iter_re = re.compile(r"model_(\d+)\.pt$")
+        iter_paths: list[tuple[int, str]] = []
+        for p in paths:
+            m = iter_re.search(os.path.basename(p))
+            if m is None:
+                continue
+            iter_paths.append((int(m.group(1)), p))
+        if len(iter_paths) <= keep_n:
+            return
+        iter_paths.sort(key=lambda x: x[0])   # oldest first
+        to_remove = iter_paths[:-keep_n]
+        for _, p in to_remove:
+            try:
+                os.remove(p)
+            except OSError as e:
+                print(f"[FBCprRunner] WARN: could not remove {p}: {e}", flush=True)
+                continue
+            replay_p = _replay_sibling_path(p)
+            if os.path.exists(replay_p):
+                try:
+                    os.remove(replay_p)
+                except OSError as e:
+                    print(f"[FBCprRunner] WARN: could not remove {replay_p}: {e}",
+                          flush=True)
 
     def load(
         self,
