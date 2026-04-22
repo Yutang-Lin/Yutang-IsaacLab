@@ -94,10 +94,24 @@ from isaaclab_tasks.utils.hydra import hydra_task_config
 
 # PLACEHOLDER: Extension template (do not remove this comment)
 
+# TF32 matmul — critical on Blackwell (B200). Use the modern API as the
+# authoritative switch; legacy ``allow_tf32`` flags are deprecated and
+# not respected on sm_100 in some PyTorch builds.
+torch.set_float32_matmul_precision("high")
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 torch.backends.cudnn.deterministic = False
 torch.backends.cudnn.benchmark = False
+
+if torch.cuda.is_available():
+    _dev = torch.cuda.get_device_capability()
+    print(
+        f"[train.py] cuda_cap=sm_{_dev[0]}{_dev[1]} "
+        f"matmul_precision={torch.get_float32_matmul_precision()} "
+        f"allow_tf32(mm)={torch.backends.cuda.matmul.allow_tf32} "
+        f"allow_tf32(cudnn)={torch.backends.cudnn.allow_tf32}",
+        flush=True,
+    )
 
 
 @hydra_task_config(args_cli.task, "rsl_rl_cfg_entry_point")
