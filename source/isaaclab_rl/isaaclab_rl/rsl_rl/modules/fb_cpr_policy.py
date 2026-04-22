@@ -691,6 +691,7 @@ class Discriminator(nn.Module):
         hidden_dim: int = 1024,
         hidden_layers: int = 3,
         input_keys: str | tp.Sequence[str] | None = None,
+        zero_obs_tail_dims: int = 0,
     ) -> None:
         super().__init__()
         self.input_filter = build_input_filter(obs_space, input_keys)
@@ -700,6 +701,15 @@ class Discriminator(nn.Module):
         )
         assert len(filtered_space.shape) == 1, "filtered_space must have a 1D shape"
         obs_dim = filtered_space.shape[0]
+        # Ablation: zero out the last N dims of the filtered obs at the
+        # disc boundary. Does NOT shrink the network — we keep the same
+        # input width and rely on the 0-valued tail to carry no info.
+        # This way existing checkpoints load without shape changes and
+        # the ablation is a pure data-side intervention.
+        assert 0 <= zero_obs_tail_dims <= obs_dim, (
+            f"zero_obs_tail_dims={zero_obs_tail_dims} must be in [0, {obs_dim}]"
+        )
+        self.zero_obs_tail_dims = int(zero_obs_tail_dims)
         seq: list[nn.Module] = [nn.Linear(obs_dim + z_dim, hidden_dim), nn.LayerNorm(hidden_dim), nn.Tanh()]
         for _ in range(hidden_layers - 1):
             seq += [nn.Linear(hidden_dim, hidden_dim), nn.ReLU()]
@@ -711,6 +721,10 @@ class Discriminator(nn.Module):
 
     def compute_logits(self, obs: torch.Tensor | dict[str, torch.Tensor], z: torch.Tensor) -> torch.Tensor:
         obs = self.input_filter(obs)
+        if self.zero_obs_tail_dims > 0:
+            # In-place would modify the caller's tensor — use a clone + index.
+            obs = obs.clone()
+            obs[..., -self.zero_obs_tail_dims:] = 0.0
         x = torch.cat([z, obs], dim=1)
         return self.trunk(x)
 
@@ -802,6 +816,15 @@ class FBCprNetworkCfg:
     discriminator_hidden_dim: int = 1024
     discriminator_hidden_layers: int = 3
     discriminator_input_keys: tp.Sequence[str] = ("state", "privileged_state")
+    # Ablation knob: zero out the last N dims of the disc's concat-filtered
+    # obs BEFORE it's passed into the trunk. For BFM-Zero's obs layout,
+    # ``privileged_state`` is the last key in ``discriminator_input_keys``
+    # and its final 93 dims are ``local_body_ang_vel`` (31 keypoints × 3).
+    # Setting this to 93 masks that block so the disc cannot separate
+    # policy vs expert on sim-vs-mocap ω distribution gap (end-effector
+    # ω is especially noisy in PhysX vs spline-smoothed LAFAN). Base
+    # ``root_ang_vel`` (inside ``state``) is unaffected.
+    discriminator_zero_obs_tail_dims: int = 0
 
     # Obs normalizer (BatchNorm1d with affine=False) momentums per key
     obs_normalizer_momentum: dict[str, float] = field(
@@ -909,6 +932,7 @@ class FBCprAuxPolicy(nn.Module):
             hidden_dim=cfg.discriminator_hidden_dim,
             hidden_layers=cfg.discriminator_hidden_layers,
             input_keys=cfg.discriminator_input_keys,
+            zero_obs_tail_dims=getattr(cfg, "discriminator_zero_obs_tail_dims", 0),
         )
 
         # Critic (twin Q for discriminator reward, scalar output per ensemble member).

@@ -1175,6 +1175,14 @@ class RslRlFBCprPolicyCfg:
         "state",
         "privileged_state",
     )
+    discriminator_zero_obs_tail_dims: int = 0
+    """Zero out the last N dims of the disc's concat-filtered obs at the
+    input boundary. For BFM-Zero's standard obs layout (``state`` +
+    ``privileged_state``) the last 93 dims are ``local_body_ang_vel``.
+    Setting this to 93 masks that block so the disc cannot separate
+    policy vs expert on the ω-distribution gap (sim PhysX ω vs mocap
+    spline-derived ω). Base ``root_ang_vel`` (inside ``state``) is
+    unaffected. Default 0 = disabled."""
 
     # Obs normalizer: per-key BatchNorm1d (affine=False) momentums.
     obs_normalizer_momentum: dict[str, float] = MISSING
