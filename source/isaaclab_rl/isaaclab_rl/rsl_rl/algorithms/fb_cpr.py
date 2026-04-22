@@ -80,6 +80,17 @@ class FBCprAuxAlgorithmCfg:
     lr_aux_critic: float = 3e-4
     lr_discriminator: float = 1e-5
 
+    # LR anneling. When ``lr_anneal_enable=True`` and ``lr_anneal_steps>0``,
+    # linearly decay each optimizer's LR from the DDP-scaled start value
+    # (``base_lr * sqrt(world_size)``) down to the un-scaled base value
+    # (``base_lr``) over ``lr_anneal_steps`` env-steps. Past that point the
+    # LR stays at ``base_lr``. Rationale: on DDP the sqrt-scaled LR matches
+    # the reduced gradient noise but overshoots the single-rank training
+    # dynamics once the policy is well-anchored; annealing recovers the
+    # single-rank late-stage learning rate.
+    lr_anneal_enable: bool = False
+    lr_anneal_steps: int = 0
+
     # Optim
     weight_decay: float = 0.0
     weight_decay_discriminator: float = 0.0
@@ -186,6 +197,18 @@ class FBCprAux:
             torch.distributed.is_available() and torch.distributed.is_initialized()
         )
 
+        # Remember the un-scaled base LRs BEFORE DDP sqrt-scaling. Used as
+        # the target ("bottom") of the linear anneal schedule when
+        # ``lr_anneal_enable`` is set.
+        self._base_lrs: Dict[str, float] = {
+            "actor": float(cfg.lr_actor),
+            "critic": float(cfg.lr_critic),
+            "aux_critic": float(cfg.lr_aux_critic),
+            "f": float(cfg.lr_f),
+            "b": float(cfg.lr_b),
+            "discriminator": float(cfg.lr_discriminator),
+        }
+
         # DDP LR scaling: ``lr_*  *= sqrt(world_size)`` for EVERY branch.
         # Under DDP each update step averages gradients across ranks, which
         # reduces gradient noise by sqrt(world_size); the square-root rule
@@ -208,6 +231,17 @@ class FBCprAux:
                   f"aux_critic={cfg.lr_aux_critic:.3g} F={cfg.lr_f:.3g} "
                   f"B={cfg.lr_b:.3g} disc={cfg.lr_discriminator:.3g}",
                   flush=True)
+
+        # Post-DDP-scaling LRs — the "top" of the anneal ramp. Equal to
+        # ``_base_lrs`` under single-rank (so anneal is a no-op).
+        self._start_lrs: Dict[str, float] = {
+            "actor": float(cfg.lr_actor),
+            "critic": float(cfg.lr_critic),
+            "aux_critic": float(cfg.lr_aux_critic),
+            "f": float(cfg.lr_f),
+            "b": float(cfg.lr_b),
+            "discriminator": float(cfg.lr_discriminator),
+        }
 
         # Put the policy on device. The policy holds *all* networks, including
         # obs normalizer + aux reward normalizer + target networks.
@@ -670,6 +704,38 @@ class FBCprAux:
                 b.view(-1).copy_(flat[offset: offset + n].to(b.dtype))
                 offset += n
 
+    def _anneal_lrs(self, step: int) -> Dict[str, float]:
+        """Linearly anneal every optimizer's LR from the DDP-scaled start
+        down to the un-scaled base LR over ``cfg.lr_anneal_steps``
+        env-steps. Returns the current LR per branch for logging. No-op
+        (returns the start LRs) when ``cfg.lr_anneal_enable=False`` or
+        ``cfg.lr_anneal_steps <= 0``.
+
+        ``step`` is the global env-step counter threaded in from the
+        runner (``tot_timesteps`` — summed across ranks), so the anneal
+        schedule is the same regardless of world_size.
+        """
+        if not bool(self.cfg.lr_anneal_enable):
+            return dict(self._start_lrs)
+        total = int(self.cfg.lr_anneal_steps)
+        if total <= 0:
+            return dict(self._start_lrs)
+        alpha = max(0.0, min(1.0, float(step) / float(total)))
+        out: Dict[str, float] = {}
+        for name, opt in (
+            ("actor", self.actor_optimizer),
+            ("critic", self.critic_optimizer),
+            ("aux_critic", self.aux_critic_optimizer),
+            ("f", self.forward_optimizer),
+            ("b", self.backward_optimizer),
+            ("discriminator", self.discriminator_optimizer),
+        ):
+            lr = (1.0 - alpha) * self._start_lrs[name] + alpha * self._base_lrs[name]
+            for g in opt.param_groups:
+                g["lr"] = lr
+            out[name] = lr
+        return out
+
     def update(self, replay_buffer: Dict[str, Any], step: int) -> Dict[str, torch.Tensor]:
         """One full FB-CPR-Aux update step.
 
@@ -680,6 +746,8 @@ class FBCprAux:
           - ``"expert_slicer"``: expert buffer, with ``.sample(batch_size)``
             returning at least `observation` and `next.observation`.
         """
+        current_lrs = self._anneal_lrs(step)
+
         expert_batch = replay_buffer[self._EXPERT_KEY].sample(self.cfg.batch_size)
         train_batch = replay_buffer[self._REPLAY_KEY].sample(self.cfg.batch_size)
 
@@ -954,6 +1022,13 @@ class FBCprAux:
         # once per learn-iter in ``FBCprRunner`` (after all num_agent_updates
         # backward passes), so per-update drift inside one iter is acceptable
         # and we save 15× the NCCL traffic.
+
+        # Emit per-branch LR when anneal is active. One scalar per branch;
+        # useful for confirming the schedule hits base_lr by the target
+        # step (and as a sanity check that the knob is being honored).
+        if bool(self.cfg.lr_anneal_enable) and int(self.cfg.lr_anneal_steps) > 0:
+            for name, lr in current_lrs.items():
+                metrics[f"lr/{name}"] = torch.tensor(lr, device=self.device)
 
         return metrics
 

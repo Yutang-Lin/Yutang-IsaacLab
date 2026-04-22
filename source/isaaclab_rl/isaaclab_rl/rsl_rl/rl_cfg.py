@@ -1214,6 +1214,15 @@ class RslRlFBCprAlgorithmCfg:
     lr_aux_critic: float = 3e-4
     lr_discriminator: float = 1e-5
 
+    # LR anneling. When ``lr_anneal_enable=True`` and ``lr_anneal_steps>0``,
+    # every optimizer's LR linearly decays from the DDP-scaled start
+    # (``sqrt(world_size) * base_lr``) to the un-scaled ``base_lr`` over
+    # ``lr_anneal_steps`` GLOBAL env-steps (i.e. the counter summed across
+    # ranks — same schedule regardless of world_size). No-op under single-
+    # rank (start == base). Both default off.
+    lr_anneal_enable: bool = False
+    lr_anneal_steps: int = 0
+
     # Optim
     weight_decay: float = 0.0
     weight_decay_discriminator: float = 0.0
