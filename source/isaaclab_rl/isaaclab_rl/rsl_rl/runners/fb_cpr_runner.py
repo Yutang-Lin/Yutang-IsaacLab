@@ -1053,6 +1053,24 @@ class FBCprRunner:
     ) -> dict:
         """Load a checkpoint. Set ``load_replay=True`` to also restore the
         replay buffer from the sibling ``.replay.pt`` file.
+
+        IMPORTANT: if the replay buffer is NOT restored (either because
+        ``load_replay=False`` or the sibling file is missing), the runner
+        rewinds ``local_timesteps`` and ``_last_eval_step`` so the
+        warmup and eval gates both re-fire on resume. Without this:
+
+          - warmup is skipped (``local_timesteps >> num_seed_steps``) so
+            the policy fills the empty replay with on-policy rollouts
+            only — no uniform-random exploration to re-seed the buffer.
+          - eval doesn't fire again until ``eval_every_steps`` LOCAL env-
+            steps have accumulated post-resume, which is counter-intuitive
+            for a just-loaded checkpoint.
+          - the disc sees a tiny replay of repeated transitions and
+            relearns its separator on a degenerate distribution, which
+            manifests as disc_loss climbing visibly after resume.
+
+        ``tot_timesteps`` (global wall-clock counter for logging) is
+        preserved regardless — we only rewind the cadence gates.
         """
         ckpt = torch.load(path, map_location=self.device, weights_only=False)
         self.policy.load_state_dict(ckpt["model"])
@@ -1065,15 +1083,35 @@ class FBCprRunner:
         self.tot_timesteps = ckpt.get("tot_timesteps", 0)
         self._local_timesteps = ckpt.get("local_timesteps", 0)
         self._last_eval_step = ckpt.get("last_eval_step", self._last_eval_step)
+
+        replay_restored = False
         if load_replay:
             replay_path = _replay_sibling_path(path)
             if os.path.exists(replay_path):
                 rdict = torch.load(replay_path, map_location="cpu", weights_only=False)
                 self.replay_buffer.load_state_dict(rdict["replay"])
+                replay_restored = True
                 print(f"[FBCprRunner] loaded replay from {replay_path}", flush=True)
             else:
                 print(f"[FBCprRunner] WARN: load_replay=True but no {replay_path}",
                       flush=True)
+
+        if not replay_restored:
+            # Replay is empty. Rewind the cadence gates so warmup re-runs
+            # with uniform-random actions (filling the replay with the
+            # post-resume policy's state distribution + explicit noise),
+            # and eval fires again early. Keep self.tot_timesteps so the
+            # wandb x-axis continues smoothly.
+            self._local_timesteps = 0
+            self._last_eval_step = 0
+            print(
+                f"[FBCprRunner] Replay not restored — rewinding "
+                f"local_timesteps=0 and _last_eval_step=0 so warmup "
+                f"({self.num_seed_steps} per-rank env-steps) and eval "
+                f"gates fire on resume. tot_timesteps kept at "
+                f"{self.tot_timesteps} for logging continuity.",
+                flush=True,
+            )
         return ckpt.get("infos", {})
 
     # --- train/eval toggles ---------------------------------------------- #
