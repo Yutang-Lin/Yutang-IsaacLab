@@ -253,25 +253,47 @@ class FBCprAux:
     def _build_optimizers(self) -> None:
         cfg = self.cfg
         p = self.policy
+        # ``fused=True`` enables PyTorch's fused Adam CUDA kernel, which
+        # issues one kernel per param group instead of one per param
+        # tensor. On a 440M-param network with 96 optimizer steps/iter
+        # (6 nets × 16 updates), this saves ~100-200 ms/iter on B200.
+        # Requires all params on CUDA — always true for our setup.
+        adam_kwargs = {"fused": True}
         self.backward_optimizer = torch.optim.Adam(
-            p._backward_map.parameters(), lr=cfg.lr_b, weight_decay=cfg.weight_decay
+            p._backward_map.parameters(),
+            lr=cfg.lr_b,
+            weight_decay=cfg.weight_decay,
+            **adam_kwargs,
         )
         self.forward_optimizer = torch.optim.Adam(
-            p._forward_map.parameters(), lr=cfg.lr_f, weight_decay=cfg.weight_decay
+            p._forward_map.parameters(),
+            lr=cfg.lr_f,
+            weight_decay=cfg.weight_decay,
+            **adam_kwargs,
         )
         self.actor_optimizer = torch.optim.Adam(
-            p._actor.parameters(), lr=cfg.lr_actor, weight_decay=cfg.weight_decay
+            p._actor.parameters(),
+            lr=cfg.lr_actor,
+            weight_decay=cfg.weight_decay,
+            **adam_kwargs,
         )
         self.critic_optimizer = torch.optim.Adam(
-            p._critic.parameters(), lr=cfg.lr_critic, weight_decay=cfg.weight_decay
+            p._critic.parameters(),
+            lr=cfg.lr_critic,
+            weight_decay=cfg.weight_decay,
+            **adam_kwargs,
         )
         self.aux_critic_optimizer = torch.optim.Adam(
-            p._aux_critic.parameters(), lr=cfg.lr_aux_critic, weight_decay=cfg.weight_decay
+            p._aux_critic.parameters(),
+            lr=cfg.lr_aux_critic,
+            weight_decay=cfg.weight_decay,
+            **adam_kwargs,
         )
         self.discriminator_optimizer = torch.optim.Adam(
             p._discriminator.parameters(),
             lr=cfg.lr_discriminator,
             weight_decay=cfg.weight_decay_discriminator,
+            **adam_kwargs,
         )
 
         # Param lists for fast soft updates.
@@ -632,19 +654,29 @@ class FBCprAux:
 
         # =============================================================
         # PHASE 1: disc + F/B + aux_critic all have NO data dependency
-        # on each other's updated weights. We collapse their 4 separate
-        # all_reduces into ONE merged all_reduce across the concatenated
-        # grads of all four networks. Saves 3× the per-call NCCL latency
-        # — material on cross-node fabrics (EFA, IB) where latency
-        # dominates over bandwidth for 10-100 MB messages.
+        # on each other's updated weights.
         #
-        # Implementation: wrap the DDP-wrapped backwards in ``no_sync()``
-        # so DDP's in-backward bucket hooks do NOT fire. The disc path
-        # is already manual (not DDP-wrapped); ``_merge_phase1_reduce``
-        # tells ``backward_discriminator`` to skip its manual reduce too.
-        # Then we fire a single merged reduce + scatter back.
+        # Two reduce strategies:
+        #   (a) DDP bucket hooks fire async all_reduce during backward,
+        #       overlapping comm with compute on the next network's
+        #       backward. Best on NVSwitch / fast intra-node fabrics
+        #       where bandwidth is plentiful and latency is negligible.
+        #   (b) Merge all 4 allreduces into ONE by wrapping DDP in
+        #       no_sync() and reducing manually at phase end. Saves
+        #       NCCL per-call latency — wins on slow/high-latency
+        #       fabrics (EFA without GDR, cross-node IB).
+        #
+        # On B200 + NVSwitch (intra-node): strategy (a) is faster.
+        # On EFA without GDR / cross-node bandwidth-limited: (b) wins.
+        # Controlled by ``merge_phase1_reduce`` on the algorithm cfg;
+        # default False (favor overlap) which is correct for modern
+        # GPU clusters with NVSwitch.
         # =============================================================
-        self._merge_phase1_reduce = bool(self.is_distributed and self._is_ddp_wrapped)
+        self._merge_phase1_reduce = bool(
+            self.is_distributed
+            and self._is_ddp_wrapped
+            and getattr(self.cfg, "merge_phase1_reduce", False)
+        )
 
         if self._merge_phase1_reduce:
             phase1_ddp_nets = [
@@ -659,7 +691,11 @@ class FBCprAux:
             phase1_ctx = contextlib.nullcontext()
 
         with phase1_ctx:
-            disc_metrics, _ = self.backward_discriminator(
+            # When merge is off, ``backward_discriminator`` fires its
+            # own async reduce and returns a handle — we must wait on
+            # it before step. When merge is on the handle is None and
+            # the merged reduce below handles disc's grads too.
+            disc_metrics, disc_handle = self.backward_discriminator(
                 expert_obs=expert_obs,
                 expert_z=expert_z,
                 train_obs=train_obs,
@@ -668,6 +704,11 @@ class FBCprAux:
                 if self.cfg.grad_penalty_discriminator > 0
                 else None,
             )
+            # DDP bucket hooks on F, B, aux_critic fire async allreduce
+            # during backward; they return None handles and are waited
+            # on internally by DDP. Merge mode is in no_sync(), so
+            # those hooks are suppressed and the merged reduce covers
+            # them.
             fb_metrics, _, _ = self.backward_fb(
                 obs=train_obs,
                 action=train_action,
@@ -686,7 +727,8 @@ class FBCprAux:
                 z=train_z,
             )
 
-        # One merged all_reduce across {disc, F, B, aux_critic} grads.
+        # One merged all_reduce across {disc, F, B, aux_critic} grads
+        # (only when merge strategy is enabled).
         if self._merge_phase1_reduce:
             merged_handle = reduce_gradients_merged_async([
                 self.policy._discriminator,  # not DDP-wrapped; use manually
@@ -698,11 +740,11 @@ class FBCprAux:
                 self._unwrap(self.policy._aux_critic),
             ])
             finish_merged_async_reduce(merged_handle)
+            disc_handle = None  # merged reduce covered disc too
 
-        # Step all three optimizers. Handles are no-ops when the merged
-        # reduce already ran (or when single-rank). ``step_fb`` still
-        # applies grad clipping before its optimizer.step().
-        self.step_discriminator(None)
+        # Step all three optimizers. ``step_fb`` still applies grad
+        # clipping before optimizer.step().
+        self.step_discriminator(disc_handle)
         self.step_fb(None, None, clip_grad_norm)
         self.step_aux_critic(None)
 
