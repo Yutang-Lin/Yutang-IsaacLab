@@ -443,8 +443,13 @@ class FBCprRunner:
             eval0 = self._run_tracking_eval(update_priorities=False)
             if self._is_head and eval0 is not None and self.log_dir is not None and self.writer is not None:
                 env_steps = int(self.tot_timesteps)
+                # Log the initial eval on the SAME curve as subsequent
+                # evals (``Eval/*``) so wandb/TB show a continuous
+                # trajectory from untrained-policy baseline onwards.
+                # Priority updates were suppressed above, so feeding this
+                # point into the main curve is purely a logging choice.
                 for k, v in eval0.items():
-                    self.writer.add_scalar(f"{k}_initial", v, env_steps)
+                    self.writer.add_scalar(k, v, env_steps)
                 print(
                     f"[FBCprRunner] initial eval: "
                     f"mpjpe_mm={eval0.get('Eval/mpjpe_mm', 0):.1f} "
