@@ -416,6 +416,23 @@ class FBCprExpertBuffer:
         self._priorities = torch.ones(len(self._motion_names), dtype=torch.float32, device=self.device)
         self._priorities = self._priorities / self._priorities.sum()
 
+        # --- Flat concatenated obs buffers for O(1) sample() --------------
+        # Same trick as the RSI flat buffer: cat all motions along time,
+        # keep per-motion ``_motion_obs_starts`` offsets, then sample()
+        # can do ``flat[global_frame_idx]`` with ONE indexed read per leaf
+        # instead of a Python for-loop over unique motions. Cost: 2× RAM
+        # on the expert dataset (~2 GB here), which is fine on GPU.
+        self._flat_state = torch.cat(self._states, dim=0).contiguous()
+        self._flat_priv = torch.cat(self._privs, dim=0).contiguous()
+        self._flat_last_action = torch.cat(self._last_actions, dim=0).contiguous()
+        self._flat_history_actor = torch.cat(self._history_actors, dim=0).contiguous()
+        _obs_offs = [0]
+        for m in self._states:
+            _obs_offs.append(_obs_offs[-1] + int(m.shape[0]))
+        self._motion_obs_starts = torch.tensor(
+            _obs_offs[:-1], dtype=torch.long, device=self.device,
+        )  # [num_motions]; absolute start in flat_*.
+
     # -- properties --------------------------------------------------------
 
     @property
@@ -583,37 +600,22 @@ class FBCprExpertBuffer:
         frame_nxt = frame_cur + 1
         motion_flat = motion_picks.unsqueeze(1).expand(-1, seq_length).reshape(-1)  # [B]
 
-        state, priv, last_action, history = [], [], [], []
-        state_nxt, priv_nxt, last_action_nxt, history_nxt = [], [], [], []
-
-        # Batched gather per unique motion keeps this cheap for large datasets.
-        # For typical num_slices ~ thousands and ~hundreds of motions this is
-        # still fast enough; we just iterate over unique picks.
-        unique_motions, inverse = torch.unique(motion_flat, return_inverse=True)
-        # Zero-init (not empty_like) to guard against any gather miss leaving
-        # uninitialized memory (1e37 NaN-bait) in the output. Cheap at
-        # batch_size 1024 × 4 tensors.
-        out_state = torch.zeros((motion_flat.shape[0], self._state_dim), device=self.device)
-        out_priv = torch.zeros((motion_flat.shape[0], self._priv_dim), device=self.device)
-        out_act = torch.zeros((motion_flat.shape[0], self._action_dim), device=self.device)
-        out_hist = torch.zeros((motion_flat.shape[0], self._history_actor_dim), device=self.device)
-        out_state_n = torch.zeros_like(out_state)
-        out_priv_n = torch.zeros_like(out_priv)
-        out_act_n = torch.zeros_like(out_act)
-        out_hist_n = torch.zeros_like(out_hist)
-
-        for u in unique_motions.tolist():
-            mask = motion_flat == u
-            fc = frame_cur[mask]
-            fn = frame_nxt[mask]
-            out_state[mask] = self._states[u][fc]
-            out_priv[mask] = self._privs[u][fc]
-            out_act[mask] = self._last_actions[u][fc]
-            out_hist[mask] = self._history_actors[u][fc]
-            out_state_n[mask] = self._states[u][fn]
-            out_priv_n[mask] = self._privs[u][fn]
-            out_act_n[mask] = self._last_actions[u][fn]
-            out_hist_n[mask] = self._history_actors[u][fn]
+        # Fully-vectorized gather using the flat obs buffers (one big
+        # indexed read per leaf tensor instead of a Python loop over
+        # unique motions). Scales to O(1) in the number of motions —
+        # matters a lot when the dataset is clip-diced (862 motions
+        # instead of 40) and ``num_slices`` would otherwise touch ~128
+        # distinct motions per ``sample()`` call, 16 times per iter.
+        global_cur = self._motion_obs_starts[motion_flat] + frame_cur  # [B]
+        global_nxt = self._motion_obs_starts[motion_flat] + frame_nxt  # [B]
+        out_state = self._flat_state[global_cur]
+        out_priv = self._flat_priv[global_cur]
+        out_act = self._flat_last_action[global_cur]
+        out_hist = self._flat_history_actor[global_cur]
+        out_state_n = self._flat_state[global_nxt]
+        out_priv_n = self._flat_priv[global_nxt]
+        out_act_n = self._flat_last_action[global_nxt]
+        out_hist_n = self._flat_history_actor[global_nxt]
 
         B = out_state.shape[0]
         terminated = torch.zeros((B, 1), dtype=torch.bool, device=self.device)
@@ -663,25 +665,19 @@ class FBCprExpertBuffer:
         def _move(x: torch.Tensor) -> torch.Tensor:
             return x.to(target_device, non_blocking=True) if x.device != torch.device(target_device) else x
 
-        # Build N*batch_size rows by calling sample(batch_size) num_chunks times
-        # and concatenating. Each call preserves the N_i x seq_length layout,
-        # so concatenating along dim 0 keeps chunk-i's rows contiguous.
-        big_batches = [self.sample(batch_size, seq_length=seq_length) for _ in range(num_chunks)]
+        # Single fused sample for all chunks: one motion/frame draw, one
+        # gather per leaf, then slice. Eliminates the num_chunks-sized
+        # Python loop of sample() calls (the hot path when the dataset
+        # is clip-diced — ~862 motions, with hundreds of unique picks
+        # per batch). Keeps the N × seq_length contiguous layout.
+        big = self.sample(batch_size * num_chunks, seq_length=seq_length)
 
-        def _stack_obs(key: str, sub: str | None = None) -> torch.Tensor:
-            if sub is None:
-                vals = [b["observation"][key] for b in big_batches]
-            else:
-                vals = [b[sub]["observation"][key] for b in big_batches]
-            return _move(torch.cat(vals, dim=0))
-
-        # Stack every leaf tensor and issue a single async transfer per leaf.
-        obs_keys = ["state", "privileged_state", "last_action", "history_actor"]
-        obs_flat = {k: _stack_obs(k) for k in obs_keys}
-        next_obs_flat = {k: _stack_obs(k, sub="next") for k in obs_keys}
-        action_flat = _move(torch.cat([b["action"] for b in big_batches], dim=0))
-        z_flat = _move(torch.cat([b["z"] for b in big_batches], dim=0))
-        term_flat = _move(torch.cat([b["next"]["terminated"] for b in big_batches], dim=0))
+        obs_keys = ("state", "privileged_state", "last_action", "history_actor")
+        obs_flat = {k: _move(big["observation"][k]) for k in obs_keys}
+        next_obs_flat = {k: _move(big["next"]["observation"][k]) for k in obs_keys}
+        action_flat = _move(big["action"])
+        z_flat = _move(big["z"])
+        term_flat = _move(big["next"]["terminated"])
 
         chunks: list[dict] = []
         for i in range(num_chunks):
