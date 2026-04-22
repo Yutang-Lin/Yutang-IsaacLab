@@ -786,7 +786,9 @@ class FBCprNetworkCfg:
     actor_std: float = 0.05
     actor_input_keys: tp.Sequence[str] = ("state", "last_action", "history_actor")
 
-    # Critic (twin Q for discriminator reward); re-uses ForwardMap with output_dim=1
+    # Critic (twin Q for discriminator reward); re-uses ForwardMap with
+    # ``output_dim = 1`` (scalar Q) or ``output_dim = critic_n_quantiles``
+    # when ``critic_distributional=True`` (quantile-regression critic).
     critic_hidden_dim: int = 2048
     critic_model: str = "residual"
     critic_hidden_layers: int = 6
@@ -798,8 +800,16 @@ class FBCprNetworkCfg:
         "last_action",
         "history_actor",
     )
+    # QR distributional critic knobs. When ``critic_distributional=True`` the
+    # critic head emits ``critic_n_quantiles`` outputs in place of the single
+    # scalar Q. The algorithm trains it with quantile-Huber loss (Dabney et
+    # al. 2018) and the actor consumes ``Q = mean(quantiles)`` so the outer
+    # update logic is unchanged.
+    critic_distributional: bool = False
+    critic_n_quantiles: int = 51
+    critic_huber_kappa: float = 1.0
 
-    # Aux critic (twin Q for aux env reward); re-uses ForwardMap with output_dim=1
+    # Aux critic (twin Q for aux env reward). Same contract as critic above.
     aux_critic_hidden_dim: int = 2048
     aux_critic_model: str = "residual"
     aux_critic_hidden_layers: int = 6
@@ -811,6 +821,9 @@ class FBCprNetworkCfg:
         "last_action",
         "history_actor",
     )
+    aux_critic_distributional: bool = False
+    aux_critic_n_quantiles: int = 51
+    aux_critic_huber_kappa: float = 1.0
 
     # Discriminator
     discriminator_hidden_dim: int = 1024
@@ -935,7 +948,10 @@ class FBCprAuxPolicy(nn.Module):
             zero_obs_tail_dims=getattr(cfg, "discriminator_zero_obs_tail_dims", 0),
         )
 
-        # Critic (twin Q for discriminator reward, scalar output per ensemble member).
+        # Critic (twin Q for discriminator reward). Output is 1 scalar Q per
+        # ensemble member by default, or ``critic_n_quantiles`` (QR) when
+        # ``critic_distributional=True``.
+        critic_out = cfg.critic_n_quantiles if cfg.critic_distributional else 1
         self._critic = ForwardMap(
             obs_space,
             z_dim=cfg.z_dim,
@@ -946,10 +962,11 @@ class FBCprAuxPolicy(nn.Module):
             embedding_layers=cfg.critic_embedding_layers,
             num_parallel=cfg.critic_num_parallel,
             input_keys=cfg.critic_input_keys,
-            output_dim=1,
+            output_dim=critic_out,
         )
 
-        # Aux critic (twin Q for aux env reward, scalar output per ensemble member).
+        # Aux critic (twin Q for aux env reward). Same contract as above.
+        aux_critic_out = cfg.aux_critic_n_quantiles if cfg.aux_critic_distributional else 1
         self._aux_critic = ForwardMap(
             obs_space,
             z_dim=cfg.z_dim,
@@ -960,7 +977,7 @@ class FBCprAuxPolicy(nn.Module):
             embedding_layers=cfg.aux_critic_embedding_layers,
             num_parallel=cfg.aux_critic_num_parallel,
             input_keys=cfg.aux_critic_input_keys,
-            output_dim=1,
+            output_dim=aux_critic_out,
         )
 
         # Aux reward normalizer (EMA).

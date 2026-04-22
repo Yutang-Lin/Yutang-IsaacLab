@@ -1241,20 +1241,44 @@ class FBCprAux:
         z: torch.Tensor,
     ) -> Tuple[Dict[str, torch.Tensor], Any]:
         p = self.policy
+        pol_cfg = self._unwrap(p).cfg
+        distributional = bool(getattr(pol_cfg, "critic_distributional", False))
         num_parallel = self._unwrap(p._critic).num_parallel
         with torch.no_grad():
             reward = p._discriminator.compute_reward(obs, z)
             dist = p._actor(next_obs, z, p.actor_std)
             next_action = dist.sample(clip=self.cfg.stddev_clip)
             next_Qs = p._target_critic(next_obs, z, next_action)
-            Q_mean, Q_unc, next_V = self._pessimistic_value(
-                next_Qs, self.cfg.critic_pessimism_penalty
-            )
-            target_Q = reward + discount.view(-1, 1) * next_V
-            expanded = target_Q.expand(num_parallel, -1, -1)
+            # Shapes:
+            #   scalar critic:       next_Qs = [num_parallel, batch, 1]
+            #   distributional QR:   next_Qs = [num_parallel, batch, n_q]
+            if distributional:
+                # Ensemble-reduce to scalar for pessimism computation, then
+                # apply a uniform shift across all target quantiles. The
+                # target distribution keeps its shape from the target net,
+                # just pulled down by ``penalty * unc``.
+                next_Qs_scalar = next_Qs.mean(dim=-1)                 # [np, batch]
+                Q_mean, Q_unc, _ = self._pessimistic_value(
+                    next_Qs_scalar, self.cfg.critic_pessimism_penalty,
+                )
+                next_q_mean = next_Qs.mean(dim=0)                     # [batch, n_q]
+                next_V = next_q_mean - self.cfg.critic_pessimism_penalty * Q_unc.unsqueeze(-1)
+                target_Q = reward + discount.view(-1, 1) * next_V     # [batch, n_q]
+            else:
+                Q_mean, Q_unc, next_V = self._pessimistic_value(
+                    next_Qs, self.cfg.critic_pessimism_penalty
+                )
+                target_Q = reward + discount.view(-1, 1) * next_V     # [batch, 1]
 
-        Qs = p._critic(obs, z, action)
-        critic_loss = 0.5 * num_parallel * F.mse_loss(Qs, expanded)
+        Qs = p._critic(obs, z, action)                                # [np, batch, n_q_or_1]
+
+        if distributional:
+            critic_loss = self._quantile_huber_loss(
+                Qs, target_Q, kappa=float(pol_cfg.critic_huber_kappa),
+            )
+        else:
+            expanded = target_Q.expand(num_parallel, -1, -1)
+            critic_loss = 0.5 * num_parallel * F.mse_loss(Qs, expanded)
 
         self.critic_optimizer.zero_grad(set_to_none=True)
         critic_loss.backward()
@@ -1270,6 +1294,10 @@ class FBCprAux:
                 "critic_loss": critic_loss.mean(),
                 "mean_disc_reward": reward.mean(),
             }
+            if distributional:
+                # Spread across the quantile axis — if it collapses to ~0
+                # the distributional head has degenerated to scalar Q.
+                out["critic_q_spread"] = Qs.std(dim=-1).mean()
         return out, handle
 
     def step_critic(self, handle: Any) -> Dict[str, torch.Tensor]:
@@ -1290,19 +1318,36 @@ class FBCprAux:
         z: torch.Tensor,
     ) -> Tuple[Dict[str, torch.Tensor], Any]:
         p = self.policy
+        pol_cfg = self._unwrap(p).cfg
+        distributional = bool(getattr(pol_cfg, "aux_critic_distributional", False))
         num_parallel = self._unwrap(p._aux_critic).num_parallel
         with torch.no_grad():
             dist = p._actor(next_obs, z, p.actor_std)
             next_action = dist.sample(clip=self.cfg.stddev_clip)
             next_Qs = p._target_aux_critic(next_obs, z, next_action)
-            Q_mean, Q_unc, next_V = self._pessimistic_value(
-                next_Qs, self.cfg.aux_critic_pessimism_penalty
-            )
-            target_Q = aux_reward + discount.view(-1, 1) * next_V
-            expanded = target_Q.expand(num_parallel, -1, -1)
+            if distributional:
+                next_Qs_scalar = next_Qs.mean(dim=-1)
+                Q_mean, Q_unc, _ = self._pessimistic_value(
+                    next_Qs_scalar, self.cfg.aux_critic_pessimism_penalty,
+                )
+                next_q_mean = next_Qs.mean(dim=0)
+                next_V = next_q_mean - self.cfg.aux_critic_pessimism_penalty * Q_unc.unsqueeze(-1)
+                target_Q = aux_reward + discount.view(-1, 1) * next_V
+            else:
+                Q_mean, Q_unc, next_V = self._pessimistic_value(
+                    next_Qs, self.cfg.aux_critic_pessimism_penalty
+                )
+                target_Q = aux_reward + discount.view(-1, 1) * next_V
 
         Qs = p._aux_critic(obs, z, action)
-        aux_critic_loss = 0.5 * num_parallel * F.mse_loss(Qs, expanded)
+
+        if distributional:
+            aux_critic_loss = self._quantile_huber_loss(
+                Qs, target_Q, kappa=float(pol_cfg.aux_critic_huber_kappa),
+            )
+        else:
+            expanded = target_Q.expand(num_parallel, -1, -1)
+            aux_critic_loss = 0.5 * num_parallel * F.mse_loss(Qs, expanded)
 
         self.aux_critic_optimizer.zero_grad(set_to_none=True)
         aux_critic_loss.backward()
@@ -1318,6 +1363,8 @@ class FBCprAux:
                 "aux_critic_loss": aux_critic_loss.mean(),
                 "mean_aux_reward": aux_reward.mean(),
             }
+            if distributional:
+                out["aux_critic_q_spread"] = Qs.std(dim=-1).mean()
         return out, handle
 
     def step_aux_critic(self, handle: Any) -> Dict[str, torch.Tensor]:
@@ -1356,13 +1403,22 @@ class FBCprAux:
                 ).float().mean().detach(),
             }
 
-        # Q from discriminator-reward critic
+        # Q from discriminator-reward critic. If the critic is distributional
+        # (output shape [num_parallel, batch, n_q]), collapse to scalar Q by
+        # averaging the quantile dimension before applying pessimism — the
+        # mean of the quantile vector is the distribution's mean, which is
+        # the right statistic for the policy-gradient objective.
+        pol_cfg = self._unwrap(p).cfg
         Qs_disc = p._critic(obs, z, sampled_action)
+        if bool(getattr(pol_cfg, "critic_distributional", False)):
+            Qs_disc = Qs_disc.mean(dim=-1, keepdim=True)
         _, _, Q_discriminator = self._pessimistic_value(
             Qs_disc, self.cfg.actor_pessimism_penalty
         )
-        # Q from aux-reward critic
+        # Q from aux-reward critic (same contract).
         Qs_aux = p._aux_critic(obs, z, sampled_action)
+        if bool(getattr(pol_cfg, "aux_critic_distributional", False)):
+            Qs_aux = Qs_aux.mean(dim=-1, keepdim=True)
         _, _, Q_aux = self._pessimistic_value(Qs_aux, self.cfg.actor_pessimism_penalty)
         # Q from FB (implicit Q = F·z)
         Fs = p._forward_map(obs, z, sampled_action)
@@ -1422,6 +1478,52 @@ class FBCprAux:
         scaling = n * n - n
         preds_unc = diffs.sum(dim=(dim, dim + 1)) / max(scaling, 1)
         return preds_mean, preds_unc, preds_mean - pessimism_penalty * preds_unc
+
+    # --- helper: quantile regression Huber loss ---------------------------- #
+
+    @staticmethod
+    def _quantile_huber_loss(
+        pred_quantiles: torch.Tensor,
+        target_quantiles: torch.Tensor,
+        kappa: float = 1.0,
+    ) -> torch.Tensor:
+        """Quantile-regression Huber loss (Dabney et al. 2018).
+
+        Args:
+            pred_quantiles: ``[num_parallel, batch, n_q]`` — per-ensemble
+                quantile outputs from the online critic.
+            target_quantiles: ``[batch, n_q]`` — target quantile values
+                (shared across ensemble; each head fits the same
+                distribution). Targets are NOT sorted; TD-style updates
+                preserve the quantile index because τ_i is a fixed grid.
+            kappa: Huber switch-point.
+
+        Returns:
+            Scalar loss (mean over batch, sum over predicted-quantile
+            axis, averaged across target-quantile axis and ensemble
+            members — matches the widely-used QR-DQN normalization).
+        """
+        n_q = pred_quantiles.shape[-1]
+        device = pred_quantiles.device
+        dtype = pred_quantiles.dtype
+        # τ_i = (i + 0.5) / n_q — midpoint quantile fractions.
+        tau = (torch.arange(n_q, device=device, dtype=dtype) + 0.5) / n_q
+        tau = tau.view(1, 1, 1, n_q)                                 # [1, 1, 1, n_q_pred]
+
+        # u[..., i, j] = target[j] - pred[i]
+        pred = pred_quantiles.unsqueeze(-1)                           # [np, B, n_q_pred, 1]
+        tgt = target_quantiles.unsqueeze(0).unsqueeze(-2)             # [1,  B, 1,         n_q_tgt]
+        u = tgt - pred                                                # [np, B, n_q_pred, n_q_tgt]
+        abs_u = u.abs()
+        huber = torch.where(
+            abs_u <= kappa,
+            0.5 * u.pow(2),
+            kappa * (abs_u - 0.5 * kappa),
+        )
+        # Quantile weight: |τ - 1{u < 0}|.
+        w = (tau - (u < 0).to(dtype)).abs()
+        loss = (w * huber / max(kappa, 1e-8)).mean(dim=-1).sum(dim=-1)   # sum over n_q_pred
+        return loss.mean()                                            # mean over ensemble & batch
 
     # --- (de)serialization ------------------------------------------------- #
 

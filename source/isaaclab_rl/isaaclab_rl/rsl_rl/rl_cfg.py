@@ -1154,6 +1154,14 @@ class RslRlFBCprPolicyCfg:
         "last_action",
         "history_actor",
     )
+    # Quantile-regression distributional critic (Dabney et al. 2018). When
+    # True, critic head emits ``critic_n_quantiles`` outputs in place of
+    # the scalar Q; trained with quantile Huber loss. Actor consumes the
+    # quantile mean for its policy-gradient objective. Off by default
+    # (scalar Q); existing ckpts load unchanged.
+    critic_distributional: bool = False
+    critic_n_quantiles: int = 51
+    critic_huber_kappa: float = 1.0
 
     # Aux critic (twin Q for aux env reward)
     aux_critic_hidden_dim: int = 2048
@@ -1167,6 +1175,9 @@ class RslRlFBCprPolicyCfg:
         "last_action",
         "history_actor",
     )
+    aux_critic_distributional: bool = False
+    aux_critic_n_quantiles: int = 51
+    aux_critic_huber_kappa: float = 1.0
 
     # Discriminator
     discriminator_hidden_dim: int = 1024
