@@ -880,10 +880,11 @@ class FBCprAux:
             disc_handle = None  # merged reduce covered disc too
 
         # Step all three optimizers. ``step_fb`` still applies grad
-        # clipping before optimizer.step().
-        self.step_discriminator(disc_handle)
-        self.step_fb(None, None, clip_grad_norm)
-        self.step_aux_critic(None)
+        # clipping before optimizer.step(). Each step returns a
+        # grad_norm/* dict we merge into metrics.
+        disc_gn = self.step_discriminator(disc_handle)
+        fb_gn = self.step_fb(None, None, clip_grad_norm)
+        aux_gn = self.step_aux_critic(None)
 
         # Clear the merge flag so nested / repeat calls (there shouldn't
         # be any) don't carry stale state.
@@ -894,6 +895,9 @@ class FBCprAux:
         metrics.update(fb_metrics)
         metrics.update(aux_metrics)
         metrics.update(aux_rew_logs)
+        metrics.update(disc_gn)
+        metrics.update(fb_gn)
+        metrics.update(aux_gn)
 
         # =============================================================
         # PHASE 2: critic. Depends on NEW disc (for disc_reward), so
@@ -906,8 +910,9 @@ class FBCprAux:
             next_obs=train_next_obs,
             z=train_z,
         )
-        self.step_critic(critic_handle)
+        critic_gn = self.step_critic(critic_handle)
         metrics.update(critic_metrics)
+        metrics.update(critic_gn)
 
         # =============================================================
         # PHASE 3: actor. Depends on NEW critic / aux_critic / F for
@@ -918,8 +923,9 @@ class FBCprAux:
             action=train_action,
             z=train_z,
         )
-        self.step_actor(actor_handle, clip_grad_norm)
+        actor_gn = self.step_actor(actor_handle, clip_grad_norm)
         metrics.update(actor_metrics)
+        metrics.update(actor_gn)
 
         # 7) Polyak soft updates
         with torch.no_grad():
@@ -995,9 +1001,16 @@ class FBCprAux:
                 out["disc_wgan_gp_loss"] = wgan_gp.detach()
         return out, handle
 
-    def step_discriminator(self, handle: Any) -> None:
+    def step_discriminator(self, handle: Any) -> Dict[str, torch.Tensor]:
         finish_async_reduce(handle)
+        # ``clip_grad_norm_(..., max_norm=inf)`` is a no-op clip that
+        # returns the pre-clip L2 grad norm for free; avoids a second
+        # pass-over-params that a manual sum-of-squares would need.
+        gn = torch.nn.utils.clip_grad_norm_(
+            self.policy._discriminator.parameters(), float("inf"),
+        )
         self.discriminator_optimizer.step()
+        return {"grad_norm/discriminator": gn.detach()}
 
     def _gradient_penalty_wgan(
         self,
@@ -1124,15 +1137,25 @@ class FBCprAux:
             }
         return out, F_handle, B_handle
 
-    def step_fb(self, F_handle: Any, B_handle: Any, clip_grad_norm: float | None) -> None:
+    def step_fb(
+        self, F_handle: Any, B_handle: Any, clip_grad_norm: float | None,
+    ) -> Dict[str, torch.Tensor]:
         p = self.policy
         finish_async_reduce(F_handle)
         finish_async_reduce(B_handle)
-        if clip_grad_norm is not None:
-            torch.nn.utils.clip_grad_norm_(p._forward_map.parameters(), clip_grad_norm)
-            torch.nn.utils.clip_grad_norm_(p._backward_map.parameters(), clip_grad_norm)
+        # ``clip_grad_norm_`` returns the pre-clip total L2 norm. Use the
+        # configured max_norm if clipping is on; otherwise use inf as a
+        # no-op clip that still returns the norm (cheaper than a manual
+        # sum-of-squares second pass).
+        max_norm = float(clip_grad_norm) if clip_grad_norm is not None else float("inf")
+        gn_f = torch.nn.utils.clip_grad_norm_(p._forward_map.parameters(), max_norm)
+        gn_b = torch.nn.utils.clip_grad_norm_(p._backward_map.parameters(), max_norm)
         self.forward_optimizer.step()
         self.backward_optimizer.step()
+        return {
+            "grad_norm/forward_map": gn_f.detach(),
+            "grad_norm/backward_map": gn_b.detach(),
+        }
 
     def backward_critic(
         self,
@@ -1174,9 +1197,13 @@ class FBCprAux:
             }
         return out, handle
 
-    def step_critic(self, handle: Any) -> None:
+    def step_critic(self, handle: Any) -> Dict[str, torch.Tensor]:
         finish_async_reduce(handle)
+        gn = torch.nn.utils.clip_grad_norm_(
+            self.policy._critic.parameters(), float("inf"),
+        )
         self.critic_optimizer.step()
+        return {"grad_norm/critic": gn.detach()}
 
     def backward_aux_critic(
         self,
@@ -1218,9 +1245,13 @@ class FBCprAux:
             }
         return out, handle
 
-    def step_aux_critic(self, handle: Any) -> None:
+    def step_aux_critic(self, handle: Any) -> Dict[str, torch.Tensor]:
         finish_async_reduce(handle)
+        gn = torch.nn.utils.clip_grad_norm_(
+            self.policy._aux_critic.parameters(), float("inf"),
+        )
         self.aux_critic_optimizer.step()
+        return {"grad_norm/aux_critic": gn.detach()}
 
     def backward_actor(
         self,
@@ -1231,6 +1262,24 @@ class FBCprAux:
         p = self.policy
         dist = p._actor(obs, z, p.actor_std)
         sampled_action = dist.sample(clip=self.cfg.stddev_clip)
+
+        # --- action saturation diagnostics ------------------------------
+        # ``loc`` is the actor's pre-sample mean; TruncatedNormal clamps
+        # final samples into [-1+eps, +1-eps]. Saturation happens when
+        # |loc| approaches 1 (mean is pushed to the action bound) or when
+        # noise regularly drives loc+eps outside the interval.
+        with torch.no_grad():
+            loc = dist.loc
+            act_stats = {
+                "act_loc/abs_mean": loc.abs().mean().detach(),
+                "act_loc/abs_p95": loc.abs().float().quantile(0.95).detach(),
+                "act_loc/frac_gt_0_9": (loc.abs() > 0.9).float().mean().detach(),
+                "act_loc/frac_gt_0_99": (loc.abs() > 0.99).float().mean().detach(),
+                "act_sample/abs_mean": sampled_action.abs().mean().detach(),
+                "act_sample/frac_clamped": (
+                    sampled_action.abs() >= (1.0 - 2.0 * dist.eps)
+                ).float().mean().detach(),
+            }
 
         # Q from discriminator-reward critic
         Qs_disc = p._critic(obs, z, sampled_action)
@@ -1264,14 +1313,18 @@ class FBCprAux:
                 "Q_aux": Q_aux.mean(),
                 "Q_fb": Q_fb.mean(),
             }
+            out.update(act_stats)
         return out, handle
 
-    def step_actor(self, handle: Any, clip_grad_norm: float | None) -> None:
+    def step_actor(
+        self, handle: Any, clip_grad_norm: float | None,
+    ) -> Dict[str, torch.Tensor]:
         p = self.policy
         finish_async_reduce(handle)
-        if clip_grad_norm is not None:
-            torch.nn.utils.clip_grad_norm_(p._actor.parameters(), clip_grad_norm)
+        max_norm = float(clip_grad_norm) if clip_grad_norm is not None else float("inf")
+        gn = torch.nn.utils.clip_grad_norm_(p._actor.parameters(), max_norm)
         self.actor_optimizer.step()
+        return {"grad_norm/actor": gn.detach()}
 
     # --- helper: pessimistic value (BFM's get_targets_uncertainty) --------- #
 
