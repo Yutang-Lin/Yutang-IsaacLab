@@ -137,12 +137,17 @@ class FBCprAuxAlgorithmCfg:
     # single-rank.
     stream_parallel_phase1: bool = False
 
-    # torch.compile on the 5 trainable online networks. Uses
-    # ``reduce-overhead`` mode (CUDA graphs) when available for big
-    # speedups on small-batch workloads. First iter pays a ~1-2 min
-    # compile cost. Works best on shape-stable workloads — FB-CPR
-    # qualifies. Default False. Options: "", "default",
-    # "reduce-overhead", "max-autotune".
+    # torch.compile on the 5 trainable online networks. First iter pays
+    # a ~1-2 min compile cost; FB-CPR's shapes are fully static so there
+    # are no recompiles after warm-up.
+    #
+    # IMPORTANT: on PyTorch 2.7, ``reduce-overhead`` (CUDA graphs) is
+    # broken when combined with user CUDA streams — see pytorch/pytorch
+    # issues #180396 / #180497 (fix lands in release/2.12). So:
+    #   - With ``stream_parallel_phase1=True``, use ``"default"`` only.
+    #   - On 2.12+, ``"reduce-overhead"`` becomes safe again.
+    # Default "" (disabled). Options: "", "default", "reduce-overhead",
+    # "max-autotune".
     compile_mode: str = ""
 
     # Merge the 4 phase-1 allreduces into one. Helps on slow/high-
@@ -254,11 +259,25 @@ class FBCprAux:
 
         # --- torch.compile on the 5 trainable online networks ---------- #
         # Applied AFTER DDP wrapping so the compiled graph includes the
-        # DDP forward dispatch. ``reduce-overhead`` mode uses CUDA graphs
-        # which eliminate per-kernel launch overhead on small batches —
-        # the dominant cost for FB-CPR on B200. Shape-stable workload, so
-        # no recompile churn expected.
+        # DDP forward dispatch (``DDPOptimizer`` inserts bucket-aligned
+        # graph breaks — see pytorch.org/docs/stable/notes/ddp.html).
+        #
+        # IMPORTANT on PyTorch 2.7: ``reduce-overhead`` mode is broken
+        # when combined with user CUDA streams (issues #180396/#180497,
+        # fix lands in release/2.12). If ``stream_parallel_phase1`` is
+        # also enabled we force-downgrade to ``"default"`` to avoid the
+        # silent breakage.
         compile_mode = getattr(cfg, "compile_mode", "") or ""
+        if (
+            compile_mode == "reduce-overhead"
+            and getattr(cfg, "stream_parallel_phase1", False)
+            and self.is_distributed
+        ):
+            print(f"[FBCprAux] WARNING: torch.compile(mode='reduce-overhead') "
+                  f"is broken with user CUDA streams on PyTorch 2.7 "
+                  f"(pytorch#180396). Downgrading to mode='default'.",
+                  flush=True)
+            compile_mode = "default"
         if compile_mode:
             compile_kwargs = {"mode": compile_mode, "fullgraph": False}
             self.policy._forward_map = torch.compile(self.policy._forward_map, **compile_kwargs)

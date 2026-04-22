@@ -1266,7 +1266,12 @@ class RslRlFBCprAlgorithmCfg:
     """``torch.compile`` mode for the 5 trainable online networks (F, B,
     actor, critic, aux_critic). Empty = disabled. Options:
     "default" | "reduce-overhead" | "max-autotune".
-    ``reduce-overhead`` uses CUDA graphs — best for small-batch RL."""
+
+    IMPORTANT: On PyTorch 2.7, ``reduce-overhead`` (CUDA graphs) is
+    broken when combined with user CUDA streams (pytorch#180396,
+    #180497; fix in release/2.12). When ``stream_parallel_phase1=True``
+    the algorithm auto-downgrades ``reduce-overhead`` → ``default``.
+    Use ``"default"`` when pairing with streams on 2.7."""
 
     merge_phase1_reduce: bool = False
     """Merge the 4 phase-1 allreduces into one. Wins on slow/high-latency
