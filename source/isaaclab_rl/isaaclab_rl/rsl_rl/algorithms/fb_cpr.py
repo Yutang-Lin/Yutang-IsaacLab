@@ -128,6 +128,27 @@ class FBCprAuxAlgorithmCfg:
     # AMP (bf16) — kept False by default; enable only if you know why.
     amp: bool = False
 
+    # --- B200 / NVSwitch perf flags ------------------------------------
+    # Parallelize phase-1 backwards (disc + F/B + aux_critic) across
+    # independent CUDA streams. On fast intra-node fabrics (NVSwitch)
+    # this overlaps 4 otherwise-serial backward compute chunks, saving
+    # ~10-15% iter time at some engineering/debugging cost. Default
+    # False (keep the safe sequential path). Disables automatically on
+    # single-rank.
+    stream_parallel_phase1: bool = False
+
+    # torch.compile on the 5 trainable online networks. Uses
+    # ``reduce-overhead`` mode (CUDA graphs) when available for big
+    # speedups on small-batch workloads. First iter pays a ~1-2 min
+    # compile cost. Works best on shape-stable workloads — FB-CPR
+    # qualifies. Default False. Options: "", "default",
+    # "reduce-overhead", "max-autotune".
+    compile_mode: str = ""
+
+    # Merge the 4 phase-1 allreduces into one. Helps on slow/high-
+    # latency fabrics (EFA without GDR). On NVSwitch this loses the
+    # compute/comm overlap that DDP bucket hooks provide — leave False.
+    merge_phase1_reduce: bool = False
 
     # Aux rewards: mapping name -> scaling coefficient (applied BEFORE the
     # aux_reward normalizer). Env-exposed rewards not listed here are
@@ -230,6 +251,50 @@ class FBCprAux:
             self._is_ddp_wrapped = True
             print(f"[FBCprAux] DDP-wrapped F/B/actor/critic/aux_critic "
                   f"(disc kept on manual async reduce)", flush=True)
+
+        # --- torch.compile on the 5 trainable online networks ---------- #
+        # Applied AFTER DDP wrapping so the compiled graph includes the
+        # DDP forward dispatch. ``reduce-overhead`` mode uses CUDA graphs
+        # which eliminate per-kernel launch overhead on small batches —
+        # the dominant cost for FB-CPR on B200. Shape-stable workload, so
+        # no recompile churn expected.
+        compile_mode = getattr(cfg, "compile_mode", "") or ""
+        if compile_mode:
+            compile_kwargs = {"mode": compile_mode, "fullgraph": False}
+            self.policy._forward_map = torch.compile(self.policy._forward_map, **compile_kwargs)
+            self.policy._backward_map = torch.compile(self.policy._backward_map, **compile_kwargs)
+            self.policy._actor = torch.compile(self.policy._actor, **compile_kwargs)
+            self.policy._critic = torch.compile(self.policy._critic, **compile_kwargs)
+            self.policy._aux_critic = torch.compile(self.policy._aux_critic, **compile_kwargs)
+            # Disc uses autograd.grad(create_graph=True) for WGAN-GP, which
+            # is known to hit graph breaks with torch.compile — leave it
+            # eager. Target networks never need compile (no backward).
+            print(f"[FBCprAux] torch.compile mode={compile_mode} applied to "
+                  f"F/B/actor/critic/aux_critic (disc stays eager)", flush=True)
+
+        # --- Stream-parallel phase-1 backward setup -------------------- #
+        # When enabled, phase-1 backward passes (disc + F/B + aux_critic)
+        # run concurrently on dedicated CUDA streams, then sync before
+        # the merged allreduce + optimizer.step(). Requires
+        # ``merge_phase1_reduce=True`` to work — DDP's in-backward bucket
+        # hooks serialize on the main stream and defeat the parallelism.
+        self._stream_parallel_phase1 = bool(
+            getattr(cfg, "stream_parallel_phase1", False)
+            and self.is_distributed
+            and self._is_ddp_wrapped
+        )
+        if self._stream_parallel_phase1:
+            # Force merge mode on when streams are active (required).
+            cfg.merge_phase1_reduce = True
+            self._phase1_stream_disc = torch.cuda.Stream()
+            self._phase1_stream_fb = torch.cuda.Stream()
+            self._phase1_stream_aux = torch.cuda.Stream()
+            print(f"[FBCprAux] stream_parallel_phase1 enabled "
+                  f"(auto-enabled merge_phase1_reduce)", flush=True)
+        else:
+            self._phase1_stream_disc = None
+            self._phase1_stream_fb = None
+            self._phase1_stream_aux = None
 
         # Optimizers.
         self._build_optimizers()
@@ -690,42 +755,95 @@ class FBCprAux:
         else:
             phase1_ctx = contextlib.nullcontext()
 
+        # Stream-parallel uses three dedicated CUDA streams so the three
+        # backward passes run concurrently. Each stream waits on the
+        # current (default) stream so the upstream tensors (train_obs,
+        # aux_reward, etc.) are visible. After all three finish, the
+        # default stream waits on them before the merged allreduce runs.
+        if self._stream_parallel_phase1:
+            cur_stream = torch.cuda.current_stream()
+            self._phase1_stream_disc.wait_stream(cur_stream)
+            self._phase1_stream_fb.wait_stream(cur_stream)
+            self._phase1_stream_aux.wait_stream(cur_stream)
+
         with phase1_ctx:
             # When merge is off, ``backward_discriminator`` fires its
             # own async reduce and returns a handle — we must wait on
             # it before step. When merge is on the handle is None and
             # the merged reduce below handles disc's grads too.
-            disc_metrics, disc_handle = self.backward_discriminator(
-                expert_obs=expert_obs,
-                expert_z=expert_z,
-                train_obs=train_obs,
-                train_z=train_z,
-                grad_penalty=self.cfg.grad_penalty_discriminator
-                if self.cfg.grad_penalty_discriminator > 0
-                else None,
-            )
+            if self._stream_parallel_phase1:
+                with torch.cuda.stream(self._phase1_stream_disc):
+                    disc_metrics, disc_handle = self.backward_discriminator(
+                        expert_obs=expert_obs,
+                        expert_z=expert_z,
+                        train_obs=train_obs,
+                        train_z=train_z,
+                        grad_penalty=self.cfg.grad_penalty_discriminator
+                        if self.cfg.grad_penalty_discriminator > 0
+                        else None,
+                    )
+            else:
+                disc_metrics, disc_handle = self.backward_discriminator(
+                    expert_obs=expert_obs,
+                    expert_z=expert_z,
+                    train_obs=train_obs,
+                    train_z=train_z,
+                    grad_penalty=self.cfg.grad_penalty_discriminator
+                    if self.cfg.grad_penalty_discriminator > 0
+                    else None,
+                )
             # DDP bucket hooks on F, B, aux_critic fire async allreduce
             # during backward; they return None handles and are waited
             # on internally by DDP. Merge mode is in no_sync(), so
             # those hooks are suppressed and the merged reduce covers
             # them.
-            fb_metrics, _, _ = self.backward_fb(
-                obs=train_obs,
-                action=train_action,
-                discount=discount,
-                next_obs=train_next_obs,
-                goal=train_next_obs,
-                z=train_z,
-                q_loss_coef=q_loss_coef,
-            )
-            aux_metrics, _ = self.backward_aux_critic(
-                obs=train_obs,
-                action=train_action,
-                discount=discount,
-                aux_reward=aux_reward,
-                next_obs=train_next_obs,
-                z=train_z,
-            )
+            if self._stream_parallel_phase1:
+                with torch.cuda.stream(self._phase1_stream_fb):
+                    fb_metrics, _, _ = self.backward_fb(
+                        obs=train_obs,
+                        action=train_action,
+                        discount=discount,
+                        next_obs=train_next_obs,
+                        goal=train_next_obs,
+                        z=train_z,
+                        q_loss_coef=q_loss_coef,
+                    )
+                with torch.cuda.stream(self._phase1_stream_aux):
+                    aux_metrics, _ = self.backward_aux_critic(
+                        obs=train_obs,
+                        action=train_action,
+                        discount=discount,
+                        aux_reward=aux_reward,
+                        next_obs=train_next_obs,
+                        z=train_z,
+                    )
+            else:
+                fb_metrics, _, _ = self.backward_fb(
+                    obs=train_obs,
+                    action=train_action,
+                    discount=discount,
+                    next_obs=train_next_obs,
+                    goal=train_next_obs,
+                    z=train_z,
+                    q_loss_coef=q_loss_coef,
+                )
+                aux_metrics, _ = self.backward_aux_critic(
+                    obs=train_obs,
+                    action=train_action,
+                    discount=discount,
+                    aux_reward=aux_reward,
+                    next_obs=train_next_obs,
+                    z=train_z,
+                )
+
+        # Rejoin the streams back onto the default stream. The merged
+        # allreduce below runs on the default stream and must see
+        # finalized grads from all three backward streams.
+        if self._stream_parallel_phase1:
+            cur_stream = torch.cuda.current_stream()
+            cur_stream.wait_stream(self._phase1_stream_disc)
+            cur_stream.wait_stream(self._phase1_stream_fb)
+            cur_stream.wait_stream(self._phase1_stream_aux)
 
         # One merged all_reduce across {disc, F, B, aux_critic} grads
         # (only when merge strategy is enabled).

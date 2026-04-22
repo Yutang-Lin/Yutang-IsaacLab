@@ -1254,6 +1254,26 @@ class RslRlFBCprAlgorithmCfg:
     # AMP (bf16)
     amp: bool = False
 
+    # Perf flags (safe defaults off).
+    stream_parallel_phase1: bool = False
+    """Parallelize phase-1 backwards (disc + F/B + aux_critic) across CUDA
+    streams. Saves ~10-15% iter-time on fast intra-node fabrics like B200
+    NVSwitch by overlapping 4 otherwise-serial backward chunks. Pair with
+    ``merge_phase1_reduce=True`` — streams need the merged manual reduce
+    since DDP bucket hooks serialize on the main stream."""
+
+    compile_mode: str = ""
+    """``torch.compile`` mode for the 5 trainable online networks (F, B,
+    actor, critic, aux_critic). Empty = disabled. Options:
+    "default" | "reduce-overhead" | "max-autotune".
+    ``reduce-overhead`` uses CUDA graphs — best for small-batch RL."""
+
+    merge_phase1_reduce: bool = False
+    """Merge the 4 phase-1 allreduces into one. Wins on slow/high-latency
+    fabrics (EFA without GDR). Required if ``stream_parallel_phase1=True``.
+    On NVSwitch alone, losing DDP bucket overlap costs more than latency
+    savings — keep False."""
+
     # Aux rewards: name -> scaling coefficient. Default matches BFM-Zero.
     aux_rewards_scaling: dict[str, float] = MISSING
 
