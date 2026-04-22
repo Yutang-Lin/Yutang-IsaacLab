@@ -37,6 +37,17 @@ from isaaclab_rl.rsl_rl.storage.fb_cpr_storage import (
 __all__ = ["FBCprRunner"]
 
 
+def _replay_sibling_path(ckpt_path: str) -> str:
+    """``/a/b/model_<n>.pt`` -> ``/a/b/model_<n>.replay.pt`` (keeps the
+    light policy/optimizer ckpt separate from the big replay state).
+    Works for any ``.pt`` filename; appends ``.replay.pt`` if the input
+    has no ``.pt`` extension.
+    """
+    if ckpt_path.endswith(".pt"):
+        return ckpt_path[:-3] + ".replay.pt"
+    return ckpt_path + ".replay.pt"
+
+
 class _PrefetchedSampler:
     """Tiny iterator shim that exposes a ``.sample(batch_size)`` method backed
     by a pre-sampled list of chunks.
@@ -646,8 +657,19 @@ class FBCprRunner:
                         current_reward = statistics.mean(rewbuffer)
                         if current_reward > best_reward:
                             best_reward = current_reward
+                            # model_best: policy only — resumed checkpoints
+                            # come from the iter saves below, not from
+                            # model_best.
                             self.save(os.path.join(self.log_dir, "model_best.pt"))
-                    self.save(os.path.join(self.log_dir, f"model_{it}.pt"))
+                    # Save the light (policy + optim + meta) checkpoint
+                    # every save_interval. The heavy replay sibling is
+                    # saved every ``save_replay_every_n`` light-save
+                    # intervals — large enough to avoid bloating disk
+                    # (~5 GB per replay), small enough to allow warm-start.
+                    save_iter_path = os.path.join(self.log_dir, f"model_{it}.pt")
+                    n_between = int(self.alg_cfg.get("save_replay_every_n", 10))
+                    save_replay = n_between > 0 and ((it // self.save_interval) % n_between == 0)
+                    self.save(save_iter_path, save_replay=save_replay)
 
             if self._is_head and it == start_iter and self.log_dir is not None:
                 import rsl_rl
@@ -655,7 +677,12 @@ class FBCprRunner:
 
         self._local_timesteps = local_timesteps
         if self._is_head and self.log_dir is not None:
-            self.save(os.path.join(self.log_dir, f"model_{self.current_learning_iteration}.pt"))
+            # Final save: always include replay so the next resume can
+            # warm-start without rebuilding the buffer from scratch.
+            self.save(
+                os.path.join(self.log_dir, f"model_{self.current_learning_iteration}.pt"),
+                save_replay=True,
+            )
 
     # --- tracking eval --------------------------------------------------- #
 
@@ -976,22 +1003,57 @@ class FBCprRunner:
 
     # --- checkpoint I/O -------------------------------------------------- #
 
-    def save(self, path: str, infos: Any | None = None) -> None:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        torch.save(
-            {
-                "model": self.policy.state_dict(),
-                "optimizers": self.alg.optimizer_dict,
-                "iter": self.current_learning_iteration,
-                "tot_timesteps": self.tot_timesteps,
-                "local_timesteps": getattr(self, "_local_timesteps", 0),
-                "last_eval_step": self._last_eval_step,
-                "infos": infos or {},
-            },
-            path,
-        )
+    def save(
+        self,
+        path: str,
+        infos: Any | None = None,
+        *,
+        save_replay: bool = False,
+    ) -> None:
+        """Save a checkpoint.
 
-    def load(self, path: str, load_optimizer: bool = True) -> dict:
+        By default saves a LIGHT checkpoint (no replay buffer) — fast,
+        small, and sufficient for policy evaluation / sim2sim.
+
+        When ``save_replay=True`` ALSO writes a ``<stem>.replay.pt``
+        sibling file containing the replay buffer state. Load with
+        ``load(..., load_replay=True)`` to resume training from the
+        exact buffer state. The replay file is large (~5 GB for the
+        production config), so we only write it periodically.
+        """
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        base = {
+            "model": self.policy.state_dict(),
+            "optimizers": self.alg.optimizer_dict,
+            "iter": self.current_learning_iteration,
+            "tot_timesteps": self.tot_timesteps,
+            "local_timesteps": getattr(self, "_local_timesteps", 0),
+            "last_eval_step": self._last_eval_step,
+            "infos": infos or {},
+        }
+        torch.save(base, path)
+        if save_replay:
+            # Separate sibling file keeps the lightweight ckpt small even
+            # when we periodically snapshot the replay too. Path convention:
+            #   model_<iter>.pt           (light, policy + opt + meta)
+            #   model_<iter>.replay.pt    (heavy, replay buffer state)
+            replay_path = _replay_sibling_path(path)
+            try:
+                torch.save({"replay": self.replay_buffer.state_dict()}, replay_path)
+            except Exception as e:
+                print(f"[FBCprRunner] WARN: failed to save replay to {replay_path}: {e}",
+                      flush=True)
+
+    def load(
+        self,
+        path: str,
+        load_optimizer: bool = True,
+        *,
+        load_replay: bool = False,
+    ) -> dict:
+        """Load a checkpoint. Set ``load_replay=True`` to also restore the
+        replay buffer from the sibling ``.replay.pt`` file.
+        """
         ckpt = torch.load(path, map_location=self.device, weights_only=False)
         self.policy.load_state_dict(ckpt["model"])
         if load_optimizer and "optimizers" in ckpt:
@@ -1003,6 +1065,15 @@ class FBCprRunner:
         self.tot_timesteps = ckpt.get("tot_timesteps", 0)
         self._local_timesteps = ckpt.get("local_timesteps", 0)
         self._last_eval_step = ckpt.get("last_eval_step", self._last_eval_step)
+        if load_replay:
+            replay_path = _replay_sibling_path(path)
+            if os.path.exists(replay_path):
+                rdict = torch.load(replay_path, map_location="cpu", weights_only=False)
+                self.replay_buffer.load_state_dict(rdict["replay"])
+                print(f"[FBCprRunner] loaded replay from {replay_path}", flush=True)
+            else:
+                print(f"[FBCprRunner] WARN: load_replay=True but no {replay_path}",
+                      flush=True)
         return ckpt.get("infos", {})
 
     # --- train/eval toggles ---------------------------------------------- #

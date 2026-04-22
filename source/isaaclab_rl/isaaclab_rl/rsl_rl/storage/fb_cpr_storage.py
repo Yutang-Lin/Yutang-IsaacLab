@@ -137,6 +137,61 @@ class FBCprReplayBuffer:
     def full(self) -> bool:
         return self._is_full
 
+    # -- serialization ----------------------------------------------------
+
+    @torch.no_grad()
+    def state_dict(self) -> dict:
+        """Return everything needed to restore the exact buffer contents.
+
+        Intended for resume-with-replay checkpoints. NOTE: the state_dict
+        can be large (~5 GB for the production config). Use only when
+        warm-starting a training run.
+        """
+        return {
+            "_obs": {k: v.clone() for k, v in self._obs.items()},
+            "_next_obs": {k: v.clone() for k, v in self._next_obs.items()},
+            "_action": self._action.clone(),
+            "_z": self._z.clone(),
+            "_next_terminated": self._next_terminated.clone(),
+            "_aux_rewards": {k: v.clone() for k, v in self._aux_rewards.items()},
+            "_idx": int(self._idx),
+            "_is_full": bool(self._is_full),
+            "capacity": self.capacity,
+            "action_dim": self.action_dim,
+            "z_dim": self.z_dim,
+            "aux_reward_names": list(self.aux_reward_names),
+        }
+
+    @torch.no_grad()
+    def load_state_dict(self, sd: dict) -> None:
+        """Restore buffer contents. Shapes must match the current instance's
+        config (capacity, obs keys/shapes, action_dim, z_dim,
+        aux_reward_names) — we check the scalars explicitly."""
+        if int(sd.get("capacity", -1)) != self.capacity:
+            raise ValueError(
+                f"replay capacity mismatch: ckpt={sd.get('capacity')} vs "
+                f"cur={self.capacity}"
+            )
+        if int(sd.get("action_dim", -1)) != self.action_dim:
+            raise ValueError("replay action_dim mismatch")
+        if int(sd.get("z_dim", -1)) != self.z_dim:
+            raise ValueError("replay z_dim mismatch")
+        for k in self._obs_shapes:
+            if k in sd["_obs"]:
+                self._obs[k].copy_(sd["_obs"][k].to(self._obs[k].device))
+            if k in sd["_next_obs"]:
+                self._next_obs[k].copy_(sd["_next_obs"][k].to(self._next_obs[k].device))
+        self._action.copy_(sd["_action"].to(self._action.device))
+        self._z.copy_(sd["_z"].to(self._z.device))
+        self._next_terminated.copy_(sd["_next_terminated"].to(self._next_terminated.device))
+        for name in self.aux_reward_names:
+            if name in sd["_aux_rewards"]:
+                self._aux_rewards[name].copy_(
+                    sd["_aux_rewards"][name].to(self._aux_rewards[name].device),
+                )
+        self._idx = int(sd["_idx"])
+        self._is_full = bool(sd["_is_full"])
+
     @torch.no_grad()
     def add(self, batch_dict: dict) -> None:
         """Append a batch of transitions, wrapping around on overflow.
