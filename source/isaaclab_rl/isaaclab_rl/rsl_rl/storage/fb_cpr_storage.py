@@ -280,10 +280,15 @@ class FBCprReplayBuffer:
             )
         self._ensure_traj_info()
         num_slices = batch_size // seq_length
-        eligible = self._lengths >= (seq_length + 1)
+        # Episode "length" includes the truncated row (post-reset obs).
+        # The last valid transition's next_obs is at position length-2 (0-indexed).
+        # A window of seq_length obs frames needs next_obs at start+seq_length,
+        # so we need start + seq_length <= length - 2, i.e. length >= seq_length + 2.
+        min_len = seq_length + 2
+        eligible = self._lengths >= min_len
         if not bool(eligible.any().item()):
             raise RuntimeError(
-                f"No trajectories with length >= {seq_length + 1}; buffer too small or all episodes shorter."
+                f"No trajectories with length >= {min_len}; buffer too small or all episodes shorter."
             )
         eligible_idx = eligible.nonzero(as_tuple=False).squeeze(-1)
         eligible_lengths = self._lengths[eligible_idx]
@@ -293,8 +298,10 @@ class FBCprReplayBuffer:
         sel_lengths = eligible_lengths[traj_sel]
         sel_starts = eligible_starts[traj_sel]  # [num_slices, 2]
 
-        end_point = (sel_lengths - seq_length - 1).clamp_min(0).to(torch.float32)
-        relative_starts = (torch.rand(num_slices, device=self.device) * end_point).floor().to(torch.long)
+        # max start = length - seq_length - 2 so that last next_obs
+        # at start + seq_length stays before the truncated row.
+        end_point = (sel_lengths - seq_length - 2).clamp_min(0).to(torch.float32)
+        relative_starts = (torch.rand(num_slices, device=self.device) * (end_point + 1.0)).floor().to(torch.long)
 
         time_starts = (sel_starts[:, 0] + relative_starts)  # [num_slices]
         env_ids = sel_starts[:, 1]  # [num_slices]
