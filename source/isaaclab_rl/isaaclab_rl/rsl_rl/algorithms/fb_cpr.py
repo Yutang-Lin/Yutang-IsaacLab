@@ -238,36 +238,30 @@ class FBCprAux:
         # un-scaled base LR, annealing BOTH multipliers away over
         # ``lr_anneal_steps`` env-steps.
         #
-        # Discriminator special case: at large effective batch + cleaner
-        # gradient the BCE classifier saturates very fast (decision margin
-        # widens within a few hundred updates), which makes
-        # ``log(D/(1-D))`` bimodal/heavy-tailed and turns the critic's TD
-        # target into a hard, discontinuous regression problem. We dampen
-        # disc's scaling to 0.25× of the other branches, clamped at a 1x
-        # floor so single-rank / batch==1024 stays unchanged.
+        # Discriminator gets the same ``combined_mult`` as every other branch.
+        # The "disc saturates too fast on clean gradient" artifact is now
+        # addressed on the downstream side by scaling
+        # ``critic_target_tau`` / ``fb_target_tau`` with sqrt(W*B/B_ref) so
+        # the critic's target network keeps up with the online's new speed —
+        # rather than by slowing disc down.
         import math
         REF_BATCH_SIZE = 1024
-        DISC_SCALING_FACTOR = 0.25
         ws = (int(torch.distributed.get_world_size())
               if self.is_distributed else 1)
         bs_mult = math.sqrt(max(int(cfg.batch_size), 1) / REF_BATCH_SIZE)
         ws_mult = math.sqrt(max(ws, 1))
         combined_mult = ws_mult * bs_mult
-        # Damped disc multiplier: keep 1x as floor so we never go BELOW
-        # the single-rank base LR.
-        disc_mult = max(1.0, DISC_SCALING_FACTOR * combined_mult)
         if combined_mult != 1.0:
             cfg.lr_actor = float(cfg.lr_actor) * combined_mult
             cfg.lr_critic = float(cfg.lr_critic) * combined_mult
             cfg.lr_aux_critic = float(cfg.lr_aux_critic) * combined_mult
             cfg.lr_f = float(cfg.lr_f) * combined_mult
             cfg.lr_b = float(cfg.lr_b) * combined_mult
-            cfg.lr_discriminator = float(cfg.lr_discriminator) * disc_mult
+            cfg.lr_discriminator = float(cfg.lr_discriminator) * combined_mult
             print(
                 f"[FBCprAux] LR scaling: world_size={ws} (×{ws_mult:.3f})  "
                 f"batch_size={cfg.batch_size}/{REF_BATCH_SIZE} (×{bs_mult:.3f})  "
-                f"combined ×{combined_mult:.3f}  disc ×{disc_mult:.3f} "
-                f"(0.25× combined, floored at 1)",
+                f"combined ×{combined_mult:.3f}",
                 flush=True,
             )
             print(
@@ -275,6 +269,61 @@ class FBCprAux:
                 f"actor={cfg.lr_actor:.3g} critic={cfg.lr_critic:.3g} "
                 f"aux_critic={cfg.lr_aux_critic:.3g} F={cfg.lr_f:.3g} "
                 f"B={cfg.lr_b:.3g} disc={cfg.lr_discriminator:.3g}",
+                flush=True,
+            )
+
+        # EMA normalizer time-constant scaling.
+        #
+        # The obs_normalizer (per-key BatchNorm1d) and aux_reward_normalizer
+        # (EMA) are low-pass filters specified in per-iter units. When LR
+        # scaling makes the online network move sqrt(W*B/B_ref) faster per
+        # iter, the policy's obs / aux-reward distributions drift the same
+        # factor faster — and the normalizer stats lag proportionally unless
+        # we speed them up. We bump each effective ``momentum`` (= 1-tau for
+        # EMA) by ``combined_mult`` so the EMA window in policy-drift units
+        # stays invariant with batch/ws.
+        #
+        # Clipped: BatchNorm momentum ≤ 0.5 (instability past that), EMA tau
+        # ≥ 0.5 (momentum ≤ 0.5). We use the SAME combined_mult as LR (no
+        # disc-damp); these are downstream of the online network's motion,
+        # not upstream like disc.
+        if combined_mult != 1.0 and combined_mult > 0.0:
+            import math as _math
+            # BatchNorm per-key momentum on _obs_normalizer._normalizers[<k>]._normalizer
+            new_obs_moms: Dict[str, float] = {}
+            if hasattr(self.policy, "_obs_normalizer") and hasattr(
+                self.policy._obs_normalizer, "_normalizers"
+            ):
+                for key, mod in self.policy._obs_normalizer._normalizers.items():
+                    bn = getattr(mod, "_normalizer", None)
+                    if bn is None or not hasattr(bn, "momentum"):
+                        continue
+                    old_mom = float(bn.momentum if bn.momentum is not None else 0.01)
+                    new_mom = min(0.5, old_mom * combined_mult)
+                    bn.momentum = new_mom
+                    new_obs_moms[key] = new_mom
+
+            # EMA aux_reward_normalizer: tau is the retention factor, so
+            # effective momentum = 1 - tau. Scale the momentum, clip to 0.5.
+            new_aux_tau: float | None = None
+            if hasattr(self.policy, "_aux_reward_normalizer"):
+                ema = self.policy._aux_reward_normalizer
+                if hasattr(ema, "tau"):
+                    old_tau = float(ema.tau)
+                    old_mom = 1.0 - old_tau
+                    new_mom = min(0.5, old_mom * combined_mult)
+                    new_aux_tau = 1.0 - new_mom
+                    ema.tau = new_aux_tau
+
+            aux_tau_str = (
+                f"{new_aux_tau:.4g}" if new_aux_tau is not None else "n/a"
+            )
+            obs_moms_str = ", ".join(
+                f"{k}={v:.3g}" for k, v in new_obs_moms.items()
+            )
+            print(
+                f"[FBCprAux] EMA normalizer scaling (×{combined_mult:.3f}): "
+                f"obs_momentum={{{obs_moms_str}}}  aux_tau={aux_tau_str}",
                 flush=True,
             )
 
