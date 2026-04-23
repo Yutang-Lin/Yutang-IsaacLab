@@ -534,13 +534,25 @@ class FBCprRunner:
                         time_outs = time_outs.to(self.device).bool()
                     terminated = (dones.bool() & ~time_outs).view(-1, 1)
 
-                    # Drop transitions for envs that reset last step (``done_prev``):
-                    # ``obs_dict`` for those envs is the post-reset observation,
-                    # so pairing it with the current step's ``new_obs`` as an
-                    # (s, a, s') tuple would span a reset boundary. BFM
-                    # filters the same way via ``indexes = ~done``
-                    # (train.py:458, 466, 478).
-                    keep = ~done_prev
+                    # Drop transitions that cross a reset boundary:
+                    #  (a) ``done_prev`` — envs that reset at the PREVIOUS
+                    #      iter have their post-reset obs in ``obs_dict``, so
+                    #      pairing with ``new_obs`` spans the boundary.
+                    #  (b) ``dones`` — envs that reset DURING this iter.
+                    #      IsaacLab's ``DirectRLEnv.step`` resets in-place
+                    #      before computing the returned ``new_obs``, so
+                    #      ``new_obs`` for those envs is the post-reset RSI
+                    #      state. Storing ``(pre_reset_obs, action,
+                    #      post_reset_obs)`` lets the critic / aux-critic /
+                    #      F-map bootstrap their Bellman target on the RSI
+                    #      state, which is OOD for target nets that only saw
+                    #      mid-episode states — triggers a per-reset jump in
+                    #      critic_loss / aux_critic_loss / fb_offdiag that
+                    #      persists until the target nets re-adjust.
+                    #  BFM's ``indexes = ~done`` only filters (a); because
+                    #  their policy tracks, V(post_reset_obs) is still a
+                    #  reasonable estimate. We filter both to be safe.
+                    keep = ~done_prev & ~dones.bool()
                     if bool(keep.any().item()):
                         keep_idx = keep.nonzero(as_tuple=False).view(-1)
                         batch_obs = {k: v[keep_idx] for k, v in obs_dict.items()}
