@@ -73,7 +73,6 @@ class FBCprReplayBuffer:
         obs_space: Any,
         action_dim: int,
         z_dim: int,
-        seq_length: int,
         aux_reward_names: list[str],
         device: str | torch.device = "cpu",
         pin_memory: bool | None = None,
@@ -84,7 +83,11 @@ class FBCprReplayBuffer:
         self.device = torch.device(device)
         self.action_dim = int(action_dim)
         self.z_dim = int(z_dim)
-        self.seq_length = int(seq_length)
+        # BFM's train replay uses seq_length=1 (individual transitions).
+        # seq_length=8 is only for the expert slicer. The train buffer's
+        # trajectory awareness is for episode-boundary safety, not for
+        # returning contiguous multi-frame windows.
+        self.seq_length = 1
         self.aux_reward_names = list(aux_reward_names)
 
         if pin_memory is None:
@@ -152,7 +155,6 @@ class FBCprReplayBuffer:
             "num_envs": self.num_envs,
             "action_dim": self.action_dim,
             "z_dim": self.z_dim,
-            "seq_length": self.seq_length,
             "aux_reward_names": list(self.aux_reward_names),
         }
 

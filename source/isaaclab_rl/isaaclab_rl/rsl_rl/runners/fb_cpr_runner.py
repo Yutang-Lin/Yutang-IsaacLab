@@ -189,7 +189,6 @@ class FBCprRunner:
             obs_space=self.obs_space,
             action_dim=self.action_dim,
             z_dim=self.policy.z_dim,
-            seq_length=net_cfg.seq_length,
             aux_reward_names=aux_reward_names,
             device=self.alg_cfg.get("replay_device", "cpu"),
         )
