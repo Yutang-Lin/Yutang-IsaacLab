@@ -876,8 +876,11 @@ class FBCprAux:
         expert_z = self.encode_expert(next_obs=expert_next_obs)
         train_z = train_batch["z"].to(self.device, non_blocking=True)
 
-        # Mixed-z sampling + optional relabel. Needed before any backward
-        # since fb/critic/aux/actor all read train_z.
+        # BFM order: disc sees ORIGINAL train_z (from rollout), THEN relabel.
+        # The discriminator must train on the actual (s, z) pairs from the
+        # replay — not freshly sampled z's that were never rolled out.
+        disc_train_z = train_z
+
         z = self.sample_mixed_z(train_goal=train_next_obs, expert_encodings=expert_z).clone()
         self._zbuf_add(z)
         if self.cfg.relabel_ratio is not None:
@@ -965,7 +968,7 @@ class FBCprAux:
                         expert_obs=expert_obs,
                         expert_z=expert_z,
                         train_obs=train_obs,
-                        train_z=train_z,
+                        train_z=disc_train_z,
                         grad_penalty=self.cfg.grad_penalty_discriminator
                         if self.cfg.grad_penalty_discriminator > 0
                         else None,
@@ -975,7 +978,7 @@ class FBCprAux:
                     expert_obs=expert_obs,
                     expert_z=expert_z,
                     train_obs=train_obs,
-                    train_z=train_z,
+                    train_z=disc_train_z,
                     grad_penalty=self.cfg.grad_penalty_discriminator
                     if self.cfg.grad_penalty_discriminator > 0
                     else None,
