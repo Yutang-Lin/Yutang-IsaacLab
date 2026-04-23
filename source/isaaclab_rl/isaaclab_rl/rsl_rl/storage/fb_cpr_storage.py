@@ -294,7 +294,7 @@ class FBCprReplayBuffer:
         sel_starts = eligible_starts[traj_sel]  # [num_slices, 2]
 
         end_point = (sel_lengths - seq_length - 1).clamp_min(0).to(torch.float32)
-        relative_starts = (torch.rand(num_slices, device=self.device) * (end_point + 1.0)).floor().to(torch.long)
+        relative_starts = (torch.rand(num_slices, device=self.device) * end_point).floor().to(torch.long)
 
         time_starts = (sel_starts[:, 0] + relative_starts)  # [num_slices]
         env_ids = sel_starts[:, 1]  # [num_slices]

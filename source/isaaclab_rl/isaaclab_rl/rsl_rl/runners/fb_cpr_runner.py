@@ -559,8 +559,14 @@ class FBCprRunner:
                     self.replay_buffer.extend(batch)
 
                     # Update prev flags for the NEXT step's write.
+                    # BFM stores terminated/truncated separately. The buffer's
+                    # episode segmenter uses truncated only (end_key="truncated"),
+                    # but we store the full done signal as truncated so that
+                    # both hard-termination and timeout mark episode boundaries
+                    # for the sampler. In BFM-Zero production all terminations
+                    # are disabled so terminated≡False and truncated≡done.
                     prev_terminated = terminated.clone()
-                    prev_truncated = (dones.bool()).view(-1, 1)
+                    prev_truncated = dones.bool().view(-1, 1)
 
                     # Book-keeping
                     cur_reward_sum += rewards
