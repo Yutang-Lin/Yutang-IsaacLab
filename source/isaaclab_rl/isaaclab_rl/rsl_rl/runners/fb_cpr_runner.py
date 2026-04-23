@@ -783,9 +783,17 @@ class FBCprRunner:
                     "history_actor": win["history_actor"][1:].to(self.device, non_blocking=True),
                 }
                 z = self.policy.backward_map(next_obs_dict)   # [L-1, z_dim]
-                # rolling mean over seq_length-window (BFM tracking_inference)
+                # Match BFM's eval z-encoding exactly
+                # (humanoidverse_isaac.py:424-427 and tracking_inference.py:72-73):
+                #   for step in range(z.shape[0]):
+                #       end_idx = min(step + 1, z.shape[0])  # window = 1 frame
+                #       z[step] = z[step:end_idx].mean(dim=0)
+                # which is mathematically an identity (mean over 1 frame).
+                # We keep the loop for bit-wise parity with BFM's code path
+                # even though it's a no-op. DO NOT substitute ``seq_length``
+                # for the 1 here — BFM's eval does NOT temporally average.
                 for s in range(z.shape[0]):
-                    end = min(s + seq_length, z.shape[0])
+                    end = min(s + 1, z.shape[0])
                     z[s] = z[s:end].mean(dim=0)
                 z = self.policy.project_z(z)
                 z_per_motion.append(z)

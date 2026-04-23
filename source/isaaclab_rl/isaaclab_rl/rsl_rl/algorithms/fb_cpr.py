@@ -136,7 +136,13 @@ class FBCprAuxAlgorithmCfg:
     rollout_expert_trajectories_percentage: float = 0.5
     z_buffer_size: int = 8192
 
-    # AMP (bf16) — kept False by default; enable only if you know why.
+    # AMP (bf16). NOTE: the autocast context is NOT currently wired around
+    # our forward/backward passes. Setting this True has no numerical
+    # effect — it only gates the ``_amp_dtype`` attribute used in a few
+    # diagnostic places. BFM uses per-update ``autocast(amp=cfg.amp)``
+    # wrappers around every sub-network forward; porting them over is a
+    # larger change we haven't taken on. Leave False unless you also wire
+    # the autocast contexts.
     amp: bool = False
 
     # --- B200 / NVSwitch perf flags ------------------------------------
