@@ -745,8 +745,22 @@ class FBCprRunner:
 
         snap = env_u.snapshot_state()
         try:
-            # --- assign a motion id to each env (cycle) ---
-            motion_of_env = torch.arange(num_envs, device=self.device) % num_motions
+            # --- assign a motion id to each env (cycle, shuffled) ---
+            # BFM shuffles env indices before assigning motions so that each
+            # motion gets evaluated with multiple DR instances (mass/friction
+            # are randomized per-env at startup and stay fixed for the whole
+            # run). Without shuffling, motion m is always evaluated with
+            # env m's specific DR settings — biasing per-motion MPJPE by the
+            # DR instance. We use a deterministic shuffle (seed=0) so eval
+            # results are reproducible across runs.
+            g = torch.Generator(device="cpu")
+            g.manual_seed(0)
+            perm_cpu = torch.randperm(num_envs, generator=g)
+            shuffled_env_idxs = perm_cpu.to(self.device)
+            motion_of_env = torch.zeros(num_envs, device=self.device, dtype=torch.long)
+            motion_of_env[shuffled_env_idxs] = (
+                torch.arange(num_envs, device=self.device) % num_motions
+            )
 
             # --- per-motion windows of length L = eval_rollout_length+1 ---
             L = int(self.eval_rollout_length) + 1
@@ -805,13 +819,24 @@ class FBCprRunner:
             # Set env into eval mode (skip reset-source counters)
             if hasattr(env_u, "_eval_mode"):
                 env_u._eval_mode = True
-            # Write the motion-aligned initial state directly to the sim.
+            env_ids_all = env_u._ALL_INDICES
+            # BFM's eval calls env.reset(target_states=...) which triggers the
+            # full reset logic (clears action_history, episode_length_buf, obs
+            # history buffers, MDP term private state) AND writes the target
+            # pose/joints. We reproduce this: first call _reset_idx on all
+            # envs (clears all training-time stale state), then override the
+            # joint/root state to the motion's frame-0. Without this, the
+            # eval rollout would use stale history_actor / action_history /
+            # last_actions from the paused training rollout — corrupting
+            # the policy's obs and producing biased MPJPE.
+            env_u._reset_idx(env_ids_all)
+            # Write the motion-aligned initial state directly to the sim
+            # (overrides whatever _reset_idx wrote via the normal reset path).
             joint_pos_full = torch.zeros(num_envs, env_u.robot.data.joint_pos.shape[1], device=self.device)
             joint_vel_full = torch.zeros_like(joint_pos_full)
             joint_order_t = torch.as_tensor(env_u.joint_order, device=self.device, dtype=torch.long)
             joint_pos_full[:, joint_order_t] = jp0
             joint_vel_full[:, joint_order_t] = jv0
-            env_ids_all = env_u._ALL_INDICES
             env_u.robot.write_joint_position_to_sim(joint_pos_full, env_ids=env_ids_all)
             env_u.robot.write_joint_velocity_to_sim(joint_vel_full, env_ids=env_ids_all)
             # RSI z is relative to env origin.
@@ -825,6 +850,12 @@ class FBCprRunner:
             )
             env_u.scene.write_data_to_sim()
             env_u.sim.forward()
+            # Refresh last_* joint buffers to the NEW state (they were set
+            # to the pre-write sim state by _reset_idx; we need them to
+            # reflect the post-write state so the first obs/reward is clean).
+            env_u._refresh_sim_tensors(env_ids_all)
+            env_u.last_joint_pos[env_ids_all] = env_u.joint_pos[env_ids_all]
+            env_u.last_joint_vel[env_ids_all] = env_u.joint_vel[env_ids_all]
 
             # --- rollout ---
             obs_flat, extras = self.env.get_observations()
