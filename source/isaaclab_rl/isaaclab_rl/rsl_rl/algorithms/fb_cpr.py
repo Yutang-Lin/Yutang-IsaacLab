@@ -209,28 +209,46 @@ class FBCprAux:
             "discriminator": float(cfg.lr_discriminator),
         }
 
-        # DDP LR scaling: ``lr_*  *= sqrt(world_size)`` for EVERY branch.
-        # Under DDP each update step averages gradients across ranks, which
-        # reduces gradient noise by sqrt(world_size); the square-root rule
-        # keeps the effective step size per example unchanged. This applies
-        # uniformly — including the slow-moving B encoder and discriminator,
-        # since they see the same world_size × batch_size effective batch
-        # per update.
-        if self.is_distributed:
-            import math
-            ws = int(torch.distributed.get_world_size())
-            s = math.sqrt(max(ws, 1))
-            cfg.lr_actor = float(cfg.lr_actor) * s
-            cfg.lr_critic = float(cfg.lr_critic) * s
-            cfg.lr_aux_critic = float(cfg.lr_aux_critic) * s
-            cfg.lr_f = float(cfg.lr_f) * s
-            cfg.lr_b = float(cfg.lr_b) * s
-            cfg.lr_discriminator = float(cfg.lr_discriminator) * s
-            print(f"[FBCprAux] DDP world_size={ws}, sqrt-scaled LRs: "
-                  f"actor={cfg.lr_actor:.3g} critic={cfg.lr_critic:.3g} "
-                  f"aux_critic={cfg.lr_aux_critic:.3g} F={cfg.lr_f:.3g} "
-                  f"B={cfg.lr_b:.3g} disc={cfg.lr_discriminator:.3g}",
-                  flush=True)
+        # LR scaling. Two independent sqrt terms stack multiplicatively:
+        #   (1) DDP world_size: gradient averaging over ``world_size`` ranks
+        #       reduces noise by sqrt(world_size); bumping the LR by the
+        #       same factor keeps the per-example step size unchanged.
+        #   (2) Batch size: same story within a rank — going from the
+        #       reference batch of 1024 to ``batch_size`` further reduces
+        #       noise by sqrt(batch_size/1024). Applied alongside world_size.
+        #
+        # Combined multiplier: sqrt(world_size) * sqrt(batch_size / 1024).
+        # Reference batch is 1024 (single-rank BFM default); at batch=1024
+        # single-rank this is a no-op. The LR-anneal schedule targets the
+        # un-scaled base LR, annealing BOTH multipliers away over
+        # ``lr_anneal_steps`` env-steps.
+        import math
+        REF_BATCH_SIZE = 1024
+        ws = (int(torch.distributed.get_world_size())
+              if self.is_distributed else 1)
+        bs_mult = math.sqrt(max(int(cfg.batch_size), 1) / REF_BATCH_SIZE)
+        ws_mult = math.sqrt(max(ws, 1))
+        combined_mult = ws_mult * bs_mult
+        if combined_mult != 1.0:
+            cfg.lr_actor = float(cfg.lr_actor) * combined_mult
+            cfg.lr_critic = float(cfg.lr_critic) * combined_mult
+            cfg.lr_aux_critic = float(cfg.lr_aux_critic) * combined_mult
+            cfg.lr_f = float(cfg.lr_f) * combined_mult
+            cfg.lr_b = float(cfg.lr_b) * combined_mult
+            cfg.lr_discriminator = float(cfg.lr_discriminator) * combined_mult
+            print(
+                f"[FBCprAux] LR scaling: world_size={ws} (×{ws_mult:.3f})  "
+                f"batch_size={cfg.batch_size}/{REF_BATCH_SIZE} (×{bs_mult:.3f})  "
+                f"combined ×{combined_mult:.3f}",
+                flush=True,
+            )
+            print(
+                f"[FBCprAux] scaled LRs: "
+                f"actor={cfg.lr_actor:.3g} critic={cfg.lr_critic:.3g} "
+                f"aux_critic={cfg.lr_aux_critic:.3g} F={cfg.lr_f:.3g} "
+                f"B={cfg.lr_b:.3g} disc={cfg.lr_discriminator:.3g}",
+                flush=True,
+            )
 
         # Post-DDP-scaling LRs — the "top" of the anneal ramp. Equal to
         # ``_base_lrs`` under single-rank (so anneal is a no-op).
