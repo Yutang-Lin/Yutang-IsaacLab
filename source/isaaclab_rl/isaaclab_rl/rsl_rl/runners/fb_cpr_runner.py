@@ -185,9 +185,11 @@ class FBCprRunner:
         aux_reward_names = list(algo_cfg.aux_rewards_scaling.keys())
         self.replay_buffer = FBCprReplayBuffer(
             capacity=int(self.alg_cfg.get("replay_capacity", 5_120_000)),
+            num_envs=self.env.num_envs,
             obs_space=self.obs_space,
             action_dim=self.action_dim,
             z_dim=self.policy.z_dim,
+            seq_length=net_cfg.seq_length,
             aux_reward_names=aux_reward_names,
             device=self.alg_cfg.get("replay_device", "cpu"),
         )
@@ -436,14 +438,12 @@ class FBCprRunner:
         lenbuffer: deque[float] = deque(maxlen=500)
         cur_reward_sum = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
         cur_ep_length = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
-        # BFM-style done_prev mask: envs that reset on the PREVIOUS step have
-        # a fresh post-reset obs in ``obs_dict`` that should NOT be paired
-        # with the current-iter ``new_obs`` as a valid TD transition (the
-        # pair would span a reset boundary and poison the TD target).
-        # BFM filters via ``indexes = ~done`` before ``replay_buffer.extend``
-        # (train.py:458, 466, 478). We mirror this by writing only the
-        # transitions from envs NOT flagged in ``done_prev``.
-        done_prev = torch.zeros(self.env.num_envs, dtype=torch.bool, device=self.device)
+        # BFM-style done tracking. The trajectory buffer stores ALL envs
+        # every step (no done-filtering) and uses the ``truncated`` column
+        # to mark episode boundaries. ``terminated`` and ``truncated`` from
+        # the PREVIOUS step are written alongside the current obs/action.
+        prev_terminated = torch.zeros(self.env.num_envs, 1, dtype=torch.bool, device=self.device)
+        prev_truncated = torch.zeros(self.env.num_envs, 1, dtype=torch.bool, device=self.device)
 
         start_iter = self.current_learning_iteration
         tot_iter = start_iter + num_learning_iterations
@@ -533,54 +533,34 @@ class FBCprRunner:
                     else:
                         time_outs = time_outs.to(self.device).bool()
                     terminated = (dones.bool() & ~time_outs).view(-1, 1)
+                    truncated = time_outs.view(-1, 1)
 
-                    # Drop transitions that cross a reset boundary:
-                    #  (a) ``done_prev`` — envs that reset at the PREVIOUS
-                    #      iter have their post-reset obs in ``obs_dict``, so
-                    #      pairing with ``new_obs`` spans the boundary.
-                    #  (b) ``dones`` — envs that reset DURING this iter.
-                    #      IsaacLab's ``DirectRLEnv.step`` resets in-place
-                    #      before computing the returned ``new_obs``, so
-                    #      ``new_obs`` for those envs is the post-reset RSI
-                    #      state. Storing ``(pre_reset_obs, action,
-                    #      post_reset_obs)`` lets the critic / aux-critic /
-                    #      F-map bootstrap their Bellman target on the RSI
-                    #      state, which is OOD for target nets that only saw
-                    #      mid-episode states — triggers a per-reset jump in
-                    #      critic_loss / aux_critic_loss / fb_offdiag that
-                    #      persists until the target nets re-adjust.
-                    #  BFM's ``indexes = ~done`` only filters (a); because
-                    #  their policy tracks, V(post_reset_obs) is still a
-                    #  reasonable estimate. We filter both to be safe.
-                    keep = ~done_prev & ~dones.bool()
-                    if bool(keep.any().item()):
-                        keep_idx = keep.nonzero(as_tuple=False).view(-1)
-                        batch_obs = {k: v[keep_idx] for k, v in obs_dict.items()}
-                        batch_next_obs = {k: v[keep_idx] for k, v in new_obs.items()}
-                        batch = {
-                            "observation": batch_obs,
-                            "action": actions[keep_idx],
-                            "z": z_context[keep_idx],
-                            "next": {
-                                "observation": batch_next_obs,
-                                "terminated": terminated[keep_idx],
-                            },
-                            "aux_rewards": {k: v[keep_idx] for k, v in aux_rewards_dict.items()},
-                        }
-                        # Safety net: any iter where stored obs / aux_rewards go
-                        # NaN or inf, print once and continue. Matches BFM's
-                        # implicit fail-loud behaviour without killing the run.
-                        if (self.tot_timesteps // self.env.num_envs) % 500 == 0:
-                            for k, v in batch_obs.items():
-                                if torch.isnan(v).any() or torch.isinf(v).any():
-                                    print(f"[WARN env_steps={self.tot_timesteps}] "
-                                          f"obs[{k}] has nan={int(torch.isnan(v).sum())} "
-                                          f"inf={int(torch.isinf(v).sum())}", flush=True)
-                            for k, v in batch["aux_rewards"].items():
-                                if torch.isnan(v).any() or torch.isinf(v).any():
-                                    print(f"[WARN env_steps={self.tot_timesteps}] "
-                                          f"aux_rewards[{k}] has nan/inf", flush=True)
-                        self.replay_buffer.add(batch)
+                    # BFM trajectory-buffer style: write ALL envs every step.
+                    # The ``truncated`` column marks episode boundaries so the
+                    # sampler never draws sub-sequences across resets.
+                    # ``prev_terminated`` / ``prev_truncated`` are from the
+                    # PRECEDING step (matching BFM's layout where each row
+                    # stores the done flags that led to this obs).
+                    batch = {
+                        "observation": obs_dict,
+                        "action": actions,
+                        "z": z_context,
+                        "terminated": prev_terminated,
+                        "truncated": prev_truncated,
+                        "aux_rewards": aux_rewards_dict,
+                    }
+                    # Safety net: periodic NaN check.
+                    if (self.tot_timesteps // self.env.num_envs) % 500 == 0:
+                        for k, v in obs_dict.items():
+                            if torch.isnan(v).any() or torch.isinf(v).any():
+                                print(f"[WARN env_steps={self.tot_timesteps}] "
+                                      f"obs[{k}] has nan={int(torch.isnan(v).sum())} "
+                                      f"inf={int(torch.isinf(v).sum())}", flush=True)
+                    self.replay_buffer.extend(batch)
+
+                    # Update prev flags for the NEXT step's write.
+                    prev_terminated = terminated.clone()
+                    prev_truncated = (dones.bool()).view(-1, 1)
 
                     # Book-keeping
                     cur_reward_sum += rewards
@@ -591,9 +571,6 @@ class FBCprRunner:
                         lenbuffer.extend(cur_ep_length[new_ids][:, 0].cpu().numpy().tolist())
                         cur_reward_sum[new_ids] = 0
                         cur_ep_length[new_ids] = 0
-
-                    # Update done_prev (for next iter's write-filter).
-                    done_prev = dones.bool()
 
                     # Update per-env step_count (reset on done).
                     step_count = step_count + 1

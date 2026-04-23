@@ -53,74 +53,70 @@ def _index_obs_dict(obs: dict[str, torch.Tensor], idx: torch.Tensor) -> dict[str
 # ---------------------------------------------------------------------------
 
 class FBCprReplayBuffer:
-    """Flat circular replay buffer storing (obs, action, z, next_obs, next_terminated, aux_rewards).
+    """Trajectory-aware 2D circular replay buffer matching BFM-Zero's
+    ``TrajectoryDictBufferMultiDim``.
 
-    Transitions are appended as batches via ``add(batch_dict)``; when the write
-    cursor reaches ``capacity`` it wraps, so older transitions get overwritten
-    in FIFO order. Sampling is uniform over currently valid indices (``len(self)``).
+    Storage layout: ``[time_steps, num_envs, ...]`` — each ``extend()`` call
+    appends one time-slice ``[1, num_envs, ...]`` across all parallel envs.
+    Episode boundaries are marked by the ``truncated`` column; ``sample()``
+    draws contiguous sub-sequences of length ``seq_length`` that never cross
+    episode boundaries, exactly as BFM-Zero does.
+
+    ``capacity`` is the total number of transitions (= ``time_steps * num_envs``).
+    The time-axis length is ``capacity // num_envs``.
     """
 
     def __init__(
         self,
         capacity: int,
+        num_envs: int,
         obs_space: Any,
         action_dim: int,
         z_dim: int,
+        seq_length: int,
         aux_reward_names: list[str],
         device: str | torch.device = "cpu",
         pin_memory: bool | None = None,
     ) -> None:
-        self.capacity = int(capacity)
+        self.num_envs = int(num_envs)
+        self.time_capacity = int(capacity) // self.num_envs
+        self.capacity = self.time_capacity  # __len__ counts time-steps
         self.device = torch.device(device)
         self.action_dim = int(action_dim)
         self.z_dim = int(z_dim)
+        self.seq_length = int(seq_length)
         self.aux_reward_names = list(aux_reward_names)
 
-        # Only pin memory when storing on CPU (pin_memory is a no-op otherwise
-        # and raises on some GPU tensor constructors). Caller can force.
         if pin_memory is None:
             pin_memory = self.device.type == "cpu"
         self._pin_memory = bool(pin_memory)
 
-        # obs_space is expected to be gymnasium Dict of Box entries; we only
-        # peek at ``.spaces`` to get per-key shapes. We keep a list of ordered
-        # keys to keep the dict layout stable across calls.
         if hasattr(obs_space, "spaces"):
             self._obs_shapes = {k: _space_shape(v) for k, v in obs_space.spaces.items()}
         else:
-            # Allow passing an already-resolved dict[str, shape].
             self._obs_shapes = {k: tuple(v) for k, v in dict(obs_space).items()}
 
-        # Pre-allocate storage.
+        # 2D storage: [time_capacity, num_envs, ...]
         self._obs: dict[str, torch.Tensor] = {
-            k: self._alloc((self.capacity, *shape))
+            k: self._alloc((self.time_capacity, self.num_envs, *shape))
             for k, shape in self._obs_shapes.items()
         }
-        self._next_obs: dict[str, torch.Tensor] = {
-            k: self._alloc((self.capacity, *shape))
-            for k, shape in self._obs_shapes.items()
-        }
-        self._action = self._alloc((self.capacity, self.action_dim))
-        self._z = self._alloc((self.capacity, self.z_dim))
-        self._next_terminated = self._alloc((self.capacity, 1), dtype=torch.bool)
+        self._action = self._alloc((self.time_capacity, self.num_envs, self.action_dim))
+        self._z = self._alloc((self.time_capacity, self.num_envs, self.z_dim))
+        self._terminated = self._alloc((self.time_capacity, self.num_envs, 1), dtype=torch.bool)
+        self._truncated = self._alloc((self.time_capacity, self.num_envs, 1), dtype=torch.bool)
         self._aux_rewards: dict[str, torch.Tensor] = {
-            name: self._alloc((self.capacity, 1)) for name in self.aux_reward_names
+            name: self._alloc((self.time_capacity, self.num_envs, 1)) for name in self.aux_reward_names
         }
 
-        # Circular write cursor + "have we wrapped at least once" flag.
         self._idx = 0
         self._is_full = False
-
-    # -- allocation helper -------------------------------------------------
+        self._recompute_traj_info = True
+        # Cached trajectory start/stop/length info (recomputed lazily).
+        self._start_idx: torch.Tensor | None = None
+        self._lengths: torch.Tensor | None = None
 
     def _alloc(self, shape: tuple[int, ...], dtype: torch.dtype = torch.float32) -> torch.Tensor:
-        # NOTE: ``torch.zeros(...).pin_memory()`` is NOT reliably zero: the
-        # pinned-memory allocator returns uninitialized pages and the
-        # subsequent copy from the non-pinned source has (in some PyTorch
-        # builds) produced garbage for large allocations. Allocate pinned
-        # directly, then explicitly zero_() — cheap one-time cost at init
-        # that prevents 1e37-valued "uninitialized read" NaN poisoning of
-        # downstream BatchNorm running stats.
         if self._pin_memory and self.device.type == "cpu":
             t = torch.empty(shape, dtype=dtype, pin_memory=True)
         else:
@@ -128,62 +124,51 @@ class FBCprReplayBuffer:
         t.zero_()
         return t
 
-    # -- public API --------------------------------------------------------
-
     def __len__(self) -> int:
-        return self.capacity if self._is_full else self._idx
+        return self.time_capacity if self._is_full else self._idx
 
     @property
     def full(self) -> bool:
         return self._is_full
 
+    @property
+    def total_transitions(self) -> int:
+        return len(self) * self.num_envs
+
     # -- serialization ----------------------------------------------------
 
     @torch.no_grad()
     def state_dict(self) -> dict:
-        """Return everything needed to restore the exact buffer contents.
-
-        Intended for resume-with-replay checkpoints. NOTE: the state_dict
-        can be large (~5 GB for the production config). Use only when
-        warm-starting a training run.
-        """
         return {
             "_obs": {k: v.clone() for k, v in self._obs.items()},
-            "_next_obs": {k: v.clone() for k, v in self._next_obs.items()},
             "_action": self._action.clone(),
             "_z": self._z.clone(),
-            "_next_terminated": self._next_terminated.clone(),
+            "_terminated": self._terminated.clone(),
+            "_truncated": self._truncated.clone(),
             "_aux_rewards": {k: v.clone() for k, v in self._aux_rewards.items()},
             "_idx": int(self._idx),
             "_is_full": bool(self._is_full),
-            "capacity": self.capacity,
+            "time_capacity": self.time_capacity,
+            "num_envs": self.num_envs,
             "action_dim": self.action_dim,
             "z_dim": self.z_dim,
+            "seq_length": self.seq_length,
             "aux_reward_names": list(self.aux_reward_names),
         }
 
     @torch.no_grad()
     def load_state_dict(self, sd: dict) -> None:
-        """Restore buffer contents. Shapes must match the current instance's
-        config (capacity, obs keys/shapes, action_dim, z_dim,
-        aux_reward_names) — we check the scalars explicitly."""
-        if int(sd.get("capacity", -1)) != self.capacity:
-            raise ValueError(
-                f"replay capacity mismatch: ckpt={sd.get('capacity')} vs "
-                f"cur={self.capacity}"
-            )
-        if int(sd.get("action_dim", -1)) != self.action_dim:
-            raise ValueError("replay action_dim mismatch")
-        if int(sd.get("z_dim", -1)) != self.z_dim:
-            raise ValueError("replay z_dim mismatch")
+        if int(sd.get("time_capacity", sd.get("capacity", -1))) != self.time_capacity:
+            raise ValueError("replay time_capacity mismatch")
+        if int(sd.get("num_envs", -1)) != self.num_envs:
+            raise ValueError("replay num_envs mismatch")
         for k in self._obs_shapes:
             if k in sd["_obs"]:
                 self._obs[k].copy_(sd["_obs"][k].to(self._obs[k].device))
-            if k in sd["_next_obs"]:
-                self._next_obs[k].copy_(sd["_next_obs"][k].to(self._next_obs[k].device))
         self._action.copy_(sd["_action"].to(self._action.device))
         self._z.copy_(sd["_z"].to(self._z.device))
-        self._next_terminated.copy_(sd["_next_terminated"].to(self._next_terminated.device))
+        self._terminated.copy_(sd["_terminated"].to(self._terminated.device))
+        self._truncated.copy_(sd["_truncated"].to(self._truncated.device))
         for name in self.aux_reward_names:
             if name in sd["_aux_rewards"]:
                 self._aux_rewards[name].copy_(
@@ -191,133 +176,171 @@ class FBCprReplayBuffer:
                 )
         self._idx = int(sd["_idx"])
         self._is_full = bool(sd["_is_full"])
+        self._recompute_traj_info = True
+
+    # -- extend (one time-step across all envs) ----------------------------
 
     @torch.no_grad()
-    def add(self, batch_dict: dict) -> None:
-        """Append a batch of transitions, wrapping around on overflow.
+    def extend(self, batch_dict: dict) -> None:
+        """Append one time-step slice ``[1, num_envs, ...]``.
 
-        ``batch_dict`` must follow the same shape as ``sample()`` output: an
-        ``observation`` dict, ``action``, ``z``, ``next.observation`` dict,
-        ``next.terminated``, and (optionally) ``aux_rewards`` sub-dict.
+        ``batch_dict`` keys: ``observation`` (dict), ``action`` [num_envs, A],
+        ``z`` [num_envs, Z], ``terminated`` [num_envs, 1], ``truncated``
+        [num_envs, 1], and optionally ``aux_rewards`` sub-dict.
         """
         obs = batch_dict["observation"]
-        next_obs = batch_dict["next"]["observation"]
-        # Use any obs key to read batch size.
-        any_key = next(iter(self._obs_shapes))
-        n = obs[any_key].shape[0]
-        if n == 0:
-            return
-        if n > self.capacity:
-            raise ValueError(
-                f"Batch size {n} larger than replay capacity {self.capacity}; "
-                "split into smaller chunks or increase capacity."
-            )
+        t = self._idx
 
-        end = self._idx + n
-        if end <= self.capacity:
-            sl1 = slice(self._idx, end)
-            self._write_slice(sl1, obs, next_obs, batch_dict, src_slice=slice(0, n))
-            self._idx = end
-            if self._idx == self.capacity:
-                self._is_full = True
-                self._idx = 0
-        else:
-            # Wrap: write [self._idx:capacity], then [0:remainder].
-            first = self.capacity - self._idx
-            sl1 = slice(self._idx, self.capacity)
-            sl2 = slice(0, n - first)
-            self._write_slice(sl1, obs, next_obs, batch_dict, src_slice=slice(0, first))
-            self._write_slice(sl2, obs, next_obs, batch_dict, src_slice=slice(first, n))
-            self._is_full = True
-            self._idx = n - first
-
-    def _write_slice(
-        self,
-        dst: slice,
-        obs: dict,
-        next_obs: dict,
-        batch_dict: dict,
-        src_slice: slice,
-    ) -> None:
-        # CRITICAL: when src is on GPU and dst is on pinned CPU, we MUST use
-        # ``dst.copy_(src)`` (no ``non_blocking``) rather than the pattern
-        # ``dst[...] = src.to(cpu, non_blocking=True)`` which creates an
-        # intermediate non-pinned CPU tensor. That intermediate is filled by
-        # cudaMemcpyAsync and the subsequent ``__setitem__`` on CPU does NOT
-        # wait for the CUDA stream, so we end up copying uninitialized
-        # memory (observed as ±8.51e+37 poisoning the replay buffer).
-        # A blocking ``.copy_()`` GPU→pinned-CPU is already fast (PyTorch
-        # uses cudaMemcpy, not cudaMemcpyAsync, when the destination is
-        # pinned and non_blocking=False), and a single synchronize per
-        # batch-add is negligible vs. the NaN blow-up it prevents.
-        def _sync_copy(dst_view: torch.Tensor, src_t: torch.Tensor) -> None:
-            if src_t.device == dst_view.device:
-                dst_view.copy_(src_t)
+        def _copy(dst: torch.Tensor, src: torch.Tensor) -> None:
+            if src.device == dst.device:
+                dst.copy_(src)
             else:
-                dst_view.copy_(src_t, non_blocking=False)
+                dst.copy_(src, non_blocking=False)
 
         for k in self._obs_shapes:
-            _sync_copy(self._obs[k][dst], obs[k][src_slice])
-            _sync_copy(self._next_obs[k][dst], next_obs[k][src_slice])
-        _sync_copy(self._action[dst], batch_dict["action"][src_slice])
-        _sync_copy(self._z[dst], batch_dict["z"][src_slice])
-        term = batch_dict["next"]["terminated"][src_slice]
+            _copy(self._obs[k][t], obs[k])
+        _copy(self._action[t], batch_dict["action"])
+        _copy(self._z[t], batch_dict["z"])
+        term = batch_dict["terminated"]
         if term.dtype != torch.bool:
             term = term.bool()
         if term.dim() == 1:
             term = term.unsqueeze(-1)
-        _sync_copy(self._next_terminated[dst], term)
+        _copy(self._terminated[t], term)
+        trunc = batch_dict["truncated"]
+        if trunc.dtype != torch.bool:
+            trunc = trunc.bool()
+        if trunc.dim() == 1:
+            trunc = trunc.unsqueeze(-1)
+        _copy(self._truncated[t], trunc)
         aux = batch_dict.get("aux_rewards", {})
         for name in self.aux_reward_names:
             if name not in aux:
                 continue
-            v = aux[name][src_slice]
+            v = aux[name]
             if v.dim() == 1:
                 v = v.unsqueeze(-1)
-            _sync_copy(self._aux_rewards[name][dst], v)
+            _copy(self._aux_rewards[name][t], v)
+
+        self._idx = t + 1
+        if self._idx >= self.time_capacity:
+            self._is_full = True
+            self._idx = 0
+        self._recompute_traj_info = True
+
+    # -- trajectory segmentation (BFM's find_start_stop_traj) ---------------
+
+    def _ensure_traj_info(self) -> None:
+        if not self._recompute_traj_info:
+            return
+        done = self._truncated[:len(self)].squeeze(-1)  # [T, E] bool
+        T = done.shape[0]
+        E = done.shape[1]
+        starts_list: list[torch.Tensor] = []
+        lengths_list: list[int] = []
+        if self._is_full:
+            cursor = (self._idx - 1) % self.time_capacity
+            done_copy = done.clone()
+            done_copy[cursor] = True
+        else:
+            done_copy = done.clone()
+            done_copy[T - 1] = True
+        for e in range(E):
+            col = done_copy[:, e]
+            ends = col.nonzero(as_tuple=False).squeeze(-1)
+            if ends.numel() == 0:
+                starts_list.append(torch.tensor([0, e], device=self.device))
+                lengths_list.append(T)
+                continue
+            prev_end = -1
+            for end_t in ends.tolist():
+                start_t = (prev_end + 1) % T if prev_end >= 0 else 0
+                if self._is_full and prev_end == -1:
+                    start_t = (ends[-1].item() + 1) % T
+                length = end_t - start_t + 1
+                if length <= 0:
+                    length += T
+                starts_list.append(torch.tensor([start_t, e], device=self.device))
+                lengths_list.append(length)
+                prev_end = end_t
+        self._start_idx = torch.stack(starts_list)  # [N_traj, 2]
+        self._lengths = torch.tensor(lengths_list, device=self.device, dtype=torch.long)
+        self._recompute_traj_info = False
+
+    # -- sampling (BFM's get_idxs + _tensor_slices_from_startend) -----------
 
     @torch.no_grad()
-    def sample(self, batch_size: int) -> dict:
-        n = len(self)
-        if n == 0:
+    def sample(self, batch_size: int, seq_length: int | None = None) -> dict:
+        seq_length = seq_length or self.seq_length
+        if len(self) == 0:
             raise RuntimeError("FBCprReplayBuffer.sample() called on empty buffer")
-        idx = torch.randint(0, n, (batch_size,), device=self.device)
+        if batch_size % seq_length != 0:
+            raise ValueError(
+                f"batch_size ({batch_size}) must be divisible by seq_length ({seq_length})"
+            )
+        self._ensure_traj_info()
+        num_slices = batch_size // seq_length
+        eligible = self._lengths >= (seq_length + 1)
+        if not bool(eligible.any().item()):
+            raise RuntimeError(
+                f"No trajectories with length >= {seq_length + 1}; buffer too small or all episodes shorter."
+            )
+        eligible_idx = eligible.nonzero(as_tuple=False).squeeze(-1)
+        eligible_lengths = self._lengths[eligible_idx]
+        eligible_starts = self._start_idx[eligible_idx]
+
+        traj_sel = torch.randint(eligible_idx.shape[0], (num_slices,), device=self.device)
+        sel_lengths = eligible_lengths[traj_sel]
+        sel_starts = eligible_starts[traj_sel]  # [num_slices, 2]
+
+        end_point = (sel_lengths - seq_length - 1).clamp_min(0).to(torch.float32)
+        relative_starts = (torch.rand(num_slices, device=self.device) * (end_point + 1.0)).floor().to(torch.long)
+
+        time_starts = (sel_starts[:, 0] + relative_starts)  # [num_slices]
+        env_ids = sel_starts[:, 1]  # [num_slices]
+
+        arange = torch.arange(seq_length, device=self.device)  # [seq_length]
+        # time indices: [num_slices, seq_length] -> flatten to [batch_size]
+        time_idx = (time_starts.unsqueeze(1) + arange.unsqueeze(0)) % self.time_capacity
+        time_idx = time_idx.reshape(-1)
+        env_idx = env_ids.unsqueeze(1).expand(-1, seq_length).reshape(-1)
+        # next-step indices (t+1)
+        time_idx_next = (time_idx + 1) % self.time_capacity
+
+        return self._gather(time_idx, env_idx, time_idx_next)
+
+    def _gather(self, time_idx: torch.Tensor, env_idx: torch.Tensor,
+                time_idx_next: torch.Tensor) -> dict:
+        obs = {k: v[time_idx, env_idx] for k, v in self._obs.items()}
+        next_obs = {k: v[time_idx_next, env_idx] for k, v in self._obs.items()}
         return {
-            "observation": _index_obs_dict(self._obs, idx),
-            "action": self._action[idx],
-            "z": self._z[idx],
+            "observation": obs,
+            "action": self._action[time_idx, env_idx],
+            "z": self._z[time_idx, env_idx],
             "next": {
-                "observation": _index_obs_dict(self._next_obs, idx),
-                "terminated": self._next_terminated[idx],
+                "observation": next_obs,
+                "terminated": self._terminated[time_idx_next, env_idx],
             },
-            "aux_rewards": {name: self._aux_rewards[name][idx] for name in self.aux_reward_names},
+            "aux_rewards": {
+                name: self._aux_rewards[name][time_idx, env_idx]
+                for name in self.aux_reward_names
+            },
         }
 
     def sample_chunks(self, batch_size: int, num_chunks: int, target_device: str | torch.device) -> list[dict]:
-        """Sample ``num_chunks`` batches of size ``batch_size`` in ONE call.
-
-        When the replay lives on CPU and training on GPU, this amortises the
-        CPU→GPU transfer across all ``num_chunks`` updates — every leaf tensor
-        is moved in a single async non_blocking copy, then sliced back into
-        per-chunk views. Much faster than calling :meth:`sample` in a loop
-        when ``num_chunks`` is large (e.g. BFM's 16 agent updates/iter).
-        """
-        n = len(self)
-        if n == 0:
-            raise RuntimeError("FBCprReplayBuffer.sample_chunks() called on empty buffer")
+        """Sample ``num_chunks`` batches in ONE call, then transfer to ``target_device``."""
         total = int(batch_size) * int(num_chunks)
-        idx = torch.randint(0, n, (total,), device=self.device)
+        big = self.sample(total, seq_length=self.seq_length)
 
         def _move(x: torch.Tensor) -> torch.Tensor:
             return x.to(target_device, non_blocking=True)
 
-        # Gather + single async transfer per leaf tensor.
-        obs_flat = {k: _move(self._obs[k][idx]) for k in self._obs_shapes}
-        next_obs_flat = {k: _move(self._next_obs[k][idx]) for k in self._obs_shapes}
-        action_flat = _move(self._action[idx])
-        z_flat = _move(self._z[idx])
-        term_flat = _move(self._next_terminated[idx])
-        aux_flat = {name: _move(self._aux_rewards[name][idx]) for name in self.aux_reward_names}
+        obs_flat = {k: _move(v) for k, v in big["observation"].items()}
+        next_obs_flat = {k: _move(v) for k, v in big["next"]["observation"].items()}
+        action_flat = _move(big["action"])
+        z_flat = _move(big["z"])
+        term_flat = _move(big["next"]["terminated"])
+        aux_flat = {name: _move(big["aux_rewards"][name]) for name in self.aux_reward_names}
 
         chunks: list[dict] = []
         for i in range(num_chunks):
