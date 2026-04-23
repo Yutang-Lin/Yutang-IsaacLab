@@ -228,11 +228,16 @@ class FBCprRunner:
 
     # --- BFM-Zero obs-space composition ------------------------------- #
 
-    # Maps the 4 BFM-agent obs keys to the per-term names we expect to
-    # find in the env's observation_cfg. The env must define obs terms
-    # with these names; the runner concatenates them in the same order
-    # inside each group to match the expert-dataset layout.
-    _BFM_KEY_GROUPS: dict[str, tuple[str, ...]] = {
+    # Maps the BFM-agent obs keys to the per-term names we expect to find
+    # in the env's observation_cfg. The env must define obs terms with
+    # these names; the runner concatenates them in the same order inside
+    # each group to match the expert-dataset layout.
+    #
+    # Tasks extending BFM-Zero with new obs keys (e.g. BFM-Terrain's
+    # ``height_scan``) should set the algorithm-cfg entry
+    # ``obs_key_groups`` to override the default. The env's obs cfg must
+    # have matching term names.
+    _BFM_KEY_GROUPS_DEFAULT: dict[str, tuple[str, ...]] = {
         "state": ("state", "gravity", "root_ang_vel"),
         "last_action": ("last_action",),
         # History fields are concatenated in alphabetical order to match BFM's
@@ -247,6 +252,17 @@ class FBCprRunner:
         ),
         "privileged_state": ("priv_max_local_self",),
     }
+
+    @property
+    def _BFM_KEY_GROUPS(self) -> dict[str, tuple[str, ...]]:
+        """Resolve the per-agent-key obs mapping from cfg (``obs_key_groups``),
+        with ``_BFM_KEY_GROUPS_DEFAULT`` as fallback.
+        """
+        override = self.alg_cfg.get("obs_key_groups", None)
+        if override:
+            # Normalize list -> tuple for stable iteration.
+            return {k: tuple(v) for k, v in override.items()}
+        return dict(self._BFM_KEY_GROUPS_DEFAULT)
 
     def _resolve_obs_key_groups(self) -> dict[str, dict[str, slice]]:
         """Compute per-term slice ranges in the flat policy / critic tensors.
@@ -1126,6 +1142,38 @@ class FBCprRunner:
                 opt = getattr(self.alg, name, None)
                 if opt is not None:
                     opt.load_state_dict(sd)
+            # ``Adam.load_state_dict`` overwrites each param_group's ``lr``
+            # with the saved value — so the LR scaling (``sqrt(world_size) *
+            # sqrt(batch_size / 1024)``, 0.25× disc damping, etc.) computed
+            # fresh at runner init gets clobbered on resume. Re-apply the
+            # current-cfg LRs here so cfg changes (new world_size, new
+            # batch_size, new disc-damping factor, LR-anneal schedule)
+            # take effect immediately on resume. The Adam momentum buffers
+            # loaded from ckpt remain intact.
+            if hasattr(self.alg, "_start_lrs"):
+                opts_by_name = (
+                    ("actor", getattr(self.alg, "actor_optimizer", None)),
+                    ("critic", getattr(self.alg, "critic_optimizer", None)),
+                    ("aux_critic", getattr(self.alg, "aux_critic_optimizer", None)),
+                    ("f", getattr(self.alg, "forward_optimizer", None)),
+                    ("b", getattr(self.alg, "backward_optimizer", None)),
+                    ("discriminator", getattr(self.alg, "discriminator_optimizer", None)),
+                )
+                reapplied: dict[str, float] = {}
+                for name, opt in opts_by_name:
+                    if opt is None or name not in self.alg._start_lrs:
+                        continue
+                    lr = float(self.alg._start_lrs[name])
+                    for g in opt.param_groups:
+                        g["lr"] = lr
+                    reapplied[name] = lr
+                if reapplied:
+                    pretty = "  ".join(f"{k}={v:.3g}" for k, v in reapplied.items())
+                    print(
+                        f"[FBCprRunner] reapplied start LRs after resume "
+                        f"(Adam momentums preserved): {pretty}",
+                        flush=True,
+                    )
         self.current_learning_iteration = ckpt.get("iter", 0)
         self.tot_timesteps = ckpt.get("tot_timesteps", 0)
         self._local_timesteps = ckpt.get("local_timesteps", 0)

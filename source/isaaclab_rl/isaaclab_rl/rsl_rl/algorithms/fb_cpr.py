@@ -171,6 +171,21 @@ class FBCprAuxAlgorithmCfg:
     # ignored (still logged upstream).
     aux_rewards_scaling: dict[str, float] = field(default_factory=dict)
 
+    # Optional override for ``FBCprRunner._BFM_KEY_GROUPS`` — lets a task
+    # with extra obs terms (e.g. BFM-Terrain's ``height_scan``) route them
+    # into new agent-input dict keys without touching the runner. Leave
+    # empty to use the flat-floor BFM-Zero default.
+    #
+    # Example:
+    #   obs_key_groups = {
+    #       "state": ("state", "gravity", "root_ang_vel"),
+    #       "last_action": ("last_action",),
+    #       "history_actor": (... 5 history terms ...),
+    #       "privileged_state": ("priv_max_local_self",),
+    #       "height_scan": ("height_scan",),
+    #   }
+    obs_key_groups: dict[str, tuple[str, ...]] = field(default_factory=dict)
+
 
 # --------------------------------------------------------------------------- #
 # Algorithm

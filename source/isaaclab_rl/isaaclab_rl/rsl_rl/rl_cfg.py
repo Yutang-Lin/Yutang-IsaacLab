@@ -1310,6 +1310,12 @@ class RslRlFBCprAlgorithmCfg:
     # Aux rewards: name -> scaling coefficient. Default matches BFM-Zero.
     aux_rewards_scaling: dict[str, float] = MISSING
 
+    # Optional override for ``FBCprRunner._BFM_KEY_GROUPS`` — lets a task
+    # with extra obs terms (e.g. BFM-Terrain's ``height_scan``) route them
+    # into new agent-input dict keys. Leave empty to use the flat-floor
+    # BFM-Zero default.
+    obs_key_groups: dict[str, tuple[str, ...]] = dict()
+
     # Replay / seed
     replay_capacity: int = 5_120_000
     """Total replay capacity across all envs (flat circular). BFM's 5.12M."""
