@@ -1361,6 +1361,18 @@ class RslRlFBCprAlgorithmCfg:
     eval_priority_mode: Literal["exp", "lin"] = "exp"
     """How the clamped+scaled MPJPE maps to priority weight (BFM: ``exp``)."""
 
+    # Checkpoint pruning / replay-save cadence — read by ``FBCprRunner``.
+    save_replay_every_n: int = 10
+    """Save the heavy ``.replay.pt`` sibling file every ``save_replay_every_n``
+    *light-save intervals* (i.e., every ``save_replay_every_n * save_interval``
+    training iterations). Set to 1 to save the replay every time the
+    light ckpt fires, or 0 to never save the replay."""
+
+    keep_last_n_checkpoints: int = 10
+    """Keep only the ``N`` newest ``model_<iter>.pt`` files (and their
+    paired ``.replay.pt`` siblings). ``model_best.pt`` is never pruned.
+    Set to 0 to disable pruning."""
+
 
 #########################
 # Runner configurations #

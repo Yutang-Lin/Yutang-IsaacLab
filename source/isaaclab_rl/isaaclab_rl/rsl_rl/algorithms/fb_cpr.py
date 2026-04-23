@@ -222,24 +222,37 @@ class FBCprAux:
         # single-rank this is a no-op. The LR-anneal schedule targets the
         # un-scaled base LR, annealing BOTH multipliers away over
         # ``lr_anneal_steps`` env-steps.
+        #
+        # Discriminator special case: at large effective batch + cleaner
+        # gradient the BCE classifier saturates very fast (decision margin
+        # widens within a few hundred updates), which makes
+        # ``log(D/(1-D))`` bimodal/heavy-tailed and turns the critic's TD
+        # target into a hard, discontinuous regression problem. We dampen
+        # disc's scaling to 0.25× of the other branches, clamped at a 1x
+        # floor so single-rank / batch==1024 stays unchanged.
         import math
         REF_BATCH_SIZE = 1024
+        DISC_SCALING_FACTOR = 0.25
         ws = (int(torch.distributed.get_world_size())
               if self.is_distributed else 1)
         bs_mult = math.sqrt(max(int(cfg.batch_size), 1) / REF_BATCH_SIZE)
         ws_mult = math.sqrt(max(ws, 1))
         combined_mult = ws_mult * bs_mult
+        # Damped disc multiplier: keep 1x as floor so we never go BELOW
+        # the single-rank base LR.
+        disc_mult = max(1.0, DISC_SCALING_FACTOR * combined_mult)
         if combined_mult != 1.0:
             cfg.lr_actor = float(cfg.lr_actor) * combined_mult
             cfg.lr_critic = float(cfg.lr_critic) * combined_mult
             cfg.lr_aux_critic = float(cfg.lr_aux_critic) * combined_mult
             cfg.lr_f = float(cfg.lr_f) * combined_mult
             cfg.lr_b = float(cfg.lr_b) * combined_mult
-            cfg.lr_discriminator = float(cfg.lr_discriminator) * combined_mult
+            cfg.lr_discriminator = float(cfg.lr_discriminator) * disc_mult
             print(
                 f"[FBCprAux] LR scaling: world_size={ws} (×{ws_mult:.3f})  "
                 f"batch_size={cfg.batch_size}/{REF_BATCH_SIZE} (×{bs_mult:.3f})  "
-                f"combined ×{combined_mult:.3f}",
+                f"combined ×{combined_mult:.3f}  disc ×{disc_mult:.3f} "
+                f"(0.25× combined, floored at 1)",
                 flush=True,
             )
             print(

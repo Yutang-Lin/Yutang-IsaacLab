@@ -398,6 +398,15 @@ class FBCprExpertBuffer:
         root_ang_vel_chunks: list[torch.Tensor] = []
         reset_fields_complete = True
 
+        # Per-motion metadata for BFM-Terrain (and any other task that needs
+        # to route RSI by motion source). ``motion_source_id`` defaults to 0
+        # (= "regular" / flat-floor) if the .pt doesn't carry the field;
+        # ``requires_terrain`` defaults to False. ``terrain_mesh_path`` may
+        # be used by the env to build its shared terrain mesh.
+        self._motion_source_id: list[int] = []
+        self._requires_terrain: list[bool] = []
+        self._terrain_mesh_paths: list[str] = []
+
         for name in self._motion_names:
             m = all_motions[name]
             self._states.append(m["state"].to(self.device).contiguous())
@@ -418,6 +427,10 @@ class FBCprExpertBuffer:
                     bucket.append(m[key].to(self.device).contiguous())
                 else:
                     reset_fields_complete = False
+            # Per-motion tags (default-safe for legacy .pt files).
+            self._motion_source_id.append(int(m.get("motion_source_id", 0)))
+            self._requires_terrain.append(bool(m.get("requires_terrain", False)))
+            self._terrain_mesh_paths.append(str(m.get("terrain_mesh_path", "")))
 
         self._lengths_t = torch.tensor(self._lengths, dtype=torch.long, device=self.device)
 
@@ -487,6 +500,27 @@ class FBCprExpertBuffer:
         self._motion_obs_starts = torch.tensor(
             _obs_offs[:-1], dtype=torch.long, device=self.device,
         )  # [num_motions]; absolute start in flat_*.
+
+        # Per-motion metadata as tensors (for device-efficient gather).
+        self.motion_source_id_t = torch.tensor(
+            self._motion_source_id, dtype=torch.long, device=self.device,
+        )
+        self.requires_terrain_t = torch.tensor(
+            self._requires_terrain, dtype=torch.bool, device=self.device,
+        )
+        # When RSI fields are available, expose per-RSI-frame metadata via
+        # the flat buffer ordering. ``_motion_lengths_rsi`` gives the frame
+        # count per motion; ``repeat_interleave`` maps that back to per-frame.
+        if self.supports_reset_states:
+            self.frame_motion_source_id = torch.repeat_interleave(
+                self.motion_source_id_t, self._motion_lengths_rsi,
+            )  # [total_frames]
+            self.frame_requires_terrain = torch.repeat_interleave(
+                self.requires_terrain_t, self._motion_lengths_rsi,
+            )  # [total_frames]
+        else:
+            self.frame_motion_source_id = torch.zeros(0, dtype=torch.long, device=self.device)
+            self.frame_requires_terrain = torch.zeros(0, dtype=torch.bool, device=self.device)
 
     # -- properties --------------------------------------------------------
 
@@ -589,6 +623,8 @@ class FBCprExpertBuffer:
             "root_quat": self.root_quat_buffer[frame],
             "root_lin_vel": self.root_lin_vel_buffer[frame],
             "root_ang_vel": self.root_ang_vel_buffer[frame],
+            "motion_source_id": self.frame_motion_source_id[frame],
+            "requires_terrain": self.frame_requires_terrain[frame],
         }
 
     # -- priority updates (stub-ish; accepted by agent) --------------------
