@@ -729,6 +729,8 @@ class FBCprAux:
         batch = expert_buffer.sample(batch_dim * traj_length, seq_length=traj_length)
         next_obs = batch["next"]["observation"]
         next_obs = self._to_device(next_obs)
+        # BFM calls self._model.backward_map() which normalizes obs first.
+        next_obs = self.policy._normalize(next_obs)
         z = self.policy._backward_map(next_obs)
         z = z.view(batch_dim, traj_length, z.shape[-1])
         for step in range(traj_length):

@@ -498,17 +498,15 @@ class ObsNormalizer(nn.Module):
 
     def forward(self, x: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         out: dict[str, torch.Tensor] = {}
-        # Preserve the original dict entries (so non-normalized keys pass through unchanged).
-        for key, tensor in x.items():
-            if key in self._normalizers:
-                out[key] = self._normalizers[key](tensor)
-            else:
-                out[key] = tensor
-        # And emit a KeyError for any normalizer keys missing from the obs if strict.
-        if not self.allow_mismatching_keys:
-            for key in self._normalizers.keys():
-                if key not in x:
-                    raise KeyError(f"Key '{key}' not found in the observation, but expected by normalizer.")
+        # BFM iterates normalizer keys only — obs keys not in the normalizer
+        # are DROPPED (not passed through). This matches BFM's behavior where
+        # expert obs missing 'history_actor' produces a 3-key output dict.
+        for key in self._normalizers.keys():
+            if key not in x:
+                if self.allow_mismatching_keys:
+                    continue
+                raise KeyError(f"Key '{key}' not found in the observation, but expected by normalizer.")
+            out[key] = self._normalizers[key](x[key])
         return out
 
 
