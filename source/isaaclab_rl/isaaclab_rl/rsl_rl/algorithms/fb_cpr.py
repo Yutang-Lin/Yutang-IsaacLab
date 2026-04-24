@@ -1646,3 +1646,32 @@ class FBCprAux:
             opt = getattr(self, name, None)
             if opt is not None:
                 opt.load_state_dict(sd)
+
+
+##########################
+# FBCprCond — variant with an extra "measure_cond" exteroceptive obs key
+# fed into F / actor / aux_critic. All training logic is inherited from
+# :class:`FBCprAux` — the algorithm is obs-key agnostic.
+##########################
+
+
+@configclass
+class FBCprCondAlgorithmCfg(FBCprAuxAlgorithmCfg):
+    """Training hyperparameters for :class:`FBCprCond`. Inherits every
+    knob from :class:`FBCprAuxAlgorithmCfg`; only the ``class_name`` is
+    flipped so the runner factory picks the :class:`FBCprCond` class."""
+
+    class_name: str = "FBCprCond"
+
+
+class FBCprCond(FBCprAux):
+    """FBCprAux trained with an extra exteroceptive ``measure_cond`` obs.
+
+    All training logic — obs batching, target updates, optimizer steps —
+    is inherited unchanged. The policy module (``FBCprCondPolicy``)
+    handles the new obs key through its input filters and normalizer;
+    this class exists purely so the runner's ``class_name`` dispatch can
+    pick it up.
+    """
+
+    pass

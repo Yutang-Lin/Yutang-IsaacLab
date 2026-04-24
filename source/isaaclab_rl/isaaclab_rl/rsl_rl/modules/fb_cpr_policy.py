@@ -1091,11 +1091,106 @@ class FBCprAuxPolicy(nn.Module):
         return dist.sample().float()
 
 
+##########################
+# FB-CPR-Aux-Cond variant — extra exteroceptive "measure_cond" obs key
+##########################
+
+
+@configclass
+class FBCprCondNetworkCfg(FBCprNetworkCfg):
+    """FB-CPR-Aux variant conditioned on an extra exteroceptive obs key.
+
+    The obs key (default ``"measure_cond"``) is appended to:
+      * the Forward (F) network inputs — successor-measure condition,
+      * the Actor inputs,
+      * the Aux-critic inputs.
+
+    It is NOT fed into the Backward map (B), the discriminator-reward
+    critic, or the discriminator itself. An ``ObsNormalizer`` entry is
+    added so BatchNorm1d stats are tracked per-key like the others.
+
+    All other FBCprNetworkCfg defaults are inherited unchanged.
+    """
+
+    measure_cond_key: str = "measure_cond"
+    include_measure_cond_in_forward: bool = True
+    include_measure_cond_in_actor: bool = True
+    include_measure_cond_in_aux_critic: bool = True
+    measure_cond_momentum: float = 0.01
+
+    def __post_init__(self):
+        # __post_init__ on a subclass: configclass propagates parent defaults
+        # before this runs, so we just augment the key tuples and the
+        # normalizer dict.
+        mk = self.measure_cond_key
+
+        def _append_if_missing(keys: tp.Sequence[str]) -> tp.Sequence[str]:
+            return tuple(keys) if mk in keys else tuple(list(keys) + [mk])
+
+        if self.include_measure_cond_in_forward:
+            self.forward_input_keys = _append_if_missing(self.forward_input_keys)
+        if self.include_measure_cond_in_actor:
+            self.actor_input_keys = _append_if_missing(self.actor_input_keys)
+        if self.include_measure_cond_in_aux_critic:
+            self.aux_critic_input_keys = _append_if_missing(self.aux_critic_input_keys)
+
+        # Normalizer entry for the new key.
+        if mk not in self.obs_normalizer_momentum:
+            self.obs_normalizer_momentum = {
+                **self.obs_normalizer_momentum,
+                mk: self.measure_cond_momentum,
+            }
+
+
+class FBCprCondPolicy(FBCprAuxPolicy):
+    """:class:`FBCprAuxPolicy` conditioned on an extra exteroceptive obs
+    key (``cfg.measure_cond_key``), fed into the F network, the actor,
+    and the aux critic (but NOT B, the disc-reward critic, or the
+    discriminator).
+
+    All of the plumbing — ``DictInputConcatFilter``, ``ObsNormalizer``,
+    target nets, act/critic/aux_critic forwards — is inherited unchanged.
+    The cfg's ``__post_init__`` augments the input-key tuples; the base
+    class then builds each net with the extended inputs.
+    """
+
+    def __init__(self, obs_space, action_dim: int, cfg: FBCprCondNetworkCfg):
+        mk = cfg.measure_cond_key
+        if mk not in obs_space.spaces:
+            raise ValueError(
+                f"FBCprCondPolicy: obs_space is missing measure_cond_key "
+                f"'{mk}'. Available keys: {list(obs_space.spaces)}"
+            )
+        super().__init__(obs_space, action_dim, cfg)
+        self.measure_cond_key = mk
+
+    def load_state_dict(self, state_dict, strict: bool = True):
+        """Be forgiving when loading an older FBCprAux checkpoint.
+
+        Old checkpoints do not have a ``measure_cond`` entry in the
+        obs-normalizer, and the F / actor / aux_critic first-layer
+        shapes differ by ``measure_cond_dim`` columns. Fall back to
+        ``strict=False`` and rely on fresh init for the missing rows.
+        """
+        try:
+            return super().load_state_dict(state_dict, strict=strict)
+        except RuntimeError as e:
+            print(
+                "[FBCprCondPolicy] load_state_dict strict=True failed "
+                f"({e.__class__.__name__}). Retrying with strict=False; "
+                "F/actor/aux_critic first layers and measure_cond "
+                "normalizer stats will be re-initialized."
+            )
+            return super().load_state_dict(state_dict, strict=False)
+
+
 __all__ = [
     # Configs
     "FBCprNetworkCfg",
+    "FBCprCondNetworkCfg",
     # Top-level policy
     "FBCprAuxPolicy",
+    "FBCprCondPolicy",
     # Networks
     "BackwardMap",
     "ForwardMap",

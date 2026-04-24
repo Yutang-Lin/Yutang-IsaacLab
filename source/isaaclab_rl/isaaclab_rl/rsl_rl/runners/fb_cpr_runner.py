@@ -24,9 +24,16 @@ import torch
 from rsl_rl.env import VecEnv
 from rsl_rl.utils import store_code_state
 
-from isaaclab_rl.rsl_rl.algorithms.fb_cpr import FBCprAux, FBCprAuxAlgorithmCfg
+from isaaclab_rl.rsl_rl.algorithms.fb_cpr import (
+    FBCprAux,
+    FBCprAuxAlgorithmCfg,
+    FBCprCond,
+    FBCprCondAlgorithmCfg,
+)
 from isaaclab_rl.rsl_rl.modules.fb_cpr_policy import (
     FBCprAuxPolicy,
+    FBCprCondNetworkCfg,
+    FBCprCondPolicy,
     FBCprNetworkCfg,
 )
 from isaaclab_rl.rsl_rl.storage.fb_cpr_storage import (
@@ -34,7 +41,7 @@ from isaaclab_rl.rsl_rl.storage.fb_cpr_storage import (
     FBCprReplayBuffer,
 )
 
-__all__ = ["FBCprRunner"]
+__all__ = ["FBCprRunner", "FBCprCondRunner"]
 
 
 def _replay_sibling_path(ckpt_path: str) -> str:
@@ -156,11 +163,11 @@ class FBCprRunner:
 
         # --- Policy -----------------------------------------------------
         net_cfg = self._build_network_cfg(self.policy_cfg)
-        self.policy = FBCprAuxPolicy(self.obs_space, action_dim=self.action_dim, cfg=net_cfg)
+        self.policy = self._POLICY_CLS(self.obs_space, action_dim=self.action_dim, cfg=net_cfg)
 
         # --- Algorithm --------------------------------------------------
         algo_cfg = self._build_algo_cfg(self.alg_cfg)
-        self.alg = FBCprAux(self.policy, cfg=algo_cfg, device=self.device)
+        self.alg = self._ALGO_CLS(self.policy, cfg=algo_cfg, device=self.device)
 
         # --- Expert buffer ---------------------------------------------
         expert_path = self.alg_cfg.get("expert_dataset_path")
@@ -371,9 +378,16 @@ class FBCprRunner:
 
     # --- helpers to translate rl_cfg.py configclass dict -> dataclasses -- #
 
-    @staticmethod
-    def _build_network_cfg(policy_cfg: dict) -> FBCprNetworkCfg:
-        cfg = FBCprNetworkCfg()
+    # --- class-level refs so subclasses can swap the policy / algorithm /
+    # cfg classes without duplicating __init__ ---
+    _POLICY_CLS = FBCprAuxPolicy
+    _ALGO_CLS = FBCprAux
+    _NET_CFG_CLS = FBCprNetworkCfg
+    _ALGO_CFG_CLS = FBCprAuxAlgorithmCfg
+
+    @classmethod
+    def _build_network_cfg(cls, policy_cfg: dict) -> FBCprNetworkCfg:
+        cfg = cls._NET_CFG_CLS()
         for k, v in policy_cfg.items():
             if hasattr(cfg, k):
                 setattr(cfg, k, v)
@@ -390,9 +404,9 @@ class FBCprRunner:
                 setattr(cfg, tuple_key, tuple(val))
         return cfg
 
-    @staticmethod
-    def _build_algo_cfg(alg_cfg: dict) -> FBCprAuxAlgorithmCfg:
-        cfg = FBCprAuxAlgorithmCfg(aux_rewards_scaling=dict(alg_cfg.get("aux_rewards_scaling", {})))
+    @classmethod
+    def _build_algo_cfg(cls, alg_cfg: dict) -> FBCprAuxAlgorithmCfg:
+        cfg = cls._ALGO_CFG_CLS(aux_rewards_scaling=dict(alg_cfg.get("aux_rewards_scaling", {})))
         for k, v in alg_cfg.items():
             if hasattr(cfg, k):
                 setattr(cfg, k, v)
@@ -1283,3 +1297,34 @@ class FBCprRunner:
     def add_git_repo_to_log(self, file: str) -> None:
         """No-op stub — rsl_rl's BaseRunner signature. We don't track git state."""
         return None
+
+
+##########################
+# FBCprCondRunner — adds the ``measure_cond`` obs group
+##########################
+
+
+class FBCprCondRunner(FBCprRunner):
+    """FBCpr runner variant for :class:`FBCprCond` / :class:`FBCprCondPolicy`.
+
+    Identical to :class:`FBCprRunner` except:
+      * instantiates :class:`FBCprCondPolicy` + :class:`FBCprCond`,
+      * adds a default ``measure_cond`` entry to the obs-key-groups map
+        so the env's ``measure_cond`` term is collected into its own
+        group in the Dict obs space (users can still override this via
+        ``alg_cfg['obs_key_groups']``).
+    """
+
+    _POLICY_CLS = FBCprCondPolicy
+    _ALGO_CLS = FBCprCond
+    _NET_CFG_CLS = FBCprCondNetworkCfg
+    _ALGO_CFG_CLS = FBCprCondAlgorithmCfg
+
+    # Extend the default obs-key-groups with a ``measure_cond`` group. The
+    # env is expected to define an obs term of the same name on the
+    # critic (and optionally policy) side. If the env uses a different
+    # term name, override via ``alg_cfg['obs_key_groups']``.
+    _BFM_KEY_GROUPS_DEFAULT: dict[str, tuple[str, ...]] = {
+        **FBCprRunner._BFM_KEY_GROUPS_DEFAULT,
+        "measure_cond": ("measure_cond",),
+    }
