@@ -865,7 +865,14 @@ class FBCprRunner:
             jp_log = torch.zeros(num_envs, L, num_joints, device=self.device)
             # dof_pos_dev = first num_joints dims of the env's `state` obs key
             dpd_log = torch.zeros(num_envs, L, num_joints, device=self.device)
-            jp_log[:, 0] = env_u.joint_pos[:, joint_order_t]
+            # env_u.joint_pos is ALREADY in the canonical (cfg.robot_joint_order)
+            # order — see base_env.py:298 where it's built as
+            # ``robot.data.joint_pos[:, self.joint_order]``. Expert buffer's
+            # joint_pos is in the same canonical order. So direct comparison,
+            # NO additional reindexing. (Previous code did ``[:, joint_order_t]``
+            # which double-indexed and permuted the joints, massively inflating
+            # Eval/mpjpe_mm.)
+            jp_log[:, 0] = env_u.joint_pos
             dpd_log[:, 0] = obs_dict["state"][:, :num_joints]
             for t in range(1, L):
                 # Pack z for each env at time t (cap at motion length).
@@ -881,7 +888,7 @@ class FBCprRunner:
                 action = self.policy.act(obs_dict, z_batch, mean=True)
                 new_obs, _, _, infos = self.env.step(action.to(self.env.device))
                 obs_dict = self._obs_to_device(new_obs, infos)
-                jp_log[:, t] = env_u.joint_pos[:, joint_order_t]
+                jp_log[:, t] = env_u.joint_pos
                 dpd_log[:, t] = obs_dict["state"][:, :num_joints]
 
             # --- per-motion metrics ---
