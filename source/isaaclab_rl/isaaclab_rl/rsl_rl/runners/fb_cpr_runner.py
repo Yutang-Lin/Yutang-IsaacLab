@@ -1169,7 +1169,24 @@ class FBCprRunner:
         preserved regardless — we only rewind the cadence gates.
         """
         ckpt = torch.load(path, map_location=self.device, weights_only=False)
-        self.policy.load_state_dict(ckpt["model"])
+        model_sd = ckpt["model"]
+        # Strip the ``.module.`` infix that DDP adds to the five wrapped
+        # nets (forward/backward/actor/critic/aux_critic) when the ckpt
+        # was saved under DDP but we're loading in non-DDP (play / single
+        # rank). The discriminator is never wrapped so its keys are flat
+        # in both cases. If the current policy IS DDP-wrapped (resume
+        # under the same world_size), we leave the keys alone.
+        if not self.is_distributed and any(".module." in k for k in model_sd.keys()):
+            fixed_sd = {}
+            for k, v in model_sd.items():
+                if ".module." in k:
+                    k = k.replace(".module.", ".", 1)
+                fixed_sd[k] = v
+            model_sd = fixed_sd
+            print(f"[FBCprRunner] stripped DDP '.module.' prefix from "
+                  f"{len(ckpt['model'])} state_dict keys (non-DDP load).",
+                  flush=True)
+        self.policy.load_state_dict(model_sd)
         if load_optimizer and "optimizers" in ckpt:
             for name, sd in ckpt["optimizers"].items():
                 opt = getattr(self.alg, name, None)
