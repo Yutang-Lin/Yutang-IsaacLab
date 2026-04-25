@@ -547,6 +547,48 @@ class BackwardMap(nn.Module):
         return self.net(x)
 
 
+class ReconstructionHead(nn.Module):
+    """Decode ``z`` back into a concat of per-key obs slices (e.g. end-effector
+    positions). Used as a regulariser pulling ``B`` to retain spatial info.
+    """
+
+    def __init__(
+        self,
+        z_dim: int,
+        targets: tp.Sequence[tuple[str, int, int]],
+        hidden_dim: int = 256,
+        hidden_layers: int = 2,
+    ) -> None:
+        super().__init__()
+        self.targets = [(str(k), int(s), int(e)) for (k, s, e) in targets]
+        self.output_dim = sum(e - s for _, s, e in self.targets)
+        assert self.output_dim > 0, "ReconstructionHead needs at least one target slice."
+        seq: list[nn.Module] = [nn.Linear(z_dim, hidden_dim), nn.LayerNorm(hidden_dim), nn.Tanh()]
+        for _ in range(max(0, hidden_layers - 1)):
+            seq += [nn.Linear(hidden_dim, hidden_dim), nn.ReLU()]
+        seq += [nn.Linear(hidden_dim, self.output_dim)]
+        self.net = nn.Sequential(*seq)
+
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        return self.net(z)
+
+    def gather_target(self, obs: dict[str, torch.Tensor]) -> torch.Tensor:
+        """Pull the concat of slices from ``obs`` matching ``self.targets``.
+
+        Expects ``obs`` to be a dict of ``[B, dim_k]`` tensors. Raises
+        ``KeyError`` if any target key is missing.
+        """
+        parts: list[torch.Tensor] = []
+        for key, s, e in self.targets:
+            if key not in obs:
+                raise KeyError(
+                    f"ReconstructionHead: obs dict missing key '{key}'. "
+                    f"Available keys: {list(obs.keys())}"
+                )
+            parts.append(obs[key][:, s:e])
+        return torch.cat(parts, dim=-1)
+
+
 class ForwardMap(nn.Module):
     """BFM forward map ``F(s, z, a) -> z`` (also reused as the critic / aux-critic)."""
 
@@ -855,6 +897,29 @@ class FBCprNetworkCfg:
     # Tracking-inference sequence length (BFM seq_length=8 in production)
     seq_length: int = 8
 
+    # --------------------------------------------------------------- #
+    # Reconstruction head: end-effector positions from B(goal) = z
+    # --------------------------------------------------------------- #
+    # When ``recon_targets`` is non-empty, ``FBCprAuxPolicy`` builds a
+    # small MLP ``z -> R^D`` whose target is the concatenation of slices
+    # from the goal obs dict. The loss is an MSE added to the FB loss,
+    # weighted by ``FBCprAuxAlgorithmCfg.reg_recons_coeff``. Useful for
+    # anchoring ``B`` onto task-relevant features (e.g. end-effector XYZ)
+    # so the latent ``z`` retains spatial information the FB-only
+    # objective might otherwise discard.
+    #
+    # Each entry is ``(obs_key, start_dim, end_dim)`` — a half-open
+    # slice of the named key's flat vector. The targets are concatenated
+    # in the order listed. Example (BFM-Terrain, 31-keypoint layout, pelvis
+    # stripped so local_body_pos starts at priv index 1):
+    #     ankle_left  = keypoint 6  -> priv[1 + (6-1)*3 : 1 + 6*3]   = [16:19]
+    #     ankle_right = keypoint 12 -> priv[1 + (12-1)*3 : 1 + 12*3] = [34:37]
+    #     wrist_left  = keypoint 22 -> priv[1 + (22-1)*3 : 1 + 22*3] = [64:67]
+    #     wrist_right = keypoint 29 -> priv[1 + (29-1)*3 : 1 + 29*3] = [85:88]
+    recon_targets: tp.Sequence[tuple[str, int, int]] = ()
+    recon_hidden_dim: int = 256
+    recon_hidden_layers: int = 2
+
 
 ##########################
 # Top-level policy
@@ -910,6 +975,18 @@ class FBCprAuxPolicy(nn.Module):
             norm=cfg.backward_norm,
             input_keys=cfg.backward_input_keys,
         )
+
+        # Optional reconstruction head (end-effector decoder from z).
+        # Parameters are added to the backward optimizer inside FBCprAux
+        # so ``B`` is trained jointly with the decoder.
+        self._reconstruction_head: ReconstructionHead | None = None
+        if cfg.recon_targets:
+            self._reconstruction_head = ReconstructionHead(
+                z_dim=cfg.z_dim,
+                targets=cfg.recon_targets,
+                hidden_dim=cfg.recon_hidden_dim,
+                hidden_layers=cfg.recon_hidden_layers,
+            )
 
         # Forward map (z-output).
         self._forward_map = ForwardMap(

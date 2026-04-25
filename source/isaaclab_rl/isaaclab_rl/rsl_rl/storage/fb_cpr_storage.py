@@ -396,14 +396,100 @@ class FBCprExpertBuffer:
         seq_length: int,
         device: str | torch.device = "cpu",
         motion_ids: list[str] | None = None,
+        length_proportional_priors: bool = True,
+        distributed_shard: bool = False,
+        shard_rank: int = 0,
+        shard_world_size: int = 1,
+        shard_seed: int = 0,
     ) -> None:
+        """Expert motion buffer.
+
+        Args:
+            length_proportional_priors: If True (default), initial
+                ``_priorities`` are set proportional to each motion's
+                frame count, so the expected per-transition draw
+                probability is uniform across the dataset. With
+                unbalanced clip lengths (e.g. a 7468-frame continuous
+                motion alongside 8000-frame LAFAN clips) this matters a
+                lot: under uniform motion-priors the transitions from a
+                short clip are sampled ~clip-length-ratio more often per
+                update. ``update_priorities()`` (from the tracking eval)
+                overwrites this init.
+        """
         self.seq_length = int(seq_length)
+        self._length_proportional_priors = bool(length_proportional_priors)
         self.device = torch.device(device)
 
         raw = torch.load(pt_path, weights_only=False, map_location="cpu")
         if not isinstance(raw, dict) or "motions" not in raw:
             raise ValueError(
                 f"Expected a dict with 'motions' key from {pt_path}, got {type(raw)}"
+            )
+
+        # ------------------------------------------------------------- #
+        # Minimal-format dataset: motion dicts only carry raw fields
+        # (root_pos, root_quat, joint_pos, fps, ...). We derive the full
+        # obs/RSI set at load time by calling the precompute pipeline's
+        # ``_process_motion`` on each motion (per this rank's shard when
+        # distributed). Avoids shipping huge precomputed buffers on disk.
+        # ------------------------------------------------------------- #
+        self._minimal: bool = bool(raw.get("minimal", False))
+        self._minimal_derive_fn = None
+        if self._minimal:
+            # Lazy-import the precompute pipeline. It lives in the
+            # Latent-Control repo under scripts/; the runner adds it to
+            # sys.path via the cfg's ``expert_dataset_compose_script``
+            # (with a sane default relative to this file's location).
+            import importlib.util, os, sys
+            script_rel = os.environ.get(
+                "BFM_EXPERT_COMPOSE_SCRIPT",
+                # Default: Latent-Control/scripts/precompute_bfm_expert_dataset.py
+                # one sibling up from Yutang-IsaacLab.
+                os.path.abspath(os.path.join(
+                    os.path.dirname(__file__),
+                    "..", "..", "..", "..", "..", "..",
+                    "Latent-Control", "scripts",
+                    "precompute_bfm_expert_dataset.py",
+                )),
+            )
+            if not os.path.exists(script_rel):
+                raise FileNotFoundError(
+                    f"Minimal expert dataset {pt_path} requires the precompute "
+                    f"script at {script_rel} (not found). Set BFM_EXPERT_COMPOSE_SCRIPT "
+                    f"env var to its absolute path, or rebuild the dataset "
+                    f"without --minimal."
+                )
+            spec = importlib.util.spec_from_file_location(
+                "_bfm_precompute_loader", script_rel,
+            )
+            mod = importlib.util.module_from_spec(spec)
+            sys.modules["_bfm_precompute_loader"] = mod
+            spec.loader.exec_module(mod)
+            self._minimal_mod = mod
+            urdf = raw.get("urdf_path") or mod.DEFAULT_URDF
+            # Build the FK chain on the buffer's device so per-motion
+            # compose runs entirely on GPU — ~20-40x faster than CPU on
+            # a big dataset. When self.device is "cuda", pytorch_kinematics
+            # moves its internal state to the same device.
+            compose_device = str(self.device)
+            self._minimal_chain = mod._build_chain(urdf, device=compose_device)
+            self._minimal_default_q = torch.tensor(
+                [float(x) for x in raw.get("default_dof_pos", mod.DEFAULT_DOF_POS)],
+                dtype=torch.float32, device=self.device,
+            )
+            self._minimal_gravity = torch.tensor(
+                list(raw.get("gravity", [0.0, 0.0, -1.0])),
+                dtype=torch.float32, device=self.device,
+            )
+            self._minimal_history_len = int(raw.get("history_length", 4))
+            self._minimal_action_scale = float(raw.get("action_scale", 0.25))
+            self._minimal_action_clip = float(raw.get("action_clip", 5.0))
+            self._minimal_resample_fps = float(raw.get("resample_fps", 0.0)) or None
+            print(
+                f"[FBCprExpertBuffer] minimal dataset detected; "
+                f"load-time compose pipeline ready "
+                f"(urdf={os.path.basename(urdf)}).",
+                flush=True,
             )
 
         all_motions = raw["motions"]
@@ -413,6 +499,33 @@ class FBCprExpertBuffer:
             missing = [m for m in motion_ids if m not in all_motions]
             if missing:
                 raise KeyError(f"Motions not in dataset: {missing}")
+
+        # Distributed shard: randomly permute the motion list with a seed
+        # shared across ranks (so every rank gets a deterministic global
+        # permutation), then take the contiguous slice belonging to this
+        # rank. Result: each motion is owned by exactly ONE rank, and the
+        # assignment is shuffled so locomotion/manipulation/stair/etc. are
+        # spread across ranks rather than clumped by insertion order.
+        self._shard_info: dict[str, int] = {
+            "rank": int(shard_rank) if distributed_shard else 0,
+            "world_size": int(shard_world_size) if distributed_shard else 1,
+            "global_num_motions": len(motion_ids),
+            "local_num_motions": len(motion_ids),
+        }
+        if distributed_shard and shard_world_size > 1:
+            n_total = len(motion_ids)
+            g = torch.Generator(device="cpu").manual_seed(int(shard_seed))
+            perm = torch.randperm(n_total, generator=g).tolist()
+            # Even split: rank r gets indices perm[r::W] for balanced load.
+            local_idxs = [perm[i] for i in range(shard_rank, n_total, shard_world_size)]
+            motion_ids = [motion_ids[i] for i in local_idxs]
+            self._shard_info["local_num_motions"] = len(motion_ids)
+            print(
+                f"[FBCprExpertBuffer] distributed shard rank "
+                f"{shard_rank}/{shard_world_size}: {len(motion_ids)}/{n_total} motions "
+                f"(seed={shard_seed})",
+                flush=True,
+            )
 
         self._motion_names: list[str] = list(motion_ids)
         self._states: list[torch.Tensor] = []
@@ -439,8 +552,117 @@ class FBCprExpertBuffer:
         self._requires_terrain: list[bool] = []
         self._terrain_mesh_paths: list[str] = []
 
-        for name in self._motion_names:
+        # Minimal path: batch-FK across all shard motions once, then
+        # loop per-motion over the fast post-FK pipeline. FK is strongly
+        # Python-launch-bound per call, so concat along T and one kernel
+        # dispatch is ~30x faster than calling FK per motion. Velocity
+        # FD must stay per-motion (it can't cross clip boundaries), but
+        # that step is cheap.
+        batched_fk_outputs: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+        if self._minimal:
+            mod = self._minimal_mod
+            dev = self.device
+            # Collect raw tensors + lengths.
+            raw_rp: list[torch.Tensor] = []
+            raw_rq: list[torch.Tensor] = []
+            raw_jp: list[torch.Tensor] = []
+            lens: list[int] = []
+            ordered_names: list[str] = list(self._motion_names)
+            for name in ordered_names:
+                m = all_motions[name]
+                rp = m["root_pos"].to(dev, non_blocking=True)
+                rq = mod._quat_normalize(m["root_quat"].to(dev, non_blocking=True))
+                jp = m["joint_pos"].to(dev, non_blocking=True)
+                raw_rp.append(rp); raw_rq.append(rq); raw_jp.append(jp)
+                lens.append(int(rp.shape[0]))
+            cat_rp = torch.cat(raw_rp, dim=0)
+            cat_rq = torch.cat(raw_rq, dim=0)
+            cat_jp = torch.cat(raw_jp, dim=0)
+            # One batched FK call.
+            print(
+                f"[FBCprExpertBuffer] batch FK on {len(ordered_names)} motions, "
+                f"{int(cat_rp.shape[0])} total frames ...",
+                flush=True,
+            )
+            cat_wp, cat_wq = mod._world_fk(
+                self._minimal_chain, cat_jp, cat_rp, cat_rq, mod.KEYPOINT_NAMES,
+            )
+            # Split back into per-motion FK outputs.
+            offs = 0
+            for name, T in zip(ordered_names, lens):
+                batched_fk_outputs[name] = (
+                    cat_wp[offs:offs + T].contiguous(),
+                    cat_wq[offs:offs + T].contiguous(),
+                )
+                offs += T
+            # Cache raw pieces too so per-motion post-FK step avoids a
+            # second copy.
+            batched_raw = {
+                name: (raw_rp[i], raw_rq[i], raw_jp[i])
+                for i, name in enumerate(ordered_names)
+            }
+            # Free the concatenated scratch ASAP.
+            del cat_rp, cat_rq, cat_jp, cat_wp, cat_wq, raw_rp, raw_rq, raw_jp
+
+        # Progress bar for load-time compose (minimal datasets only).
+        # Falls back to a silent no-op iterator when tqdm is unavailable
+        # or the dataset is already precomputed.
+        motion_iter = self._motion_names
+        if self._minimal:
+            try:
+                from tqdm import tqdm
+                shard_tag = ""
+                if self._shard_info["world_size"] > 1:
+                    shard_tag = (
+                        f" [rank {self._shard_info['rank']}/"
+                        f"{self._shard_info['world_size']}]"
+                    )
+                motion_iter = tqdm(
+                    self._motion_names,
+                    desc=f"[ExpertBuffer] compose{shard_tag}",
+                    unit="motion",
+                    dynamic_ncols=True,
+                    mininterval=0.5,
+                )
+            except ImportError:
+                pass
+
+        for name in motion_iter:
             m = all_motions[name]
+            # Minimal-dataset path: materialise state / priv / history /
+            # velocities from the raw fields via _process_motion. We run
+            # on CPU to keep torch JIT graph simple; the buffer moves to
+            # GPU below. On a massive sharded dataset, this is the
+            # dominant load-time cost (~5 ms per 500-frame motion).
+            if self._minimal:
+                mod = self._minimal_mod
+                rp, rq, jp = batched_raw[name]
+                wp_src, wq_src = batched_fk_outputs[name]
+                src_fps_i = int(m["fps"])
+                m = mod._process_motion_from_fk(
+                    name=name,
+                    root_pos=rp, root_quat=rq, joint_pos=jp,
+                    world_pos_src=wp_src, world_quat_src=wq_src,
+                    src_fps=src_fps_i, dt_min=1e-3,
+                    keypoint_names=mod.KEYPOINT_NAMES,
+                    default_q=self._minimal_default_q,
+                    gravity_world=self._minimal_gravity,
+                    history_length=self._minimal_history_len,
+                    action_scale=self._minimal_action_scale,
+                    action_clip=self._minimal_action_clip,
+                    resample_fps=self._minimal_resample_fps,
+                    terrain_mesh=None,
+                )
+                if m is None:
+                    raise RuntimeError(
+                        f"Minimal compose returned None for motion {name!r} "
+                        f"(clip likely too short, T<3). Drop it from the dataset."
+                    )
+                # Carry over the original per-motion metadata tags.
+                m["motion_source_id"] = int(all_motions[name].get("motion_source_id", 0))
+                m["requires_terrain"] = bool(all_motions[name].get("requires_terrain", False))
+                m["terrain_id"] = int(all_motions[name].get("terrain_id", -1))
+                m["terrain_mesh_path"] = str(all_motions[name].get("terrain_mesh_path", ""))
             self._states.append(m["state"].to(self.device).contiguous())
             self._privs.append(m["privileged_state"].to(self.device).contiguous())
             self._last_actions.append(m["last_action"].to(self.device).contiguous())
@@ -512,9 +734,27 @@ class FBCprExpertBuffer:
             self.total_frames = 0
             self.num_joints = 0
 
-        # Uniform priority by default; updated via update_priorities().
-        self._priorities = torch.ones(len(self._motion_names), dtype=torch.float32, device=self.device)
-        self._priorities = self._priorities / self._priorities.sum()
+        # Initial priors: length-proportional (default) so the per-
+        # transition draw probability is equal across motions — otherwise
+        # a short clip's transitions are seen (clip_length_ratio)x more
+        # often per update than a long clip's. With a mix of 8k-frame
+        # LAFAN clips and a 7468-frame continuous motion that matters.
+        # ``update_priorities()`` (from the tracking eval) overwrites this.
+        if (
+            self._length_proportional_priors
+            and len(self._lengths) > 0
+            and sum(int(x) for x in self._lengths) > 0
+        ):
+            self._priorities = torch.tensor(
+                [float(x) for x in self._lengths],
+                dtype=torch.float32, device=self.device,
+            )
+            self._priorities = self._priorities / self._priorities.sum().clamp_min(1e-12)
+        else:
+            self._priorities = torch.ones(
+                len(self._motion_names), dtype=torch.float32, device=self.device,
+            )
+            self._priorities = self._priorities / self._priorities.sum().clamp_min(1e-12)
 
         # --- Flat concatenated obs buffers for O(1) sample() --------------
         # Same trick as the RSI flat buffer: cat all motions along time,
@@ -668,6 +908,11 @@ class FBCprExpertBuffer:
         the number of motions. Otherwise scatters the new values into the
         given indices. Non-negative values are required; values are then
         renormalised to sum to 1.
+
+        When ``length_proportional_priors`` is set, the incoming weights
+        (e.g. MPJPE-derived) are multiplied by per-motion length BEFORE
+        normalisation so the expected per-transition draw probability
+        stays uniform across motions regardless of clip-length skew.
         """
         priorities = priorities.to(self.device).float().clamp_min(0.0)
         if idxs is None:
@@ -675,9 +920,21 @@ class FBCprExpertBuffer:
                 raise ValueError(
                     f"Expected priorities of length {len(self._motion_names)}, got {priorities.numel()}"
                 )
+            if self._length_proportional_priors:
+                lens = torch.tensor(
+                    [float(x) for x in self._lengths],
+                    dtype=priorities.dtype, device=self.device,
+                )
+                priorities = priorities * lens
             self._priorities = priorities
         else:
             idxs = idxs.to(self.device).long()
+            if self._length_proportional_priors:
+                lens = torch.tensor(
+                    [float(self._lengths[int(i)]) for i in idxs.tolist()],
+                    dtype=priorities.dtype, device=self.device,
+                )
+                priorities = priorities * lens
             self._priorities[idxs] = priorities
         s = self._priorities.sum()
         if s > 0:

@@ -1207,6 +1207,15 @@ class RslRlFBCprPolicyCfg:
     # Sequence length for expert encoding mean
     seq_length: int = 8
 
+    # Reconstruction head (end-effector pos + rot6d decoded from z).
+    # Each entry is ``(obs_key, start, end)`` — a half-open slice of the
+    # named obs vector (e.g. ``priv_max_local_self`` slots for wrists/ankles).
+    # Concatenated in list order; paired with
+    # ``RslRlFBCprAlgorithmCfg.recons_coeff`` to scale the MSE loss.
+    recon_targets: tuple[tuple[str, int, int], ...] = ()
+    recon_hidden_dim: int = 256
+    recon_hidden_layers: int = 2
+
 
 @configclass
 class RslRlFBCprAlgorithmCfg:
@@ -1255,6 +1264,26 @@ class RslRlFBCprAlgorithmCfg:
     # FB loss regularizers
     ortho_coef: float = 100.0
     q_loss_coef: float = 0.0
+    recons_coeff: float = 0.0
+    """MSE weight for the reconstruction head (end-effector pos+rot6d decoded
+    from ``z = B(goal)``). Requires ``policy.recon_targets`` to be non-empty.
+    Set to 0 to disable even when the head is built."""
+
+    length_proportional_priors: bool = True
+    """When True, ``FBCprExpertBuffer`` scales the initial uniform priors AND
+    any ``update_priorities()`` call by per-motion length so the expected
+    per-transition draw probability stays uniform across motions regardless
+    of clip-length imbalance. Default True — important for datasets that
+    mix long continuous motions with short clips (e.g. the dynamic 149-s
+    motion alongside 8-13s LAFAN clips)."""
+
+    distributed_expert: bool = False
+    """When True AND the runner is under DDP (world_size>1), each rank
+    loads only a disjoint shard of the expert dataset (seeded random
+    permutation of motion IDs → rank[r::W]). Cuts per-rank GPU memory
+    linearly with world_size; required for datasets bigger than fits on
+    one GPU. Tracking-eval metrics are all-reduced so global numbers
+    are reported."""
 
     # Discriminator
     grad_penalty_discriminator: float = 10.0

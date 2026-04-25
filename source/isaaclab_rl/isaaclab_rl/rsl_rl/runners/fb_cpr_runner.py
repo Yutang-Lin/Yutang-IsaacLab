@@ -179,10 +179,18 @@ class FBCprRunner:
             cvd = os.environ.get("CUDA_VISIBLE_DEVICES", "")
             _exp_idx = 0 if (cvd and "," not in cvd) else self.gpu_local_rank
             expert_device = f"cuda:{_exp_idx}"
+        distributed_expert = bool(self.alg_cfg.get("distributed_expert", False))
         self.expert_buffer = FBCprExpertBuffer(
             pt_path=expert_path,
             seq_length=net_cfg.seq_length,
             device=expert_device,
+            length_proportional_priors=bool(
+                self.alg_cfg.get("length_proportional_priors", True)
+            ),
+            distributed_shard=distributed_expert and self.is_distributed,
+            shard_rank=self.gpu_global_rank,
+            shard_world_size=self.gpu_world_size,
+            shard_seed=int(self.cfg.get("seed", 42)),
         )
         # Forward to the env so RSI can pull from it.
         if hasattr(self.env_unwrapped, "set_expert_buffer"):
@@ -986,12 +994,37 @@ class FBCprRunner:
                 # update_priorities normalizes internally to sum=1.
                 self.expert_buffer.update_priorities(w_final)
 
-            return {
+            n_valid = int(valid.sum().item())
+            out = {
                 "Eval/mpjpe_mm": mean_mpjpe,
                 "Eval/emd": mean_emd,
                 "Eval/tracking_success": success,
-                "Eval/num_motions": float(int(valid.sum().item())),
+                "Eval/num_motions": float(n_valid),
             }
+
+            # Distributed expert: average over ranks weighted by each
+            # rank's local valid-motion count, so the reported number is
+            # over the GLOBAL (union-of-shards) motion set.
+            if (
+                self.is_distributed
+                and bool(self.alg_cfg.get("distributed_expert", False))
+                and torch.distributed.is_initialized()
+            ):
+                dev = torch.device(self.device)
+                metric_names = ["Eval/mpjpe_mm", "Eval/emd", "Eval/tracking_success"]
+                # Pack [mpjpe * n, emd * n, success * n, n] as sums to
+                # all-reduce in a single call, then recover weighted
+                # means by dividing by the total count.
+                packed = torch.tensor(
+                    [out[k] * n_valid for k in metric_names] + [float(n_valid)],
+                    dtype=torch.float64, device=dev,
+                )
+                torch.distributed.all_reduce(packed, op=torch.distributed.ReduceOp.SUM)
+                total_n = packed[-1].clamp_min(1.0)
+                for i, k in enumerate(metric_names):
+                    out[k] = float((packed[i] / total_n).item())
+                out["Eval/num_motions"] = float(packed[-1].item())
+            return out
         finally:
             if hasattr(env_u, "_eval_mode"):
                 env_u._eval_mode = False
@@ -1207,12 +1240,38 @@ class FBCprRunner:
             print(f"[FBCprRunner] stripped DDP '.module.' prefix from "
                   f"{len(ckpt['model'])} state_dict keys (non-DDP load).",
                   flush=True)
-        self.policy.load_state_dict(model_sd)
+        # Non-strict load so legacy checkpoints (pre-reconstruction-head)
+        # still resume. Extra keys are surfaced as a warning; missing keys
+        # (e.g. ``_reconstruction_head.*``) are silently initialised.
+        missing, unexpected = self.policy.load_state_dict(model_sd, strict=False)
+        new_head_keys = [k for k in missing if "_reconstruction_head" in k]
+        other_missing = [k for k in missing if "_reconstruction_head" not in k]
+        if new_head_keys:
+            print(
+                f"[FBCprRunner] checkpoint predates reconstruction head — "
+                f"{len(new_head_keys)} head params randomly initialised.",
+                flush=True,
+            )
+        if other_missing:
+            print(f"[FBCprRunner] WARN missing state_dict keys: {other_missing[:8]}"
+                  f"{' ...' if len(other_missing) > 8 else ''}", flush=True)
+        if unexpected:
+            print(f"[FBCprRunner] WARN unexpected state_dict keys: {unexpected[:8]}"
+                  f"{' ...' if len(unexpected) > 8 else ''}", flush=True)
         if load_optimizer and "optimizers" in ckpt:
             for name, sd in ckpt["optimizers"].items():
                 opt = getattr(self.alg, name, None)
-                if opt is not None:
+                if opt is None:
+                    continue
+                try:
                     opt.load_state_dict(sd)
+                except (ValueError, RuntimeError) as e:
+                    print(
+                        f"[FBCprRunner] WARN optimizer '{name}' state did not "
+                        f"match current params (probably new head attached) — "
+                        f"leaving at fresh init. ({e})",
+                        flush=True,
+                    )
             # ``Adam.load_state_dict`` overwrites each param_group's ``lr``
             # with the saved value — so the LR scaling (``sqrt(world_size) *
             # sqrt(batch_size / 1024)``, 0.25× disc damping, etc.) computed

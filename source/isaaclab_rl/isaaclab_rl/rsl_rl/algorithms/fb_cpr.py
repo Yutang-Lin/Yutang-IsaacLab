@@ -112,6 +112,30 @@ class FBCprAuxAlgorithmCfg:
     # FB loss regularizers
     ortho_coef: float = 100.0
     q_loss_coef: float = 0.0  # 0 = disabled
+    # Reconstruction-head weight: MSE between decoder(B(goal)) and the
+    # concat of obs slices declared in ``policy.recon_targets`` (e.g.
+    # end-effector XYZ). 0 disables even if the head is built; set >0
+    # to make ``B`` retain the target info.
+    recons_coeff: float = 0.0
+
+    # When True, ``FBCprExpertBuffer`` scales both the initial uniform
+    # priors AND any ``update_priorities()`` call by per-motion length so
+    # the per-transition draw probability stays uniform across motions
+    # regardless of clip-length imbalance. Default True — important for
+    # datasets that mix long continuous motions with short clips.
+    length_proportional_priors: bool = True
+
+    # When True AND the runner is running under DDP (world_size>1), each
+    # rank loads a disjoint shard of the expert dataset. The shard is
+    # chosen by applying a seeded random permutation to the motion list
+    # (same permutation on every rank, seeded by ``runner_cfg.seed``),
+    # then taking the ``perm[rank::world_size]`` slice. This cuts GPU
+    # memory linearly with world_size for large datasets.
+    # RSI still uses the rank-local shard (envs RSI only into the motions
+    # this rank owns), which for large datasets is still a statistically
+    # reasonable coverage. Tracking-eval metrics are all-reduced across
+    # ranks in the runner so global numbers are reported.
+    distributed_expert: bool = False
 
     # Discriminator
     grad_penalty_discriminator: float = 10.0
@@ -478,8 +502,13 @@ class FBCprAux:
         # (6 nets × 16 updates), this saves ~100-200 ms/iter on B200.
         # Requires all params on CUDA — always true for our setup.
         adam_kwargs = {"fused": True}
+        # Backward optimizer also trains the reconstruction head (if any)
+        # so B and the decoder move together under the same LR schedule.
+        b_params = list(p._backward_map.parameters())
+        if getattr(p, "_reconstruction_head", None) is not None:
+            b_params += list(p._reconstruction_head.parameters())
         self.backward_optimizer = torch.optim.Adam(
-            p._backward_map.parameters(),
+            b_params,
             lr=cfg.lr_b,
             weight_decay=cfg.weight_decay,
             **adam_kwargs,
@@ -1277,6 +1306,19 @@ class FBCprAux:
         orth_loss = orth_loss_offdiag + orth_loss_diag
         fb_loss = fb_loss + self.cfg.ortho_coef * orth_loss
 
+        # Reconstruction regulariser: decode end-effector (or any
+        # configured) slices of ``goal`` from ``z = B(goal)`` and minimise
+        # MSE. Pushes B to preserve task-relevant spatial info that the
+        # bare FB loss may collapse out of z.
+        recon_loss = torch.zeros((), device=z.device, dtype=z.dtype)
+        recon_head = getattr(p, "_reconstruction_head", None)
+        recons_coeff = float(self.cfg.recons_coeff)
+        if recon_head is not None and recons_coeff > 0 and isinstance(goal, dict):
+            pred = recon_head(B)
+            target = recon_head.gather_target(goal).detach()
+            recon_loss = F.mse_loss(pred, target)
+            fb_loss = fb_loss + recons_coeff * recon_loss
+
         q_loss = torch.zeros(1, device=z.device, dtype=z.dtype)
         if q_loss_coef is not None:
             with torch.no_grad():
@@ -1315,6 +1357,7 @@ class FBCprAux:
                 "orth_loss_diag": orth_loss_diag,
                 "orth_loss_offdiag": orth_loss_offdiag,
                 "q_loss": q_loss,
+                "recon_loss": recon_loss,
             }
         return out, F_handle, B_handle
 
