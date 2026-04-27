@@ -256,6 +256,45 @@ class TruncatedNormal(pyd.Normal):
         return self._clamp(x)
 
 
+class SquashedNormal:
+    """Gaussian squashed through tanh with correct log_prob (SAC-style).
+
+    ``sample()`` returns ``tanh(u)`` where ``u ~ N(mu, std)``.
+    ``log_prob()`` accounts for the tanh Jacobian:
+        ``log π(a) = log N(u | mu, std) - Σ log(1 - tanh²(u) + eps)``
+    """
+
+    def __init__(self, loc: torch.Tensor, scale: torch.Tensor, eps: float = 1e-6) -> None:
+        self._normal = pyd.Normal(loc, scale, validate_args=False)
+        self.eps = eps
+        # Expose .loc / .scale / .mean for compatibility with TruncatedNormal callers.
+        self.loc = loc
+        self.scale = scale
+
+    @property
+    def mean(self) -> torch.Tensor:
+        return torch.tanh(self.loc)
+
+    def sample(self, clip: float | None = None, sample_shape: torch.Size = torch.Size()) -> torch.Tensor:
+        u = self._normal.rsample(sample_shape)
+        if clip is not None:
+            u = self.loc + (u - self.loc).clamp(-clip, clip)
+        return torch.tanh(u)
+
+    def rsample(self, sample_shape: torch.Size = torch.Size()) -> torch.Tensor:
+        u = self._normal.rsample(sample_shape)
+        return torch.tanh(u)
+
+    def log_prob(self, action: torch.Tensor) -> torch.Tensor:
+        # Inverse tanh: u = atanh(action), clamped for numerical stability.
+        action_c = action.clamp(-1.0 + self.eps, 1.0 - self.eps)
+        u = torch.atanh(action_c)
+        log_p = self._normal.log_prob(u)
+        # Jacobian correction: -log(1 - tanh²(u)) = -log(1 - action²)
+        log_p = log_p - torch.log(1.0 - action_c.pow(2) + self.eps)
+        return log_p
+
+
 class Norm(nn.Module):
     """Projects to the sphere of radius ``sqrt(dim)`` along the last axis."""
 
@@ -674,6 +713,9 @@ class Actor(nn.Module):
         hidden_layers: int = 6,
         embedding_layers: int = 2,
         input_keys: str | tp.Sequence[str] | None = None,
+        learned_std: bool = False,
+        min_std: float = 0.01,
+        max_std: float = 1.0,
     ) -> None:
         super().__init__()
         self.input_filter = build_input_filter(obs_space, input_keys)
@@ -684,6 +726,9 @@ class Actor(nn.Module):
         assert len(filtered_space.shape) == 1, "filtered_space must have a 1D shape"
         obs_dim = filtered_space.shape[0]
         self.model = model
+        self.learned_std = learned_std
+        self._log_min_std = math.log(min_std)
+        self._log_max_std = math.log(max_std)
 
         if model == "residual":
             embed_fn = residual_embedding
@@ -696,15 +741,17 @@ class Actor(nn.Module):
         self.embed_z = embed_fn(obs_dim + z_dim, hidden_dim, embedding_layers, 1)
         self.embed_s = embed_fn(obs_dim, hidden_dim, embedding_layers, 1)
 
+        out_dim = action_dim * 2 if learned_std else action_dim
         if model == "residual":
             seq: list[nn.Module] = [ResidualBlock(hidden_dim) for _ in range(hidden_layers)]
-            seq += [Block(hidden_dim, action_dim, False)]
+            seq += [Block(hidden_dim, out_dim, False)]
         else:
             seq = []
             for _ in range(hidden_layers):
                 seq += [linear(hidden_dim, hidden_dim), nn.ReLU()]
-            seq += [linear(hidden_dim, action_dim)]
+            seq += [linear(hidden_dim, out_dim)]
         self.policy = nn.Sequential(*seq)
+        self._action_dim = action_dim
 
     def forward(
         self,
@@ -716,9 +763,17 @@ class Actor(nn.Module):
         z_embedding = self.embed_z(torch.cat([obs, z], dim=-1))
         s_embedding = self.embed_s(obs)
         embedding = torch.cat([s_embedding, z_embedding], dim=-1)
-        mu = torch.tanh(self.policy(embedding))
-        std_tensor = torch.ones_like(mu) * std
-        return TruncatedNormal(mu, std_tensor)
+        out = self.policy(embedding)
+        if self.learned_std:
+            mu_raw, log_std_raw = out.split(self._action_dim, dim=-1)
+            std_tensor = log_std_raw.clamp(self._log_min_std, self._log_max_std).exp()
+            # SquashedNormal: sample = tanh(u), u ~ N(mu_raw, std).
+            # mu_raw is NOT tanh'd here — tanh is applied inside the distribution.
+            return SquashedNormal(mu_raw, std_tensor)
+        else:
+            mu = torch.tanh(out)
+            std_tensor = torch.ones_like(mu) * std
+            return TruncatedNormal(mu, std_tensor)
 
 
 class Discriminator(nn.Module):
@@ -920,6 +975,17 @@ class FBCprNetworkCfg:
     recon_hidden_dim: int = 256
     recon_hidden_layers: int = 2
 
+    # --- Soft FB ---------------------------------------------------------
+    soft_fb: bool = False
+    entropy_critic_hidden_dim: int = 1024
+    entropy_critic_hidden_layers: int = 3
+    entropy_critic_input_keys: tp.Sequence[str] = (
+        "state", "privileged_state", "last_action", "history_actor",
+    )
+    actor_learned_std: bool = False
+    actor_min_std: float = 0.01
+    actor_max_std: float = 0.25
+
 
 ##########################
 # Top-level policy
@@ -1001,7 +1067,11 @@ class FBCprAuxPolicy(nn.Module):
             input_keys=cfg.forward_input_keys,
         )
 
+        # Soft FB flag.
+        self.soft_fb: bool = bool(getattr(cfg, "soft_fb", False))
+
         # Actor.
+        _learned_std = self.soft_fb or bool(getattr(cfg, "actor_learned_std", False))
         self._actor = Actor(
             obs_space,
             z_dim=cfg.z_dim,
@@ -1011,6 +1081,9 @@ class FBCprAuxPolicy(nn.Module):
             hidden_layers=cfg.actor_hidden_layers,
             embedding_layers=cfg.actor_embedding_layers,
             input_keys=cfg.actor_input_keys,
+            learned_std=_learned_std,
+            min_std=float(getattr(cfg, "actor_min_std", 0.01)),
+            max_std=float(getattr(cfg, "actor_max_std", 1.0)),
         )
 
         # Discriminator.
@@ -1061,11 +1134,28 @@ class FBCprAuxPolicy(nn.Module):
             scale=cfg.aux_reward_normalizer_scale,
         )
 
+        # Entropy critic Q_H(s, a, z) → scalar. Built only for Soft FB.
+        self._entropy_critic: ForwardMap | None = None
+        if self.soft_fb:
+            self._entropy_critic = ForwardMap(
+                obs_space,
+                z_dim=cfg.z_dim,
+                action_dim=action_dim,
+                hidden_dim=cfg.entropy_critic_hidden_dim,
+                model="simple",
+                hidden_layers=cfg.entropy_critic_hidden_layers,
+                embedding_layers=2,
+                num_parallel=1,
+                input_keys=cfg.entropy_critic_input_keys,
+                output_dim=1,
+            )
+
         # Target networks are lazily built in `_prepare_for_train()`.
         self._target_backward_map: nn.Module | None = None
         self._target_forward_map: nn.Module | None = None
         self._target_critic: nn.Module | None = None
         self._target_aux_critic: nn.Module | None = None
+        self._target_entropy_critic: nn.Module | None = None
 
         # By default we keep the policy in eval mode with grads off (trainer flips these on).
         self.train(False)
@@ -1079,12 +1169,15 @@ class FBCprAuxPolicy(nn.Module):
         self._target_forward_map = copy.deepcopy(self._forward_map)
         self._target_critic = copy.deepcopy(self._critic)
         self._target_aux_critic = copy.deepcopy(self._aux_critic)
+        if self._entropy_critic is not None:
+            self._target_entropy_critic = copy.deepcopy(self._entropy_critic)
         # Targets are never optimized directly.
         for target in (
             self._target_backward_map,
             self._target_forward_map,
             self._target_critic,
             self._target_aux_critic,
+            self._target_entropy_critic,
         ):
             if target is not None:
                 target.requires_grad_(False)
@@ -1092,13 +1185,35 @@ class FBCprAuxPolicy(nn.Module):
     # ---- latent sampling / projection ----
 
     def sample_z(self, batch_size: int, device: str | torch.device = "cpu") -> torch.Tensor:
-        """Sample a batch of latent ``z``. Projected to the sphere of radius ``sqrt(z_dim)`` if ``norm_z``."""
+        """Sample a batch of latent ``z``.
+
+        Standard FB: project to sphere surface of radius ``sqrt(z_dim)``.
+        Soft FB: sample from the ball with uniform radius in ``[0, R]``
+        so every entropy level is explicitly covered.
+        """
         z = torch.randn((batch_size, self.z_dim), dtype=torch.float32, device=device)
-        return self.project_z(z)
+        z = F.normalize(z, dim=-1)
+        R = math.sqrt(self.z_dim)
+        if self.soft_fb:
+            r = R * torch.rand(batch_size, 1, dtype=torch.float32, device=device)
+            return z * r
+        if self.norm_z:
+            return z * R
+        return z
 
     def project_z(self, z: torch.Tensor) -> torch.Tensor:
+        """Project z.
+
+        Standard FB: project to sphere surface (radius R).
+        Soft FB: clamp norm to [0, R] (preserve direction and magnitude
+        within the ball).
+        """
+        R = math.sqrt(z.shape[-1])
+        if self.soft_fb:
+            norm = z.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+            return z * (norm.clamp(max=R) / norm)
         if self.norm_z:
-            return math.sqrt(z.shape[-1]) * F.normalize(z, dim=-1)
+            return R * F.normalize(z, dim=-1)
         return z
 
     # ---- normalization ----
@@ -1282,6 +1397,7 @@ __all__ = [
     "EMA",
     "Norm",
     "TruncatedNormal",
+    "SquashedNormal",
     "DenseParallel",
     "ParallelLayerNorm",
     "ResidualBlock",

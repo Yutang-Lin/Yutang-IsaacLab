@@ -28,6 +28,7 @@ outer runner drives the rollout → replay → update loop.
 from __future__ import annotations
 
 import contextlib
+import math
 from dataclasses import field
 from typing import Any, Callable, Dict, Optional, Tuple
 
@@ -215,6 +216,18 @@ class FBCprAuxAlgorithmCfg:
     #       "height_scan": ("height_scan",),
     #   }
     obs_key_groups: dict[str, tuple[str, ...]] = field(default_factory=dict)
+
+    # --- Soft FB (entropy-regularised variant) --------------------------------
+    # When True, sample z from a ball (not sphere), train an entropy critic
+    # Q_H, and add an entropy bonus ``beta_z * (log_pi - Q_H)`` to the actor
+    # loss. beta_z = soft_fb_entropy_coef * clamp(1 - ||z||/R, 0, 1) so
+    # policies near the sphere surface stay deterministic while interior z's
+    # are stochastic. Bitwise-equivalent to standard FB when False.
+    soft_fb: bool = False
+    soft_fb_entropy_coef: float = 1.0
+    soft_fb_expert_future_min: tuple[float, float] = (0.3, 0.7)
+    lr_entropy_critic: float = 3e-4
+    entropy_critic_target_tau: float = 0.005
 
 
 # --------------------------------------------------------------------------- #
@@ -412,8 +425,11 @@ class FBCprAux:
             self.policy._actor = DDP(self.policy._actor, **ddp_kwargs)
             self.policy._critic = DDP(self.policy._critic, **ddp_kwargs)
             self.policy._aux_critic = DDP(self.policy._aux_critic, **ddp_kwargs)
+            if self.policy._entropy_critic is not None:
+                self.policy._entropy_critic = DDP(self.policy._entropy_critic, **ddp_kwargs)
             self._is_ddp_wrapped = True
-            print(f"[FBCprAux] DDP-wrapped F/B/actor/critic/aux_critic "
+            _ec_str = "/entropy_critic" if self.policy._entropy_critic is not None else ""
+            print(f"[FBCprAux] DDP-wrapped F/B/actor/critic/aux_critic{_ec_str} "
                   f"(disc kept on manual async reduce)", flush=True)
 
         # --- torch.compile on the 5 trainable online networks ---------- #
@@ -444,6 +460,8 @@ class FBCprAux:
             self.policy._actor = torch.compile(self.policy._actor, **compile_kwargs)
             self.policy._critic = torch.compile(self.policy._critic, **compile_kwargs)
             self.policy._aux_critic = torch.compile(self.policy._aux_critic, **compile_kwargs)
+            if self.policy._entropy_critic is not None:
+                self.policy._entropy_critic = torch.compile(self.policy._entropy_critic, **compile_kwargs)
             # Disc uses autograd.grad(create_graph=True) for WGAN-GP, which
             # is known to hit graph breaks with torch.compile — leave it
             # eager. Target networks never need compile (no backward).
@@ -543,6 +561,15 @@ class FBCprAux:
             weight_decay=cfg.weight_decay_discriminator,
             **adam_kwargs,
         )
+        # Entropy critic (Soft FB only).
+        self.entropy_critic_optimizer: torch.optim.Optimizer | None = None
+        if p._entropy_critic is not None:
+            self.entropy_critic_optimizer = torch.optim.Adam(
+                p._entropy_critic.parameters(),
+                lr=cfg.lr_entropy_critic,
+                weight_decay=cfg.weight_decay,
+                **adam_kwargs,
+            )
 
         # Param lists for fast soft updates.
         self._forward_map_params = tuple(x.data for x in p._forward_map.parameters())
@@ -561,6 +588,14 @@ class FBCprAux:
         self._target_aux_critic_params = tuple(
             x.data for x in p._target_aux_critic.parameters()
         )
+        if p._entropy_critic is not None:
+            self._entropy_critic_params = tuple(x.data for x in p._entropy_critic.parameters())
+            self._target_entropy_critic_params = tuple(
+                x.data for x in p._target_entropy_critic.parameters()
+            )
+        else:
+            self._entropy_critic_params = ()
+            self._target_entropy_critic_params = ()
 
     @property
     def optimizer_dict(self) -> Dict[str, Any]:
@@ -571,6 +606,8 @@ class FBCprAux:
             "critic_optimizer": self.critic_optimizer.state_dict(),
             "aux_critic_optimizer": self.aux_critic_optimizer.state_dict(),
             "discriminator_optimizer": self.discriminator_optimizer.state_dict(),
+            **({"entropy_critic_optimizer": self.entropy_critic_optimizer.state_dict()}
+               if self.entropy_critic_optimizer is not None else {}),
         }
 
     # --- inference surface ------------------------------------------------- #
@@ -640,11 +677,16 @@ class FBCprAux:
         shuffled = self._permute_obs(train_goal, perm)
         goals = self.policy._backward_map(shuffled)
         goals = self.policy.project_z(goals)
+        if self.cfg.soft_fb:
+            goals = self._soft_fb_scale_z(goals, alpha=2.0, beta=2.0)
         z = torch.where(mix_idxs == 0, goals, z)
 
         # Expert-encoded z's
         perm = torch.randperm(batch, device=self.device)
-        z = torch.where(mix_idxs == 1, expert_encodings[perm], z)
+        expert_z = expert_encodings[perm]
+        if self.cfg.soft_fb:
+            expert_z = self._soft_fb_scale_z(expert_z, alpha=2.0, beta=2.0)
+        z = torch.where(mix_idxs == 1, expert_z, z)
         return z
 
     @staticmethod
@@ -667,10 +709,27 @@ class FBCprAux:
         )
         N = self.cfg.batch_size // seq_length
         B_expert = B_expert.view(N, seq_length, B_expert.shape[-1])
-        z_expert = B_expert.mean(dim=1)
-        z_expert = self.policy.project_z(z_expert)
-        # Repeat-interleave back to [batch, d] so every row in the batch has
-        # the sequence-level z for its parent sequence.
+
+        if self.cfg.soft_fb:
+            R = math.sqrt(B_expert.shape[-1])
+            fmin_lo, fmin_hi = self.cfg.soft_fb_expert_future_min
+            # Per-chunk randomized future_min.
+            per_chunk_fmin = fmin_lo + (fmin_hi - fmin_lo) * torch.rand(
+                N, device=B_expert.device,
+            )  # [N]
+            normed = R * F.normalize(B_expert, dim=-1)  # [N, seq, d]
+            if seq_length > 1:
+                t = torch.linspace(0.0, 1.0, seq_length, device=B_expert.device)  # [seq]
+                weights = 1.0 - t.unsqueeze(0) * (1.0 - per_chunk_fmin.unsqueeze(1))  # [N, seq]
+            else:
+                weights = torch.ones(N, 1, device=B_expert.device)
+            scaled = normed * weights.unsqueeze(-1)  # [N, seq, d]
+            z_expert = scaled.mean(dim=1)
+            z_expert = self._soft_fb_scale_z(z_expert, normalize_first=False)
+        else:
+            z_expert = B_expert.mean(dim=1)
+            z_expert = self.policy.project_z(z_expert)
+
         z_expert = torch.repeat_interleave(z_expert, seq_length, dim=0)
         return z_expert
 
@@ -752,20 +811,84 @@ class FBCprAux:
         batch_dim: int,
         traj_length: int,
     ) -> torch.Tensor:
-        """Sample contiguous expert sub-trajectories and encode via B, with the
-        BFM-Zero seq_length-window rolling mean."""
+        """Sample contiguous expert sub-trajectories and encode via B.
+
+        Standard FB: rolling mean of B(obs) over seq_length window, then
+        project to sphere.
+
+        Soft FB: each frame in the window gets a linearly decreasing norm
+        weight (1.0 → expert_future_min) before averaging — nearer frames
+        carry stronger (more deterministic) z, farther frames carry weaker
+        (more stochastic) z. The result is NOT re-normalized to sphere;
+        instead it's directly multiplied by a Beta(5,2) factor so the
+        overall ‖z‖ reflects both the future-decay and a per-traj entropy
+        sample.
+        """
         seq_length = self.policy.seq_length
         batch = expert_buffer.sample(batch_dim * traj_length, seq_length=traj_length)
         next_obs = batch["next"]["observation"]
         next_obs = self._to_device(next_obs)
-        # BFM calls self._model.backward_map() which normalizes obs first.
         next_obs = self.policy._normalize(next_obs)
         z = self.policy._backward_map(next_obs)
         z = z.view(batch_dim, traj_length, z.shape[-1])
-        for step in range(traj_length):
-            end_idx = min(step + seq_length, traj_length)
-            z[:, step] = z[:, step:end_idx].mean(dim=1)
-        return self.policy.project_z(z)
+
+        if self.cfg.soft_fb:
+            R = math.sqrt(z.shape[-1])
+            fmin_lo, fmin_hi = self.cfg.soft_fb_expert_future_min
+            # Per-trajectory randomized future_min in [fmin_lo, fmin_hi].
+            per_traj_fmin = fmin_lo + (fmin_hi - fmin_lo) * torch.rand(
+                batch_dim, device=z.device,
+            )  # [B]
+            for step in range(traj_length):
+                end_idx = min(step + seq_length, traj_length)
+                window = z[:, step:end_idx]                        # [B, W, d]
+                W = window.shape[1]
+                window_normed = R * F.normalize(window, dim=-1)
+                if W > 1:
+                    # Per-traj weights: linspace(1.0, fmin_i, W) for each traj i.
+                    t = torch.linspace(0.0, 1.0, W, device=z.device)  # [W]
+                    weights = 1.0 - t.unsqueeze(0) * (1.0 - per_traj_fmin.unsqueeze(1))  # [B, W]
+                else:
+                    weights = torch.ones(batch_dim, 1, device=z.device)
+                window_scaled = window_normed * weights.unsqueeze(-1)  # [B, W, d]
+                z[:, step] = window_scaled.mean(dim=1)
+            # Per-trajectory Beta scale (shared across time steps).
+            beta_dist = torch.distributions.Beta(
+                torch.tensor(5.0, device=z.device),
+                torch.tensor(2.0, device=z.device),
+            )
+            scale = beta_dist.sample((batch_dim, 1, 1))  # [B, 1, 1]
+            z = z * scale
+        else:
+            for step in range(traj_length):
+                end_idx = min(step + seq_length, traj_length)
+                z[:, step] = z[:, step:end_idx].mean(dim=1)
+            z = self.policy.project_z(z)
+        return z
+
+    def _soft_fb_scale_z(
+        self, z: torch.Tensor, alpha: float = 5.0, beta: float = 2.0,
+        normalize_first: bool = True,
+    ) -> torch.Tensor:
+        """Scale z by a Beta-sampled norm.
+
+        Args:
+            z: input z tensor [N, d].
+            alpha, beta: Beta distribution parameters.
+            normalize_first: if True, project to sphere (‖z‖=R) before
+                scaling. If False, multiply the existing z directly
+                (preserves the pre-existing norm structure).
+        """
+        if normalize_first:
+            R = math.sqrt(z.shape[-1])
+            z = R * F.normalize(z, dim=-1)
+        n = z.shape[0]
+        beta_dist = torch.distributions.Beta(
+            torch.tensor(alpha, device=z.device),
+            torch.tensor(beta, device=z.device),
+        )
+        scale = beta_dist.sample((n, 1))
+        return z * scale
 
     def _to_device(self, obs: torch.Tensor | dict[str, torch.Tensor]):
         if isinstance(obs, dict):
@@ -1117,6 +1240,17 @@ class FBCprAux:
         metrics.update(critic_metrics)
         metrics.update(critic_gn)
 
+        # Soft FB: entropy critic (between critic and actor).
+        if self.cfg.soft_fb:
+            ec_metrics = self.backward_entropy_critic(
+                obs=train_obs,
+                action=train_action,
+                discount=discount,
+                next_obs=train_next_obs,
+                z=train_z,
+            )
+            metrics.update(ec_metrics)
+
         # =============================================================
         # PHASE 3: actor. Depends on NEW critic / aux_critic / F for
         # its Q targets.
@@ -1152,6 +1286,12 @@ class FBCprAux:
                 self._target_aux_critic_params,
                 self.cfg.critic_target_tau,
             )
+            if self._entropy_critic_params:
+                _soft_update_params(
+                    self._entropy_critic_params,
+                    self._target_entropy_critic_params,
+                    self.cfg.entropy_critic_target_tau,
+                )
 
         # NOTE: running-stat sync across ranks is NOT done here. It happens
         # once per learn-iter in ``FBCprRunner`` (after all num_agent_updates
@@ -1524,6 +1664,47 @@ class FBCprAux:
         self.aux_critic_optimizer.step()
         return {"grad_norm/aux_critic": gn.detach()}
 
+    # --- Soft FB: entropy critic -------------------------------------------- #
+
+    def backward_entropy_critic(
+        self,
+        obs: torch.Tensor | dict[str, torch.Tensor],
+        action: torch.Tensor,
+        discount: torch.Tensor,
+        next_obs: torch.Tensor | dict[str, torch.Tensor],
+        z: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        """Train Q_H via soft TD: target = -log_pi(a'|s',z) + γ Q_H_target(s',a',z)."""
+        p = self.policy
+        if p._entropy_critic is None:
+            return {}
+
+        with torch.no_grad():
+            next_dist = p._actor(next_obs, z, p.actor_std)
+            next_action = next_dist.sample()
+            log_pi_next = next_dist.log_prob(next_action).sum(dim=-1).clamp(-100.0, 100.0)  # [B]
+            # _target_entropy_critic returns [1, B, 1] (num_parallel=1)
+            target_qh_raw = p._target_entropy_critic(
+                next_obs, z, next_action,
+            ).squeeze(0).squeeze(-1)  # [B]
+            target_qh = -log_pi_next + discount * target_qh_raw
+
+        # [1, B, 1] → [B]
+        qh_pred = p._entropy_critic(obs, z, action).squeeze(0).squeeze(-1)
+        loss = F.mse_loss(qh_pred, target_qh)
+
+        self.entropy_critic_optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(p._entropy_critic.parameters(), float("inf"))
+        self.entropy_critic_optimizer.step()
+        return {
+            "entropy_critic_loss": loss.detach(),
+            "entropy_critic_q_mean": qh_pred.mean().detach(),
+            "entropy_critic_target_mean": target_qh.mean().detach(),
+        }
+
+    # --- actor --------------------------------------------------------------- #
+
     def backward_actor(
         self,
         obs: torch.Tensor | dict[str, torch.Tensor],
@@ -1575,11 +1756,49 @@ class FBCprAux:
         _, _, Q_fb = self._pessimistic_value(Qs_fb, self.cfg.actor_pessimism_penalty)
 
         weight = Q_fb.abs().mean().detach() if self.cfg.scale_reg else 1.0
-        actor_loss = (
-            -Q_discriminator.mean() * self.cfg.reg_coeff * weight
-            - Q_aux.mean() * self.cfg.reg_coeff_aux * weight
-            - Q_fb.mean()
-        )
+
+        if self.cfg.soft_fb and p._entropy_critic is not None:
+            # Soft FB actor loss:
+            #   beta_z * (log_pi - Q_H) - Q_fb - reg*Q_disc - reg_aux*Q_aux
+            R = math.sqrt(p.z_dim)
+            z_norms = z.norm(dim=-1)
+            beta_z = self.cfg.soft_fb_entropy_coef * (
+                1.0 - z_norms / R
+            ).clamp(min=0.0)
+            log_pi = dist.log_prob(sampled_action).sum(dim=-1).clamp(-100.0, 100.0)  # [B]
+            Q_H = p._entropy_critic(obs, z, sampled_action).squeeze(0).squeeze(-1).detach()  # [B]
+            soft_core = (beta_z * (log_pi - Q_H)).mean()
+            actor_loss = (
+                soft_core
+                - Q_fb.mean()
+                - Q_discriminator.mean() * self.cfg.reg_coeff * weight
+                - Q_aux.mean() * self.cfg.reg_coeff_aux * weight
+            )
+            # Stash for logging (detached).
+            self._soft_fb_actor_logs = {
+                "z_norm_mean": z_norms.mean().detach(),
+                "z_norm_std": z_norms.std().detach(),
+                "z_norm_min": z_norms.min().detach(),
+                "z_norm_max": z_norms.max().detach(),
+                "beta_z_mean": beta_z.mean().detach(),
+                "beta_z_std": beta_z.std().detach(),
+                "policy_entropy_mean": -log_pi.mean().detach(),
+                "log_pi_mean": log_pi.mean().detach(),
+                "q_fb_mean": Q_fb.mean().detach(),
+                "q_h_mean": Q_H.mean().detach(),
+                "soft_actor_core_loss": soft_core.detach(),
+            }
+            if hasattr(p._actor, 'learned_std') and p._actor.learned_std:
+                log_std = dist.scale.log()
+                self._soft_fb_actor_logs["actor_log_std_mean"] = log_std.mean().detach()
+                self._soft_fb_actor_logs["actor_log_std_min"] = log_std.min().detach()
+                self._soft_fb_actor_logs["actor_log_std_max"] = log_std.max().detach()
+        else:
+            actor_loss = (
+                -Q_discriminator.mean() * self.cfg.reg_coeff * weight
+                - Q_aux.mean() * self.cfg.reg_coeff_aux * weight
+                - Q_fb.mean()
+            )
 
         self.actor_optimizer.zero_grad(set_to_none=True)
         actor_loss.backward()
@@ -1594,6 +1813,9 @@ class FBCprAux:
                 "Q_fb": Q_fb.mean(),
             }
             out.update(act_stats)
+            if hasattr(self, "_soft_fb_actor_logs"):
+                out.update(self._soft_fb_actor_logs)
+                del self._soft_fb_actor_logs
         return out, handle
 
     def step_actor(

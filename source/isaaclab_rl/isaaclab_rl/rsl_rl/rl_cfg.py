@@ -1216,6 +1216,17 @@ class RslRlFBCprPolicyCfg:
     recon_hidden_dim: int = 256
     recon_hidden_layers: int = 2
 
+    # Soft FB
+    soft_fb: bool = False
+    entropy_critic_hidden_dim: int = 1024
+    entropy_critic_hidden_layers: int = 3
+    entropy_critic_input_keys: tuple[str, ...] = (
+        "state", "privileged_state", "last_action", "history_actor",
+    )
+    actor_learned_std: bool = False
+    actor_min_std: float = 0.01
+    actor_max_std: float = 0.25
+
 
 @configclass
 class RslRlFBCprAlgorithmCfg:
@@ -1344,6 +1355,13 @@ class RslRlFBCprAlgorithmCfg:
     # into new agent-input dict keys. Leave empty to use the flat-floor
     # BFM-Zero default.
     obs_key_groups: dict[str, tuple[str, ...]] = dict()
+
+    # Soft FB
+    soft_fb: bool = False
+    soft_fb_entropy_coef: float = 1.0
+    soft_fb_expert_future_min: tuple[float, float] = (0.3, 0.7)
+    lr_entropy_critic: float = 3e-4
+    entropy_critic_target_tau: float = 0.005
 
     # Replay / seed
     replay_capacity: int = 5_120_000
