@@ -1682,7 +1682,7 @@ class FBCprAux:
         with torch.no_grad():
             next_dist = p._actor(next_obs, z, p.actor_std)
             next_action = next_dist.sample()
-            log_pi_next = next_dist.log_prob(next_action).sum(dim=-1).clamp(-100.0, 100.0)  # [B]
+            log_pi_next = next_dist.log_prob(next_action).mean(dim=-1)  # [B] per-dim avg
             # _target_entropy_critic returns [1, B, 1] (num_parallel=1)
             target_qh_raw = p._target_entropy_critic(
                 next_obs, z, next_action,
@@ -1765,7 +1765,7 @@ class FBCprAux:
             beta_z = self.cfg.soft_fb_entropy_coef * (
                 1.0 - z_norms / R
             ).clamp(min=0.0)
-            log_pi = dist.log_prob(sampled_action).sum(dim=-1).clamp(-100.0, 100.0)  # [B]
+            log_pi = dist.log_prob(sampled_action).mean(dim=-1)  # [B] per-dim avg
             Q_H = p._entropy_critic(obs, z, sampled_action).squeeze(0).squeeze(-1).detach()  # [B]
             soft_core = (beta_z * (log_pi - Q_H)).mean()
             actor_loss = (

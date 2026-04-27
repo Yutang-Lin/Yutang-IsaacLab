@@ -753,6 +753,25 @@ class Actor(nn.Module):
         self.policy = nn.Sequential(*seq)
         self._action_dim = action_dim
 
+        # For SquashedNormal (learned_std), scale down the last layer so
+        # mu_raw starts near zero (tanh(0) = 0, well inside [-1,1]) and
+        # log_std_raw starts near the midpoint of the clamped range.
+        # Without this, orthogonal init produces |mu_raw| ~ 1-3 at init,
+        # pushing tanh to saturation and making log_prob ≈ -∞.
+        if learned_std:
+            last_module = seq[-1]
+            with torch.no_grad():
+                if isinstance(last_module, Block):
+                    # Block.mlp = Sequential(LayerNorm, Linear [, Mish])
+                    lin = last_module.mlp[1]
+                    lin.weight.data.mul_(0.01)
+                    if hasattr(lin, "bias") and lin.bias is not None:
+                        lin.bias.data.zero_()
+                elif isinstance(last_module, (nn.Linear, DenseParallel)):
+                    last_module.weight.data.mul_(0.01)
+                    if hasattr(last_module, "bias") and last_module.bias is not None:
+                        last_module.bias.data.zero_()
+
     def forward(
         self,
         obs: torch.Tensor | dict[str, torch.Tensor],
