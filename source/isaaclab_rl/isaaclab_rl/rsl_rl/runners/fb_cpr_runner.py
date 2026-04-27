@@ -1106,6 +1106,14 @@ class FBCprRunner:
             "Q_aux",
             "mean_disc_reward",
             "mean_aux_reward",
+            # Soft FB
+            "log_pi_mean",
+            "beta_z_mean",
+            "entropy_critic_loss",
+            "soft_actor_core_loss",
+            "q_h_mean",
+            "actor_log_std_mean",
+            # Eval
             "Eval/mpjpe_mm",
             "Eval/tracking_success",
         )

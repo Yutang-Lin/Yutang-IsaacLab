@@ -259,17 +259,18 @@ class TruncatedNormal(pyd.Normal):
 class SquashedNormal:
     """Gaussian squashed through tanh with correct log_prob (SAC-style).
 
-    ``sample()`` returns ``tanh(u)`` where ``u ~ N(mu, std)``.
-    ``log_prob()`` accounts for the tanh Jacobian:
-        ``log π(a) = log N(u | mu, std) - Σ log(1 - tanh²(u) + eps)``
+    ``sample()`` returns ``tanh(u)`` where ``u ~ N(mu, std)`` and caches
+    ``u`` so ``log_prob()`` can use the pre-tanh value directly, avoiding
+    the numerically unstable ``atanh(tanh(u))`` round-trip that breaks
+    when ``tanh(u)`` saturates to ±1 in float32.
     """
 
     def __init__(self, loc: torch.Tensor, scale: torch.Tensor, eps: float = 1e-6) -> None:
         self._normal = pyd.Normal(loc, scale, validate_args=False)
         self.eps = eps
-        # Expose .loc / .scale / .mean for compatibility with TruncatedNormal callers.
         self.loc = loc
         self.scale = scale
+        self._cached_u: torch.Tensor | None = None
 
     @property
     def mean(self) -> torch.Tensor:
@@ -279,19 +280,22 @@ class SquashedNormal:
         u = self._normal.rsample(sample_shape)
         if clip is not None:
             u = self.loc + (u - self.loc).clamp(-clip, clip)
+        self._cached_u = u
         return torch.tanh(u)
 
     def rsample(self, sample_shape: torch.Size = torch.Size()) -> torch.Tensor:
         u = self._normal.rsample(sample_shape)
+        self._cached_u = u
         return torch.tanh(u)
 
     def log_prob(self, action: torch.Tensor) -> torch.Tensor:
-        # Inverse tanh: u = atanh(action), clamped for numerical stability.
-        action_c = action.clamp(-1.0 + self.eps, 1.0 - self.eps)
-        u = torch.atanh(action_c)
+        if self._cached_u is not None and action.shape == self._cached_u.shape:
+            u = self._cached_u
+        else:
+            action_c = action.clamp(-1.0 + self.eps, 1.0 - self.eps)
+            u = torch.atanh(action_c)
         log_p = self._normal.log_prob(u)
-        # Jacobian correction: -log(1 - tanh²(u)) = -log(1 - action²)
-        log_p = log_p - torch.log(1.0 - action_c.pow(2) + self.eps)
+        log_p = log_p - torch.log(1.0 - torch.tanh(u).pow(2) + self.eps)
         return log_p
 
 
