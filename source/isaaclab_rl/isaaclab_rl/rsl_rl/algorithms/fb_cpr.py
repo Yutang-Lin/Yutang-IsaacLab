@@ -1767,14 +1767,15 @@ class FBCprAux:
             ).clamp(min=0.0)
             log_pi = dist.log_prob(sampled_action).mean(dim=-1)  # [B] per-dim avg
             Q_H = p._entropy_critic(obs, z, sampled_action).squeeze(0).squeeze(-1).detach()  # [B]
-            soft_core = (beta_z * (log_pi - Q_H)).mean() * weight
+            soft_core_unweighted = (beta_z * (log_pi - Q_H)).mean()
+            soft_core = soft_core_unweighted * weight
             actor_loss = (
                 soft_core
                 - Q_fb.mean()
                 - Q_discriminator.mean() * self.cfg.reg_coeff * weight
                 - Q_aux.mean() * self.cfg.reg_coeff_aux * weight
             )
-            # Stash for logging (detached).
+            # Stash for logging (detached) — raw values, not weighted.
             self._soft_fb_actor_logs = {
                 "z_norm_mean": z_norms.mean().detach(),
                 "z_norm_std": z_norms.std().detach(),
@@ -1786,7 +1787,7 @@ class FBCprAux:
                 "log_pi_mean": log_pi.mean().detach(),
                 "q_fb_mean": Q_fb.mean().detach(),
                 "q_h_mean": Q_H.mean().detach(),
-                "soft_actor_core_loss": soft_core.detach(),
+                "soft_actor_core_loss": soft_core_unweighted.detach(),
             }
             if hasattr(p._actor, 'learned_std') and p._actor.learned_std:
                 log_std = dist.scale.log()
