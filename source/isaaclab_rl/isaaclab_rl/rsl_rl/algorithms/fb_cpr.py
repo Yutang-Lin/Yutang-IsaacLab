@@ -1767,7 +1767,7 @@ class FBCprAux:
             ).clamp(min=0.0)
             log_pi = dist.log_prob(sampled_action).mean(dim=-1)  # [B] per-dim avg
             Q_H = p._entropy_critic(obs, z, sampled_action).squeeze(0).squeeze(-1).detach()  # [B]
-            soft_core = (beta_z * (log_pi - Q_H)).mean()
+            soft_core = (beta_z * (log_pi - Q_H)).mean() * weight
             actor_loss = (
                 soft_core
                 - Q_fb.mean()
