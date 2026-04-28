@@ -1795,7 +1795,7 @@ class FBCprAux:
             target_qh_raw = p._target_entropy_critic(
                 next_obs, z, next_action,
             ).squeeze(0).squeeze(-1)  # [B]
-            target_qh = -log_pi_next + discount * target_qh_raw
+            target_qh = -log_pi_next + discount.view(-1) * target_qh_raw
 
         # [1, B, 1] → [B]
         qh_pred = p._entropy_critic(obs, z, action).squeeze(0).squeeze(-1)
