@@ -539,6 +539,15 @@ class FBCprRunner:
                     else:
                         actions = self.policy.act(obs_dict, z_context, mean=False)
 
+                    # Push tracking reference positions to env for debug viz.
+                    env_u = self.env.unwrapped
+                    if hasattr(env_u, "set_ref_motion_keypoints"):
+                        ref_pos = self.alg.get_tracking_ref_root_pos(
+                            step_count, self.expert_buffer,
+                        )
+                        if ref_pos is not None:
+                            env_u.set_ref_motion_keypoints(ref_pos.unsqueeze(1))
+
                     new_obs, rewards, dones, infos = self.env.step(actions.to(self.env.device))
                     new_obs = self._obs_to_device(new_obs, infos)
                     rewards = rewards.to(self.device)
