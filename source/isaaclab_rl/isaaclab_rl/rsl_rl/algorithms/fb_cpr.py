@@ -1832,13 +1832,7 @@ class FBCprAux:
             loc = dist.loc
             act_stats = {
                 "act_loc/abs_mean": loc.abs().mean().detach(),
-                "act_loc/abs_p95": loc.abs().float().quantile(0.95).detach(),
                 "act_loc/frac_gt_0_9": (loc.abs() > 0.9).float().mean().detach(),
-                "act_loc/frac_gt_0_99": (loc.abs() > 0.99).float().mean().detach(),
-                "act_sample/abs_mean": sampled_action.abs().mean().detach(),
-                "act_sample/frac_clamped": (
-                    sampled_action.abs() >= (1.0 - 2.0 * dist.eps)
-                ).float().mean().detach(),
             }
 
         # Q from discriminator-reward critic. If the critic is distributional
@@ -1863,14 +1857,13 @@ class FBCprAux:
         Qs_fb = (Fs * z).sum(dim=-1)
         _, _, Q_fb = self._pessimistic_value(Qs_fb, self.cfg.actor_pessimism_penalty)
 
-        if self.cfg.soft_fb and self.cfg.scale_reg:
-            # Normalize weight to sphere-surface scale so disc/aux
-            # regularization doesn't weaken for ball-interior z's.
-            # Clamp z_norm to at least 0.1*R to prevent explosion for
-            # near-zero z's.
+        if self.cfg.soft_fb:
             R = math.sqrt(p.z_dim)
-            z_norm = z.norm(dim=-1).clamp(min=0.1 * R)
-            Q_fb_normalized = Q_fb * (R / z_norm)
+            z_norms = z.norm(dim=-1)
+
+        if self.cfg.soft_fb and self.cfg.scale_reg:
+            z_norm_clamped = z_norms.clamp(min=0.1 * R)
+            Q_fb_normalized = Q_fb * (R / z_norm_clamped)
             weight = Q_fb_normalized.abs().mean().detach()
         elif self.cfg.scale_reg:
             weight = Q_fb.abs().mean().detach()
@@ -1878,14 +1871,13 @@ class FBCprAux:
             weight = 1.0
 
         if self.cfg.soft_fb and p._entropy_critic is not None:
-            # Soft FB actor loss:
-            #   beta_z * (log_pi - Q_H) - Q_fb - reg*Q_disc - reg_aux*Q_aux
-            R = math.sqrt(p.z_dim)
-            z_norms = z.norm(dim=-1)
             beta_z = self.cfg.soft_fb_entropy_coef * (
                 1.0 - z_norms / R
             ).clamp(min=0.0)
             log_pi = dist.log_prob(sampled_action).mean(dim=-1)  # [B] per-dim avg
+            # Reuse Q_H from the entropy critic — no extra forward pass.
+            # The entropy critic was just updated in backward_entropy_critic
+            # but detach() ensures no gradient flows.
             Q_H = p._entropy_critic(obs, z, sampled_action).squeeze(0).squeeze(-1).detach()  # [B]
             soft_core_unweighted = (beta_z * (log_pi - Q_H)).mean()
             soft_core = soft_core_unweighted * weight
