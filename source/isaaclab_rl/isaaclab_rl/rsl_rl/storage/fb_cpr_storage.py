@@ -652,6 +652,10 @@ class FBCprExpertBuffer:
                     action_clip=self._minimal_action_clip,
                     resample_fps=self._minimal_resample_fps,
                     terrain_mesh=None,
+                    terrain_z_precomputed=(
+                        all_motions[name]["terrain_z"]
+                        if "terrain_z" in all_motions[name] else None
+                    ),
                 )
                 if m is None:
                     raise RuntimeError(
