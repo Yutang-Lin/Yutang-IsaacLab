@@ -312,6 +312,8 @@ class FBCprAux:
             cfg.lr_f = float(cfg.lr_f) * combined_mult
             cfg.lr_b = float(cfg.lr_b) * combined_mult
             cfg.lr_discriminator = float(cfg.lr_discriminator) * combined_mult
+            cfg.lr_entropy_critic = float(cfg.lr_entropy_critic) * combined_mult
+            cfg.lr_manifold_attractor = float(cfg.lr_manifold_attractor) * combined_mult
             print(
                 f"[FBCprAux] LR scaling: world_size={ws} (×{ws_mult:.3f})  "
                 f"batch_size={cfg.batch_size}/{REF_BATCH_SIZE} (×{bs_mult:.3f})  "
