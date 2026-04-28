@@ -1755,7 +1755,19 @@ class FBCprAux:
         Qs_fb = (Fs * z).sum(dim=-1)
         _, _, Q_fb = self._pessimistic_value(Qs_fb, self.cfg.actor_pessimism_penalty)
 
-        weight = Q_fb.abs().mean().detach() if self.cfg.scale_reg else 1.0
+        if self.cfg.soft_fb and self.cfg.scale_reg:
+            # Normalize weight to sphere-surface scale so disc/aux
+            # regularization doesn't weaken for ball-interior z's.
+            # Clamp z_norm to at least 0.1*R to prevent explosion for
+            # near-zero z's.
+            R = math.sqrt(p.z_dim)
+            z_norm = z.norm(dim=-1).clamp(min=0.1 * R)
+            Q_fb_normalized = Q_fb * (R / z_norm)
+            weight = Q_fb_normalized.abs().mean().detach()
+        elif self.cfg.scale_reg:
+            weight = Q_fb.abs().mean().detach()
+        else:
+            weight = 1.0
 
         if self.cfg.soft_fb and p._entropy_critic is not None:
             # Soft FB actor loss:
