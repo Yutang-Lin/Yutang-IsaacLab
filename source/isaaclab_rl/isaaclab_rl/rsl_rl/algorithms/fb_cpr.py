@@ -1875,9 +1875,9 @@ class FBCprAux:
                 1.0 - z_norms / R
             ).clamp(min=0.0)
             log_pi = dist.log_prob(sampled_action).mean(dim=-1)  # [B] per-dim avg
-            # Reuse Q_H from the entropy critic — no extra forward pass.
-            # The entropy critic was just updated in backward_entropy_critic
-            # but detach() ensures no gradient flows.
+            # Q_H evaluated on the actor's sampled_action (different from
+            # the replay action used in backward_entropy_critic). Detached
+            # so no gradient flows through the entropy critic.
             Q_H = p._entropy_critic(obs, z, sampled_action).squeeze(0).squeeze(-1).detach()  # [B]
             soft_core_unweighted = (beta_z * (log_pi - Q_H)).mean()
             soft_core = soft_core_unweighted * weight
