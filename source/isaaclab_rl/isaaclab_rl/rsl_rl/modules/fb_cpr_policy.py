@@ -857,6 +857,61 @@ class Discriminator(nn.Module):
         return s.log() - (1 - s).log()
 
 
+class ManifoldAttractor(nn.Module):
+    """Unconditional discriminator D(s_t, s_{t+1}) — no z conditioning.
+
+    Classifies (current_obs, next_obs) transitions as expert vs policy,
+    constraining the policy to stay on the expert motion manifold.
+    """
+
+    def __init__(
+        self,
+        obs_space: gymnasium.spaces.Space,
+        hidden_dim: int = 1024,
+        hidden_layers: int = 3,
+        input_keys: str | tp.Sequence[str] | None = None,
+    ) -> None:
+        super().__init__()
+        self.input_filter = build_input_filter(obs_space, input_keys)
+        filtered_space = self.input_filter.output_space
+        assert isinstance(filtered_space, gymnasium.spaces.Box)
+        obs_dim = filtered_space.shape[0]
+        # Input: concat(obs_t, obs_{t+1}) = 2 * obs_dim
+        seq: list[nn.Module] = [
+            nn.Linear(obs_dim * 2, hidden_dim), nn.LayerNorm(hidden_dim), nn.Tanh(),
+        ]
+        for _ in range(hidden_layers - 1):
+            seq += [nn.Linear(hidden_dim, hidden_dim), nn.ReLU()]
+        seq += [nn.Linear(hidden_dim, 1)]
+        self.trunk = nn.Sequential(*seq)
+
+    def compute_logits(
+        self,
+        obs: torch.Tensor | dict[str, torch.Tensor],
+        next_obs: torch.Tensor | dict[str, torch.Tensor],
+    ) -> torch.Tensor:
+        o = self.input_filter(obs)
+        no = self.input_filter(next_obs)
+        return self.trunk(torch.cat([o, no], dim=-1))
+
+    def forward(
+        self,
+        obs: torch.Tensor | dict[str, torch.Tensor],
+        next_obs: torch.Tensor | dict[str, torch.Tensor],
+    ) -> torch.Tensor:
+        return torch.sigmoid(self.compute_logits(obs, next_obs))
+
+    def compute_reward(
+        self,
+        obs: torch.Tensor | dict[str, torch.Tensor],
+        next_obs: torch.Tensor | dict[str, torch.Tensor],
+        eps: float = 1e-7,
+    ) -> torch.Tensor:
+        s = self.forward(obs, next_obs)
+        s = torch.clamp(s, eps, 1 - eps)
+        return s.log() - (1 - s).log()
+
+
 ##########################
 # Configs
 ##########################
@@ -997,6 +1052,12 @@ class FBCprNetworkCfg:
     recon_targets: tp.Sequence[tuple[str, int, int]] = ()
     recon_hidden_dim: int = 256
     recon_hidden_layers: int = 2
+
+    # --- Manifold attractor ----------------------------------------------
+    manifold_attractor: bool = False
+    manifold_attractor_hidden_dim: int = 1024
+    manifold_attractor_hidden_layers: int = 3
+    manifold_attractor_input_keys: tp.Sequence[str] = ("state", "privileged_state")
 
     # --- Soft FB ---------------------------------------------------------
     soft_fb: bool = False
@@ -1156,6 +1217,16 @@ class FBCprAuxPolicy(nn.Module):
             translate=cfg.aux_reward_normalizer_translate,
             scale=cfg.aux_reward_normalizer_scale,
         )
+
+        # Manifold attractor D_ma(s_t, s_{t+1}) — unconditional disc.
+        self._manifold_attractor: ManifoldAttractor | None = None
+        if getattr(cfg, "manifold_attractor", False):
+            self._manifold_attractor = ManifoldAttractor(
+                obs_space,
+                hidden_dim=cfg.manifold_attractor_hidden_dim,
+                hidden_layers=cfg.manifold_attractor_hidden_layers,
+                input_keys=cfg.manifold_attractor_input_keys,
+            )
 
         # Entropy critic Q_H(s, a, z) → scalar. Built only for Soft FB.
         self._entropy_critic: ForwardMap | None = None

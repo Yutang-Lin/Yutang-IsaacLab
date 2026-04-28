@@ -217,6 +217,17 @@ class FBCprAuxAlgorithmCfg:
     #   }
     obs_key_groups: dict[str, tuple[str, ...]] = field(default_factory=dict)
 
+    # --- Manifold attractor (unconditional discriminator) ---------------------
+    # When True, adds a second discriminator D_ma(s_t, s_{t+1}) that
+    # classifies transitions WITHOUT z conditioning. This constrains the
+    # policy to stay on the expert motion manifold regardless of z.
+    # The D_ma reward is added to the critic target alongside the existing
+    # z-conditioned discriminator reward.
+    manifold_attractor: bool = False
+    manifold_attractor_coeff: float = 0.05  # weight in actor loss (same role as reg_coeff)
+    lr_manifold_attractor: float = 1e-5
+    grad_penalty_manifold_attractor: float = 10.0
+
     # --- Soft FB (entropy-regularised variant) --------------------------------
     # When True, sample z from a ball (not sphere), train an entropy critic
     # Q_H, and add an entropy bonus ``beta_z * (log_pi - Q_H)`` to the actor
@@ -561,6 +572,16 @@ class FBCprAux:
             weight_decay=cfg.weight_decay_discriminator,
             **adam_kwargs,
         )
+        # Manifold attractor (unconditional disc).
+        self.manifold_attractor_optimizer: torch.optim.Optimizer | None = None
+        if p._manifold_attractor is not None:
+            self.manifold_attractor_optimizer = torch.optim.Adam(
+                p._manifold_attractor.parameters(),
+                lr=cfg.lr_manifold_attractor,
+                weight_decay=cfg.weight_decay_discriminator,
+                **adam_kwargs,
+            )
+
         # Entropy critic (Soft FB only).
         self.entropy_critic_optimizer: torch.optim.Optimizer | None = None
         if p._entropy_critic is not None:
@@ -608,6 +629,8 @@ class FBCprAux:
             "discriminator_optimizer": self.discriminator_optimizer.state_dict(),
             **({"entropy_critic_optimizer": self.entropy_critic_optimizer.state_dict()}
                if self.entropy_critic_optimizer is not None else {}),
+            **({"manifold_attractor_optimizer": self.manifold_attractor_optimizer.state_dict()}
+               if self.manifold_attractor_optimizer is not None else {}),
         }
 
     # --- inference surface ------------------------------------------------- #
@@ -1137,6 +1160,16 @@ class FBCprAux:
                     if self.cfg.grad_penalty_discriminator > 0
                     else None,
                 )
+            # Manifold attractor — trained alongside disc in phase 1.
+            if self.cfg.manifold_attractor:
+                ma_metrics = self.backward_manifold_attractor(
+                    expert_obs=expert_obs,
+                    expert_next_obs=train_next_obs,  # expert next obs from replay
+                    train_obs=train_obs,
+                    train_next_obs=train_next_obs,
+                )
+                disc_metrics.update(ma_metrics)
+
             # DDP bucket hooks on F, B, aux_critic fire async allreduce
             # during backward; they return None handles and are waited
             # on internally by DDP. Merge mode is in no_sync(), so
@@ -1351,6 +1384,65 @@ class FBCprAux:
                 out["disc_wgan_gp_loss"] = wgan_gp.detach()
         return out, handle
 
+    # --- Manifold attractor ------------------------------------------------- #
+
+    def backward_manifold_attractor(
+        self,
+        expert_obs: torch.Tensor | dict[str, torch.Tensor],
+        expert_next_obs: torch.Tensor | dict[str, torch.Tensor],
+        train_obs: torch.Tensor | dict[str, torch.Tensor],
+        train_next_obs: torch.Tensor | dict[str, torch.Tensor],
+    ) -> Dict[str, torch.Tensor]:
+        """Train D_ma(s_t, s_{t+1}) — unconditional transition discriminator."""
+        p = self.policy
+        if p._manifold_attractor is None:
+            return {}
+        ma = p._manifold_attractor
+        expert_logits = ma.compute_logits(expert_obs, expert_next_obs)
+        train_logits = ma.compute_logits(train_obs, train_next_obs)
+        expert_loss = -F.logsigmoid(expert_logits)
+        train_loss = F.softplus(train_logits)
+        loss = torch.mean(expert_loss + train_loss)
+
+        if self.cfg.grad_penalty_manifold_attractor > 0:
+            gp = self._gradient_penalty_manifold_attractor(
+                expert_obs, expert_next_obs, train_obs, train_next_obs,
+            )
+            loss = loss + self.cfg.grad_penalty_manifold_attractor * gp
+
+        self.manifold_attractor_optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(ma.parameters(), float("inf"))
+        self.manifold_attractor_optimizer.step()
+        return {
+            "ma_loss": loss.detach(),
+            "ma_expert_loss": expert_loss.mean().detach(),
+            "ma_train_loss": train_loss.mean().detach(),
+        }
+
+    def _gradient_penalty_manifold_attractor(
+        self,
+        real_obs, real_next_obs, fake_obs, fake_next_obs,
+    ) -> torch.Tensor:
+        """WGAN-GP on manifold attractor."""
+        ma = self.policy._manifold_attractor
+        obs_filter = ma.input_filter
+        real_o = obs_filter(real_obs)
+        real_no = obs_filter(real_next_obs)
+        fake_o = obs_filter(fake_obs)
+        fake_no = obs_filter(fake_next_obs)
+        alpha = torch.rand(real_o.shape[0], 1, device=real_o.device)
+        interp_o = (alpha * real_o + (1 - alpha) * fake_o).requires_grad_(True)
+        interp_no = (alpha * real_no + (1 - alpha) * fake_no).requires_grad_(True)
+        cat_interp = torch.cat([interp_o, interp_no], dim=-1)
+        d_interp = ma.trunk(cat_interp)
+        grad = autograd.grad(
+            d_interp, cat_interp,
+            grad_outputs=torch.ones_like(d_interp),
+            create_graph=True, retain_graph=True,
+        )[0]
+        return ((grad.norm(2, dim=1) - 1) ** 2).mean()
+
     def step_discriminator(self, handle: Any) -> Dict[str, torch.Tensor]:
         finish_async_reduce(handle)
         # ``clip_grad_norm_(..., max_norm=inf)`` is a no-op clip that
@@ -1533,8 +1625,13 @@ class FBCprAux:
         pol_cfg = self._unwrap(p).cfg
         distributional = bool(getattr(pol_cfg, "critic_distributional", False))
         num_parallel = self._unwrap(p._critic).num_parallel
+        _ma_reward = None
         with torch.no_grad():
             reward = p._discriminator.compute_reward(obs, z)
+            # Manifold attractor: add unconditional transition reward.
+            if self.cfg.manifold_attractor and p._manifold_attractor is not None:
+                _ma_reward = p._manifold_attractor.compute_reward(obs, next_obs)
+                reward = reward + self.cfg.manifold_attractor_coeff * _ma_reward
             dist = p._actor(next_obs, z, p.actor_std)
             next_action = dist.sample(clip=self.cfg.stddev_clip)
             next_Qs = p._target_critic(next_obs, z, next_action)
@@ -1582,6 +1679,7 @@ class FBCprAux:
                 "unc_Q": Q_unc.mean(),
                 "critic_loss": critic_loss.mean(),
                 "mean_disc_reward": reward.mean(),
+                **({"mean_ma_reward": _ma_reward.mean()} if _ma_reward is not None else {}),
             }
             if distributional:
                 # Spread across the quantile axis — if it collapses to ~0

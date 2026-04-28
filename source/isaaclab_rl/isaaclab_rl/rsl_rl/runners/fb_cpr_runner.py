@@ -1107,6 +1107,8 @@ class FBCprRunner:
             "Q_aux",
             "mean_disc_reward",
             "mean_aux_reward",
+            # Manifold attractor
+            "ma_loss",
             # Soft FB
             "log_pi_mean",
             "beta_z_mean",

@@ -1216,6 +1216,12 @@ class RslRlFBCprPolicyCfg:
     recon_hidden_dim: int = 256
     recon_hidden_layers: int = 2
 
+    # Manifold attractor
+    manifold_attractor: bool = False
+    manifold_attractor_hidden_dim: int = 1024
+    manifold_attractor_hidden_layers: int = 3
+    manifold_attractor_input_keys: tuple[str, ...] = ("state", "privileged_state")
+
     # Soft FB
     soft_fb: bool = False
     entropy_critic_hidden_dim: int = 1024
@@ -1355,6 +1361,12 @@ class RslRlFBCprAlgorithmCfg:
     # into new agent-input dict keys. Leave empty to use the flat-floor
     # BFM-Zero default.
     obs_key_groups: dict[str, tuple[str, ...]] = dict()
+
+    # Manifold attractor
+    manifold_attractor: bool = False
+    manifold_attractor_coeff: float = 0.05
+    lr_manifold_attractor: float = 1e-5
+    grad_penalty_manifold_attractor: float = 10.0
 
     # Soft FB
     soft_fb: bool = False
