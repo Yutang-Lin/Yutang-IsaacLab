@@ -957,31 +957,36 @@ class FBCprExpertBuffer:
             )
         num_slices = batch_size // seq_length
 
-        # Eligibility: need at least seq_length + 1 frames per motion.
-        eligible_mask = self._lengths_t >= (seq_length + 1)
+        # Eligibility: need at least 50 frames (~1s at 50Hz). Short motions
+        # are circular-padded so they can be sampled for tracking trajectories
+        # even if shorter than seq_length.
+        MIN_FRAMES = 50
+        eligible_mask = self._lengths_t >= MIN_FRAMES
         if not bool(eligible_mask.any().item()):
-            raise RuntimeError(
-                f"No motion has at least {seq_length + 1} frames; lower seq_length."
-            )
+            raise RuntimeError(f"No motion has at least {MIN_FRAMES} frames.")
         eligible_idx = torch.nonzero(eligible_mask, as_tuple=False).squeeze(-1)
         eligible_priors = self._priorities[eligible_idx]
         eligible_priors = eligible_priors / eligible_priors.sum().clamp_min(1e-12)
         eligible_lengths = self._lengths_t[eligible_idx]
 
-        # Pick a motion per slice (weighted), then a frame start within it.
+        # Pick a motion per slice (weighted), then a random start.
         sel = torch.multinomial(eligible_priors, num_slices, replacement=True)
         motion_picks = eligible_idx[sel]                    # [num_slices]
         motion_lens = eligible_lengths[sel]                 # [num_slices]
-        # Legal starts: t in [0, T - seq_length - 1] inclusive.
+        # For motions longer than seq_length: start in [0, T-seq_length-1].
+        # For shorter motions: start at 0, frames will wrap via modulo.
         rand01 = torch.rand(num_slices, device=self.device)
         max_start = (motion_lens - seq_length - 1).clamp_min(0).to(torch.float32)
         starts = (rand01 * (max_start + 1.0)).floor().to(torch.long)
 
         # Build per-slice arange window and flatten.
         arange = torch.arange(seq_length, device=self.device).unsqueeze(0)     # [1, seq_length]
-        # frame_idx_cur[t, s] and frame_idx_nxt[t, s] -> flattened [B].
-        frame_cur = (starts.unsqueeze(1) + arange).reshape(-1)                  # [B]
-        frame_nxt = frame_cur + 1
+        raw_frame = starts.unsqueeze(1) + arange                                # [num_slices, seq_length]
+        # Circular wrap for short motions: frame % (T-1) keeps within
+        # valid obs range [0, T-2] (T-1 is next_obs of last transition).
+        usable_lens = (motion_lens - 1).clamp_min(1).unsqueeze(1)              # [num_slices, 1]
+        frame_cur = (raw_frame % usable_lens).reshape(-1)                       # [B]
+        frame_nxt = ((raw_frame + 1) % usable_lens).reshape(-1)                 # [B]
         motion_flat = motion_picks.unsqueeze(1).expand(-1, seq_length).reshape(-1)  # [B]
 
         # Fully-vectorized gather using the flat obs buffers (one big
