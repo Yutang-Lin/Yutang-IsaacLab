@@ -903,6 +903,64 @@ class FBCprExpertBuffer:
             "requires_terrain": self.frame_requires_terrain[frame],
         }
 
+    def sample_tracking_trajectories(
+        self, num_trajs: int, traj_length: int,
+    ) -> dict:
+        """Sample contiguous expert sub-trajectories for tracking.
+
+        Returns a dict with:
+            - "observation": dict of obs tensors [B, ...]  (B = num_trajs * traj_length)
+            - "next_observation": dict [B, ...]
+            - "motion_ids": [num_trajs] — which motion each trajectory is from
+            - "starts": [num_trajs] — start frame within each motion
+            - "motion_lens": [num_trajs] — usable length of each motion
+        """
+        MIN_FRAMES = 50
+        eligible_mask = self._lengths_t >= MIN_FRAMES
+        if not bool(eligible_mask.any().item()):
+            raise RuntimeError(f"No motion has at least {MIN_FRAMES} frames.")
+        eligible_idx = torch.nonzero(eligible_mask, as_tuple=False).squeeze(-1)
+        eligible_priors = self._priorities[eligible_idx]
+        eligible_priors = eligible_priors / eligible_priors.sum().clamp_min(1e-12)
+        eligible_lengths = self._lengths_t[eligible_idx]
+
+        sel = torch.multinomial(eligible_priors, num_trajs, replacement=True)
+        motion_picks = eligible_idx[sel]
+        motion_lens = eligible_lengths[sel]
+        rand01 = torch.rand(num_trajs, device=self.device)
+        max_start = (motion_lens - traj_length - 1).clamp_min(0).to(torch.float32)
+        starts = (rand01 * (max_start + 1.0)).floor().to(torch.long)
+
+        arange = torch.arange(traj_length, device=self.device).unsqueeze(0)
+        raw_frame = starts.unsqueeze(1) + arange
+        usable_lens = (motion_lens - 1).clamp_min(1).unsqueeze(1)
+        frame_cur = (raw_frame % usable_lens).reshape(-1)
+        frame_nxt = ((raw_frame + 1) % usable_lens).reshape(-1)
+        motion_flat = motion_picks.unsqueeze(1).expand(-1, traj_length).reshape(-1)
+
+        global_cur = self._motion_obs_starts[motion_flat] + frame_cur
+        global_nxt = self._motion_obs_starts[motion_flat] + frame_nxt
+
+        obs = {
+            "state": self._flat_state[global_cur],
+            "privileged_state": self._flat_priv[global_cur],
+            "last_action": self._flat_last_action[global_cur],
+            "history_actor": self._flat_history_actor[global_cur],
+        }
+        next_obs = {
+            "state": self._flat_state[global_nxt],
+            "privileged_state": self._flat_priv[global_nxt],
+            "last_action": self._flat_last_action[global_nxt],
+            "history_actor": self._flat_history_actor[global_nxt],
+        }
+        return {
+            "observation": obs,
+            "next_observation": next_obs,
+            "motion_ids": motion_picks,
+            "starts": starts,
+            "motion_lens": motion_lens,
+        }
+
     # -- priority updates (stub-ish; accepted by agent) --------------------
 
     def update_priorities(self, priorities: torch.Tensor, idxs: torch.Tensor | None = None) -> None:

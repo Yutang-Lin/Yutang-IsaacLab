@@ -830,6 +830,38 @@ class FBCprAux:
         return z
 
     @torch.no_grad()
+    def get_tracking_ref_root_pos(
+        self, step_count: torch.Tensor, expert_buffer: Any,
+    ) -> torch.Tensor | None:
+        """Return per-env reference root_pos [N, 3] for tracking envs.
+
+        Non-tracking envs get zeros. Efficiently looks up root_pos from
+        the expert buffer using stored motion_ids + frame offsets.
+        Returns None if no tracking is active.
+        """
+        if not hasattr(self, "_tracking_motion_ids") or self._tracking_motion_ids is None:
+            return None
+        if not hasattr(self, "_env_idx_with_expert_rollout") or self._env_idx_with_expert_rollout is None:
+            return None
+        N = step_count.shape[0]
+        ref = torch.zeros(N, 3, device=self.device)
+        traj_len = self.cfg.rollout_expert_trajectories_length
+        local_t = step_count[self._env_idx_with_expert_rollout] % traj_len
+        n_track = len(self._env_idx_with_expert_rollout)
+        # Look up root_pos from expert buffer's flat root_pos_buffer.
+        if expert_buffer.root_pos_buffer is not None:
+            motion_ids = self._tracking_motion_ids  # [n_track]
+            starts = self._tracking_starts           # [n_track]
+            motion_lens = self._tracking_motion_lens  # [n_track]
+            # Circular wrap for short motions.
+            usable = (motion_lens - 1).clamp_min(1)
+            frame = (starts + local_t.view(-1)) % usable
+            obs_starts = expert_buffer._motion_obs_starts[motion_ids]
+            global_idx = obs_starts + frame
+            ref[self._env_idx_with_expert_rollout] = expert_buffer.root_pos_buffer[global_idx]
+        return ref
+
+    @torch.no_grad()
     def _sample_tracking_z(
         self,
         expert_buffer: Any,
@@ -850,9 +882,13 @@ class FBCprAux:
         sample.
         """
         seq_length = self.policy.seq_length
-        batch = expert_buffer.sample(batch_dim * traj_length, seq_length=traj_length)
-        next_obs = batch["next"]["observation"]
+        batch = expert_buffer.sample_tracking_trajectories(batch_dim, traj_length)
+        next_obs = batch["next_observation"]
         next_obs = self._to_device(next_obs)
+        # Store motion info for reference visualization.
+        self._tracking_motion_ids = batch["motion_ids"]
+        self._tracking_starts = batch["starts"]
+        self._tracking_motion_lens = batch["motion_lens"]
         next_obs = self.policy._normalize(next_obs)
         z = self.policy._backward_map(next_obs)
         z = z.view(batch_dim, traj_length, z.shape[-1])
