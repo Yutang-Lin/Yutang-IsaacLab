@@ -13,6 +13,7 @@ history_actor}`` (and must forward per-step aux_rewards in ``extras["aux_rewards
 
 from __future__ import annotations
 
+import math
 import os
 import statistics
 import time
