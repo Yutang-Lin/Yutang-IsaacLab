@@ -1152,6 +1152,15 @@ class FBCprAux:
                         if self.cfg.grad_penalty_discriminator > 0
                         else None,
                     )
+                    # Manifold attractor on same stream as disc (no dependency).
+                    if self.cfg.manifold_attractor:
+                        ma_metrics = self.backward_manifold_attractor(
+                            expert_obs=expert_obs,
+                            expert_next_obs=train_next_obs,
+                            train_obs=train_obs,
+                            train_next_obs=train_next_obs,
+                        )
+                        disc_metrics.update(ma_metrics)
             else:
                 disc_metrics, disc_handle = self.backward_discriminator(
                     expert_obs=expert_obs,
@@ -1162,15 +1171,14 @@ class FBCprAux:
                     if self.cfg.grad_penalty_discriminator > 0
                     else None,
                 )
-            # Manifold attractor — trained alongside disc in phase 1.
-            if self.cfg.manifold_attractor:
-                ma_metrics = self.backward_manifold_attractor(
-                    expert_obs=expert_obs,
-                    expert_next_obs=train_next_obs,  # expert next obs from replay
-                    train_obs=train_obs,
-                    train_next_obs=train_next_obs,
-                )
-                disc_metrics.update(ma_metrics)
+                if self.cfg.manifold_attractor:
+                    ma_metrics = self.backward_manifold_attractor(
+                        expert_obs=expert_obs,
+                        expert_next_obs=train_next_obs,
+                        train_obs=train_obs,
+                        train_next_obs=train_next_obs,
+                    )
+                    disc_metrics.update(ma_metrics)
 
             # DDP bucket hooks on F, B, aux_critic fire async allreduce
             # during backward; they return None handles and are waited
@@ -1271,11 +1279,8 @@ class FBCprAux:
             next_obs=train_next_obs,
             z=train_z,
         )
-        critic_gn = self.step_critic(critic_handle)
-        metrics.update(critic_metrics)
-        metrics.update(critic_gn)
-
-        # Soft FB: entropy critic (between critic and actor).
+        # Entropy critic has no dependency on the just-updated critic
+        # (it uses target networks), so run it while critic grads reduce.
         if self.cfg.soft_fb:
             ec_metrics = self.backward_entropy_critic(
                 obs=train_obs,
@@ -1285,6 +1290,9 @@ class FBCprAux:
                 z=train_z,
             )
             metrics.update(ec_metrics)
+        critic_gn = self.step_critic(critic_handle)
+        metrics.update(critic_metrics)
+        metrics.update(critic_gn)
 
         # =============================================================
         # PHASE 3: actor. Depends on NEW critic / aux_critic / F for
