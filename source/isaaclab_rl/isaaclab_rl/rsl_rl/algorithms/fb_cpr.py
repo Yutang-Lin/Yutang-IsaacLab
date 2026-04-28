@@ -853,9 +853,10 @@ class FBCprAux:
             motion_ids = self._tracking_motion_ids  # [n_track]
             starts = self._tracking_starts           # [n_track]
             motion_lens = self._tracking_motion_lens  # [n_track]
+            # +1 to align with the z encoding which uses next_obs (frame t+1).
             # Circular wrap for short motions.
             usable = (motion_lens - 1).clamp_min(1)
-            frame = (starts + local_t.view(-1)) % usable
+            frame = (starts + local_t.view(-1) + 1) % usable
             obs_starts = expert_buffer._motion_obs_starts[motion_ids]
             global_idx = obs_starts + frame
             ref[self._env_idx_with_expert_rollout] = expert_buffer.root_pos_buffer[global_idx]
