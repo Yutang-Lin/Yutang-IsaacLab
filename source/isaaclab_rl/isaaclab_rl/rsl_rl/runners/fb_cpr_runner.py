@@ -1094,6 +1094,7 @@ class FBCprRunner:
 
     # --- utilities ------------------------------------------------------- #
 
+    @torch.inference_mode()
     def _terrain_rsi_from_tracking(
         self,
         env_ids: torch.Tensor,
