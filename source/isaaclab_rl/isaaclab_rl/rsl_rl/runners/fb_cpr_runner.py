@@ -1123,13 +1123,20 @@ class FBCprRunner:
         jv_usd = torch.zeros_like(jp_usd)
         jp_usd[:, joint_order_t] = jp_canon
         jv_usd[:, joint_order_t] = jv_canon
-        eu.robot.write_joint_position_to_sim(jp_usd, env_ids=env_ids)
-        eu.robot.write_joint_velocity_to_sim(jv_usd, env_ids=env_ids)
-        eu.robot.write_root_pose_to_sim(
-            torch.cat([rp, rq], dim=-1), env_ids=env_ids)
-        eu.robot.write_root_velocity_to_sim(
-            torch.cat([rlv, rav], dim=-1), env_ids=env_ids)
-        eu.scene.write_data_to_sim()
+        with torch.inference_mode(False):
+            jp_usd = jp_usd.clone()
+            jv_usd = jv_usd.clone()
+            rp = rp.clone()
+            rq = rq.clone()
+            rlv = rlv.clone()
+            rav = rav.clone()
+            eu.robot.write_joint_position_to_sim(jp_usd, env_ids=env_ids)
+            eu.robot.write_joint_velocity_to_sim(jv_usd, env_ids=env_ids)
+            eu.robot.write_root_pose_to_sim(
+                torch.cat([rp, rq], dim=-1), env_ids=env_ids)
+            eu.robot.write_root_velocity_to_sim(
+                torch.cat([rlv, rav], dim=-1), env_ids=env_ids)
+            eu.scene.write_data_to_sim()
 
     def _obs_to_device(self, obs: Any, extras: dict | None = None) -> Dict[str, torch.Tensor]:
         """Convert the env's flat ``policy`` + ``critic`` tensors into a BFM-agent dict.
