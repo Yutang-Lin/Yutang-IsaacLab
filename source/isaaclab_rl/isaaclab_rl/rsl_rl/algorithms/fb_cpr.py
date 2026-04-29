@@ -764,6 +764,7 @@ class FBCprAux:
         z: torch.Tensor | None,
         step_count: torch.Tensor,
         expert_buffer: Any | None = None,
+        robot_root_xy: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Update the rollout-time z context.
 
@@ -788,6 +789,8 @@ class FBCprAux:
                     n_elem,
                     self.cfg.rollout_expert_trajectories_length,
                 )
+                if robot_root_xy is not None:
+                    self._tracking_sample_robot_xy = robot_root_xy[self._env_idx_with_expert_rollout].clone()
                 z[self._env_idx_with_expert_rollout] = self._tracking_z[:, 0]
             else:
                 self._env_idx_with_expert_rollout = None
@@ -819,6 +822,9 @@ class FBCprAux:
                     n_elem,
                     self.cfg.rollout_expert_trajectories_length,
                 )
+                # Store robot XY at tracking-z sample time for ref viz alignment.
+                if robot_root_xy is not None:
+                    self._tracking_sample_robot_xy = robot_root_xy[self._env_idx_with_expert_rollout].clone()
             if getattr(self, "_env_idx_with_expert_rollout", None) is not None:
                 mod_time = idxs[self._env_idx_with_expert_rollout].view(-1)
                 T = self._tracking_z.shape[1]
@@ -862,8 +868,19 @@ class FBCprAux:
                 self._cached_obs_starts_dev = expert_buffer._motion_obs_starts.to(self.device)
                 self._cached_root_pos_dev = expert_buffer.root_pos_buffer.to(self.device)
             obs_starts = self._cached_obs_starts_dev[motion_ids]
+            # Get motion's frame-0 root_pos (the anchor in expert space).
+            frame0 = (starts) % usable
+            global_idx_0 = (obs_starts + frame0).long()
+            motion_anchor_xy = self._cached_root_pos_dev[global_idx_0, :2]  # [n_track, 2]
+            # Current frame root_pos.
             global_idx = (obs_starts + frame).long()
-            ref[self._env_idx_with_expert_rollout] = self._cached_root_pos_dev[global_idx]
+            motion_pos = self._cached_root_pos_dev[global_idx]  # [n_track, 3]
+            # Offset: replace motion's absolute XY with robot_sample_xy + delta.
+            if hasattr(self, "_tracking_sample_robot_xy") and self._tracking_sample_robot_xy is not None:
+                delta_xy = motion_pos[:, :2] - motion_anchor_xy
+                motion_pos = motion_pos.clone()
+                motion_pos[:, :2] = self._tracking_sample_robot_xy.to(self.device) + delta_xy
+            ref[self._env_idx_with_expert_rollout] = motion_pos
         return ref
 
     @torch.no_grad()

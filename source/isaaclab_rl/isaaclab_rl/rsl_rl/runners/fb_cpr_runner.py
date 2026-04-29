@@ -453,7 +453,8 @@ class FBCprRunner:
 
         # Per-env z context.
         z_context = self.alg.maybe_update_rollout_context(
-            z=None, step_count=step_count, expert_buffer=self.expert_buffer
+            z=None, step_count=step_count, expert_buffer=self.expert_buffer,
+            robot_root_xy=self.env.unwrapped.robot.data.root_pos_w[:, :2].to(self.device) if hasattr(self.env.unwrapped, "robot") else None,
         )
 
         rewbuffer: deque[float] = deque(maxlen=500)
@@ -514,6 +515,7 @@ class FBCprRunner:
             # internal eval act() calls. Recompute to be safe.
             z_context = self.alg.maybe_update_rollout_context(
                 z=None, step_count=step_count, expert_buffer=self.expert_buffer,
+                robot_root_xy=self.env.unwrapped.robot.data.root_pos_w[:, :2].to(self.device) if hasattr(self.env.unwrapped, "robot") else None,
             )
 
         # Track LOCAL env-steps (per-rank) for warmup / update cadence / eval
@@ -615,7 +617,8 @@ class FBCprRunner:
 
                     # Update z context for next step.
                     z_context = self.alg.maybe_update_rollout_context(
-                        z=z_context, step_count=step_count, expert_buffer=self.expert_buffer
+                        z=z_context, step_count=step_count, expert_buffer=self.expert_buffer,
+                        robot_root_xy=self.env.unwrapped.robot.data.root_pos_w[:, :2].to(self.device) if hasattr(self.env.unwrapped, "robot") else None,
                     )
 
                     obs_dict = new_obs
