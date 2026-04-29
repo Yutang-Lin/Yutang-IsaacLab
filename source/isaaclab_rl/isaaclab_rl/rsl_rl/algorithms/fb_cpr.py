@@ -850,16 +850,20 @@ class FBCprAux:
         n_track = len(self._env_idx_with_expert_rollout)
         # Look up root_pos from expert buffer's flat root_pos_buffer.
         if expert_buffer.root_pos_buffer is not None:
-            motion_ids = self._tracking_motion_ids  # [n_track]
-            starts = self._tracking_starts           # [n_track]
-            motion_lens = self._tracking_motion_lens  # [n_track]
+            motion_ids = self._tracking_motion_ids.to(self.device)
+            starts = self._tracking_starts.to(self.device)
+            motion_lens = self._tracking_motion_lens.to(self.device)
             # +1 to align with the z encoding which uses next_obs (frame t+1).
             # Circular wrap for short motions.
             usable = (motion_lens - 1).clamp_min(1)
             frame = (starts + local_t.view(-1) + 1) % usable
-            obs_starts = expert_buffer._motion_obs_starts[motion_ids]
-            global_idx = obs_starts + frame
-            ref[self._env_idx_with_expert_rollout] = expert_buffer.root_pos_buffer[global_idx]
+            # Cache device-local copies to avoid per-step transfers.
+            if not hasattr(self, "_cached_obs_starts_dev"):
+                self._cached_obs_starts_dev = expert_buffer._motion_obs_starts.to(self.device)
+                self._cached_root_pos_dev = expert_buffer.root_pos_buffer.to(self.device)
+            obs_starts = self._cached_obs_starts_dev[motion_ids]
+            global_idx = (obs_starts + frame).long()
+            ref[self._env_idx_with_expert_rollout] = self._cached_root_pos_dev[global_idx]
         return ref
 
     @torch.no_grad()
