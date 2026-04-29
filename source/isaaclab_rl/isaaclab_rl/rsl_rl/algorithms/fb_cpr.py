@@ -765,38 +765,31 @@ class FBCprAux:
         step_count: torch.Tensor,
         expert_buffer: Any | None = None,
         robot_root_xy: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+        robot_root_quat: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, dict | None]:
         """Update the rollout-time z context.
 
-        Mirrors BFM-Zero's ``FBAgent.maybe_update_rollout_context``. Called once
-        per env step by the runner with the current per-env ``step_count``.
+        Called once per env step by the runner with per-env ``step_count``.
+
+        Returns:
+            (z, terrain_reset_env_ids): z is the updated per-env latent.
+            terrain_reset_env_ids is a tensor of env indices that were
+            assigned terrain-required motions and need an env reset to
+            align with the terrain, or None.
         """
         if z is None:
             z = self.policy.sample_z(step_count.shape[0], device=self.device)
             if self.cfg.rollout_expert_trajectories and expert_buffer is not None:
-                n_elem = max(
-                    1,
-                    int(
-                        self.cfg.rollout_expert_trajectories_percentage
-                        * step_count.shape[0]
-                    ),
+                terrain_envs = self._resample_tracking(
+                    step_count, expert_buffer, robot_root_xy, robot_root_quat,
                 )
-                self._env_idx_with_expert_rollout = torch.randint(
-                    0, step_count.shape[0], size=(n_elem,), device=self.device
-                )
-                self._tracking_z = self._sample_tracking_z(
-                    expert_buffer,
-                    n_elem,
-                    self.cfg.rollout_expert_trajectories_length,
-                )
-                if robot_root_xy is not None:
-                    self._tracking_sample_robot_xy = robot_root_xy[self._env_idx_with_expert_rollout].clone()
-                z[self._env_idx_with_expert_rollout] = self._tracking_z[:, 0]
+                z[self._tracking_env_idx] = self._tracking_z[:, 0]
+                return z, terrain_envs
             else:
-                self._env_idx_with_expert_rollout = None
-            return z
+                self._tracking_env_idx = None
+            return z, None
 
-        # existing z — periodic refresh
+        # Periodic z refresh for non-tracking envs.
         mask_reset_z = (step_count % self.cfg.update_z_every_step == 0).view(-1, 1)
         if self.cfg.use_mix_rollout and not self._zbuf_empty():
             new_z = self._zbuf_sample(z.shape[0])
@@ -804,36 +797,100 @@ class FBCprAux:
             new_z = self.policy.sample_z(z.shape[0], device=self.device)
         z = torch.where(mask_reset_z, new_z, z.to(self.device))
 
+        terrain_envs = None
         if self.cfg.rollout_expert_trajectories and expert_buffer is not None:
             idxs = step_count % self.cfg.rollout_expert_trajectories_length
             if bool((idxs == 0).any()):
-                n_elem = max(
-                    1,
-                    int(
-                        self.cfg.rollout_expert_trajectories_percentage
-                        * step_count.shape[0]
-                    ),
+                terrain_envs = self._resample_tracking(
+                    step_count, expert_buffer, robot_root_xy, robot_root_quat,
                 )
-                self._env_idx_with_expert_rollout = torch.randint(
-                    0, step_count.shape[0], size=(n_elem,), device=self.device
-                )
-                self._tracking_z = self._sample_tracking_z(
-                    expert_buffer,
-                    n_elem,
-                    self.cfg.rollout_expert_trajectories_length,
-                )
-                # Store robot XY at tracking-z sample time for ref viz alignment.
-                if robot_root_xy is not None:
-                    self._tracking_sample_robot_xy = robot_root_xy[self._env_idx_with_expert_rollout].clone()
-            if getattr(self, "_env_idx_with_expert_rollout", None) is not None:
-                mod_time = idxs[self._env_idx_with_expert_rollout].view(-1)
-                T = self._tracking_z.shape[1]
-                mod_time = torch.clamp(mod_time, 0, T - 1)
-                z[self._env_idx_with_expert_rollout] = self._tracking_z[
-                    torch.arange(len(self._env_idx_with_expert_rollout), device=self.device),
-                    mod_time,
+            if getattr(self, "_tracking_env_idx", None) is not None:
+                mod_time = idxs[self._tracking_env_idx].view(-1)
+                mod_time = torch.clamp(mod_time, 0, self._tracking_z.shape[1] - 1)
+                n = len(self._tracking_env_idx)
+                z[self._tracking_env_idx] = self._tracking_z[
+                    torch.arange(n, device=self.device), mod_time,
                 ]
-        return z
+        return z, terrain_envs
+
+    def _resample_tracking(
+        self,
+        step_count: torch.Tensor,
+        expert_buffer: Any,
+        robot_root_xy: torch.Tensor | None,
+        robot_root_quat: torch.Tensor | None,
+    ) -> torch.Tensor | None:
+        """Pick new tracking envs, sample trajectories, encode z, store viz anchors.
+
+        Returns env indices that were assigned terrain-required motions
+        (the caller should reset those envs to align with the terrain).
+        Returns None if no terrain motions were sampled.
+        """
+        n_envs = step_count.shape[0]
+        n_elem = max(1, int(self.cfg.rollout_expert_trajectories_percentage * n_envs))
+        self._tracking_env_idx = torch.randint(0, n_envs, (n_elem,), device=self.device)
+        traj_len = self.cfg.rollout_expert_trajectories_length
+        self._tracking_z = self._sample_tracking_z(expert_buffer, n_elem, traj_len)
+        # Store robot pose at sample time for reference visualization (on device).
+        if robot_root_xy is not None:
+            self._tracking_robot_xy = robot_root_xy[self._tracking_env_idx].to(self.device).clone()
+        else:
+            self._tracking_robot_xy = None
+        self._tracking_heading_delta = self._compute_heading_delta(
+            expert_buffer, robot_root_quat,
+        )
+        # Return terrain env indices + their tracking motion/start for caller to reset.
+        rt = getattr(self, "_tracking_requires_terrain", None)
+        if rt is not None and rt.any():
+            mask = rt.to(self.device)
+            return {
+                "env_ids": self._tracking_env_idx[mask],
+                "motion_ids": self._tracking_motion_ids[mask],
+                "starts": self._tracking_starts[mask],
+            }
+        return None
+
+    def update_tracking_pose_after_reset(
+        self,
+        reset_env_ids: torch.Tensor,
+        robot_root_xy: torch.Tensor,
+        robot_root_quat: torch.Tensor,
+    ) -> None:
+        """Update stored robot pose for terrain-reset envs.
+
+        Called by the runner AFTER ``_reset_idx`` so that reference viz
+        uses the post-reset robot position (not the stale pre-reset one).
+        """
+        if self._tracking_robot_xy is None or self._tracking_env_idx is None:
+            return
+        # Vectorized: find tracking slots that correspond to reset envs.
+        reset_set = reset_env_ids.to(self.device)
+        mask = (self._tracking_env_idx.unsqueeze(1) == reset_set.unsqueeze(0)).any(dim=1)
+        if not mask.any():
+            return
+        reset_eids = self._tracking_env_idx[mask]
+        self._tracking_robot_xy[mask] = robot_root_xy[reset_eids].to(self.device)
+        if self._tracking_heading_delta is not None and self._cached_root_quat_dev is not None:
+            robot_yaw = self._yaw_from_quat(robot_root_quat[reset_eids].to(self.device))
+            anchor_idx = self._tracking_anchor_global_idx()[mask]
+            motion_yaw = self._yaw_from_quat(self._cached_root_quat_dev[anchor_idx])
+            self._tracking_heading_delta[mask] = robot_yaw - motion_yaw
+
+    def _ensure_buffer_cache(self, expert_buffer: Any) -> None:
+        """Lazily cache expert buffer tensors on self.device."""
+        if not hasattr(self, "_cached_obs_starts_dev"):
+            self._cached_obs_starts_dev = expert_buffer._motion_obs_starts.to(self.device)
+            self._cached_root_pos_dev = expert_buffer.root_pos_buffer.to(self.device)
+            self._cached_root_quat_dev = (
+                expert_buffer.root_quat_buffer.to(self.device)
+                if expert_buffer.root_quat_buffer is not None else None
+            )
+
+    def _tracking_anchor_global_idx(self) -> torch.Tensor:
+        """Global flat index for each tracking trajectory's anchor frame."""
+        usable = (self._tracking_motion_lens - 1).clamp_min(1)
+        frame0 = self._tracking_starts % usable
+        return (self._cached_obs_starts_dev[self._tracking_motion_ids] + frame0).long()
 
     @torch.no_grad()
     def get_tracking_ref_root_pos(
@@ -841,47 +898,94 @@ class FBCprAux:
     ) -> torch.Tensor | None:
         """Return per-env reference root_pos [N, 3] for tracking envs.
 
-        Non-tracking envs get zeros. Efficiently looks up root_pos from
-        the expert buffer using stored motion_ids + frame offsets.
-        Returns None if no tracking is active.
+        XY delta from the motion anchor is rotated by the heading difference
+        between the robot at sample time and the motion at its anchor frame.
         """
-        if not hasattr(self, "_tracking_motion_ids") or self._tracking_motion_ids is None:
+        if getattr(self, "_tracking_env_idx", None) is None:
             return None
-        if not hasattr(self, "_env_idx_with_expert_rollout") or self._env_idx_with_expert_rollout is None:
+        if getattr(self, "_tracking_motion_ids", None) is None:
             return None
+        if expert_buffer.root_pos_buffer is None:
+            return None
+        self._ensure_buffer_cache(expert_buffer)
         N = step_count.shape[0]
         ref = torch.zeros(N, 3, device=self.device)
         traj_len = self.cfg.rollout_expert_trajectories_length
-        local_t = step_count[self._env_idx_with_expert_rollout] % traj_len
-        n_track = len(self._env_idx_with_expert_rollout)
-        # Look up root_pos from expert buffer's flat root_pos_buffer.
-        if expert_buffer.root_pos_buffer is not None:
-            motion_ids = self._tracking_motion_ids.to(self.device)
-            starts = self._tracking_starts.to(self.device)
-            motion_lens = self._tracking_motion_lens.to(self.device)
-            # +1 to align with the z encoding which uses next_obs (frame t+1).
-            # Circular wrap for short motions.
-            usable = (motion_lens - 1).clamp_min(1)
-            frame = (starts + local_t.view(-1) + 1) % usable
-            # Cache device-local copies to avoid per-step transfers.
-            if not hasattr(self, "_cached_obs_starts_dev"):
-                self._cached_obs_starts_dev = expert_buffer._motion_obs_starts.to(self.device)
-                self._cached_root_pos_dev = expert_buffer.root_pos_buffer.to(self.device)
-            obs_starts = self._cached_obs_starts_dev[motion_ids]
-            # Get motion's frame-0 root_pos (the anchor in expert space).
-            frame0 = (starts) % usable
-            global_idx_0 = (obs_starts + frame0).long()
-            motion_anchor_xy = self._cached_root_pos_dev[global_idx_0, :2]  # [n_track, 2]
-            # Current frame root_pos.
-            global_idx = (obs_starts + frame).long()
-            motion_pos = self._cached_root_pos_dev[global_idx]  # [n_track, 3]
-            # Offset: replace motion's absolute XY with robot_sample_xy + delta.
-            if hasattr(self, "_tracking_sample_robot_xy") and self._tracking_sample_robot_xy is not None:
-                delta_xy = motion_pos[:, :2] - motion_anchor_xy
-                motion_pos = motion_pos.clone()
-                motion_pos[:, :2] = self._tracking_sample_robot_xy.to(self.device) + delta_xy
-            ref[self._env_idx_with_expert_rollout] = motion_pos
+        local_t = step_count[self._tracking_env_idx] % traj_len
+        usable = (self._tracking_motion_lens - 1).clamp_min(1)
+        frame = (self._tracking_starts + local_t.view(-1) + 1) % usable
+        obs_starts = self._cached_obs_starts_dev[self._tracking_motion_ids]
+        anchor_idx = self._tracking_anchor_global_idx()
+        motion_anchor_xy = self._cached_root_pos_dev[anchor_idx, :2]
+        motion_pos = self._cached_root_pos_dev[(obs_starts + frame).long()]
+        if self._tracking_robot_xy is not None:
+            delta_xy = motion_pos[:, :2] - motion_anchor_xy
+            if self._tracking_heading_delta is not None:
+                cos_d = torch.cos(self._tracking_heading_delta).unsqueeze(-1)
+                sin_d = torch.sin(self._tracking_heading_delta).unsqueeze(-1)
+                dx, dy = delta_xy[:, 0:1], delta_xy[:, 1:2]
+                delta_xy = torch.cat([cos_d * dx - sin_d * dy,
+                                      sin_d * dx + cos_d * dy], dim=-1)
+            motion_pos = motion_pos.clone()
+            motion_pos[:, :2] = self._tracking_robot_xy + delta_xy
+        ref[self._tracking_env_idx] = motion_pos
         return ref
+
+    @torch.no_grad()
+    def get_tracking_ref_body_pos(
+        self, step_count: torch.Tensor, expert_buffer: Any,
+    ) -> torch.Tensor | None:
+        """Return per-env reference body keypoints [N, K, 3] via FK.
+
+        Same frame logic as get_tracking_ref_root_pos, but runs FK to get
+        all body positions. Heading rotation + XY offset are applied.
+        """
+        if getattr(self, "_tracking_env_idx", None) is None:
+            return None
+        if getattr(self, "_tracking_motion_ids", None) is None:
+            return None
+        if expert_buffer.root_pos_buffer is None:
+            return None
+        self._ensure_buffer_cache(expert_buffer)
+        traj_len = self.cfg.rollout_expert_trajectories_length
+        local_t = step_count[self._tracking_env_idx] % traj_len
+        usable = (self._tracking_motion_lens - 1).clamp_min(1)
+        frame = (self._tracking_starts + local_t.view(-1) + 1) % usable
+        obs_starts = self._cached_obs_starts_dev[self._tracking_motion_ids]
+        global_idx = (obs_starts + frame).long()
+        body_pos = expert_buffer.compute_body_pos(global_idx)
+        if body_pos is None:
+            return None
+        N = step_count.shape[0]
+        K = body_pos.shape[1]
+        ref = torch.zeros(N, K, 3, device=self.device)
+        body_pos = body_pos.to(self.device)
+        # No offset/rotation — use raw FK positions from the dataset directly.
+        ref[self._tracking_env_idx] = body_pos
+        return ref
+
+    @staticmethod
+    def _yaw_from_quat(quat: torch.Tensor) -> torch.Tensor:
+        """Extract yaw from wxyz quaternion. Returns [N]."""
+        w, x, y, z = quat[:, 0], quat[:, 1], quat[:, 2], quat[:, 3]
+        return torch.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
+
+    def _compute_heading_delta(
+        self, expert_buffer: Any, robot_root_quat: torch.Tensor | None,
+    ) -> torch.Tensor | None:
+        """Return yaw difference (robot - motion anchor) or None."""
+        if robot_root_quat is None:
+            return None
+        self._ensure_buffer_cache(expert_buffer)
+        if self._cached_root_quat_dev is None:
+            return None
+        robot_yaw = self._yaw_from_quat(
+            robot_root_quat[self._tracking_env_idx].to(self.device),
+        )
+        motion_yaw = self._yaw_from_quat(
+            self._cached_root_quat_dev[self._tracking_anchor_global_idx()],
+        )
+        return robot_yaw - motion_yaw
 
     @torch.no_grad()
     def _sample_tracking_z(
@@ -907,10 +1011,12 @@ class FBCprAux:
         batch = expert_buffer.sample_tracking_trajectories(batch_dim, traj_length)
         next_obs = batch["next_observation"]
         next_obs = self._to_device(next_obs)
-        # Store motion info for reference visualization.
-        self._tracking_motion_ids = batch["motion_ids"]
-        self._tracking_starts = batch["starts"]
-        self._tracking_motion_lens = batch["motion_lens"]
+        # Store motion info for reference visualization + terrain reset.
+        self._tracking_motion_ids = batch["motion_ids"].to(self.device)
+        self._tracking_starts = batch["starts"].to(self.device)
+        self._tracking_motion_lens = batch["motion_lens"].to(self.device)
+        rt = batch.get("requires_terrain")
+        self._tracking_requires_terrain = rt.to(self.device) if rt is not None else None
         next_obs = self.policy._normalize(next_obs)
         z = self.policy._backward_map(next_obs)
         z = z.view(batch_dim, traj_length, z.shape[-1])

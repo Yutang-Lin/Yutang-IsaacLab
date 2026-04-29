@@ -452,10 +452,24 @@ class FBCprRunner:
         step_count = torch.zeros(self.env.num_envs, dtype=torch.long, device=self.device)
 
         # Per-env z context.
-        z_context = self.alg.maybe_update_rollout_context(
+        _robot = self.env.unwrapped.robot if hasattr(self.env.unwrapped, "robot") else None
+        z_context, terrain_reset = self.alg.maybe_update_rollout_context(
             z=None, step_count=step_count, expert_buffer=self.expert_buffer,
-            robot_root_xy=self.env.unwrapped.robot.data.root_pos_w[:, :2].to(self.device) if hasattr(self.env.unwrapped, "robot") else None,
+            robot_root_xy=_robot.data.root_pos_w[:, :2].to(self.device) if _robot else None,
+            robot_root_quat=_robot.data.root_quat_w.to(self.device) if _robot else None,
         )
+        if terrain_reset is not None:
+            env_ids = terrain_reset["env_ids"]
+            self._terrain_rsi_from_tracking(
+                env_ids, terrain_reset["motion_ids"], terrain_reset["starts"],
+            )
+            step_count[env_ids] = 0
+            if _robot is not None:
+                self.alg.update_tracking_pose_after_reset(
+                    env_ids,
+                    _robot.data.root_pos_w[:, :2].to(self.device),
+                    _robot.data.root_quat_w.to(self.device),
+                )
 
         rewbuffer: deque[float] = deque(maxlen=500)
         lenbuffer: deque[float] = deque(maxlen=500)
@@ -513,10 +527,23 @@ class FBCprRunner:
             # already took (line 369) is still from before the eval so it
             # is still valid, but z_context may have been touched by the
             # internal eval act() calls. Recompute to be safe.
-            z_context = self.alg.maybe_update_rollout_context(
+            z_context, terrain_reset = self.alg.maybe_update_rollout_context(
                 z=None, step_count=step_count, expert_buffer=self.expert_buffer,
-                robot_root_xy=self.env.unwrapped.robot.data.root_pos_w[:, :2].to(self.device) if hasattr(self.env.unwrapped, "robot") else None,
+                robot_root_xy=_robot.data.root_pos_w[:, :2].to(self.device) if _robot else None,
+                robot_root_quat=_robot.data.root_quat_w.to(self.device) if _robot else None,
             )
+            if terrain_reset is not None and hasattr(self.env_unwrapped, "_reset_idx"):
+                env_ids = terrain_reset["env_ids"]
+                self._terrain_rsi_from_tracking(
+                    env_ids, terrain_reset["motion_ids"], terrain_reset["starts"],
+                )
+                step_count[env_ids] = 0
+                if _robot is not None:
+                    self.alg.update_tracking_pose_after_reset(
+                        env_ids,
+                        _robot.data.root_pos_w[:, :2].to(self.device),
+                        _robot.data.root_quat_w.to(self.device),
+                    )
 
         # Track LOCAL env-steps (per-rank) for warmup / update cadence / eval
         # cadence. Each rank has its own replay buffer, so
@@ -616,10 +643,32 @@ class FBCprRunner:
                     step_count = torch.where(dones.bool(), torch.zeros_like(step_count), step_count)
 
                     # Update z context for next step.
-                    z_context = self.alg.maybe_update_rollout_context(
+                    z_context, terrain_reset = self.alg.maybe_update_rollout_context(
                         z=z_context, step_count=step_count, expert_buffer=self.expert_buffer,
-                        robot_root_xy=self.env.unwrapped.robot.data.root_pos_w[:, :2].to(self.device) if hasattr(self.env.unwrapped, "robot") else None,
+                        robot_root_xy=_robot.data.root_pos_w[:, :2].to(self.device) if _robot else None,
+                        robot_root_quat=_robot.data.root_quat_w.to(self.device) if _robot else None,
                     )
+                    if terrain_reset is not None and hasattr(self.env_unwrapped, "_reset_idx"):
+                        env_ids = terrain_reset["env_ids"]
+                        already_done = dones[env_ids].bool()
+                        if not already_done.all():
+                            mask = ~already_done
+                            need_reset = env_ids[mask]
+                            self._terrain_rsi_from_tracking(
+                                need_reset,
+                                terrain_reset["motion_ids"][mask],
+                                terrain_reset["starts"][mask],
+                            )
+                            step_count[need_reset] = 0
+                            dones[need_reset] = 1
+                            fresh_obs, fresh_extras = self.env.get_observations()
+                            new_obs = self._obs_to_device(fresh_obs, fresh_extras)
+                            if _robot is not None:
+                                self.alg.update_tracking_pose_after_reset(
+                                    need_reset,
+                                    _robot.data.root_pos_w[:, :2].to(self.device),
+                                    _robot.data.root_quat_w.to(self.device),
+                                )
 
                     obs_dict = new_obs
 
@@ -1044,6 +1093,43 @@ class FBCprRunner:
             env_u.restore_state(snap)
 
     # --- utilities ------------------------------------------------------- #
+
+    def _terrain_rsi_from_tracking(
+        self,
+        env_ids: torch.Tensor,
+        motion_ids: torch.Tensor,
+        starts: torch.Tensor,
+    ) -> None:
+        """Reset specific envs to the tracking context's motion/frame.
+
+        Uses ``get_reset_states_at`` so the robot is placed at the exact
+        same motion frame that the tracking z was encoded from.
+        """
+        eu = self.env_unwrapped
+        states = self.expert_buffer.get_reset_states_at(
+            motion_ids.to(self.expert_buffer.device),
+            starts.to(self.expert_buffer.device),
+        )
+        n = env_ids.shape[0]
+        dev = self.device
+        jp_canon = states["joint_pos"].to(dev)
+        jv_canon = states["joint_vel"].to(dev)
+        rp = states["root_pos"].to(dev)
+        rq = states["root_quat"].to(dev)
+        rlv = states["root_lin_vel"].to(dev)
+        rav = states["root_ang_vel"].to(dev)
+        joint_order_t = torch.as_tensor(eu.joint_order, device=dev, dtype=torch.long)
+        jp_usd = torch.zeros(n, eu.robot.data.joint_pos.shape[1], device=dev)
+        jv_usd = torch.zeros_like(jp_usd)
+        jp_usd[:, joint_order_t] = jp_canon
+        jv_usd[:, joint_order_t] = jv_canon
+        eu.robot.write_joint_position_to_sim(jp_usd, env_ids=env_ids)
+        eu.robot.write_joint_velocity_to_sim(jv_usd, env_ids=env_ids)
+        eu.robot.write_root_pose_to_sim(
+            torch.cat([rp, rq], dim=-1), env_ids=env_ids)
+        eu.robot.write_root_velocity_to_sim(
+            torch.cat([rlv, rav], dim=-1), env_ids=env_ids)
+        eu.scene.write_data_to_sim()
 
     def _obs_to_device(self, obs: Any, extras: dict | None = None) -> Dict[str, torch.Tensor]:
         """Convert the env's flat ``policy`` + ``critic`` tensors into a BFM-agent dict.

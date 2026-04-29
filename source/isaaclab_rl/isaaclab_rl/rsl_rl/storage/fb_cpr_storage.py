@@ -862,7 +862,41 @@ class FBCprExpertBuffer:
             })
         return out
 
+    @torch.no_grad()
+    def compute_body_pos(self, global_frames: torch.Tensor) -> torch.Tensor | None:
+        """Run FK for the given flat-buffer frame indices, return [N, K, 3]."""
+        if not self.supports_reset_states:
+            return None
+        mod = getattr(self, "_minimal_mod", None)
+        chain = getattr(self, "_minimal_chain", None)
+        if mod is None or chain is None:
+            return None
+        idx = global_frames.to(self.joint_pos_buffer.device)
+        jp = self.joint_pos_buffer[idx]
+        rp = self.root_pos_buffer[idx]
+        rq = self.root_quat_buffer[idx]
+        wp, _ = mod._world_fk(chain, jp, rp, rq, mod.KEYPOINT_NAMES)
+        return wp  # [N, K, 3]
+
     # -- RSI -------------------------------------------------------------- #
+
+    @torch.no_grad()
+    def get_reset_states_at(self, motion_ids: torch.Tensor, frame_offsets: torch.Tensor) -> dict:
+        """Return RSI state for specific motion/frame pairs."""
+        starts = self._motion_starts[motion_ids]
+        lens = self._motion_lengths_rsi[motion_ids]
+        offsets = frame_offsets.clamp(max=lens - 1)
+        frame = starts + offsets
+        return {
+            "joint_pos": self.joint_pos_buffer[frame],
+            "joint_vel": self.joint_vel_buffer[frame],
+            "root_pos": self.root_pos_buffer[frame],
+            "root_quat": self.root_quat_buffer[frame],
+            "root_lin_vel": self.root_lin_vel_buffer[frame],
+            "root_ang_vel": self.root_ang_vel_buffer[frame],
+            "motion_source_id": self.frame_motion_source_id[frame],
+            "requires_terrain": self.frame_requires_terrain[frame],
+        }
 
     @torch.no_grad()
     def sample_reset_states(self, batch_size: int) -> dict:
@@ -934,8 +968,14 @@ class FBCprExpertBuffer:
         arange = torch.arange(traj_length, device=self.device).unsqueeze(0)
         raw_frame = starts.unsqueeze(1) + arange
         usable_lens = (motion_lens - 1).clamp_min(1).unsqueeze(1)
-        frame_cur = (raw_frame % usable_lens).reshape(-1)
-        frame_nxt = ((raw_frame + 1) % usable_lens).reshape(-1)
+        # Terrain motions: clamp to last frame (pad). Others: circular wrap.
+        is_terrain = self.requires_terrain_t[motion_picks].unsqueeze(1)  # [N, 1]
+        frame_cur_wrap = raw_frame % usable_lens
+        frame_cur_clamp = raw_frame.clamp(max=usable_lens - 1)
+        frame_cur = torch.where(is_terrain, frame_cur_clamp, frame_cur_wrap).reshape(-1)
+        frame_nxt_wrap = (raw_frame + 1) % usable_lens
+        frame_nxt_clamp = (raw_frame + 1).clamp(max=usable_lens - 1)
+        frame_nxt = torch.where(is_terrain, frame_nxt_clamp, frame_nxt_wrap).reshape(-1)
         motion_flat = motion_picks.unsqueeze(1).expand(-1, traj_length).reshape(-1)
 
         global_cur = self._motion_obs_starts[motion_flat] + frame_cur
@@ -959,6 +999,7 @@ class FBCprExpertBuffer:
             "motion_ids": motion_picks,
             "starts": starts,
             "motion_lens": motion_lens,
+            "requires_terrain": self.requires_terrain_t[motion_picks],
         }
 
     # -- priority updates (stub-ish; accepted by agent) --------------------
