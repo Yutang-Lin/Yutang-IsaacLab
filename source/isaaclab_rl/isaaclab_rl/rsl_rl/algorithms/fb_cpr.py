@@ -844,14 +844,23 @@ class FBCprAux:
             self._tracking_robot_xy = robot_root_xy[self._tracking_env_idx].to(self.device).clone()
         else:
             self._tracking_robot_xy = None
-        # Sample and encode z — pass global_rh + terrain info for expert obs patching.
+        # Sample trajectories first (sets _tracking_motion_ids/starts/lens).
+        batch = expert_buffer.sample_tracking_trajectories(n_elem, traj_len)
+        self._tracking_motion_ids = batch["motion_ids"].to(self.device)
+        self._tracking_starts = batch["starts"].to(self.device)
+        self._tracking_motion_lens = batch["motion_lens"].to(self.device)
+        rt = batch.get("requires_terrain")
+        self._tracking_requires_terrain = rt.to(self.device) if rt is not None else None
+        # Now compute heading delta (needs motion_ids/starts).
+        self._tracking_heading_delta = self._compute_heading_delta(
+            expert_buffer, robot_root_quat,
+        )
+        # Encode z with expert obs patching for terrain-variant root_h.
         self._tracking_z = self._sample_tracking_z(
             expert_buffer, n_elem, traj_len,
             terrain_variant_root_h=use_global,
             terrain_z_fn=terrain_z_fn,
-        )
-        self._tracking_heading_delta = self._compute_heading_delta(
-            expert_buffer, robot_root_quat,
+            batch=batch,
         )
         # Return terrain env indices for caller to reset.
         rt = self._tracking_requires_terrain
@@ -1036,25 +1045,23 @@ class FBCprAux:
         traj_length: int,
         terrain_variant_root_h: torch.Tensor | None = None,
         terrain_z_fn=None,
+        batch: dict | None = None,
     ) -> torch.Tensor:
-        """Sample contiguous expert sub-trajectories and encode via B.
+        """Encode z from expert sub-trajectories.
 
-        ``terrain_variant_root_h``: [batch_dim] bool — if True for a trajectory,
-        patch expert priv_state[0] (root_h) to absolute z before encoding.
-        For terrain motions: use dataset root_pos_z directly.
-        For non-terrain motions: use dataset root_pos_z + sim terrain_z at
-        the motion's offset root XY.
+        If ``batch`` is provided (pre-sampled by caller), uses it directly.
+        Otherwise samples via ``expert_buffer.sample_tracking_trajectories``.
         """
         seq_length = self.policy.seq_length
-        batch = expert_buffer.sample_tracking_trajectories(batch_dim, traj_length)
+        if batch is None:
+            batch = expert_buffer.sample_tracking_trajectories(batch_dim, traj_length)
+            self._tracking_motion_ids = batch["motion_ids"].to(self.device)
+            self._tracking_starts = batch["starts"].to(self.device)
+            self._tracking_motion_lens = batch["motion_lens"].to(self.device)
+            rt = batch.get("requires_terrain")
+            self._tracking_requires_terrain = rt.to(self.device) if rt is not None else None
         next_obs = batch["next_observation"]
         next_obs = self._to_device(next_obs)
-        # Store motion info for reference visualization + terrain reset.
-        self._tracking_motion_ids = batch["motion_ids"].to(self.device)
-        self._tracking_starts = batch["starts"].to(self.device)
-        self._tracking_motion_lens = batch["motion_lens"].to(self.device)
-        rt = batch.get("requires_terrain")
-        self._tracking_requires_terrain = rt.to(self.device) if rt is not None else None
         # Patch expert root_h for global-root_h envs.
         if terrain_variant_root_h is not None and terrain_variant_root_h.any() and "privileged_state" in next_obs:
             self._ensure_buffer_cache(expert_buffer)
