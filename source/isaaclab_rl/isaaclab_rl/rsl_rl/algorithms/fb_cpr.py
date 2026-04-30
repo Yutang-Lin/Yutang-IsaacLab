@@ -834,11 +834,11 @@ class FBCprAux:
         self._tracking_env_idx = torch.randint(0, n_envs, (n_elem,), device=self.device)
         traj_len = self.cfg.rollout_expert_trajectories_length
         # Decide global root_h flag BEFORE z encoding.
-        grh_prob = getattr(self.cfg, "global_root_h_prob", 0.25)
+        grh_prob = getattr(self.cfg, "terrain_variant_root_h_prob", 0.25)
         use_global = torch.rand(n_elem, device=self.device) < grh_prob
         global_rh = torch.zeros(n_envs, dtype=torch.bool, device=self.device)
         global_rh[self._tracking_env_idx] = use_global
-        self._tracking_global_root_h = global_rh
+        self._tracking_terrain_variant_root_h = global_rh
         # Store robot pose for reference viz.
         if robot_root_xy is not None:
             self._tracking_robot_xy = robot_root_xy[self._tracking_env_idx].to(self.device).clone()
@@ -847,7 +847,7 @@ class FBCprAux:
         # Sample and encode z — pass global_rh + terrain info for expert obs patching.
         self._tracking_z = self._sample_tracking_z(
             expert_buffer, n_elem, traj_len,
-            global_root_h=use_global,
+            terrain_variant_root_h=use_global,
             terrain_z_fn=terrain_z_fn,
         )
         self._tracking_heading_delta = self._compute_heading_delta(
@@ -1034,12 +1034,12 @@ class FBCprAux:
         expert_buffer: Any,
         batch_dim: int,
         traj_length: int,
-        global_root_h: torch.Tensor | None = None,
+        terrain_variant_root_h: torch.Tensor | None = None,
         terrain_z_fn=None,
     ) -> torch.Tensor:
         """Sample contiguous expert sub-trajectories and encode via B.
 
-        ``global_root_h``: [batch_dim] bool — if True for a trajectory,
+        ``terrain_variant_root_h``: [batch_dim] bool — if True for a trajectory,
         patch expert priv_state[0] (root_h) to absolute z before encoding.
         For terrain motions: use dataset root_pos_z directly.
         For non-terrain motions: use dataset root_pos_z + sim terrain_z at
@@ -1056,7 +1056,7 @@ class FBCprAux:
         rt = batch.get("requires_terrain")
         self._tracking_requires_terrain = rt.to(self.device) if rt is not None else None
         # Patch expert root_h for global-root_h envs.
-        if global_root_h is not None and global_root_h.any() and "privileged_state" in next_obs:
+        if terrain_variant_root_h is not None and terrain_variant_root_h.any() and "privileged_state" in next_obs:
             self._ensure_buffer_cache(expert_buffer)
             priv = next_obs["privileged_state"]  # [B*T, priv_dim]
             B_T = priv.shape[0]
@@ -1077,8 +1077,8 @@ class FBCprAux:
             obs_starts = self._cached_obs_starts_dev[self._tracking_motion_ids]
             global_nxt = (obs_starts.unsqueeze(1) + frame_nxt).long().reshape(-1)
             root_pos_z = self._cached_root_pos_dev[global_nxt, 2]  # [B*T]
-            # Expand global_root_h to [B*T]
-            grh_flat = global_root_h.unsqueeze(1).expand(-1, traj_length).reshape(-1)
+            # Expand terrain_variant_root_h to [B*T]
+            grh_flat = terrain_variant_root_h.unsqueeze(1).expand(-1, traj_length).reshape(-1)
             # For terrain motions with global_rh: root_h = root_pos_z (already absolute).
             # For non-terrain motions with global_rh: root_h = root_pos_z + sim_terrain_z.
             new_root_h = root_pos_z.clone()
@@ -1105,7 +1105,7 @@ class FBCprAux:
                         world_xy = root_pos_xy
                     tz = terrain_z_fn(world_xy[nt_grh])
                     new_root_h[nt_grh] = new_root_h[nt_grh] + tz
-            # Apply: replace priv[:, 0] where global_root_h is set.
+            # Apply: replace priv[:, 0] where terrain_variant_root_h is set.
             priv = priv.clone()
             priv[grh_flat, 0] = new_root_h[grh_flat]
             next_obs["privileged_state"] = priv

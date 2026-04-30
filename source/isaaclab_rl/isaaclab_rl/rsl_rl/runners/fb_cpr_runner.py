@@ -653,9 +653,9 @@ class FBCprRunner:
                         terrain_z_fn=_terrain_z_fn,
                     )
                     # Sync per-env global_root_h flag to the env.
-                    grh = getattr(self.alg, "_tracking_global_root_h", None)
-                    if grh is not None and hasattr(self.env_unwrapped, "_use_global_root_h"):
-                        self.env_unwrapped._use_global_root_h = grh
+                    grh = getattr(self.alg, "_tracking_terrain_variant_root_h", None)
+                    if grh is not None and hasattr(self.env_unwrapped, "_use_terrain_variant_root_h"):
+                        self.env_unwrapped._use_terrain_variant_root_h = grh
 
                     if terrain_reset is not None and hasattr(self.env_unwrapped, "_reset_idx"):
                         env_ids = terrain_reset["env_ids"]
