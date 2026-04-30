@@ -1372,7 +1372,7 @@ class RslRlFBCprAlgorithmCfg:
     # Soft FB
     soft_fb: bool = False
     soft_fb_entropy_coef: float = 1.0
-    soft_fb_expert_future_min: tuple[float, float] = (0.3, 0.7)
+    soft_fb_expert_future_min: tuple[float, float] = (0.5, 1.0)
     lr_entropy_critic: float = 3e-4
     entropy_critic_target_tau: float = 0.005
 
