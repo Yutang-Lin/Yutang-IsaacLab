@@ -839,8 +839,17 @@ class FBCprAux:
         self._tracking_heading_delta = self._compute_heading_delta(
             expert_buffer, robot_root_quat,
         )
-        # Return terrain env indices + their tracking motion/start for caller to reset.
+        # 25% of tracking envs use global root_h (absolute pelvis z).
+        # Terrain motions always use terrain-relative root_h.
         rt = getattr(self, "_tracking_requires_terrain", None)
+        global_rh = torch.zeros(n_envs, dtype=torch.bool, device=self.device)
+        if rt is not None:
+            non_terrain = ~rt.to(self.device)
+            use_global = torch.rand(n_elem, device=self.device) < 0.25
+            global_rh_tracking = non_terrain & use_global
+            global_rh[self._tracking_env_idx] = global_rh_tracking
+        self._tracking_global_root_h = global_rh
+        # Return terrain env indices + their tracking motion/start for caller to reset.
         if rt is not None and rt.any():
             mask = rt.to(self.device)
             return {
@@ -934,11 +943,14 @@ class FBCprAux:
     @torch.no_grad()
     def get_tracking_ref_body_pos(
         self, step_count: torch.Tensor, expert_buffer: Any,
+        terrain_z_fn=None,
     ) -> torch.Tensor | None:
         """Return per-env reference body keypoints [N, K, 3] via FK.
 
-        Same frame logic as get_tracking_ref_root_pos, but runs FK to get
-        all body positions. Heading rotation + XY offset are applied.
+        For non-terrain motions, applies heading rotation + XY offset.
+        If ``terrain_z_fn`` is provided (callable: [M, 2] -> [M]), queries
+        terrain height at the motion's transformed root XY and adds it
+        to body z so reference sits on the sim terrain surface.
         """
         if getattr(self, "_tracking_env_idx", None) is None:
             return None
@@ -960,7 +972,31 @@ class FBCprAux:
         K = body_pos.shape[1]
         ref = torch.zeros(N, K, 3, device=self.device)
         body_pos = body_pos.to(self.device)
-        # No offset/rotation — use raw FK positions from the dataset directly.
+        # Terrain motions: raw dataset positions (robot init matches exactly).
+        # Non-terrain motions: apply heading rotation + XY offset from spawn randomization.
+        rt = getattr(self, "_tracking_requires_terrain", None)
+        if rt is not None and self._tracking_robot_xy is not None:
+            is_terrain = rt.to(self.device)
+            non_terrain = ~is_terrain
+            if non_terrain.any():
+                anchor_idx = self._tracking_anchor_global_idx()
+                anchor_xy = self._cached_root_pos_dev[anchor_idx, :2]
+                nt = non_terrain
+                delta_all = body_pos[nt, :, :2] - anchor_xy[nt].unsqueeze(1)
+                if self._tracking_heading_delta is not None:
+                    hd = self._tracking_heading_delta[nt]
+                    cos_d = torch.cos(hd).view(-1, 1, 1)
+                    sin_d = torch.sin(hd).view(-1, 1, 1)
+                    dx, dy = delta_all[:, :, 0:1], delta_all[:, :, 1:2]
+                    delta_all = torch.cat([cos_d * dx - sin_d * dy,
+                                           sin_d * dx + cos_d * dy], dim=-1)
+                body_pos[nt] = body_pos[nt].clone()
+                body_pos[nt, :, :2] = self._tracking_robot_xy[nt].unsqueeze(1) + delta_all
+                # Query terrain z at the motion's transformed root (pelvis) XY.
+                if terrain_z_fn is not None:
+                    motion_root_xy = body_pos[nt, 0, :2]  # pelvis after XY offset
+                    tz = terrain_z_fn(motion_root_xy)
+                    body_pos[nt, :, 2] = body_pos[nt, :, 2] + tz.unsqueeze(1)
         ref[self._tracking_env_idx] = body_pos
         return ref
 

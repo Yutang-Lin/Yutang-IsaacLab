@@ -648,6 +648,11 @@ class FBCprRunner:
                         robot_root_xy=_robot.data.root_pos_w[:, :2].to(self.device) if _robot else None,
                         robot_root_quat=_robot.data.root_quat_w.to(self.device) if _robot else None,
                     )
+                    # Sync per-env global_root_h flag to the env.
+                    grh = getattr(self.alg, "_tracking_global_root_h", None)
+                    if grh is not None and hasattr(self.env_unwrapped, "_use_global_root_h"):
+                        self.env_unwrapped._use_global_root_h = grh
+
                     if terrain_reset is not None and hasattr(self.env_unwrapped, "_reset_idx"):
                         env_ids = terrain_reset["env_ids"]
                         already_done = dones[env_ids].bool()
