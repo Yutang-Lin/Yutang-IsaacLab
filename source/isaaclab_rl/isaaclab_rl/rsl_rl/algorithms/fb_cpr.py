@@ -839,15 +839,11 @@ class FBCprAux:
         self._tracking_heading_delta = self._compute_heading_delta(
             expert_buffer, robot_root_quat,
         )
-        # 25% of tracking envs use global root_h (absolute pelvis z).
-        # Terrain motions always use terrain-relative root_h.
-        rt = getattr(self, "_tracking_requires_terrain", None)
+        # 25% of ALL tracking envs use global root_h (absolute pelvis z).
+        # Terrain motions can use it too — their dataset z already fits the terrain.
         global_rh = torch.zeros(n_envs, dtype=torch.bool, device=self.device)
-        if rt is not None:
-            non_terrain = ~rt.to(self.device)
-            use_global = torch.rand(n_elem, device=self.device) < 0.25
-            global_rh_tracking = non_terrain & use_global
-            global_rh[self._tracking_env_idx] = global_rh_tracking
+        use_global = torch.rand(n_elem, device=self.device) < 0.25
+        global_rh[self._tracking_env_idx] = use_global
         self._tracking_global_root_h = global_rh
         # Return terrain env indices + their tracking motion/start for caller to reset.
         if rt is not None and rt.any():
