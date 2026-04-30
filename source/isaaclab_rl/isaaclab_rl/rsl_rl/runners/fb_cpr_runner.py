@@ -453,10 +453,12 @@ class FBCprRunner:
 
         # Per-env z context.
         _robot = self.env.unwrapped.robot if hasattr(self.env.unwrapped, "robot") else None
+        _terrain_z_fn = getattr(self.env_unwrapped, "_get_terrain_height_xy", None)
         z_context, terrain_reset = self.alg.maybe_update_rollout_context(
             z=None, step_count=step_count, expert_buffer=self.expert_buffer,
             robot_root_xy=_robot.data.root_pos_w[:, :2].to(self.device) if _robot else None,
             robot_root_quat=_robot.data.root_quat_w.to(self.device) if _robot else None,
+            terrain_z_fn=_terrain_z_fn,
         )
         if terrain_reset is not None:
             env_ids = terrain_reset["env_ids"]
@@ -531,6 +533,7 @@ class FBCprRunner:
                 z=None, step_count=step_count, expert_buffer=self.expert_buffer,
                 robot_root_xy=_robot.data.root_pos_w[:, :2].to(self.device) if _robot else None,
                 robot_root_quat=_robot.data.root_quat_w.to(self.device) if _robot else None,
+                terrain_z_fn=_terrain_z_fn,
             )
             if terrain_reset is not None and hasattr(self.env_unwrapped, "_reset_idx"):
                 env_ids = terrain_reset["env_ids"]
@@ -647,6 +650,7 @@ class FBCprRunner:
                         z=z_context, step_count=step_count, expert_buffer=self.expert_buffer,
                         robot_root_xy=_robot.data.root_pos_w[:, :2].to(self.device) if _robot else None,
                         robot_root_quat=_robot.data.root_quat_w.to(self.device) if _robot else None,
+                        terrain_z_fn=_terrain_z_fn,
                     )
                     # Sync per-env global_root_h flag to the env.
                     grh = getattr(self.alg, "_tracking_global_root_h", None)

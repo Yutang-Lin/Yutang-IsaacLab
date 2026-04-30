@@ -766,6 +766,7 @@ class FBCprAux:
         expert_buffer: Any | None = None,
         robot_root_xy: torch.Tensor | None = None,
         robot_root_quat: torch.Tensor | None = None,
+        terrain_z_fn=None,
     ) -> tuple[torch.Tensor, dict | None]:
         """Update the rollout-time z context.
 
@@ -782,6 +783,7 @@ class FBCprAux:
             if self.cfg.rollout_expert_trajectories and expert_buffer is not None:
                 terrain_envs = self._resample_tracking(
                     step_count, expert_buffer, robot_root_xy, robot_root_quat,
+                    terrain_z_fn=terrain_z_fn,
                 )
                 z[self._tracking_env_idx] = self._tracking_z[:, 0]
                 return z, terrain_envs
@@ -803,6 +805,7 @@ class FBCprAux:
             if bool((idxs == 0).any()):
                 terrain_envs = self._resample_tracking(
                     step_count, expert_buffer, robot_root_xy, robot_root_quat,
+                    terrain_z_fn=terrain_z_fn,
                 )
             if getattr(self, "_tracking_env_idx", None) is not None:
                 mod_time = idxs[self._tracking_env_idx].view(-1)
@@ -819,35 +822,41 @@ class FBCprAux:
         expert_buffer: Any,
         robot_root_xy: torch.Tensor | None,
         robot_root_quat: torch.Tensor | None,
-    ) -> torch.Tensor | None:
+        terrain_z_fn=None,
+    ) -> dict | None:
         """Pick new tracking envs, sample trajectories, encode z, store viz anchors.
 
-        Returns env indices that were assigned terrain-required motions
-        (the caller should reset those envs to align with the terrain).
-        Returns None if no terrain motions were sampled.
+        Returns dict with terrain env info for caller to reset, or None.
+        ``terrain_z_fn``: callable([M,2] -> [M]) for sim terrain height query.
         """
         n_envs = step_count.shape[0]
         n_elem = max(1, int(self.cfg.rollout_expert_trajectories_percentage * n_envs))
         self._tracking_env_idx = torch.randint(0, n_envs, (n_elem,), device=self.device)
         traj_len = self.cfg.rollout_expert_trajectories_length
-        self._tracking_z = self._sample_tracking_z(expert_buffer, n_elem, traj_len)
-        # Store robot pose at sample time for reference visualization (on device).
+        # Decide global root_h flag BEFORE z encoding.
+        grh_prob = getattr(self.cfg, "global_root_h_prob", 0.25)
+        use_global = torch.rand(n_elem, device=self.device) < grh_prob
+        global_rh = torch.zeros(n_envs, dtype=torch.bool, device=self.device)
+        global_rh[self._tracking_env_idx] = use_global
+        self._tracking_global_root_h = global_rh
+        # Store robot pose for reference viz.
         if robot_root_xy is not None:
             self._tracking_robot_xy = robot_root_xy[self._tracking_env_idx].to(self.device).clone()
         else:
             self._tracking_robot_xy = None
+        # Sample and encode z — pass global_rh + terrain info for expert obs patching.
+        self._tracking_z = self._sample_tracking_z(
+            expert_buffer, n_elem, traj_len,
+            global_root_h=use_global,
+            terrain_z_fn=terrain_z_fn,
+        )
         self._tracking_heading_delta = self._compute_heading_delta(
             expert_buffer, robot_root_quat,
         )
-        # 25% of ALL tracking envs use global root_h (absolute pelvis z).
-        # Terrain motions can use it too — their dataset z already fits the terrain.
-        global_rh = torch.zeros(n_envs, dtype=torch.bool, device=self.device)
-        use_global = torch.rand(n_elem, device=self.device) < 0.25
-        global_rh[self._tracking_env_idx] = use_global
-        self._tracking_global_root_h = global_rh
-        # Return terrain env indices + their tracking motion/start for caller to reset.
+        # Return terrain env indices for caller to reset.
+        rt = self._tracking_requires_terrain
         if rt is not None and rt.any():
-            mask = rt.to(self.device)
+            mask = rt
             return {
                 "env_ids": self._tracking_env_idx[mask],
                 "motion_ids": self._tracking_motion_ids[mask],
@@ -1025,19 +1034,16 @@ class FBCprAux:
         expert_buffer: Any,
         batch_dim: int,
         traj_length: int,
+        global_root_h: torch.Tensor | None = None,
+        terrain_z_fn=None,
     ) -> torch.Tensor:
         """Sample contiguous expert sub-trajectories and encode via B.
 
-        Standard FB: rolling mean of B(obs) over seq_length window, then
-        project to sphere.
-
-        Soft FB: each frame in the window gets a linearly decreasing norm
-        weight (1.0 → expert_future_min) before averaging — nearer frames
-        carry stronger (more deterministic) z, farther frames carry weaker
-        (more stochastic) z. The result is NOT re-normalized to sphere;
-        instead it's directly multiplied by a Beta(5,2) factor so the
-        overall ‖z‖ reflects both the future-decay and a per-traj entropy
-        sample.
+        ``global_root_h``: [batch_dim] bool — if True for a trajectory,
+        patch expert priv_state[0] (root_h) to absolute z before encoding.
+        For terrain motions: use dataset root_pos_z directly.
+        For non-terrain motions: use dataset root_pos_z + sim terrain_z at
+        the motion's offset root XY.
         """
         seq_length = self.policy.seq_length
         batch = expert_buffer.sample_tracking_trajectories(batch_dim, traj_length)
@@ -1049,6 +1055,60 @@ class FBCprAux:
         self._tracking_motion_lens = batch["motion_lens"].to(self.device)
         rt = batch.get("requires_terrain")
         self._tracking_requires_terrain = rt.to(self.device) if rt is not None else None
+        # Patch expert root_h for global-root_h envs.
+        if global_root_h is not None and global_root_h.any() and "privileged_state" in next_obs:
+            self._ensure_buffer_cache(expert_buffer)
+            priv = next_obs["privileged_state"]  # [B*T, priv_dim]
+            B_T = priv.shape[0]
+            # Get root_pos_z for each frame from the flat buffer.
+            # Reconstruct global indices (same as sample_tracking_trajectories).
+            arange = torch.arange(traj_length, device=self.device).unsqueeze(0)
+            raw_frame = self._tracking_starts.unsqueeze(1) + arange
+            usable = (self._tracking_motion_lens - 1).clamp_min(1).unsqueeze(1)
+            is_t = self._tracking_requires_terrain
+            if is_t is not None:
+                frame_nxt = torch.where(
+                    is_t.unsqueeze(1),
+                    (raw_frame + 1).clamp(max=usable - 1),
+                    (raw_frame + 1) % usable,
+                )
+            else:
+                frame_nxt = (raw_frame + 1) % usable
+            obs_starts = self._cached_obs_starts_dev[self._tracking_motion_ids]
+            global_nxt = (obs_starts.unsqueeze(1) + frame_nxt).long().reshape(-1)
+            root_pos_z = self._cached_root_pos_dev[global_nxt, 2]  # [B*T]
+            # Expand global_root_h to [B*T]
+            grh_flat = global_root_h.unsqueeze(1).expand(-1, traj_length).reshape(-1)
+            # For terrain motions with global_rh: root_h = root_pos_z (already absolute).
+            # For non-terrain motions with global_rh: root_h = root_pos_z + sim_terrain_z.
+            new_root_h = root_pos_z.clone()
+            if terrain_z_fn is not None and is_t is not None:
+                nt_grh = grh_flat & (~is_t.unsqueeze(1).expand(-1, traj_length).reshape(-1))
+                if nt_grh.any():
+                    # Get motion root XY after offset for non-terrain motions.
+                    root_pos_xy = self._cached_root_pos_dev[global_nxt, :2]
+                    # Apply the same heading rotation + XY offset as ref viz.
+                    anchor_idx = self._tracking_anchor_global_idx()
+                    anchor_xy = self._cached_root_pos_dev[anchor_idx, :2]  # [B, 2]
+                    anchor_xy_flat = anchor_xy.unsqueeze(1).expand(-1, traj_length, -1).reshape(-1, 2)
+                    delta_xy = root_pos_xy - anchor_xy_flat
+                    if self._tracking_robot_xy is not None and self._tracking_heading_delta is not None:
+                        hd = self._tracking_heading_delta.unsqueeze(1).expand(-1, traj_length).reshape(-1)
+                        cos_d = torch.cos(hd)
+                        sin_d = torch.sin(hd)
+                        dx, dy = delta_xy[:, 0], delta_xy[:, 1]
+                        rot_xy = torch.stack([cos_d * dx - sin_d * dy,
+                                              sin_d * dx + cos_d * dy], dim=-1)
+                        rxy_flat = self._tracking_robot_xy.unsqueeze(1).expand(-1, traj_length, -1).reshape(-1, 2)
+                        world_xy = rxy_flat + rot_xy
+                    else:
+                        world_xy = root_pos_xy
+                    tz = terrain_z_fn(world_xy[nt_grh])
+                    new_root_h[nt_grh] = new_root_h[nt_grh] + tz
+            # Apply: replace priv[:, 0] where global_root_h is set.
+            priv = priv.clone()
+            priv[grh_flat, 0] = new_root_h[grh_flat]
+            next_obs["privileged_state"] = priv
         next_obs = self.policy._normalize(next_obs)
         z = self.policy._backward_map(next_obs)
         z = z.view(batch_dim, traj_length, z.shape[-1])
