@@ -1299,13 +1299,13 @@ class FBCprAuxPolicy(nn.Module):
         """Project z.
 
         Standard FB: project to sphere surface (radius R).
-        Soft FB: clamp norm to [0, R] (preserve direction and magnitude
-        within the ball).
+        Soft FB: squash norm via R * z / (||z|| + 1) — smoothly maps
+        any norm into [0, R) while preserving direction.
         """
         R = math.sqrt(z.shape[-1])
         if self.soft_fb:
             norm = z.norm(dim=-1, keepdim=True).clamp(min=1e-8)
-            return z * (norm.clamp(max=R) / norm)
+            return R * z / (norm + 1.0)
         if self.norm_z:
             return R * F.normalize(z, dim=-1)
         return z

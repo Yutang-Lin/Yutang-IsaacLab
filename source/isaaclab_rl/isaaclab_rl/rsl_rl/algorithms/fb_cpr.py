@@ -703,14 +703,14 @@ class FBCprAux:
         goals = self.policy._backward_map(shuffled)
         goals = self.policy.project_z(goals)
         if self.cfg.soft_fb:
-            goals = self._soft_fb_scale_z(goals, alpha=2.0, beta=2.0)
+            goals = self._soft_fb_scale_z(goals, alpha=2.0, beta=2.0, normalize_first=False)
         z = torch.where(mix_idxs == 0, goals, z)
 
         # Expert-encoded z's
         perm = torch.randperm(batch, device=self.device)
         expert_z = expert_encodings[perm]
         if self.cfg.soft_fb:
-            expert_z = self._soft_fb_scale_z(expert_z, alpha=2.0, beta=2.0)
+            expert_z = self._soft_fb_scale_z(expert_z, alpha=2.0, beta=2.0, normalize_first=False)
         z = torch.where(mix_idxs == 1, expert_z, z)
         return z
 
@@ -738,18 +738,19 @@ class FBCprAux:
         if self.cfg.soft_fb:
             R = math.sqrt(B_expert.shape[-1])
             fmin_lo, fmin_hi = self.cfg.soft_fb_expert_future_min
-            # Per-chunk randomized future_min.
             per_chunk_fmin = fmin_lo + (fmin_hi - fmin_lo) * torch.rand(
                 N, device=B_expert.device,
             )  # [N]
-            normed = R * F.normalize(B_expert, dim=-1)  # [N, seq, d]
             if seq_length > 1:
-                t = torch.linspace(0.0, 1.0, seq_length, device=B_expert.device)  # [seq]
-                weights = 1.0 - t.unsqueeze(0) * (1.0 - per_chunk_fmin.unsqueeze(1))  # [N, seq]
+                t = torch.linspace(0.0, 1.0, seq_length, device=B_expert.device)
+                weights = 1.0 - t.unsqueeze(0) * (1.0 - per_chunk_fmin.unsqueeze(1))
             else:
                 weights = torch.ones(N, 1, device=B_expert.device)
-            scaled = normed * weights.unsqueeze(-1)  # [N, seq, d]
-            z_expert = scaled.mean(dim=1)
+            # Decay-weighted sum → squash (no per-frame sphere normalization).
+            scaled = B_expert * weights.unsqueeze(-1)
+            z_sum = scaled.sum(dim=1)
+            norm = z_sum.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+            z_expert = R * z_sum / (norm + 1.0)
             z_expert = self._soft_fb_scale_z(z_expert, normalize_first=False)
         else:
             z_expert = B_expert.mean(dim=1)
@@ -1123,7 +1124,6 @@ class FBCprAux:
         if self.cfg.soft_fb:
             R = math.sqrt(z.shape[-1])
             fmin_lo, fmin_hi = self.cfg.soft_fb_expert_future_min
-            # Per-trajectory randomized future_min in [fmin_lo, fmin_hi].
             per_traj_fmin = fmin_lo + (fmin_hi - fmin_lo) * torch.rand(
                 batch_dim, device=z.device,
             )  # [B]
@@ -1131,15 +1131,17 @@ class FBCprAux:
                 end_idx = min(step + seq_length, traj_length)
                 window = z[:, step:end_idx]                        # [B, W, d]
                 W = window.shape[1]
-                window_normed = R * F.normalize(window, dim=-1)
                 if W > 1:
-                    # Per-traj weights: linspace(1.0, fmin_i, W) for each traj i.
                     t = torch.linspace(0.0, 1.0, W, device=z.device)  # [W]
                     weights = 1.0 - t.unsqueeze(0) * (1.0 - per_traj_fmin.unsqueeze(1))  # [B, W]
                 else:
                     weights = torch.ones(batch_dim, 1, device=z.device)
-                window_scaled = window_normed * weights.unsqueeze(-1)  # [B, W, d]
-                z[:, step] = window_scaled.mean(dim=1)
+                # Decay-weighted sum (no per-frame sphere normalization).
+                window_scaled = window * weights.unsqueeze(-1)     # [B, W, d]
+                z_sum = window_scaled.sum(dim=1)                   # [B, d]
+                # Squash: R * z / (||z|| + 1)
+                norm = z_sum.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+                z[:, step] = R * z_sum / (norm + 1.0)
             # Per-trajectory Beta scale (shared across time steps).
             beta_dist = torch.distributions.Beta(
                 torch.tensor(5.0, device=z.device),
