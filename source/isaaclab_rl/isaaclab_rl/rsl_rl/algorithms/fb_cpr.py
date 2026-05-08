@@ -702,15 +702,11 @@ class FBCprAux:
         shuffled = self._permute_obs(train_goal, perm)
         goals = self.policy._backward_map(shuffled)
         goals = self.policy.project_z(goals)
-        if self.cfg.soft_fb:
-            goals = self._soft_fb_scale_z(goals, alpha=2.0, beta=2.0, normalize_first=False)
         z = torch.where(mix_idxs == 0, goals, z)
 
         # Expert-encoded z's
         perm = torch.randperm(batch, device=self.device)
         expert_z = expert_encodings[perm]
-        if self.cfg.soft_fb:
-            expert_z = self._soft_fb_scale_z(expert_z, alpha=2.0, beta=2.0, normalize_first=False)
         z = torch.where(mix_idxs == 1, expert_z, z)
         return z
 
@@ -751,7 +747,6 @@ class FBCprAux:
             z_sum = scaled.sum(dim=1)
             norm = z_sum.norm(dim=-1, keepdim=True).clamp(min=1e-8)
             z_expert = R * z_sum / (norm + 1.0)
-            z_expert = self._soft_fb_scale_z(z_expert, normalize_first=False)
         else:
             z_expert = B_expert.mean(dim=1)
             z_expert = self.policy.project_z(z_expert)
@@ -1142,13 +1137,6 @@ class FBCprAux:
                 # Squash: R * z / (||z|| + 1)
                 norm = z_sum.norm(dim=-1, keepdim=True).clamp(min=1e-8)
                 z[:, step] = R * z_sum / (norm + 1.0)
-            # Per-trajectory Beta scale (shared across time steps).
-            beta_dist = torch.distributions.Beta(
-                torch.tensor(5.0, device=z.device),
-                torch.tensor(2.0, device=z.device),
-            )
-            scale = beta_dist.sample((batch_dim, 1, 1))  # [B, 1, 1]
-            z = z * scale
         else:
             for step in range(traj_length):
                 end_idx = min(step + seq_length, traj_length)
