@@ -1282,15 +1282,14 @@ class FBCprAuxPolicy(nn.Module):
         """Sample a batch of latent ``z``.
 
         Standard FB: project to sphere surface of radius ``sqrt(z_dim)``.
-        Soft FB: sample from the ball with uniform radius in ``[0, R]``
-        so every entropy level is explicitly covered.
+        Soft FB: sample from unit ball (R=1) with uniform radius.
         """
         z = torch.randn((batch_size, self.z_dim), dtype=torch.float32, device=device)
         z = F.normalize(z, dim=-1)
-        R = math.sqrt(self.z_dim)
         if self.soft_fb:
-            r = R * torch.rand(batch_size, 1, dtype=torch.float32, device=device)
+            r = torch.rand(batch_size, 1, dtype=torch.float32, device=device)
             return z * r
+        R = math.sqrt(self.z_dim)
         if self.norm_z:
             return z * R
         return z
@@ -1298,14 +1297,14 @@ class FBCprAuxPolicy(nn.Module):
     def project_z(self, z: torch.Tensor) -> torch.Tensor:
         """Project z.
 
-        Standard FB: project to sphere surface (radius R).
-        Soft FB: squash norm via R * z / (||z|| + 1) — smoothly maps
-        any norm into [0, R) while preserving direction.
+        Standard FB: project to sphere surface (radius sqrt(z_dim)).
+        Soft FB: squash norm via z / (||z|| + 1) — smoothly maps
+        any norm into [0, 1) while preserving direction. R=1.
         """
-        R = math.sqrt(z.shape[-1])
         if self.soft_fb:
             norm = z.norm(dim=-1, keepdim=True).clamp(min=1e-8)
-            return R * z / (norm + 1.0)
+            return z / (norm + 1.0)
+        R = math.sqrt(z.shape[-1])
         if self.norm_z:
             return R * F.normalize(z, dim=-1)
         return z

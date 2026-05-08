@@ -732,7 +732,7 @@ class FBCprAux:
         B_expert = B_expert.view(N, seq_length, B_expert.shape[-1])
 
         if self.cfg.soft_fb:
-            R = math.sqrt(B_expert.shape[-1])
+            R = 1.0  # soft FB uses unit ball
             fmin_lo, fmin_hi = self.cfg.soft_fb_expert_future_min
             per_chunk_fmin = fmin_lo + (fmin_hi - fmin_lo) * torch.rand(
                 N, device=B_expert.device,
@@ -1117,7 +1117,7 @@ class FBCprAux:
         z = z.view(batch_dim, traj_length, z.shape[-1])
 
         if self.cfg.soft_fb:
-            R = math.sqrt(z.shape[-1])
+            R = 1.0  # soft FB uses unit ball
             fmin_lo, fmin_hi = self.cfg.soft_fb_expert_future_min
             per_traj_fmin = fmin_lo + (fmin_hi - fmin_lo) * torch.rand(
                 batch_dim, device=z.device,
@@ -1794,11 +1794,19 @@ class FBCprAux:
         fb_diag = -torch.diagonal(diff, dim1=1, dim2=2).mean() * Ms.shape[0]
         fb_loss = fb_offdiag + fb_diag
 
-        # Orthonormality loss on B.
-        Cov = torch.matmul(B, B.T)
-        orth_loss_diag = -Cov.diag().mean()
-        orth_loss_offdiag = 0.5 * (Cov * self._off_diag).pow(2).sum() / self._off_diag_sum
-        orth_loss = orth_loss_offdiag + orth_loss_diag
+        # Orthonormality loss on B: ||E[B(s)B(s)^T] - I||^2
+        if self.cfg.soft_fb:
+            # Feature covariance [z_dim, z_dim] — push toward identity.
+            BtB = torch.matmul(B.T, B) / B.shape[0]  # [d, d]
+            orth_loss = (BtB - torch.eye(B.shape[1], device=B.device)).pow(2).mean()
+            orth_loss_diag = (BtB.diag() - 1.0).pow(2).mean()
+            orth_loss_offdiag = BtB.pow(2).sum() / (B.shape[1] ** 2) - orth_loss_diag
+        else:
+            # Legacy batch gram matrix for standard FB.
+            Cov = torch.matmul(B, B.T)
+            orth_loss_diag = -Cov.diag().mean()
+            orth_loss_offdiag = 0.5 * (Cov * self._off_diag).pow(2).sum() / self._off_diag_sum
+            orth_loss = orth_loss_offdiag + orth_loss_diag
         fb_loss = fb_loss + self.cfg.ortho_coef * orth_loss
 
         # Reconstruction regulariser: decode end-effector (or any
@@ -2111,7 +2119,7 @@ class FBCprAux:
         _, _, Q_fb = self._pessimistic_value(Qs_fb, self.cfg.actor_pessimism_penalty)
 
         if self.cfg.soft_fb:
-            R = math.sqrt(p.z_dim)
+            R = 1.0  # soft FB uses unit ball
             z_norms = z.norm(dim=-1)
 
         if self.cfg.soft_fb and self.cfg.scale_reg:
