@@ -1798,9 +1798,11 @@ class FBCprAux:
         if self.cfg.soft_fb:
             # Feature covariance [z_dim, z_dim] — push toward identity.
             BtB = torch.matmul(B.T, B) / B.shape[0]  # [d, d]
-            orth_loss = (BtB - torch.eye(B.shape[1], device=B.device)).pow(2).mean()
-            orth_loss_diag = (BtB.diag() - 1.0).pow(2).mean()
-            orth_loss_offdiag = BtB.pow(2).sum() / (B.shape[1] ** 2) - orth_loss_diag
+            diff = BtB - torch.eye(B.shape[1], device=B.device)
+            orth_loss = diff.pow(2).mean()
+            orth_loss_diag = diff.diag().pow(2).mean()
+            d = B.shape[1]
+            orth_loss_offdiag = (diff.pow(2).sum() - diff.diag().pow(2).sum()) / (d * (d - 1))
         else:
             # Legacy batch gram matrix for standard FB.
             Cov = torch.matmul(B, B.T)
