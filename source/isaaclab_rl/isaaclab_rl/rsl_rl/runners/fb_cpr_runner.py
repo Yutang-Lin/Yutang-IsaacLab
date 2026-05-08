@@ -1456,6 +1456,13 @@ class FBCprRunner:
                 f"{self.tot_timesteps} for logging continuity.",
                 flush=True,
             )
+        # Reset torch.compile cache after loading — prevents compiled graph
+        # guard mismatches from causing permanent eager-mode fallback.
+        try:
+            torch._dynamo.reset()
+        except Exception:
+            pass
+
         return ckpt.get("infos", {})
 
     # --- train/eval toggles ---------------------------------------------- #
