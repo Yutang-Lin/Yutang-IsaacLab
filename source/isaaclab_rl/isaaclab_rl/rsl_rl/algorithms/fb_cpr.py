@@ -940,6 +940,71 @@ class FBCprAux:
         return ref
 
     @torch.no_grad()
+    def get_global_fb_targets(
+        self, step_count: torch.Tensor, expert_buffer: Any,
+        global_fb_zero_prob: float = 0.5,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+        """Return per-env (target_xy [N,2], target_yaw [N], active [N] bool).
+
+        For tracking envs: target is the motion's current frame root_pos_xy
+        (with heading rotation + spawn offset applied). Probabilistically
+        zeroed with ``global_fb_zero_prob``.
+        Non-tracking envs: always inactive.
+        """
+        if getattr(self, "_tracking_env_idx", None) is None:
+            return None
+        if getattr(self, "_tracking_motion_ids", None) is None:
+            return None
+        if expert_buffer.root_pos_buffer is None:
+            return None
+        self._ensure_buffer_cache(expert_buffer)
+        N = step_count.shape[0]
+        target_xy = torch.zeros(N, 2, device=self.device)
+        target_yaw = torch.zeros(N, device=self.device)
+        active = torch.zeros(N, dtype=torch.bool, device=self.device)
+
+        traj_len = self.cfg.rollout_expert_trajectories_length
+        local_t = step_count[self._tracking_env_idx] % traj_len
+        usable = (self._tracking_motion_lens - 1).clamp_min(1)
+        frame = (self._tracking_starts + local_t.view(-1) + 1) % usable
+        obs_starts = self._cached_obs_starts_dev[self._tracking_motion_ids]
+        global_idx = (obs_starts + frame).long()
+
+        motion_pos = self._cached_root_pos_dev[global_idx]
+        motion_quat = self._cached_root_quat_dev[global_idx]
+
+        # Apply heading rotation + XY offset (same as get_tracking_ref_root_pos)
+        anchor_idx = self._tracking_anchor_global_idx()
+        motion_anchor_xy = self._cached_root_pos_dev[anchor_idx, :2]
+        if self._tracking_robot_xy is not None:
+            delta_xy = motion_pos[:, :2] - motion_anchor_xy
+            if self._tracking_heading_delta is not None:
+                cos_d = torch.cos(self._tracking_heading_delta).unsqueeze(-1)
+                sin_d = torch.sin(self._tracking_heading_delta).unsqueeze(-1)
+                dx, dy = delta_xy[:, 0:1], delta_xy[:, 1:2]
+                delta_xy = torch.cat([cos_d * dx - sin_d * dy,
+                                      sin_d * dx + cos_d * dy], dim=-1)
+            world_xy = self._tracking_robot_xy + delta_xy
+        else:
+            world_xy = motion_pos[:, :2]
+
+        # Target yaw from motion quat + heading delta
+        motion_yaw = self._yaw_from_quat(motion_quat)
+        if self._tracking_heading_delta is not None:
+            world_yaw = motion_yaw + self._tracking_heading_delta
+        else:
+            world_yaw = motion_yaw
+
+        # Probabilistic zeroing
+        n_track = len(self._tracking_env_idx)
+        keep = torch.rand(n_track, device=self.device) >= global_fb_zero_prob
+        target_xy[self._tracking_env_idx] = world_xy
+        target_yaw[self._tracking_env_idx] = world_yaw
+        active[self._tracking_env_idx] = keep
+
+        return target_xy, target_yaw, active
+
+    @torch.no_grad()
     def get_tracking_ref_body_pos(
         self, step_count: torch.Tensor, expert_buffer: Any,
         terrain_z_fn=None,
