@@ -34,6 +34,7 @@ from .student_lfm_bfm_tracker import StudentLFMBFMTracker
 from .student_bc_bfm_tracker import StudentBCBFMTracker
 from .sparse_successor_policy import SparseSuccessorPolicy
 from .fb_cpr_policy import FBCprAuxPolicy, FBCprNetworkCfg
+from .vision_student import VisionStudent, DepthEncoder
 
 import torch
 from typing import Callable
