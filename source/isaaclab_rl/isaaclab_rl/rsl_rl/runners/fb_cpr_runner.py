@@ -136,6 +136,7 @@ class FBCprRunner:
                 backend="nccl",
                 rank=self.gpu_global_rank,
                 world_size=self.gpu_world_size,
+                device_id=torch.device(f"cuda:{_dev_idx}"),
             )
 
         # Seed everything (match BFM's ``set_seed_everywhere``). This fixes
