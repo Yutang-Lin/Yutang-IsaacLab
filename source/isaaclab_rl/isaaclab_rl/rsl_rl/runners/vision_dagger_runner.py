@@ -371,7 +371,7 @@ class VisionDAggerRunner(FBCprRunner):
                         n_third, 1, target_device=self.device,
                     )
                     expert_batch = next(iter(expert_chunks))
-                    z_expert = self.alg.encode_expert(expert_batch["next_observation"])
+                    z_expert = self.alg.encode_expert(expert_batch["next"]["observation"])
 
                     # Random z
                     z_random = self.policy.sample_z(n, device=self.device)
