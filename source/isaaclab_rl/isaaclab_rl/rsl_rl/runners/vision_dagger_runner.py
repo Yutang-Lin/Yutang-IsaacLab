@@ -61,6 +61,13 @@ class VisionDAggerRunner(FBCprRunner):
         # Initialize the full FB-CPR runner (loads teacher policy, expert buffer, etc.)
         super().__init__(env, train_cfg, log_dir=log_dir, device=device, **kwargs)
 
+        # Load teacher checkpoint (the FB-CPR policy weights)
+        dagger_cfg = self.alg_cfg.get("dagger", {})
+        teacher_ckpt_path = dagger_cfg.get("teacher_ckpt", "")
+        if teacher_ckpt_path:
+            print(f"[VisionDAggerRunner] Loading teacher from: {teacher_ckpt_path}", flush=True)
+            super().load(teacher_ckpt_path, load_optimizer=False)
+
         # Freeze teacher (the loaded FB-CPR policy)
         self.policy.eval()
         for p in self.policy.parameters():
