@@ -366,12 +366,14 @@ class VisionDAggerRunner(FBCprRunner):
                     z_goal = self.policy.backward_map(shuffled_obs)
                     z_goal = self.policy.project_z(z_goal)
 
-                    # Expert-encoded z
+                    # Expert-encoded z — sample n_third transitions, encode via B
                     expert_chunks = self.expert_buffer.sample_chunks(
                         n_third, 1, target_device=self.device,
                     )
                     expert_batch = next(iter(expert_chunks))
-                    z_expert = self.alg.encode_expert(expert_batch["next"]["observation"])
+                    expert_next_obs = expert_batch["next"]["observation"]
+                    B_out = self.policy._backward_map(expert_next_obs).detach()
+                    z_expert = self.policy.project_z(B_out)
 
                     # Random z
                     z_random = self.policy.sample_z(n, device=self.device)
