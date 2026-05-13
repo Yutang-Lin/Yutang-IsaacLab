@@ -582,10 +582,8 @@ class FBCprRunner:
 
                     # Push global FB targets (XY + yaw) to env before step.
                     if hasattr(env_u, "set_global_fb_targets"):
-                        global_fb_prob = float(getattr(env_u.cfg, "global_fb_zero_prob", 0.5))
                         targets = self.alg.get_global_fb_targets(
                             step_count, self.expert_buffer,
-                            global_fb_zero_prob=global_fb_prob,
                         )
                         if targets is not None:
                             env_u.set_global_fb_targets(*targets)

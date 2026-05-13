@@ -824,6 +824,9 @@ class FBCprAux:
         global_rh = torch.zeros(n_envs, dtype=torch.bool, device=self.device)
         global_rh[self._tracking_env_idx] = use_global
         self._tracking_terrain_variant_root_h = global_rh
+        # Global FB: sample active mask once per tracking episode.
+        global_fb_prob = getattr(self.cfg, "global_fb_zero_prob", 0.5)
+        self._tracking_global_fb_active = torch.rand(n_elem, device=self.device) >= global_fb_prob
         # Store robot pose for reference viz.
         if robot_root_xy is not None:
             self._tracking_robot_xy = robot_root_xy[self._tracking_env_idx].to(self.device).clone()
@@ -942,13 +945,12 @@ class FBCprAux:
     @torch.no_grad()
     def get_global_fb_targets(
         self, step_count: torch.Tensor, expert_buffer: Any,
-        global_fb_zero_prob: float = 0.5,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
         """Return per-env (target_xy [N,2], target_yaw [N], active [N] bool).
 
         For tracking envs: target is the motion's current frame root_pos_xy
-        (with heading rotation + spawn offset applied). Probabilistically
-        zeroed with ``global_fb_zero_prob``.
+        (with heading rotation + spawn offset applied). Active mask is
+        sampled once per tracking episode in ``_resample_tracking``.
         Non-tracking envs: always inactive.
         """
         if getattr(self, "_tracking_env_idx", None) is None:
@@ -995,12 +997,14 @@ class FBCprAux:
         else:
             world_yaw = motion_yaw
 
-        # Probabilistic zeroing
-        n_track = len(self._tracking_env_idx)
-        keep = torch.rand(n_track, device=self.device) >= global_fb_zero_prob
+        # Use per-episode mask (sampled once at resample time, not per-step).
         target_xy[self._tracking_env_idx] = world_xy
         target_yaw[self._tracking_env_idx] = world_yaw
-        active[self._tracking_env_idx] = keep
+        global_fb_mask = getattr(self, "_tracking_global_fb_active", None)
+        if global_fb_mask is not None:
+            active[self._tracking_env_idx] = global_fb_mask
+        else:
+            active[self._tracking_env_idx] = True
 
         return target_xy, target_yaw, active
 

@@ -1324,6 +1324,7 @@ class RslRlFBCprAlgorithmCfg:
     rollout_expert_trajectories_length: int = 250
     rollout_expert_trajectories_percentage: float = 0.5
     terrain_variant_root_h_prob: float = 0.50
+    global_fb_zero_prob: float = 0.5
     z_buffer_size: int = 8192
 
     # AMP (bf16)
