@@ -94,8 +94,9 @@ class VisionDAggerRunner(FBCprRunner):
             depth_height=self.depth_height,
             depth_width=self.depth_width,
             depth_feature_dim=dagger_cfg.get("depth_feature_dim", 128),
-            hidden_dims=tuple(dagger_cfg.get("hidden_dims", [512, 256, 128])),
-            activation=dagger_cfg.get("activation", "elu"),
+            hidden_dim=dagger_cfg.get("hidden_dim", 2048),
+            hidden_layers=dagger_cfg.get("hidden_layers", 6),
+            embedding_layers=dagger_cfg.get("embedding_layers", 2),
         ).to(self.device)
 
         # Student optimizer

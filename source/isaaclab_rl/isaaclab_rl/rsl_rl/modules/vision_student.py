@@ -4,8 +4,9 @@
 
 """Vision-based student policy for BFM DAgger distillation.
 
-Replaces height-scan with a depth image encoder (lightweight CNN).
-Receives z from teacher's backward map to preserve multi-behavior capability.
+Matches the teacher's Actor architecture (residual embedding + residual
+trunk) but replaces height_scan with a depth CNN encoder. This ensures
+the student has the same capacity as the teacher.
 """
 
 from __future__ import annotations
@@ -42,8 +43,49 @@ class DepthEncoder(nn.Module):
         return self.fc(feat)
 
 
+# --- Residual building blocks (mirrors fb_cpr_policy.py) ---
+
+class _ResidualBlock(nn.Module):
+    def __init__(self, dim: int) -> None:
+        super().__init__()
+        self.mlp = nn.Sequential(nn.LayerNorm(dim), nn.Linear(dim, dim), nn.Mish())
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x + self.mlp(x)
+
+
+class _Block(nn.Module):
+    def __init__(self, input_dim: int, output_dim: int, activation: bool) -> None:
+        super().__init__()
+        seq = [nn.LayerNorm(input_dim), nn.Linear(input_dim, output_dim)]
+        if activation:
+            seq.append(nn.Mish())
+        self.mlp = nn.Sequential(*seq)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.mlp(x)
+
+
+def _residual_embedding(input_dim: int, hidden_dim: int, hidden_layers: int) -> nn.Sequential:
+    assert hidden_layers >= 2
+    seq: list[nn.Module] = [_Block(input_dim, hidden_dim, True)]
+    for _ in range(hidden_layers - 2):
+        seq.append(_ResidualBlock(hidden_dim))
+    seq.append(_Block(hidden_dim, hidden_dim // 2, True))
+    return nn.Sequential(*seq)
+
+
 class VisionStudent(nn.Module):
-    """Vision DAgger student: depth CNN + (proprio, z) → action MLP."""
+    """Vision DAgger student matching teacher Actor architecture.
+
+    Architecture (mirrors fb_cpr_policy.Actor):
+      depth → DepthEncoder → depth_feat
+      obs = cat(depth_feat, proprio)
+      z_emb = residual_embedding(cat(obs, z))  → hidden_dim//2
+      s_emb = residual_embedding(obs)           → hidden_dim//2
+      trunk_input = cat(s_emb, z_emb)           → hidden_dim
+      output = residual_trunk(trunk_input)       → action_dim
+    """
 
     is_recurrent = False
 
@@ -55,8 +97,10 @@ class VisionStudent(nn.Module):
         depth_height: int = 58,
         depth_width: int = 87,
         depth_feature_dim: int = 128,
-        hidden_dims: tuple[int, ...] = (512, 256, 128),
-        activation: str = "elu",
+        hidden_dim: int = 2048,
+        hidden_layers: int = 6,
+        embedding_layers: int = 2,
+        **kwargs,
     ):
         super().__init__()
         self.num_proprio = num_proprio
@@ -67,35 +111,24 @@ class VisionStudent(nn.Module):
 
         self.depth_encoder = DepthEncoder(depth_height, depth_width, depth_feature_dim)
 
-        mlp_input_dim = depth_feature_dim + num_proprio + z_dim
-        act_fn = {"elu": nn.ELU, "relu": nn.ReLU, "silu": nn.SiLU, "tanh": nn.Tanh}[activation]
+        obs_dim = depth_feature_dim + num_proprio
 
-        layers: list[nn.Module] = []
-        in_dim = mlp_input_dim
-        for h in hidden_dims:
-            layers.append(nn.Linear(in_dim, h))
-            layers.append(act_fn())
-            in_dim = h
-        layers.append(nn.Linear(in_dim, num_actions))
-        self.mlp = nn.Sequential(*layers)
+        # Match teacher Actor: two residual embeddings each → hidden_dim//2
+        self.embed_z = _residual_embedding(obs_dim + z_dim, hidden_dim, embedding_layers)
+        self.embed_s = _residual_embedding(obs_dim, hidden_dim, embedding_layers)
 
-        self._init_weights()
-
-    def _init_weights(self):
-        for m in self.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.orthogonal_(m.weight, gain=0.01)
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
-            elif isinstance(m, nn.Conv2d):
-                nn.init.kaiming_normal_(m.weight, nonlinearity="linear")
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
+        # Residual trunk at full hidden_dim (cat of two hidden_dim//2 embeddings)
+        seq: list[nn.Module] = [_ResidualBlock(hidden_dim) for _ in range(hidden_layers)]
+        seq.append(_Block(hidden_dim, num_actions, False))
+        self.trunk = nn.Sequential(*seq)
 
     def forward(self, depth: torch.Tensor, proprio: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
         depth_feat = self.depth_encoder(depth)
-        x = torch.cat([depth_feat, proprio, z], dim=-1)
-        return self.mlp(x)
+        obs = torch.cat([depth_feat, proprio], dim=-1)
+        z_emb = self.embed_z(torch.cat([obs, z], dim=-1))
+        s_emb = self.embed_s(obs)
+        h = torch.cat([s_emb, z_emb], dim=-1)
+        return self.trunk(h)
 
     def act_inference(self, depth: torch.Tensor, proprio: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
         return self.forward(depth, proprio, z)
