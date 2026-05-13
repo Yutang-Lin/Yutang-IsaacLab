@@ -108,6 +108,7 @@ class VisionDAggerRunner(FBCprRunner):
 
         # Wrap student in DDP if distributed
         if self.is_distributed:
+            torch.distributed.barrier()
             from torch.nn.parallel import DistributedDataParallel as DDP
             self.student = DDP(
                 self.student,
@@ -177,6 +178,10 @@ class VisionDAggerRunner(FBCprRunner):
 
     def learn(self, num_learning_iterations: int, init_at_random_ep_len: bool = False):  # noqa: C901
         self._is_head = (not self.is_distributed) or (self.gpu_global_rank == 0)
+
+        # DDP: broadcast teacher weights from rank 0 so all ranks are aligned.
+        if self.is_distributed:
+            self.alg.broadcast_parameters()
 
         # Setup logging
         if self.log_dir is not None and self.writer is None and self._is_head:
