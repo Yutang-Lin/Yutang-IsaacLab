@@ -99,6 +99,17 @@ class VisionDAggerRunner(FBCprRunner):
         self._dagger_batch_size = dagger_cfg.get("batch_size", 2048)
         self._dagger_relabel_ratio = dagger_cfg.get("relabel_ratio", 0.5)
 
+        # Wrap student in DDP if distributed
+        if self.is_distributed:
+            from torch.nn.parallel import DistributedDataParallel as DDP
+            self.student = DDP(
+                self.student,
+                device_ids=[torch.cuda.current_device()],
+                broadcast_buffers=False,
+                find_unused_parameters=False,
+            )
+        self._student_module = self.student.module if self.is_distributed else self.student
+
         self.student_optimizer = torch.optim.AdamW(
             self.student.parameters(),
             lr=self._dagger_lr,
@@ -171,9 +182,7 @@ class VisionDAggerRunner(FBCprRunner):
                 from torch.utils.tensorboard import SummaryWriter
                 self.writer = SummaryWriter(log_dir=self.log_dir, flush_secs=10)
 
-        # Sync student across ranks
-        if self.is_distributed:
-            self._broadcast_student()
+        # DDP sync is handled by the DDP wrapper automatically
 
         # Initial obs
         obs_flat, extras = self.env.get_observations()
@@ -230,7 +239,7 @@ class VisionDAggerRunner(FBCprRunner):
                     teacher_action = self.policy.act(obs_dict, z_context, mean=True)
 
                     # Student executes (pure DAgger — no beta mixing)
-                    rollout_action = self.student.act_inference(
+                    rollout_action = self._student_module.act_inference(
                         depth, self.proprio_normalizer(proprio), z_context,
                     )
 
@@ -366,7 +375,7 @@ class VisionDAggerRunner(FBCprRunner):
                 z_all[relabel_idx] = new_z
                 target_all[relabel_idx] = new_teacher_action
 
-            # Mini-batch SGD
+            # Mini-batch SGD (DDP handles gradient sync automatically)
             mean_loss = 0.0
             num_batches = 0
             for _ in range(self._dagger_epochs):
@@ -385,10 +394,8 @@ class VisionDAggerRunner(FBCprRunner):
                     loss.backward()
                     if self._dagger_max_grad_norm:
                         nn.utils.clip_grad_norm_(
-                            self.student.parameters(), self._dagger_max_grad_norm
+                            self._student_module.parameters(), self._dagger_max_grad_norm
                         )
-                    if self.is_distributed:
-                        self._reduce_student_gradients()
                     self.student_optimizer.step()
                     mean_loss += loss.item()
                     num_batches += 1
@@ -434,16 +441,16 @@ class VisionDAggerRunner(FBCprRunner):
 
     def save(self, path: str, infos=None):
         torch.save({
-            "student_state_dict": self.student.state_dict(),
+            "student_state_dict": self._student_module.state_dict(),
             "optimizer_state_dict": self.student_optimizer.state_dict(),
             "proprio_normalizer_state_dict": self.proprio_normalizer.state_dict(),
             "iter": self.current_learning_iteration,
             "student_cfg": {
-                "num_proprio": self.student.num_proprio,
-                "num_actions": self.student.num_actions,
-                "z_dim": self.student.z_dim,
-                "depth_height": self.student.depth_height,
-                "depth_width": self.student.depth_width,
+                "num_proprio": self._student_module.num_proprio,
+                "num_actions": self._student_module.num_actions,
+                "z_dim": self._student_module.z_dim,
+                "depth_height": self._student_module.depth_height,
+                "depth_width": self._student_module.depth_width,
             },
             "teacher_ckpt": self.cfg.get("resume_path", ""),
         }, path)
@@ -451,7 +458,7 @@ class VisionDAggerRunner(FBCprRunner):
     def load(self, path: str, load_optimizer: bool = True):
         ckpt = torch.load(path, map_location=self.device, weights_only=False)
         if "student_state_dict" in ckpt:
-            self.student.load_state_dict(ckpt["student_state_dict"])
+            self._student_module.load_state_dict(ckpt["student_state_dict"])
             if "proprio_normalizer_state_dict" in ckpt:
                 self.proprio_normalizer.load_state_dict(ckpt["proprio_normalizer_state_dict"])
             if load_optimizer and "optimizer_state_dict" in ckpt:
@@ -459,38 +466,20 @@ class VisionDAggerRunner(FBCprRunner):
             if "iter" in ckpt:
                 self.current_learning_iteration = ckpt["iter"]
         else:
-            # Loading a teacher checkpoint — already handled by parent __init__
+            # Loading a teacher checkpoint — handled by parent
             super().load(path, load_optimizer=False)
         return ckpt
 
     def get_inference_policy(self, device=None):
         """Return student inference function for deployment."""
-        self.student.eval()
+        self._student_module.eval()
         if device:
-            self.student.to(device)
+            self._student_module.to(device)
             self.proprio_normalizer.to(device)
         normalizer = self.proprio_normalizer
+        student = self._student_module
 
         def policy_fn(depth, proprio, z):
-            return self.student.act_inference(depth, normalizer(proprio), z)
+            return student.act_inference(depth, normalizer(proprio), z)
 
         return policy_fn
-
-    def _broadcast_student(self):
-        params = [self.student.state_dict()]
-        torch.distributed.broadcast_object_list(params, src=0)
-        self.student.load_state_dict(params[0])
-
-    def _reduce_student_gradients(self):
-        grads = [p.grad.view(-1) for p in self.student.parameters() if p.grad is not None]
-        if not grads:
-            return
-        all_grads = torch.cat(grads)
-        torch.distributed.all_reduce(all_grads, op=torch.distributed.ReduceOp.SUM)
-        all_grads /= self.gpu_world_size
-        offset = 0
-        for p in self.student.parameters():
-            if p.grad is not None:
-                numel = p.numel()
-                p.grad.data.copy_(all_grads[offset:offset + numel].view_as(p.grad))
-                offset += numel
