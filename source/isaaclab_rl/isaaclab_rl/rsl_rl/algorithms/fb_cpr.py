@@ -418,10 +418,8 @@ class FBCprAux:
         # learn-iter via a fused all_reduce.
         self._is_ddp_wrapped = False
         if self.is_distributed:
-            # Barrier: ensure all ranks have completed policy init before the
-            # DDP constructor (which broadcasts params — a collective op).
-            # Without this, ranks with slower sim/camera init hang here.
             torch.distributed.barrier()
+
             from torch.nn.parallel import DistributedDataParallel as DDP
             local_rank = int(torch.distributed.get_rank()) if torch.distributed.is_initialized() else 0
             try:
