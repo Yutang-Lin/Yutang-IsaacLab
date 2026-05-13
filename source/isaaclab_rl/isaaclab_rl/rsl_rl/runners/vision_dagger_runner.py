@@ -396,7 +396,7 @@ class VisionDAggerRunner(FBCprRunner):
                     self.save(os.path.join(self.log_dir, f"model_{it}.pt"))
 
             if it == start_iter and self._is_head:
-                git_file_paths = store_code_state(self.log_dir, self.git_status_repos)
+                git_file_paths = store_code_state(self.log_dir, getattr(self, "git_status_repos", []))
                 if self.logger_type in ["wandb", "neptune"] and git_file_paths:
                     for path in git_file_paths:
                         self.writer.save_file(path)
