@@ -160,6 +160,8 @@ class FBCprAuxAlgorithmCfg:
     rollout_expert_trajectories_length: int = 250
     rollout_expert_trajectories_percentage: float = 0.5
     z_buffer_size: int = 8192
+    tracking_T_min: int = 1
+    tracking_T_max: int = 16
 
     # AMP (bf16). NOTE: the autocast context is NOT currently wired around
     # our forward/backward passes. Setting this True has no numerical
@@ -724,7 +726,12 @@ class FBCprAux:
     def encode_expert(
         self, next_obs: torch.Tensor | dict[str, torch.Tensor]
     ) -> torch.Tensor:
-        """Encode expert sub-sequences through B, average over seq_length, project."""
+        """Encode expert sub-sequences through B with variable-T window.
+
+        For each sub-sequence, samples T ∈ [T_min, T_max], computes z as
+        mean of first T frames, then repeats z for all seq_length frames
+        (all frames in the window are "real" for discriminator training).
+        """
         B_expert = self.policy._backward_map(next_obs).detach()
         seq_length = self.policy.seq_length
         assert self.cfg.batch_size % seq_length == 0, (
@@ -733,13 +740,25 @@ class FBCprAux:
         N = self.cfg.batch_size // seq_length
         B_expert = B_expert.view(N, seq_length, B_expert.shape[-1])
 
-        if self.cfg.soft_fb:
-            # Mean over seq_length window → squash.
-            z_mean = B_expert.mean(dim=1)  # [N, d]
-            norm = z_mean.norm(dim=-1, keepdim=True).clamp(min=1e-8)
-            z_expert = z_mean / (norm + 1.0)
+        # Variable T per sub-sequence (skip if T_min == T_max)
+        T_min = getattr(self.cfg, "tracking_T_min", 1)
+        T_max = min(getattr(self.cfg, "tracking_T_max", 16), seq_length)
+        if T_min < T_max:
+            T_per_seq = torch.randint(T_min, T_max + 1, (N,), device=B_expert.device)
+            # Compute z = mean(B_expert[:, 0:T]) per sequence using cumsum
+            d = B_expert.shape[-1]
+            cumz = torch.cat([torch.zeros(N, 1, d, device=B_expert.device),
+                              torch.cumsum(B_expert, dim=1)], dim=1)  # [N, seq+1, d]
+            arange_N = torch.arange(N, device=B_expert.device)
+            z_sum = cumz[arange_N, T_per_seq]  # [N, d]
+            z_expert = z_sum / T_per_seq.float().unsqueeze(-1)
         else:
             z_expert = B_expert.mean(dim=1)
+
+        if self.cfg.soft_fb:
+            norm = z_expert.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+            z_expert = z_expert / (norm + 1.0)
+        else:
             z_expert = self.policy.project_z(z_expert)
 
         z_expert = torch.repeat_interleave(z_expert, seq_length, dim=0)
@@ -829,6 +848,13 @@ class FBCprAux:
         # Global FB: sample active mask once per tracking episode.
         global_fb_prob = getattr(self.cfg, "global_fb_zero_prob", 0.5)
         self._tracking_global_fb_active = torch.rand(n_elem, device=self.device) >= global_fb_prob
+        # Per-env variable T for z computation window.
+        T_min = getattr(self.cfg, "tracking_T_min", 1)
+        T_max = getattr(self.cfg, "tracking_T_max", 16)
+        if T_min < T_max:
+            self._tracking_T = torch.randint(T_min, T_max + 1, (n_elem,), device=self.device)
+        else:
+            self._tracking_T = None
         # Store robot pose for reference viz.
         if robot_root_xy is not None:
             self._tracking_robot_xy = robot_root_xy[self._tracking_env_idx].to(self.device).clone()
@@ -1176,17 +1202,38 @@ class FBCprAux:
         z = self.policy._backward_map(next_obs)
         z = z.view(batch_dim, traj_length, z.shape[-1])
 
-        if self.cfg.soft_fb:
-            for step in range(traj_length):
-                end_idx = min(step + seq_length, traj_length)
-                z_mean = z[:, step:end_idx].mean(dim=1)            # [B, d]
-                norm = z_mean.norm(dim=-1, keepdim=True).clamp(min=1e-8)
-                z[:, step] = z_mean / (norm + 1.0)
+        # Variable-T rolling mean: per-env window from self._tracking_T
+        T_per_env = getattr(self, "_tracking_T", None)
+        if T_per_env is not None and T_per_env.shape[0] == batch_dim:
+            # Vectorized cumsum approach — no loops
+            d = z.shape[-1]
+            cumz = torch.cat([torch.zeros(batch_dim, 1, d, device=z.device), torch.cumsum(z, dim=1)], dim=1)
+            steps = torch.arange(traj_length, device=z.device)
+            end = (steps.unsqueeze(0) + T_per_env.unsqueeze(1)).clamp(max=traj_length)  # [B, T_len]
+            window = (end - steps.unsqueeze(0)).float().unsqueeze(-1)  # [B, T_len, 1]
+            arange_B = torch.arange(batch_dim, device=z.device).unsqueeze(1)
+            start_sum = cumz[arange_B, steps.unsqueeze(0)]  # [B, T_len, d]
+            end_sum = cumz[arange_B, end]  # [B, T_len, d]
+            z = (end_sum - start_sum) / window
+
+            if self.cfg.soft_fb:
+                norm = z.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+                z = z / (norm + 1.0)
+            else:
+                z = self.policy.project_z(z)
         else:
-            for step in range(traj_length):
-                end_idx = min(step + seq_length, traj_length)
-                z[:, step] = z[:, step:end_idx].mean(dim=1)
-            z = self.policy.project_z(z)
+            # Fallback: fixed seq_length (original behavior)
+            if self.cfg.soft_fb:
+                for step in range(traj_length):
+                    end_idx = min(step + seq_length, traj_length)
+                    z_mean = z[:, step:end_idx].mean(dim=1)
+                    norm = z_mean.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+                    z[:, step] = z_mean / (norm + 1.0)
+            else:
+                for step in range(traj_length):
+                    end_idx = min(step + seq_length, traj_length)
+                    z[:, step] = z[:, step:end_idx].mean(dim=1)
+                z = self.policy.project_z(z)
         return z
 
     def _soft_fb_scale_z(
