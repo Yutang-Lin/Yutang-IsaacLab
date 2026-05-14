@@ -169,10 +169,11 @@ class VisionDAggerRunner(FBCprRunner):
         return torch.cat(parts, dim=-1)
 
     def _get_depth_image(self) -> torch.Tensor:
-        """Read depth image from the env's pseudo-depth sensor.
+        """Read depth image from the env's depth sensor.
 
-        Applies D435i-style noise (z^2 Gaussian, holes, edge dropout,
-        quantization) during training for sim-to-real transfer.
+        When using RTX camera, noise + range gating is handled inside
+        the env's compute_rtx_depth(). For pseudo-depth, the runner
+        applies D435i noise.
         Returns: [N, H, W] tensor.
         """
         eu = self.env_unwrapped
@@ -182,7 +183,8 @@ class VisionDAggerRunner(FBCprRunner):
         depth[torch.isinf(depth)] = 0.0
         depth[torch.isnan(depth)] = 0.0
         depth = depth.clamp(0.0, max_dist)
-        if self.student.training:
+        # Apply noise only for pseudo-depth (RTX path handles noise internally)
+        if self.student.training and not getattr(eu.cfg, "depth_use_rtx", False):
             depth = self._depth_noise(depth)
         return depth.to(self.device)
 
