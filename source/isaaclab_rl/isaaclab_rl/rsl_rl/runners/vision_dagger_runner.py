@@ -34,6 +34,7 @@ from rsl_rl.utils import store_code_state
 
 from isaaclab_rl.rsl_rl.modules.empirical_normalization import EmpiricalNormalization
 from isaaclab_rl.rsl_rl.modules.vision_student import VisionStudent
+from isaaclab_rl.rsl_rl.modules.depth_noise import D435iDepthNoise
 
 from .fb_cpr_runner import FBCprRunner
 
@@ -130,6 +131,14 @@ class VisionDAggerRunner(FBCprRunner):
             shape=[self._student_proprio_dim], until=1.0e8
         ).to(self.device)
 
+        # D435i depth noise model for realistic training augmentation
+        self._depth_noise = D435iDepthNoise(
+            z_min=0.3,
+            z_max=dagger_cfg.get("depth_max_dist", 3.0),
+            alpha=dagger_cfg.get("depth_noise_alpha", 0.005),
+            beta=dagger_cfg.get("depth_noise_beta", 0.001),
+        )
+
         # Rollout buffer for DAgger training
         self._dagger_buffer_depth: list[torch.Tensor] = []
         self._dagger_buffer_proprio: list[torch.Tensor] = []
@@ -162,19 +171,19 @@ class VisionDAggerRunner(FBCprRunner):
     def _get_depth_image(self) -> torch.Tensor:
         """Read depth image from the env's pseudo-depth sensor.
 
-        Applies i.i.d. Gaussian noise and clamps to max distance.
+        Applies D435i-style noise (z^2 Gaussian, holes, edge dropout,
+        quantization) during training for sim-to-real transfer.
         Returns: [N, H, W] tensor.
         """
         eu = self.env_unwrapped
         depth_cam = eu.depth_camera
         depth = depth_cam.data.output["depth"].squeeze(-1)  # [N, H, W]
         max_dist = getattr(eu.cfg, "depth_camera_max_distance", 3.0)
-        noise_std = getattr(eu.cfg, "depth_camera_noise_std", 0.03)
         depth[torch.isinf(depth)] = 0.0
         depth[torch.isnan(depth)] = 0.0
-        if noise_std > 0.0 and self.student.training:
-            depth = depth + torch.randn_like(depth) * noise_std
         depth = depth.clamp(0.0, max_dist)
+        if self.student.training:
+            depth = self._depth_noise(depth)
         return depth.to(self.device)
 
     def learn(self, num_learning_iterations: int, init_at_random_ep_len: bool = False):  # noqa: C901
