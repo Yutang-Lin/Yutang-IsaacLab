@@ -254,9 +254,10 @@ class VisionDAggerRunner(FBCprRunner):
             # ---- Rollout (DAgger) ----
             self.student.eval()
             with torch.inference_mode():
-                for _ in range(self.num_steps_per_env):
+                for _step_i in range(self.num_steps_per_env):
                     # Get depth image
                     depth = self._get_depth_image()
+
                     proprio = self._get_student_proprio(obs_dict)
 
                     # Teacher labels (uses full obs_dict including height_scan)
@@ -404,7 +405,7 @@ class VisionDAggerRunner(FBCprRunner):
             # Mini-batch SGD (DDP handles gradient sync automatically)
             mean_loss = 0.0
             num_batches = 0
-            for _ in range(self._dagger_epochs):
+            for _ep in range(self._dagger_epochs):
                 perm = torch.randperm(total_samples, device=self.device)
                 for start_idx in range(0, total_samples, self._dagger_batch_size):
                     idx = perm[start_idx:start_idx + self._dagger_batch_size]
