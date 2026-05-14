@@ -1358,14 +1358,15 @@ class FBCprRunner:
         # rank). The discriminator is never wrapped so its keys are flat
         # in both cases. If the current policy IS DDP-wrapped (resume
         # under the same world_size), we leave the keys alone.
-        if not self.is_distributed and any(".module." in k for k in model_sd.keys()):
+        needs_strip = any(".module." in k or "._orig_mod." in k for k in model_sd.keys())
+        if needs_strip and not self.is_distributed:
             fixed_sd = {}
             for k, v in model_sd.items():
-                if ".module." in k:
-                    k = k.replace(".module.", ".", 1)
+                k = k.replace(".module.", ".", 1)
+                k = k.replace("._orig_mod.", ".")
                 fixed_sd[k] = v
             model_sd = fixed_sd
-            print(f"[FBCprRunner] stripped DDP '.module.' prefix from "
+            print(f"[FBCprRunner] stripped DDP/compile prefixes from "
                   f"{len(ckpt['model'])} state_dict keys (non-DDP load).",
                   flush=True)
         # Non-strict load so legacy checkpoints (pre-reconstruction-head)
