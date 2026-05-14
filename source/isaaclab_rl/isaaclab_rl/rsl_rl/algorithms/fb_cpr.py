@@ -1914,7 +1914,9 @@ class FBCprAux:
             pred = recon_head(B)
             target = recon_head.gather_target(goal).detach()
             recon_loss = F.mse_loss(pred, target)
-            fb_loss = fb_loss + recons_coeff * recon_loss
+            # Scale by |Q_fb| (stored from actor update) so recon adapts to value scale
+            q_scale = getattr(self, "_q_fb_scale", 1.0)
+            fb_loss = fb_loss + recons_coeff * q_scale * recon_loss
 
         q_loss = torch.zeros(1, device=z.device, dtype=z.dtype)
         if q_loss_coef is not None:
@@ -2224,6 +2226,8 @@ class FBCprAux:
             weight = Q_fb.abs().mean().detach()
         else:
             weight = 1.0
+        # Store Q_fb scale for recon loss in backward pass
+        self._q_fb_scale = Q_fb.abs().mean().detach().item()
 
         if self.cfg.soft_fb and p._entropy_critic is not None:
             beta_z = self.cfg.soft_fb_entropy_coef * (
