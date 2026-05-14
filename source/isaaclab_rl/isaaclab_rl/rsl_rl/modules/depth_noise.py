@@ -33,12 +33,12 @@ class D435iDepthNoise:
         self,
         z_min: float = 0.3,
         z_max: float = 3.0,
-        alpha: float = 0.005,
+        alpha: float = 0.002,
         beta: float = 0.001,
         hole_base: float = 0.001,
-        far_hole: float = 0.02,
-        edge_hole: float = 0.4,
-        edge_grad_threshold: float = 0.06,
+        far_hole: float = 0.003,
+        edge_hole: float = 0.6,
+        edge_grad_threshold: float = 0.1,
         quant_mm: float = 1.0,
     ):
         self.z_min = z_min
