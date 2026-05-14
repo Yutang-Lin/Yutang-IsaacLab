@@ -1914,9 +1914,7 @@ class FBCprAux:
             pred = recon_head(B)
             target = recon_head.gather_target(goal).detach()
             recon_loss = F.mse_loss(pred, target)
-            # Scale by |Q_fb| (stored from actor update) so recon adapts to value scale
-            q_scale = getattr(self, "_q_fb_scale", 1.0)
-            fb_loss = fb_loss + recons_coeff * q_scale * recon_loss
+            fb_loss = fb_loss + recons_coeff * recon_loss
 
         q_loss = torch.zeros(1, device=z.device, dtype=z.dtype)
         if q_loss_coef is not None:
@@ -2226,8 +2224,6 @@ class FBCprAux:
             weight = Q_fb.abs().mean().detach()
         else:
             weight = 1.0
-        # Store Q_fb scale for recon loss in backward pass
-        self._q_fb_scale = Q_fb.abs().mean().detach().item()
 
         if self.cfg.soft_fb and p._entropy_critic is not None:
             beta_z = self.cfg.soft_fb_entropy_coef * (
@@ -2377,12 +2373,23 @@ class FBCprAux:
         }
 
     def load_state_dict(self, state: Dict[str, Any]) -> None:
-        self.policy.load_state_dict(state["policy"])
+        policy_sd = state["policy"]
+        # Drop keys for modules that no longer exist (e.g. removed reconstruction head)
+        model_keys = set(self.policy.state_dict().keys())
+        extra = [k for k in policy_sd if k not in model_keys]
+        if extra:
+            print(f"[FBCprAux] load_state_dict: dropping {len(extra)} unexpected keys "
+                  f"(e.g. {extra[0]})")
+            policy_sd = {k: v for k, v in policy_sd.items() if k in model_keys}
+        self.policy.load_state_dict(policy_sd, strict=False)
         optim = state.get("optimizers", {})
         for name, sd in optim.items():
             opt = getattr(self, name, None)
             if opt is not None:
-                opt.load_state_dict(sd)
+                try:
+                    opt.load_state_dict(sd)
+                except (ValueError, RuntimeError) as e:
+                    print(f"[FBCprAux] skipping optimizer '{name}' load: {e}")
 
 
 ##########################
