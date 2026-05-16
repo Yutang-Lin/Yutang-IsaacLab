@@ -725,12 +725,17 @@ class FBCprAux:
     @torch.no_grad()
     def encode_expert(
         self, next_obs: torch.Tensor | dict[str, torch.Tensor]
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Encode expert sub-sequences through B with variable-T window.
 
         For each sub-sequence, samples T ∈ [T_min, T_max], computes z as
-        mean of first T frames, then repeats z for all seq_length frames
-        (all frames in the window are "real" for discriminator training).
+        mean of first T frames. Only frames within the T-window are "real"
+        for discriminator training; returns a mask marking valid frames.
+
+        Returns:
+            z_expert: [batch_size, z_dim] z replicated per frame
+            disc_mask: [batch_size] bool, True for frames within T-window.
+                None if no variable-T (all frames valid).
         """
         B_expert = self.policy._backward_map(next_obs).detach()
         seq_length = self.policy.seq_length
@@ -739,19 +744,23 @@ class FBCprAux:
         )
         N = self.cfg.batch_size // seq_length
         B_expert = B_expert.view(N, seq_length, B_expert.shape[-1])
+        device = B_expert.device
 
         # Variable T per sub-sequence (skip if T_min == T_max)
         T_min = getattr(self.cfg, "tracking_T_min", 1)
         T_max = min(getattr(self.cfg, "tracking_T_max", 16), seq_length)
+        disc_mask: torch.Tensor | None = None
         if T_min < T_max:
-            T_per_seq = torch.randint(T_min, T_max + 1, (N,), device=B_expert.device)
-            # Compute z = mean(B_expert[:, 0:T]) per sequence using cumsum
+            T_per_seq = torch.randint(T_min, T_max + 1, (N,), device=device)
             d = B_expert.shape[-1]
-            cumz = torch.cat([torch.zeros(N, 1, d, device=B_expert.device),
+            cumz = torch.cat([torch.zeros(N, 1, d, device=device),
                               torch.cumsum(B_expert, dim=1)], dim=1)  # [N, seq+1, d]
-            arange_N = torch.arange(N, device=B_expert.device)
+            arange_N = torch.arange(N, device=device)
             z_sum = cumz[arange_N, T_per_seq]  # [N, d]
             z_expert = z_sum / T_per_seq.float().unsqueeze(-1)
+            # Frames 0..T-1 are within window; T..seq_length-1 are not.
+            arange_T = torch.arange(seq_length, device=device).unsqueeze(0)
+            disc_mask = (arange_T < T_per_seq.unsqueeze(1)).reshape(-1)  # [N*seq_length]
         else:
             z_expert = B_expert.mean(dim=1)
 
@@ -762,7 +771,7 @@ class FBCprAux:
             z_expert = self.policy.project_z(z_expert)
 
         z_expert = torch.repeat_interleave(z_expert, seq_length, dim=0)
-        return z_expert
+        return z_expert, disc_mask
 
     @torch.no_grad()
     def maybe_update_rollout_context(
@@ -1395,8 +1404,8 @@ class FBCprAux:
             expert_obs = self.policy._obs_normalizer(expert_obs)
             expert_next_obs = self.policy._obs_normalizer(expert_next_obs)
 
-        # Encode expert → z_expert
-        expert_z = self.encode_expert(next_obs=expert_next_obs)
+        # Encode expert → z_expert (+ disc validity mask for variable T)
+        expert_z, expert_disc_mask = self.encode_expert(next_obs=expert_next_obs)
         train_z = train_batch["z"].to(self.device, non_blocking=True)
 
         # BFM order: disc sees ORIGINAL train_z (from rollout), THEN relabel.
@@ -1495,6 +1504,7 @@ class FBCprAux:
                         grad_penalty=self.cfg.grad_penalty_discriminator
                         if self.cfg.grad_penalty_discriminator > 0
                         else None,
+                        expert_mask=expert_disc_mask,
                     )
                     # Manifold attractor on same stream as disc (no dependency).
                     if self.cfg.manifold_attractor:
@@ -1514,6 +1524,7 @@ class FBCprAux:
                     grad_penalty=self.cfg.grad_penalty_discriminator
                     if self.cfg.grad_penalty_discriminator > 0
                     else None,
+                    expert_mask=expert_disc_mask,
                 )
                 if self.cfg.manifold_attractor:
                     ma_metrics = self.backward_manifold_attractor(
@@ -1703,18 +1714,52 @@ class FBCprAux:
         train_obs: torch.Tensor | dict[str, torch.Tensor],
         train_z: torch.Tensor,
         grad_penalty: float | None,
+        expert_mask: torch.Tensor | None = None,
     ) -> Tuple[Dict[str, torch.Tensor], Any]:
-        """Compute disc loss, backward, fire async reduce. Returns (metrics, reduce_handle)."""
+        """Compute disc loss, backward, fire async reduce. Returns (metrics, reduce_handle).
+
+        ``expert_mask``: optional [batch_size] bool, True for valid expert
+        (s, z) pairs (frame within T-window). Invalid frames are excluded
+        from expert_loss. Train loss uses full batch.
+        """
         disc = self.policy._discriminator
-        expert_logits = disc.compute_logits(expert_obs, expert_z)
+        if expert_mask is not None:
+            if isinstance(expert_obs, dict):
+                expert_obs_valid = {k: v[expert_mask] for k, v in expert_obs.items()}
+            else:
+                expert_obs_valid = expert_obs[expert_mask]
+            expert_z_valid = expert_z[expert_mask]
+        else:
+            expert_obs_valid = expert_obs
+            expert_z_valid = expert_z
+        expert_logits = disc.compute_logits(expert_obs_valid, expert_z_valid)
         unlabeled_logits = disc.compute_logits(train_obs, train_z)
         expert_loss = -F.logsigmoid(expert_logits)
         unlabeled_loss = F.softplus(unlabeled_logits)
-        loss = torch.mean(expert_loss + unlabeled_loss)
+        loss = expert_loss.mean() + unlabeled_loss.mean()
 
         wgan_gp = None
         if grad_penalty is not None:
-            wgan_gp = self._gradient_penalty_wgan(expert_obs, expert_z, train_obs, train_z)
+            # GP needs equal expert/train counts; if expert was filtered,
+            # the train side stays full so subsample train to match.
+            if expert_mask is not None:
+                n_valid = int(expert_mask.sum().item())
+                if isinstance(train_obs, dict):
+                    first_key = next(iter(train_obs))
+                    train_n = train_obs[first_key].shape[0]
+                else:
+                    train_n = train_obs.shape[0]
+                idx = torch.randperm(train_n, device=train_z.device)[:n_valid]
+                if isinstance(train_obs, dict):
+                    train_obs_gp = {k: v[idx] for k, v in train_obs.items()}
+                else:
+                    train_obs_gp = train_obs[idx]
+                train_z_gp = train_z[idx]
+                wgan_gp = self._gradient_penalty_wgan(
+                    expert_obs_valid, expert_z_valid, train_obs_gp, train_z_gp,
+                )
+            else:
+                wgan_gp = self._gradient_penalty_wgan(expert_obs, expert_z, train_obs, train_z)
             loss = loss + grad_penalty * wgan_gp
 
         self.discriminator_optimizer.zero_grad(set_to_none=True)
