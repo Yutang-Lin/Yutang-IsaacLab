@@ -148,6 +148,12 @@ class FBCprAuxAlgorithmCfg:
 
     # Mixed-z sampling (at training time and for the in-rollout ZBuffer)
     batch_size: int = 1024
+    # Disc batch sized as disc_num_slices * seq_length. When None, falls
+    # back to batch_size rounded down to a multiple of seq_length.
+    disc_num_slices: int | None = None
+    # Cap per-side batch for the manifold attractor (bounds compute when
+    # disc batch grows via disc_num_slices).
+    ma_max_batch: int = 1024
     discount: float = 0.98
     relabel_ratio: float | None = 0.8
     train_goal_ratio: float = 0.2
@@ -272,8 +278,9 @@ class FBCprAux:
         # multiple of seq_length for [num_slices, seq_length] reshape).
         # Main cfg.batch_size is independent and stays exact (e.g. 1024).
         seq_length = int(self.policy.seq_length)
-        if cfg.disc_num_slices is not None:
-            self._disc_batch_size = int(cfg.disc_num_slices) * seq_length
+        disc_num_slices = getattr(cfg, "disc_num_slices", None)
+        if disc_num_slices is not None:
+            self._disc_batch_size = int(disc_num_slices) * seq_length
         else:
             self._disc_batch_size = max(seq_length, (cfg.batch_size // seq_length) * seq_length)
 
