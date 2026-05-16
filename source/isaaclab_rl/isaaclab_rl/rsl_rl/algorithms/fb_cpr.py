@@ -973,13 +973,13 @@ class FBCprAux:
     @torch.no_grad()
     def get_global_fb_targets(
         self, step_count: torch.Tensor, expert_buffer: Any,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
-        """Return per-env (target_xy [N,2], target_yaw [N], active [N] bool).
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None:
+        """Return (target_xy [N,2], target_yaw [N], active [N] bool, tracking_ids [M]).
 
         For tracking envs: target is the motion's current frame root_pos_xy
         (with heading rotation + spawn offset applied). Active mask is
-        sampled once per tracking episode in ``_resample_tracking``.
-        Non-tracking envs: always inactive.
+        sampled once per tracking episode in ``_resample_tracking``
+        (controls obs visibility, not penalty).
         """
         if getattr(self, "_tracking_env_idx", None) is None:
             return None
@@ -1025,7 +1025,6 @@ class FBCprAux:
         else:
             world_yaw = motion_yaw
 
-        # Use per-episode mask (sampled once at resample time, not per-step).
         target_xy[self._tracking_env_idx] = world_xy
         target_yaw[self._tracking_env_idx] = world_yaw
         global_fb_mask = getattr(self, "_tracking_global_fb_active", None)
@@ -1034,7 +1033,7 @@ class FBCprAux:
         else:
             active[self._tracking_env_idx] = True
 
-        return target_xy, target_yaw, active
+        return target_xy, target_yaw, active, self._tracking_env_idx
 
     @torch.no_grad()
     def get_tracking_ref_body_pos(

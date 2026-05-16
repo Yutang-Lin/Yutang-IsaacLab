@@ -587,7 +587,8 @@ class FBCprRunner:
                             step_count, self.expert_buffer,
                         )
                         if targets is not None:
-                            env_u.set_global_fb_targets(*targets)
+                            xy, yaw, active, t_ids = targets
+                            env_u.set_global_fb_targets(xy, yaw, active, tracking_env_ids=t_ids)
 
                     new_obs, rewards, dones, infos = self.env.step(actions.to(self.env.device))
                     new_obs = self._obs_to_device(new_obs, infos)

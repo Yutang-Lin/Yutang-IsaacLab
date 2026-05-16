@@ -282,7 +282,8 @@ class VisionDAggerRunner(FBCprRunner):
                     if hasattr(env_u, "set_global_fb_targets"):
                         targets = self.alg.get_global_fb_targets(step_count, self.expert_buffer)
                         if targets is not None:
-                            env_u.set_global_fb_targets(*targets)
+                            xy, yaw, active, t_ids = targets
+                            env_u.set_global_fb_targets(xy, yaw, active, tracking_env_ids=t_ids)
 
                     # Step env
                     new_obs, rewards, dones, infos = self.env.step(rollout_action.to(self.env.device))
