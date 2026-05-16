@@ -276,12 +276,9 @@ class FBCprReplayBuffer:
         seq_length = seq_length or self.seq_length
         if len(self) == 0:
             raise RuntimeError("FBCprReplayBuffer.sample() called on empty buffer")
-        if batch_size % seq_length != 0:
-            raise ValueError(
-                f"batch_size ({batch_size}) must be divisible by seq_length ({seq_length})"
-            )
+        # Round batch down to a multiple of seq_length.
         self._ensure_traj_info()
-        num_slices = batch_size // seq_length
+        num_slices = max(1, batch_size // seq_length)
         # Episode "length" includes the truncated row (post-reset obs).
         # The last valid transition's next_obs is at position length-2 (0-indexed).
         # A window of seq_length obs frames needs next_obs at start+seq_length,
@@ -338,7 +335,10 @@ class FBCprReplayBuffer:
 
     def sample_chunks(self, batch_size: int, num_chunks: int, target_device: str | torch.device) -> list[dict]:
         """Sample ``num_chunks`` batches in ONE call, then transfer to ``target_device``."""
-        total = int(batch_size) * int(num_chunks)
+        # Round per-chunk batch down to multiple of seq_length BEFORE
+        # multiplying so all chunks are exactly batch_size.
+        batch_size = max(self.seq_length, (int(batch_size) // self.seq_length) * self.seq_length)
+        total = batch_size * int(num_chunks)
         big = self.sample(total, seq_length=self.seq_length)
 
         def _move(x: torch.Tensor) -> torch.Tensor:
@@ -1050,11 +1050,8 @@ class FBCprExpertBuffer:
     @torch.no_grad()
     def sample(self, batch_size: int, seq_length: int | None = None) -> dict:
         seq_length = int(seq_length) if seq_length is not None else self.seq_length
-        if batch_size < seq_length or batch_size % seq_length != 0:
-            raise ValueError(
-                f"batch_size ({batch_size}) must be a positive multiple of seq_length ({seq_length})"
-            )
-        num_slices = batch_size // seq_length
+        # Round batch down to a multiple of seq_length.
+        num_slices = max(1, batch_size // seq_length)
 
         # Eligibility: need at least 50 frames (~1s at 50Hz). Short motions
         # are circular-padded so they can be sampled for tracking trajectories
@@ -1145,10 +1142,8 @@ class FBCprExpertBuffer:
         concatenate batches along the row axis and slice contiguously.
         """
         seq_length = int(seq_length) if seq_length is not None else self.seq_length
-        if batch_size % seq_length != 0:
-            raise ValueError(
-                f"batch_size ({batch_size}) must be a positive multiple of seq_length ({seq_length})"
-            )
+        # Round each chunk's batch down to a multiple of seq_length.
+        batch_size = max(seq_length, (batch_size // seq_length) * seq_length)
 
         def _move(x: torch.Tensor) -> torch.Tensor:
             return x.to(target_device, non_blocking=True) if x.device != torch.device(target_device) else x

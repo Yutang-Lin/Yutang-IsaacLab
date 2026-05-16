@@ -1310,8 +1310,14 @@ class RslRlFBCprAlgorithmCfg:
     reg_coeff_aux: float = 0.02
     scale_reg: bool = True
 
-    # Mixed-z sampling
+    # Main batch for FB / actor / critic / aux_critic. Rounded down to
+    # a multiple of seq_length at init.
     batch_size: int = 1024
+    # Disc batch sized as disc_num_slices * seq_length (sampled
+    # separately from main batch). When None, disc uses main batch.
+    disc_num_slices: int | None = None
+    # Max per-side batch for manifold attractor.
+    ma_max_batch: int = 1024
     discount: float = 0.98
     relabel_ratio: float | None = 0.8
     train_goal_ratio: float = 0.2

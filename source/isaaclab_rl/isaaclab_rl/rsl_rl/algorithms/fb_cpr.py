@@ -268,6 +268,19 @@ class FBCprAux:
             torch.distributed.is_available() and torch.distributed.is_initialized()
         )
 
+        # Round main batch down to a multiple of seq_length.
+        seq_length = int(self.policy.seq_length)
+        rounded = max(seq_length, (int(cfg.batch_size) // seq_length) * seq_length)
+        if rounded != cfg.batch_size:
+            print(f"[FBCprAux] batch_size: cfg={cfg.batch_size} -> {rounded} "
+                  f"(rounded to multiple of seq_length={seq_length})")
+        cfg.batch_size = rounded
+        # Disc batch (independent from main batch). Default: same as main.
+        if cfg.disc_num_slices is not None:
+            self._disc_batch_size = int(cfg.disc_num_slices) * seq_length
+        else:
+            self._disc_batch_size = cfg.batch_size
+
         # Remember the un-scaled base LRs BEFORE DDP sqrt-scaling. Used as
         # the target ("bottom") of the linear anneal schedule when
         # ``lr_anneal_enable`` is set.
@@ -708,9 +721,11 @@ class FBCprAux:
         goals = self.policy.project_z(goals)
         z = torch.where(mix_idxs == 0, goals, z)
 
-        # Expert-encoded z's
-        perm = torch.randperm(batch, device=self.device)
-        expert_z = expert_encodings[perm]
+        # Expert-encoded z's. Sample with replacement so expert pool size
+        # can differ from main batch size.
+        n_expert = expert_encodings.shape[0]
+        idx = torch.randint(0, n_expert, (batch,), device=self.device)
+        expert_z = expert_encodings[idx]
         z = torch.where(mix_idxs == 1, expert_z, z)
         return z
 
@@ -739,10 +754,8 @@ class FBCprAux:
         """
         B_expert = self.policy._backward_map(next_obs).detach()
         seq_length = self.policy.seq_length
-        assert self.cfg.batch_size % seq_length == 0, (
-            f"batch_size ({self.cfg.batch_size}) must be divisible by seq_length ({seq_length})"
-        )
-        N = self.cfg.batch_size // seq_length
+        # Use the actual batch returned (may be _disc_batch_size, not cfg.batch_size).
+        N = B_expert.shape[0] // seq_length
         B_expert = B_expert.view(N, seq_length, B_expert.shape[-1])
         device = B_expert.device
 
@@ -1381,7 +1394,7 @@ class FBCprAux:
         """
         current_lrs = self._anneal_lrs(step)
 
-        expert_batch = replay_buffer[self._EXPERT_KEY].sample(self.cfg.batch_size)
+        expert_batch = replay_buffer[self._EXPERT_KEY].sample(self._disc_batch_size)
         train_batch = replay_buffer[self._REPLAY_KEY].sample(self.cfg.batch_size)
 
         train_obs = self._to_device(train_batch["observation"])
@@ -1510,7 +1523,7 @@ class FBCprAux:
                     if self.cfg.manifold_attractor:
                         ma_metrics = self.backward_manifold_attractor(
                             expert_obs=expert_obs,
-                            expert_next_obs=train_next_obs,
+                            expert_next_obs=expert_next_obs,
                             train_obs=train_obs,
                             train_next_obs=train_next_obs,
                         )
@@ -1529,7 +1542,7 @@ class FBCprAux:
                 if self.cfg.manifold_attractor:
                     ma_metrics = self.backward_manifold_attractor(
                         expert_obs=expert_obs,
-                        expert_next_obs=train_next_obs,
+                        expert_next_obs=expert_next_obs,
                         train_obs=train_obs,
                         train_next_obs=train_next_obs,
                     )
@@ -1807,7 +1820,25 @@ class FBCprAux:
         if p._manifold_attractor is None:
             return {}
         ma = p._manifold_attractor
-        n_real = next(iter(expert_obs.values())).shape[0] if isinstance(expert_obs, dict) else expert_obs.shape[0]
+        # Equalize and cap both sides for the GP (which requires equal
+        # batch sizes for the alpha interpolation).
+        ma_cap = int(getattr(self.cfg, "ma_max_batch", 1024))
+        n_e = next(iter(expert_obs.values())).shape[0] if isinstance(expert_obs, dict) else expert_obs.shape[0]
+        n_t = next(iter(train_obs.values())).shape[0] if isinstance(train_obs, dict) else train_obs.shape[0]
+        target = min(ma_cap, n_e, n_t)
+
+        def _resample(o, no, n, k):
+            if n == k:
+                return o, no
+            idx = torch.randperm(n, device=self.device)[:k]
+            if isinstance(o, dict):
+                return ({kk: v[idx] for kk, v in o.items()},
+                        {kk: v[idx] for kk, v in no.items()})
+            return o[idx], no[idx]
+
+        expert_obs, expert_next_obs = _resample(expert_obs, expert_next_obs, n_e, target)
+        train_obs, train_next_obs = _resample(train_obs, train_next_obs, n_t, target)
+        n_real = target
         if isinstance(expert_obs, dict):
             merged_obs = {k: torch.cat([expert_obs[k], train_obs[k]], dim=0) for k in expert_obs}
             merged_next = {k: torch.cat([expert_next_obs[k], train_next_obs[k]], dim=0) for k in expert_next_obs}
