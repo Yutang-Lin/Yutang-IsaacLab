@@ -1370,10 +1370,23 @@ class FBCprRunner:
             print(f"[FBCprRunner] stripped DDP/compile prefixes from "
                   f"{len(ckpt['model'])} state_dict keys (non-DDP load).",
                   flush=True)
-        # Non-strict load so legacy checkpoints (pre-reconstruction-head)
-        # still resume. Extra keys are surfaced as a warning; missing keys
-        # (e.g. ``_reconstruction_head.*``) are silently initialised.
+        # Non-strict load so legacy checkpoints (pre-reconstruction-head,
+        # old MA with D(s,s'), etc.) still resume. Drop shape-mismatched
+        # keys so the affected modules reinitialize cleanly.
+        cur_sd = self.policy.state_dict()
+        shape_mismatch = [
+            k for k in list(model_sd.keys())
+            if k in cur_sd and model_sd[k].shape != cur_sd[k].shape
+        ]
+        if shape_mismatch:
+            print(f"[FBCprRunner] dropping {len(shape_mismatch)} shape-mismatched "
+                  f"keys (will reinit): {shape_mismatch[:6]}"
+                  f"{' ...' if len(shape_mismatch) > 6 else ''}", flush=True)
+            for k in shape_mismatch:
+                del model_sd[k]
         missing, unexpected = self.policy.load_state_dict(model_sd, strict=False)
+        # Treat shape-mismatched keys as missing (so optimizer logic below knows).
+        missing = list(missing) + shape_mismatch
         new_head_keys = [k for k in missing if "_reconstruction_head" in k]
         other_missing = [k for k in missing if "_reconstruction_head" not in k]
         if new_head_keys:
@@ -1388,8 +1401,13 @@ class FBCprRunner:
         if unexpected:
             print(f"[FBCprRunner] WARN unexpected state_dict keys: {unexpected[:8]}"
                   f"{' ...' if len(unexpected) > 8 else ''}", flush=True)
+        # If we dropped MA weights (shape change), don't load its optimizer.
+        ma_reinit = any("manifold_attractor" in k for k in shape_mismatch)
         if load_optimizer and "optimizers" in ckpt:
             for name, sd in ckpt["optimizers"].items():
+                if ma_reinit and name == "manifold_attractor_optimizer":
+                    print(f"[FBCprRunner] skipping {name} (MA reinitialized)", flush=True)
+                    continue
                 opt = getattr(self.alg, name, None)
                 if opt is None:
                     continue
