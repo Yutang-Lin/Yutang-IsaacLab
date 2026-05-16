@@ -1523,9 +1523,7 @@ class FBCprAux:
                     if self.cfg.manifold_attractor:
                         ma_metrics = self.backward_manifold_attractor(
                             expert_obs=expert_obs,
-                            expert_next_obs=expert_next_obs,
                             train_obs=train_obs,
-                            train_next_obs=train_next_obs,
                         )
                         disc_metrics.update(ma_metrics)
             else:
@@ -1542,9 +1540,7 @@ class FBCprAux:
                 if self.cfg.manifold_attractor:
                     ma_metrics = self.backward_manifold_attractor(
                         expert_obs=expert_obs,
-                        expert_next_obs=expert_next_obs,
                         train_obs=train_obs,
-                        train_next_obs=train_next_obs,
                     )
                     disc_metrics.update(ma_metrics)
 
@@ -1811,11 +1807,9 @@ class FBCprAux:
     def backward_manifold_attractor(
         self,
         expert_obs: torch.Tensor | dict[str, torch.Tensor],
-        expert_next_obs: torch.Tensor | dict[str, torch.Tensor],
         train_obs: torch.Tensor | dict[str, torch.Tensor],
-        train_next_obs: torch.Tensor | dict[str, torch.Tensor],
     ) -> Dict[str, torch.Tensor]:
-        """Train D_ma(s_t, s_{t+1}) — unconditional transition discriminator."""
+        """Train D_ma(s) — unconditional state discriminator."""
         p = self.policy
         if p._manifold_attractor is None:
             return {}
@@ -1827,25 +1821,22 @@ class FBCprAux:
         n_t = next(iter(train_obs.values())).shape[0] if isinstance(train_obs, dict) else train_obs.shape[0]
         target = min(ma_cap, n_e, n_t)
 
-        def _resample(o, no, n, k):
+        def _resample(o, n, k):
             if n == k:
-                return o, no
+                return o
             idx = torch.randperm(n, device=self.device)[:k]
             if isinstance(o, dict):
-                return ({kk: v[idx] for kk, v in o.items()},
-                        {kk: v[idx] for kk, v in no.items()})
-            return o[idx], no[idx]
+                return {kk: v[idx] for kk, v in o.items()}
+            return o[idx]
 
-        expert_obs, expert_next_obs = _resample(expert_obs, expert_next_obs, n_e, target)
-        train_obs, train_next_obs = _resample(train_obs, train_next_obs, n_t, target)
+        expert_obs = _resample(expert_obs, n_e, target)
+        train_obs = _resample(train_obs, n_t, target)
         n_real = target
         if isinstance(expert_obs, dict):
             merged_obs = {k: torch.cat([expert_obs[k], train_obs[k]], dim=0) for k in expert_obs}
-            merged_next = {k: torch.cat([expert_next_obs[k], train_next_obs[k]], dim=0) for k in expert_next_obs}
         else:
             merged_obs = torch.cat([expert_obs, train_obs], dim=0)
-            merged_next = torch.cat([expert_next_obs, train_next_obs], dim=0)
-        merged_logits = ma.compute_logits(merged_obs, merged_next)
+        merged_logits = ma.compute_logits(merged_obs)
         expert_logits = merged_logits[:n_real]
         train_logits = merged_logits[n_real:]
         expert_loss = -F.logsigmoid(expert_logits)
@@ -1853,9 +1844,7 @@ class FBCprAux:
         loss = expert_loss.mean() + train_loss.mean()
 
         if self.cfg.grad_penalty_manifold_attractor > 0:
-            gp = self._gradient_penalty_manifold_attractor(
-                expert_obs, expert_next_obs, train_obs, train_next_obs,
-            )
+            gp = self._gradient_penalty_manifold_attractor(expert_obs, train_obs)
             loss = loss + self.cfg.grad_penalty_manifold_attractor * gp
 
         self.manifold_attractor_optimizer.zero_grad(set_to_none=True)
@@ -1870,22 +1859,18 @@ class FBCprAux:
 
     def _gradient_penalty_manifold_attractor(
         self,
-        real_obs, real_next_obs, fake_obs, fake_next_obs,
+        real_obs, fake_obs,
     ) -> torch.Tensor:
         """WGAN-GP on manifold attractor."""
         ma = self.policy._manifold_attractor
         obs_filter = ma.input_filter
         real_o = obs_filter(real_obs)
-        real_no = obs_filter(real_next_obs)
         fake_o = obs_filter(fake_obs)
-        fake_no = obs_filter(fake_next_obs)
         alpha = torch.rand(real_o.shape[0], 1, device=real_o.device)
-        interp_o = (alpha * real_o + (1 - alpha) * fake_o).requires_grad_(True)
-        interp_no = (alpha * real_no + (1 - alpha) * fake_no).requires_grad_(True)
-        cat_interp = torch.cat([interp_o, interp_no], dim=-1)
-        d_interp = ma.trunk(cat_interp)
+        interp = (alpha * real_o + (1 - alpha) * fake_o).requires_grad_(True)
+        d_interp = ma.trunk(interp)
         grad = autograd.grad(
-            d_interp, cat_interp,
+            d_interp, interp,
             grad_outputs=torch.ones_like(d_interp),
             create_graph=True, retain_graph=True,
         )[0]
@@ -2086,9 +2071,9 @@ class FBCprAux:
         _ma_reward = None
         with torch.no_grad():
             reward = p._discriminator.compute_reward(obs, z)
-            # Manifold attractor: add unconditional transition reward.
+            # Manifold attractor: add unconditional state reward.
             if self.cfg.manifold_attractor and p._manifold_attractor is not None:
-                _ma_reward = p._manifold_attractor.compute_reward(obs, next_obs)
+                _ma_reward = p._manifold_attractor.compute_reward(obs)
                 reward = reward + self.cfg.manifold_attractor_coeff * _ma_reward
             dist = p._actor(next_obs, z, p.actor_std)
             next_action = dist.sample(clip=self.cfg.stddev_clip)

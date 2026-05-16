@@ -858,10 +858,10 @@ class Discriminator(nn.Module):
 
 
 class ManifoldAttractor(nn.Module):
-    """Unconditional discriminator D(s_t, s_{t+1}) — no z conditioning.
-
-    Classifies (current_obs, next_obs) transitions as expert vs policy,
-    constraining the policy to stay on the expert motion manifold.
+    """Unconditional state discriminator D(s) — no z conditioning, no
+    transition pair. Classifies single obs as expert vs policy, leveraging
+    the privileged_state in obs to capture full body state. Constrains the
+    policy to stay on the expert motion manifold.
     """
 
     def __init__(
@@ -876,9 +876,8 @@ class ManifoldAttractor(nn.Module):
         filtered_space = self.input_filter.output_space
         assert isinstance(filtered_space, gymnasium.spaces.Box)
         obs_dim = filtered_space.shape[0]
-        # Input: concat(obs_t, obs_{t+1}) = 2 * obs_dim
         seq: list[nn.Module] = [
-            nn.Linear(obs_dim * 2, hidden_dim), nn.LayerNorm(hidden_dim), nn.Tanh(),
+            nn.Linear(obs_dim, hidden_dim), nn.LayerNorm(hidden_dim), nn.Tanh(),
         ]
         for _ in range(hidden_layers - 1):
             seq += [nn.Linear(hidden_dim, hidden_dim), nn.ReLU()]
@@ -888,26 +887,21 @@ class ManifoldAttractor(nn.Module):
     def compute_logits(
         self,
         obs: torch.Tensor | dict[str, torch.Tensor],
-        next_obs: torch.Tensor | dict[str, torch.Tensor],
     ) -> torch.Tensor:
-        o = self.input_filter(obs)
-        no = self.input_filter(next_obs)
-        return self.trunk(torch.cat([o, no], dim=-1))
+        return self.trunk(self.input_filter(obs))
 
     def forward(
         self,
         obs: torch.Tensor | dict[str, torch.Tensor],
-        next_obs: torch.Tensor | dict[str, torch.Tensor],
     ) -> torch.Tensor:
-        return torch.sigmoid(self.compute_logits(obs, next_obs))
+        return torch.sigmoid(self.compute_logits(obs))
 
     def compute_reward(
         self,
         obs: torch.Tensor | dict[str, torch.Tensor],
-        next_obs: torch.Tensor | dict[str, torch.Tensor],
         eps: float = 1e-7,
     ) -> torch.Tensor:
-        s = self.forward(obs, next_obs)
+        s = self.forward(obs)
         s = torch.clamp(s, eps, 1 - eps)
         return s.log() - (1 - s).log()
 
