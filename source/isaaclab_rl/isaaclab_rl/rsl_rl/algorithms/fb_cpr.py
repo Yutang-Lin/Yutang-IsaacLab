@@ -1732,8 +1732,18 @@ class FBCprAux:
         else:
             expert_obs_valid = expert_obs
             expert_z_valid = expert_z
-        expert_logits = disc.compute_logits(expert_obs_valid, expert_z_valid)
-        unlabeled_logits = disc.compute_logits(train_obs, train_z)
+
+        # Merged forward: concat real + fake, run once, split logits.
+        n_real = expert_z_valid.shape[0]
+        if isinstance(expert_obs_valid, dict):
+            merged_obs = {k: torch.cat([expert_obs_valid[k], train_obs[k]], dim=0)
+                          for k in expert_obs_valid}
+        else:
+            merged_obs = torch.cat([expert_obs_valid, train_obs], dim=0)
+        merged_z = torch.cat([expert_z_valid, train_z], dim=0)
+        merged_logits = disc.compute_logits(merged_obs, merged_z)
+        expert_logits = merged_logits[:n_real]
+        unlabeled_logits = merged_logits[n_real:]
         expert_loss = -F.logsigmoid(expert_logits)
         unlabeled_loss = F.softplus(unlabeled_logits)
         loss = expert_loss.mean() + unlabeled_loss.mean()
@@ -1797,11 +1807,19 @@ class FBCprAux:
         if p._manifold_attractor is None:
             return {}
         ma = p._manifold_attractor
-        expert_logits = ma.compute_logits(expert_obs, expert_next_obs)
-        train_logits = ma.compute_logits(train_obs, train_next_obs)
+        n_real = next(iter(expert_obs.values())).shape[0] if isinstance(expert_obs, dict) else expert_obs.shape[0]
+        if isinstance(expert_obs, dict):
+            merged_obs = {k: torch.cat([expert_obs[k], train_obs[k]], dim=0) for k in expert_obs}
+            merged_next = {k: torch.cat([expert_next_obs[k], train_next_obs[k]], dim=0) for k in expert_next_obs}
+        else:
+            merged_obs = torch.cat([expert_obs, train_obs], dim=0)
+            merged_next = torch.cat([expert_next_obs, train_next_obs], dim=0)
+        merged_logits = ma.compute_logits(merged_obs, merged_next)
+        expert_logits = merged_logits[:n_real]
+        train_logits = merged_logits[n_real:]
         expert_loss = -F.logsigmoid(expert_logits)
         train_loss = F.softplus(train_logits)
-        loss = torch.mean(expert_loss + train_loss)
+        loss = expert_loss.mean() + train_loss.mean()
 
         if self.cfg.grad_penalty_manifold_attractor > 0:
             gp = self._gradient_penalty_manifold_attractor(
