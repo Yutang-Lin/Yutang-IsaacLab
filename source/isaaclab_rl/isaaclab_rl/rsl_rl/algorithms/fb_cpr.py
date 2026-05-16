@@ -268,18 +268,14 @@ class FBCprAux:
             torch.distributed.is_available() and torch.distributed.is_initialized()
         )
 
-        # Round main batch down to a multiple of seq_length.
+        # Disc batch is sized as disc_num_slices * seq_length (must be a
+        # multiple of seq_length for [num_slices, seq_length] reshape).
+        # Main cfg.batch_size is independent and stays exact (e.g. 1024).
         seq_length = int(self.policy.seq_length)
-        rounded = max(seq_length, (int(cfg.batch_size) // seq_length) * seq_length)
-        if rounded != cfg.batch_size:
-            print(f"[FBCprAux] batch_size: cfg={cfg.batch_size} -> {rounded} "
-                  f"(rounded to multiple of seq_length={seq_length})")
-        cfg.batch_size = rounded
-        # Disc batch (independent from main batch). Default: same as main.
         if cfg.disc_num_slices is not None:
             self._disc_batch_size = int(cfg.disc_num_slices) * seq_length
         else:
-            self._disc_batch_size = cfg.batch_size
+            self._disc_batch_size = max(seq_length, (cfg.batch_size // seq_length) * seq_length)
 
         # Remember the un-scaled base LRs BEFORE DDP sqrt-scaling. Used as
         # the target ("bottom") of the linear anneal schedule when

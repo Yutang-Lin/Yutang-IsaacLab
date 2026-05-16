@@ -315,6 +315,32 @@ class FBCprReplayBuffer:
 
         return self._gather(time_idx, env_idx, time_idx_next)
 
+    def sample_flat(self, batch_size: int) -> dict:
+        """Sample exactly ``batch_size`` i.i.d. transitions (no seq_length
+        chunking). Returned tensors have shape ``[batch_size, ...]``. Used
+        by the main training path (FB/actor/critic) which doesn't need
+        the temporal sub-sequence structure that ``sample()`` produces.
+        """
+        if len(self) == 0:
+            raise RuntimeError("FBCprReplayBuffer.sample_flat() called on empty buffer")
+        self._ensure_traj_info()
+        eligible = self._lengths >= 2  # need at least one valid (obs, next_obs) pair
+        if not bool(eligible.any().item()):
+            raise RuntimeError("No trajectories with length >= 2.")
+        eligible_idx = eligible.nonzero(as_tuple=False).squeeze(-1)
+        eligible_lengths = self._lengths[eligible_idx]
+        eligible_starts = self._start_idx[eligible_idx]
+        traj_sel = torch.randint(eligible_idx.shape[0], (batch_size,), device=self.device)
+        sel_lengths = eligible_lengths[traj_sel]
+        sel_starts = eligible_starts[traj_sel]
+        # Pick a random transition index in [0, length-2].
+        end_point = (sel_lengths - 2).clamp_min(0).to(torch.float32)
+        rel = (torch.rand(batch_size, device=self.device) * (end_point + 1.0)).floor().to(torch.long)
+        time_idx = (sel_starts[:, 0] + rel) % self.time_capacity
+        env_idx = sel_starts[:, 1]
+        time_idx_next = (time_idx + 1) % self.time_capacity
+        return self._gather(time_idx, env_idx, time_idx_next)
+
     def _gather(self, time_idx: torch.Tensor, env_idx: torch.Tensor,
                 time_idx_next: torch.Tensor) -> dict:
         obs = {k: v[time_idx, env_idx] for k, v in self._obs.items()}
@@ -334,12 +360,14 @@ class FBCprReplayBuffer:
         }
 
     def sample_chunks(self, batch_size: int, num_chunks: int, target_device: str | torch.device) -> list[dict]:
-        """Sample ``num_chunks`` batches in ONE call, then transfer to ``target_device``."""
-        # Round per-chunk batch down to multiple of seq_length BEFORE
-        # multiplying so all chunks are exactly batch_size.
-        batch_size = max(self.seq_length, (int(batch_size) // self.seq_length) * self.seq_length)
-        total = batch_size * int(num_chunks)
-        big = self.sample(total, seq_length=self.seq_length)
+        """Sample ``num_chunks`` batches in ONE call, then transfer to ``target_device``.
+
+        Train batch uses flat i.i.d. sampling (no seq_length chunking) so
+        ``batch_size`` is honored exactly. The seq_length structure is
+        only needed by the expert/disc path, not FB/actor/critic.
+        """
+        total = int(batch_size) * int(num_chunks)
+        big = self.sample_flat(total)
 
         def _move(x: torch.Tensor) -> torch.Tensor:
             return x.to(target_device, non_blocking=True)
