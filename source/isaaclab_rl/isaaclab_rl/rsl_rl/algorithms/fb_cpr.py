@@ -2448,16 +2448,32 @@ class FBCprAux:
 
     def load_state_dict(self, state: Dict[str, Any]) -> None:
         policy_sd = state["policy"]
-        # Drop keys for modules that no longer exist (e.g. removed reconstruction head)
-        model_keys = set(self.policy.state_dict().keys())
-        extra = [k for k in policy_sd if k not in model_keys]
-        if extra:
-            print(f"[FBCprAux] load_state_dict: dropping {len(extra)} unexpected keys "
-                  f"(e.g. {extra[0]})")
-            policy_sd = {k: v for k, v in policy_sd.items() if k in model_keys}
+        # Drop keys for modules that no longer exist (e.g. removed
+        # reconstruction head), or whose shape no longer matches (e.g.
+        # MA changed from D(s,s') to D(s) -- input dim halved).
+        model_sd = self.policy.state_dict()
+        model_keys = set(model_sd.keys())
+        unexpected = [k for k in policy_sd if k not in model_keys]
+        shape_mismatch = [
+            k for k in policy_sd
+            if k in model_keys and policy_sd[k].shape != model_sd[k].shape
+        ]
+        drop = set(unexpected) | set(shape_mismatch)
+        if drop:
+            print(f"[FBCprAux] load_state_dict: dropping {len(drop)} keys "
+                  f"({len(unexpected)} unexpected, {len(shape_mismatch)} shape mismatch). "
+                  f"e.g. {next(iter(drop))}")
+            policy_sd = {k: v for k, v in policy_sd.items() if k not in drop}
         self.policy.load_state_dict(policy_sd, strict=False)
+
+        # If we dropped MA weights, also drop the MA optimizer state so
+        # it doesn't reference stale params.
+        ma_dropped = any("manifold_attractor" in k for k in drop)
         optim = state.get("optimizers", {})
         for name, sd in optim.items():
+            if ma_dropped and name == "manifold_attractor_optimizer":
+                print(f"[FBCprAux] skipping {name} load (MA reinitialized)")
+                continue
             opt = getattr(self, name, None)
             if opt is not None:
                 try:
