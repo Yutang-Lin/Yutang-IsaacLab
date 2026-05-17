@@ -168,6 +168,10 @@ class FBCprAuxAlgorithmCfg:
     z_buffer_size: int = 8192
     tracking_T_min: int = 1
     tracking_T_max: int = 16
+    # If non-empty, sample T uniformly from this discrete set instead of
+    # uniformly from [T_min, T_max]. Used for both expert disc encoding
+    # and per-env tracking z window.
+    tracking_T_choices: tuple[int, ...] = ()
 
     # AMP (bf16). NOTE: the autocast context is NOT currently wired around
     # our forward/backward passes. Setting this True has no numerical
@@ -762,12 +766,20 @@ class FBCprAux:
         B_expert = B_expert.view(N, seq_length, B_expert.shape[-1])
         device = B_expert.device
 
-        # Variable T per sub-sequence (skip if T_min == T_max)
+        # Variable T per sub-sequence
+        choices = tuple(getattr(self.cfg, "tracking_T_choices", ()) or ())
         T_min = getattr(self.cfg, "tracking_T_min", 1)
         T_max = min(getattr(self.cfg, "tracking_T_max", 16), seq_length)
         disc_mask: torch.Tensor | None = None
-        if T_min < T_max:
+        T_per_seq: torch.Tensor | None = None
+        if choices:
+            choices = tuple(c for c in choices if c <= seq_length)
+            choices_t = torch.tensor(choices, device=device, dtype=torch.long)
+            sel = torch.randint(0, len(choices), (N,), device=device)
+            T_per_seq = choices_t[sel]
+        elif T_min < T_max:
             T_per_seq = torch.randint(T_min, T_max + 1, (N,), device=device)
+        if T_per_seq is not None:
             d = B_expert.shape[-1]
             cumz = torch.cat([torch.zeros(N, 1, d, device=device),
                               torch.cumsum(B_expert, dim=1)], dim=1)  # [N, seq+1, d]
@@ -874,9 +886,14 @@ class FBCprAux:
         global_fb_prob = getattr(self.cfg, "global_fb_zero_prob", 0.5)
         self._tracking_global_fb_active = torch.rand(n_elem, device=self.device) >= global_fb_prob
         # Per-env variable T for z computation window.
+        choices = tuple(getattr(self.cfg, "tracking_T_choices", ()) or ())
         T_min = getattr(self.cfg, "tracking_T_min", 1)
         T_max = getattr(self.cfg, "tracking_T_max", 16)
-        if T_min < T_max:
+        if choices:
+            choices_t = torch.tensor(choices, device=self.device, dtype=torch.long)
+            sel = torch.randint(0, len(choices), (n_elem,), device=self.device)
+            self._tracking_T = choices_t[sel]
+        elif T_min < T_max:
             self._tracking_T = torch.randint(T_min, T_max + 1, (n_elem,), device=self.device)
         else:
             self._tracking_T = None
