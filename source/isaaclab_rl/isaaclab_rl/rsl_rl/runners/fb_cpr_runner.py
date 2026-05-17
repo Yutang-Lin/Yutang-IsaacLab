@@ -1353,23 +1353,44 @@ class FBCprRunner:
         """
         ckpt = torch.load(path, map_location=self.device, weights_only=False)
         model_sd = ckpt["model"]
-        # Strip the ``.module.`` infix that DDP adds to the five wrapped
-        # nets (forward/backward/actor/critic/aux_critic) when the ckpt
-        # was saved under DDP but we're loading in non-DDP (play / single
-        # rank). The discriminator is never wrapped so its keys are flat
-        # in both cases. If the current policy IS DDP-wrapped (resume
-        # under the same world_size), we leave the keys alone.
-        needs_strip = any(".module." in k or "._orig_mod." in k for k in model_sd.keys())
-        if needs_strip and not self.is_distributed:
-            fixed_sd = {}
-            for k, v in model_sd.items():
-                k = k.replace(".module.", ".", 1)
-                k = k.replace("._orig_mod.", ".")
-                fixed_sd[k] = v
+        # Align checkpoint keys to the current policy's prefix scheme.
+        # DDP adds ``.module.``; torch.compile adds ``._orig_mod.``. The
+        # checkpoint may have either, both, or neither (depending on
+        # how it was saved); the current model may also have either.
+        # Translate to whatever the current policy expects.
+        cur_keys = set(self.policy.state_dict().keys())
+        cur_has_orig_mod = any("._orig_mod." in k for k in cur_keys)
+        cur_has_module = any(".module." in k for k in cur_keys)
+
+        def _align(k: str) -> str:
+            # First strip both prefixes to get the canonical name.
+            base = k.replace(".module.", ".").replace("._orig_mod.", ".")
+            if base in cur_keys:
+                return base
+            # Then add prefixes the current model expects. Try insertion
+            # at common patterns until we find a match.
+            for prefix in ("._orig_mod.", ".module.", "._orig_mod.module.",
+                           ".module._orig_mod."):
+                # Insert after each top-level submodule name
+                # (e.g. _backward_map. -> _backward_map._orig_mod.)
+                parts = base.split(".")
+                for i in range(1, len(parts)):
+                    cand = ".".join(parts[:i]) + prefix + ".".join(parts[i:])
+                    if cand in cur_keys:
+                        return cand
+            return k  # fallback: keep as-is, will be reported as unexpected
+
+        if cur_has_orig_mod or cur_has_module or any(
+            ".module." in k or "._orig_mod." in k for k in model_sd
+        ):
+            fixed_sd = {_align(k): v for k, v in model_sd.items()}
+            n_fixed = sum(1 for k in fixed_sd if k not in model_sd)
+            if n_fixed:
+                print(f"[FBCprRunner] aligned {n_fixed} state_dict keys to "
+                      f"current model's prefix scheme "
+                      f"(orig_mod={cur_has_orig_mod}, module={cur_has_module}).",
+                      flush=True)
             model_sd = fixed_sd
-            print(f"[FBCprRunner] stripped DDP/compile prefixes from "
-                  f"{len(ckpt['model'])} state_dict keys (non-DDP load).",
-                  flush=True)
         # Non-strict load so legacy checkpoints (pre-reconstruction-head,
         # old MA with D(s,s'), etc.) still resume. Drop shape-mismatched
         # keys so the affected modules reinitialize cleanly.
