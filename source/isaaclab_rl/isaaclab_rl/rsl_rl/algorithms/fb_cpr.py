@@ -155,6 +155,9 @@ class FBCprAuxAlgorithmCfg:
     # disc batch grows via disc_num_slices).
     ma_max_batch: int = 1024
     discount: float = 0.98
+    # Separate discount for the disc-critic TD target (TD on
+    # disc.compute_reward). Falls back to ``discount`` when None.
+    discount_disc: float | None = None
     # Separate discount for the aux-critic TD target (penalty_xy_tracking
     # etc.). Falls back to ``discount`` when None.
     discount_aux: float | None = None
@@ -1462,9 +1465,11 @@ class FBCprAux:
         train_terminated = train_batch["next"]["terminated"].to(self.device, non_blocking=True)
         not_term = (~train_terminated.bool()).float()
         discount = self.cfg.discount * not_term
-        # Separate aux discount; defaults to main discount when None.
+        # Separate aux/disc discounts; default to main discount when None.
         _disc_aux = self.cfg.discount if self.cfg.discount_aux is None else self.cfg.discount_aux
+        _disc_disc = self.cfg.discount if self.cfg.discount_disc is None else self.cfg.discount_disc
         discount_aux = float(_disc_aux) * not_term
+        discount_disc = float(_disc_disc) * not_term
 
         expert_obs = self._to_device(expert_batch["observation"])
         expert_next_obs = self._to_device(expert_batch["next"]["observation"])
@@ -1702,7 +1707,7 @@ class FBCprAux:
         critic_metrics, critic_handle = self.backward_critic(
             obs=train_obs,
             action=train_action,
-            discount=discount,
+            discount=discount_disc,
             next_obs=train_next_obs,
             z=train_z,
         )
