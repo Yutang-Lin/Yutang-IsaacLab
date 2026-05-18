@@ -155,6 +155,9 @@ class FBCprAuxAlgorithmCfg:
     # disc batch grows via disc_num_slices).
     ma_max_batch: int = 1024
     discount: float = 0.98
+    # Separate discount for the aux-critic TD target (penalty_xy_tracking
+    # etc.). Falls back to ``discount`` when None.
+    discount_aux: float | None = None
     relabel_ratio: float | None = 0.8
     train_goal_ratio: float = 0.2
     expert_asm_ratio: float = 0.6
@@ -1457,7 +1460,11 @@ class FBCprAux:
         train_next_obs = self._to_device(train_batch["next"]["observation"])
         train_action = train_batch["action"].to(self.device, non_blocking=True)
         train_terminated = train_batch["next"]["terminated"].to(self.device, non_blocking=True)
-        discount = self.cfg.discount * (~train_terminated.bool()).float()
+        not_term = (~train_terminated.bool()).float()
+        discount = self.cfg.discount * not_term
+        # Separate aux discount; defaults to main discount when None.
+        _disc_aux = self.cfg.discount if self.cfg.discount_aux is None else self.cfg.discount_aux
+        discount_aux = float(_disc_aux) * not_term
 
         expert_obs = self._to_device(expert_batch["observation"])
         expert_next_obs = self._to_device(expert_batch["next"]["observation"])
@@ -1620,7 +1627,7 @@ class FBCprAux:
                     aux_metrics, _ = self.backward_aux_critic(
                         obs=train_obs,
                         action=train_action,
-                        discount=discount,
+                        discount=discount_aux,
                         aux_reward=aux_reward,
                         next_obs=train_next_obs,
                         z=train_z,
@@ -1638,7 +1645,7 @@ class FBCprAux:
                 aux_metrics, _ = self.backward_aux_critic(
                     obs=train_obs,
                     action=train_action,
-                    discount=discount,
+                    discount=discount_aux,
                     aux_reward=aux_reward,
                     next_obs=train_next_obs,
                     z=train_z,
