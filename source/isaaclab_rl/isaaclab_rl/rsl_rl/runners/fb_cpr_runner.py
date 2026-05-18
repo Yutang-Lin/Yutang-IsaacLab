@@ -585,6 +585,8 @@ class FBCprRunner:
                     if hasattr(env_u, "set_global_fb_targets"):
                         targets = self.alg.get_global_fb_targets(
                             step_count, self.expert_buffer,
+                            robot_root_xy=_robot.data.root_pos_w[:, :2].to(self.device) if _robot else None,
+                            robot_root_quat=_robot.data.root_quat_w.to(self.device) if _robot else None,
                         )
                         if targets is not None:
                             xy, yaw, active, t_ids = targets

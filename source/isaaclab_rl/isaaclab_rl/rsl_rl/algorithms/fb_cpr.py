@@ -172,6 +172,13 @@ class FBCprAuxAlgorithmCfg:
     # uniformly from [T_min, T_max]. Used for both expert disc encoding
     # and per-env tracking z window.
     tracking_T_choices: tuple[int, ...] = ()
+    # EMA alignment of the Global-FB reference frame: if > 0, each step
+    # the stored ``_tracking_robot_xy`` and ``_tracking_heading_delta``
+    # are pulled toward the robot's current root xy/yaw with rate
+    # ``global_fb_align_ema``. The motion delta from the anchor is then
+    # applied on top of this drifting frame, so the penalty stays
+    # bounded if the policy drifts laterally / off-heading. 0 = off.
+    global_fb_align_ema: float = 0.0
 
     # AMP (bf16). NOTE: the autocast context is NOT currently wired around
     # our forward/backward passes. Setting this True has no numerical
@@ -1014,7 +1021,11 @@ class FBCprAux:
 
     @torch.no_grad()
     def get_global_fb_targets(
-        self, step_count: torch.Tensor, expert_buffer: Any,
+        self,
+        step_count: torch.Tensor,
+        expert_buffer: Any,
+        robot_root_xy: torch.Tensor | None = None,
+        robot_root_quat: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None:
         """Return (target_xy [N,2], target_yaw [N], active [N] bool, tracking_ids [M]).
 
@@ -1022,6 +1033,12 @@ class FBCprAux:
         (with heading rotation + spawn offset applied). Active mask is
         sampled once per tracking episode in ``_resample_tracking``
         (controls obs visibility, not penalty).
+
+        If ``cfg.global_fb_align_ema > 0`` AND ``robot_root_*`` are provided,
+        the stored ``_tracking_robot_xy`` (anchor for the motion frame) and
+        ``_tracking_heading_delta`` are pulled toward the robot's current
+        pose by ``ema`` each step, before computing the target. This keeps
+        the penalty bounded when the policy drifts off the motion path.
         """
         if getattr(self, "_tracking_env_idx", None) is None:
             return None
@@ -1034,6 +1051,25 @@ class FBCprAux:
         target_xy = torch.zeros(N, 2, device=self.device)
         target_yaw = torch.zeros(N, device=self.device)
         active = torch.zeros(N, dtype=torch.bool, device=self.device)
+
+        # ---- Optional EMA alignment of the reference frame ----
+        ema = float(getattr(self.cfg, "global_fb_align_ema", 0.0))
+        if (ema > 0.0 and robot_root_xy is not None
+                and self._tracking_robot_xy is not None):
+            cur_xy = robot_root_xy[self._tracking_env_idx].to(self.device)
+            self._tracking_robot_xy = (1.0 - ema) * self._tracking_robot_xy + ema * cur_xy
+            if (robot_root_quat is not None
+                    and self._tracking_heading_delta is not None
+                    and self._cached_root_quat_dev is not None):
+                cur_yaw = self._yaw_from_quat(
+                    robot_root_quat[self._tracking_env_idx].to(self.device)
+                )
+                anchor_idx = self._tracking_anchor_global_idx()
+                motion_anchor_yaw = self._yaw_from_quat(self._cached_root_quat_dev[anchor_idx])
+                target_heading_delta = cur_yaw - motion_anchor_yaw
+                # Wrap to [-pi, pi] before EMA to avoid 2pi jumps.
+                d = (target_heading_delta - self._tracking_heading_delta + math.pi) % (2 * math.pi) - math.pi
+                self._tracking_heading_delta = self._tracking_heading_delta + ema * d
 
         traj_len = self.cfg.rollout_expert_trajectories_length
         local_t = step_count[self._tracking_env_idx] % traj_len
