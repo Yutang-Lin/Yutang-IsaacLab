@@ -174,10 +174,13 @@ class FBCprAuxAlgorithmCfg:
     z_buffer_size: int = 8192
     tracking_T_min: int = 1
     tracking_T_max: int = 16
-    # If non-empty, sample T uniformly from this discrete set instead of
-    # uniformly from [T_min, T_max]. Used for both expert disc encoding
-    # and per-env tracking z window.
+    # If non-empty, sample T from this discrete set instead of uniformly
+    # from [T_min, T_max]. Used for both expert disc encoding and per-env
+    # tracking z window.
     tracking_T_choices: tuple[int, ...] = ()
+    # Per-choice probabilities (must match len(tracking_T_choices) when set).
+    # Empty tuple = uniform over choices.
+    tracking_T_choice_probs: tuple[float, ...] = ()
     # EMA alignment of the Global-FB reference frame: if > 0, each step
     # the stored ``_tracking_robot_xy`` and ``_tracking_heading_delta``
     # are pulled toward the robot's current root xy/yaw with rate
@@ -781,14 +784,22 @@ class FBCprAux:
 
         # Variable T per sub-sequence
         choices = tuple(getattr(self.cfg, "tracking_T_choices", ()) or ())
+        choice_probs = tuple(getattr(self.cfg, "tracking_T_choice_probs", ()) or ())
         T_min = getattr(self.cfg, "tracking_T_min", 1)
         T_max = min(getattr(self.cfg, "tracking_T_max", 16), seq_length)
         disc_mask: torch.Tensor | None = None
         T_per_seq: torch.Tensor | None = None
         if choices:
-            choices = tuple(c for c in choices if c <= seq_length)
-            choices_t = torch.tensor(choices, device=device, dtype=torch.long)
-            sel = torch.randint(0, len(choices), (N,), device=device)
+            kept = [(c, choice_probs[i] if choice_probs else 1.0)
+                    for i, c in enumerate(choices) if c <= seq_length]
+            choices_kept = [c for c, _ in kept]
+            probs_kept = [p for _, p in kept]
+            choices_t = torch.tensor(choices_kept, device=device, dtype=torch.long)
+            if choice_probs and len(probs_kept) == len(choices_kept):
+                w = torch.tensor(probs_kept, device=device, dtype=torch.float32)
+                sel = torch.multinomial(w, N, replacement=True)
+            else:
+                sel = torch.randint(0, len(choices_kept), (N,), device=device)
             T_per_seq = choices_t[sel]
         elif T_min < T_max:
             T_per_seq = torch.randint(T_min, T_max + 1, (N,), device=device)
@@ -900,11 +911,16 @@ class FBCprAux:
         self._tracking_global_fb_active = torch.rand(n_elem, device=self.device) >= global_fb_prob
         # Per-env variable T for z computation window.
         choices = tuple(getattr(self.cfg, "tracking_T_choices", ()) or ())
+        choice_probs = tuple(getattr(self.cfg, "tracking_T_choice_probs", ()) or ())
         T_min = getattr(self.cfg, "tracking_T_min", 1)
         T_max = getattr(self.cfg, "tracking_T_max", 16)
         if choices:
             choices_t = torch.tensor(choices, device=self.device, dtype=torch.long)
-            sel = torch.randint(0, len(choices), (n_elem,), device=self.device)
+            if choice_probs and len(choice_probs) == len(choices):
+                w = torch.tensor(choice_probs, device=self.device, dtype=torch.float32)
+                sel = torch.multinomial(w, n_elem, replacement=True)
+            else:
+                sel = torch.randint(0, len(choices), (n_elem,), device=self.device)
             self._tracking_T = choices_t[sel]
         elif T_min < T_max:
             self._tracking_T = torch.randint(T_min, T_max + 1, (n_elem,), device=self.device)
