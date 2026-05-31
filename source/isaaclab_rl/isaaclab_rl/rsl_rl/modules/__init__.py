@@ -1,5 +1,6 @@
 from .empirical_normalization import EmpiricalNormalization
 from .actor_critic import ActorCritic
+from .actor_critic_adapter import ActorCriticAdapter
 from .actor_critic_recurrent import ActorCriticRecurrent
 from .twin_delayed import TwinDelayed
 from .actor_critic_ou import ActorCriticOU
