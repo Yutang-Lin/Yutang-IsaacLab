@@ -92,6 +92,7 @@ def resolve_module(checkpoint_path, device="cpu") -> tuple[_ModuleWrapper, tuple
 
 __all__ = [
     "ActorCritic",
+    "ActorCriticAdapter",
     "ActorCriticRecurrent",
     "ActorCriticOU",
     "ActorCriticDP",
