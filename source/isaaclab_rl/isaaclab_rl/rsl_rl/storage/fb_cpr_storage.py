@@ -578,6 +578,7 @@ class FBCprExpertBuffer:
         # be used by the env to build its shared terrain mesh.
         self._motion_source_id: list[int] = []
         self._requires_terrain: list[bool] = []
+        self._terrain_id: list[int] = []
         self._terrain_mesh_paths: list[str] = []
 
         # Minimal path: batch-FK across all shard motions once, then
@@ -716,6 +717,7 @@ class FBCprExpertBuffer:
             # Per-motion tags (default-safe for legacy .pt files).
             self._motion_source_id.append(int(m.get("motion_source_id", 0)))
             self._requires_terrain.append(bool(m.get("requires_terrain", False)))
+            self._terrain_id.append(int(m.get("terrain_id", -1)))
             self._terrain_mesh_paths.append(str(m.get("terrain_mesh_path", "")))
 
         self._lengths_t = torch.tensor(self._lengths, dtype=torch.long, device=self.device)
@@ -811,6 +813,9 @@ class FBCprExpertBuffer:
         )
         self.requires_terrain_t = torch.tensor(
             self._requires_terrain, dtype=torch.bool, device=self.device,
+        )
+        self.terrain_id_t = torch.tensor(
+            self._terrain_id, dtype=torch.long, device=self.device,
         )
         # When RSI fields are available, expose per-RSI-frame metadata via
         # the flat buffer ordering. ``_motion_lengths_rsi`` gives the frame
