@@ -698,31 +698,5 @@ class PPO(RslRlPPO):
                 param.grad.data.copy_(all_grads[offset : offset + numel].view_as(param.grad.data))
                 offset += numel
         else:
-            # Default: sync ALL parameters. We do NOT call
-            # super().reduce_parameters() because the stock rsl_rl version
-            # concatenates only params whose .grad is non-None:
-            #     grads = [p.grad.view(-1) for p in params if p.grad is not None]
-            # If different ranks end up with different non-None-grad SETS (e.g.
-            # a minibatch where a sub-loss is absent/zeroed leaves some params
-            # untouched by backward on one rank but not another), the per-rank
-            # all_grads tensors have DIFFERENT sizes and NCCL all_reduce
-            # deadlocks (it requires identical shapes on every rank). This was
-            # the multi-GPU hang: ranks parked at different collective lines in
-            # update(). Fix: materialize a zero grad for every parameter so the
-            # concatenated tensor is identical across ranks.
-            params = list(self.policy.parameters())
-            if self.rnd:
-                params += list(self.rnd.parameters())
-            grads = []
-            for p in params:
-                if p.grad is None:
-                    p.grad = torch.zeros_like(p)
-                grads.append(p.grad.view(-1))
-            all_grads = torch.cat(grads)
-            torch.distributed.all_reduce(all_grads, op=torch.distributed.ReduceOp.SUM)
-            all_grads /= self.gpu_world_size
-            offset = 0
-            for p in params:
-                numel = p.numel()
-                p.grad.data.copy_(all_grads[offset:offset + numel].view_as(p.grad.data))
-                offset += numel
+            # Default: sync all parameters
+            super().reduce_parameters()
