@@ -325,6 +325,61 @@ class BaseRunner(OnPolicyRunner):
         self.current_learning_iteration = 0
         self.git_status_repos = [rsl_rl.__file__]
 
+    def _configure_multi_gpu(self):
+        """Multi-GPU setup that passes ``device_id`` to ``init_process_group``.
+
+        The stock rsl_rl ``OnPolicyRunner._configure_multi_gpu`` calls
+        ``init_process_group(backend="nccl", ...)`` with NO ``device_id``. When
+        CUDA_VISIBLE_DEVICES is masked to one GPU per rank, NCCL cannot resolve
+        the rank->GPU mapping ("device currently unknown") and the FIRST
+        collective (e.g. the startup barrier) deadlocks with no timeout.
+
+        This override mirrors the working FBCprRunner path: bind the rank-local
+        device first, then init the process group WITH ``device_id`` so the
+        communicator is unambiguous.
+        """
+        self.gpu_world_size = int(os.getenv("WORLD_SIZE", "1"))
+        self.is_distributed = self.gpu_world_size > 1
+        if not self.is_distributed:
+            self.gpu_local_rank = 0
+            self.gpu_global_rank = 0
+            self.multi_gpu_cfg = None
+            return
+
+        self.gpu_local_rank = int(os.getenv("LOCAL_RANK", "0"))
+        self.gpu_global_rank = int(os.getenv("RANK", "0"))
+        self.multi_gpu_cfg = {
+            "global_rank": self.gpu_global_rank,
+            "local_rank": self.gpu_local_rank,
+            "world_size": self.gpu_world_size,
+        }
+
+        if self.device != f"cuda:{self.gpu_local_rank}":
+            raise ValueError(
+                f"Device '{self.device}' does not match expected device for "
+                f"local rank '{self.gpu_local_rank}'."
+            )
+        if self.gpu_local_rank >= self.gpu_world_size or self.gpu_global_rank >= self.gpu_world_size:
+            raise ValueError(
+                f"Local/global rank ({self.gpu_local_rank}/{self.gpu_global_rank}) "
+                f">= world size ({self.gpu_world_size})."
+            )
+
+        # Bind device BEFORE init so NCCL's comm lands on the rank-local GPU.
+        # When masked to one visible GPU per rank, that GPU is index 0 here.
+        cvd = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+        _dev_idx = 0 if (cvd and "," not in cvd) else self.gpu_local_rank
+        torch.cuda.set_device(_dev_idx)
+        if not torch.distributed.is_initialized():
+            torch.distributed.init_process_group(
+                backend="nccl",
+                rank=self.gpu_global_rank,
+                world_size=self.gpu_world_size,
+                device_id=torch.device(f"cuda:{_dev_idx}"),
+            )
+            print(f"[BaseRunner] init_process_group device_id=cuda:{_dev_idx} "
+                  f"rank={self.gpu_global_rank} world={self.gpu_world_size}", flush=True)
+
     def learn(self, num_learning_iterations: int, init_at_random_ep_len: bool = False):  # noqa: C901
         # initialize writer
         if self.log_dir is not None and self.writer is None and not self.disable_logs:
