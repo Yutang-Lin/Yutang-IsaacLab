@@ -663,29 +663,6 @@ class PPO(RslRlPPO):
 
         return loss_dict
 
-    def broadcast_parameters(self):
-        """Broadcast model parameters from rank 0 to all ranks.
-
-        Overrides the stock rsl_rl version, which uses
-        ``broadcast_object_list([state_dict])`` — that pickles the whole
-        state_dict and places the byte tensor on ``torch.cuda.current_device()``.
-        After Isaac Sim init the current device can differ from the rank's GPU,
-        so the byte-tensor broadcast lands on the wrong device and the
-        collective desyncs/hangs (100% util spin-wait, low power). Broadcasting
-        each tensor IN-PLACE on its own device avoids both the pickle and the
-        current-device dependency, and is the standard DDP approach.
-        """
-        with torch.no_grad():
-            for p in self.policy.parameters():
-                torch.distributed.broadcast(p.data, src=0)
-            for b in self.policy.buffers():
-                torch.distributed.broadcast(b.data, src=0)
-            if self.rnd:
-                for p in self.rnd.predictor.parameters():
-                    torch.distributed.broadcast(p.data, src=0)
-                for b in self.rnd.predictor.buffers():
-                    torch.distributed.broadcast(b.data, src=0)
-
     def reduce_parameters(self):
         """Collect gradients from all GPUs and average them.
 
