@@ -868,30 +868,38 @@ class FBCprExpertBuffer:
         return list(self._lengths)
 
     @torch.no_grad()
-    def get_motion_window(self, motion_id: int, num_frames: int) -> dict:
-        """Return the first ``num_frames`` frames of motion ``motion_id`` as a dict.
+    def get_motion_window(self, motion_id: int, num_frames: int, start_frame: int = 0) -> dict:
+        """Return ``num_frames`` frames of motion ``motion_id`` starting at
+        ``start_frame`` (inclusive), as a dict.
 
-        Truncates if the motion is shorter than ``num_frames`` (returns its
-        actual length), so callers should read ``result['num_frames']``
-        rather than assuming the full request.
+        ``start_frame`` enables true Reference-State-Initialization (spawn at a
+        random point within the motion, not always frame 0). It is clamped to
+        ``[0, motion_len - 1]``; the returned window covers
+        ``[start_frame : start_frame + num_frames]`` and is truncated at the
+        motion end, so callers should read ``result['num_frames']`` (the actual
+        REMAINING length from ``start_frame``) rather than assuming the request.
         """
         assert 0 <= motion_id < self.num_unique_motions
-        L = min(int(num_frames), self._lengths[motion_id])
+        mlen = self._lengths[motion_id]
+        s = max(0, min(int(start_frame), mlen - 1))
+        L = min(int(num_frames), mlen - s)
+        e = s + L
         out = {
-            "state": self._states[motion_id][:L],
-            "privileged_state": self._privs[motion_id][:L],
-            "last_action": self._last_actions[motion_id][:L],
-            "history_actor": self._history_actors[motion_id][:L],
+            "state": self._states[motion_id][s:e],
+            "privileged_state": self._privs[motion_id][s:e],
+            "last_action": self._last_actions[motion_id][s:e],
+            "history_actor": self._history_actors[motion_id][s:e],
             "num_frames": L,
+            "start_frame": s,
         }
         if self.supports_reset_states:
             out.update({
-                "joint_pos": self._per_motion_joint_pos[motion_id][:L],
-                "joint_vel": self._per_motion_joint_vel[motion_id][:L],
-                "root_pos": self._per_motion_root_pos[motion_id][:L],
-                "root_quat": self._per_motion_root_quat[motion_id][:L],
-                "root_lin_vel": self._per_motion_root_lin_vel[motion_id][:L],
-                "root_ang_vel": self._per_motion_root_ang_vel[motion_id][:L],
+                "joint_pos": self._per_motion_joint_pos[motion_id][s:e],
+                "joint_vel": self._per_motion_joint_vel[motion_id][s:e],
+                "root_pos": self._per_motion_root_pos[motion_id][s:e],
+                "root_quat": self._per_motion_root_quat[motion_id][s:e],
+                "root_lin_vel": self._per_motion_root_lin_vel[motion_id][s:e],
+                "root_ang_vel": self._per_motion_root_ang_vel[motion_id][s:e],
             })
         return out
 
