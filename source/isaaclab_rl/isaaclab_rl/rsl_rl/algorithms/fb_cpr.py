@@ -181,6 +181,12 @@ class FBCprAuxAlgorithmCfg:
     # Per-choice probabilities (must match len(tracking_T_choices) when set).
     # Empty tuple = uniform over choices.
     tracking_T_choice_probs: tuple[float, ...] = ()
+    # If True, the discriminator's positive (expert) window is ALWAYS the full
+    # seq_length regardless of the per-sequence z-window T — i.e. every frame
+    # in the sub-sequence is a valid positive. The z is still computed from the
+    # per-T window; only the disc_mask is forced to all-True. If False (default),
+    # the positive window matches T (frames 0..T-1 only).
+    disc_positive_full_window: bool = False
     # EMA alignment of the Global-FB reference frame: if > 0, each step
     # the stored ``_tracking_robot_xy`` and ``_tracking_heading_delta``
     # are pulled toward the robot's current root xy/yaw with rate
@@ -813,6 +819,11 @@ class FBCprAux:
             # Frames 0..T-1 are within window; T..seq_length-1 are not.
             arange_T = torch.arange(seq_length, device=device).unsqueeze(0)
             disc_mask = (arange_T < T_per_seq.unsqueeze(1)).reshape(-1)  # [N*seq_length]
+            # Optionally use the FULL seq_length as the discriminator positive
+            # window for every sub-sequence, regardless of its z-window T (z is
+            # still the per-T mean above; only the positive mask is widened).
+            if bool(getattr(self.cfg, "disc_positive_full_window", False)):
+                disc_mask = None
         else:
             z_expert = B_expert.mean(dim=1)
 
