@@ -1206,6 +1206,53 @@ class FBCprAux:
         ref[self._tracking_env_idx] = body_pos
         return ref
 
+    @torch.no_grad()
+    def get_tracking_ref_whole_body(
+        self, step_count: torch.Tensor, expert_buffer: Any,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None:
+        """Per-env reference whole-body state for tracking envs, for an
+        explicit heading-frame imitation reward.
+
+        Returns ``(ref_priv [N, 463], ref_joint_pos [N, 29],
+        ref_joint_vel [N, 29], tracking_mask [N] bool)``:
+          * ref_priv = the expert ``_flat_priv`` (heading-local, pelvis-relative
+            463-D: root_h + keybody pos/rot6d/lin_vel/ang_vel) at the motion's
+            current tracking frame. Directly comparable to the env's live
+            ``_compute_priv_state()`` (same layout/frame), so NO world
+            alignment is needed.
+          * ref_joint_pos/vel from the RSI joint buffers at the same frame.
+        Rows for non-tracking envs are zero with tracking_mask=False. Returns
+        None if no tracking context or the buffer lacks the fields.
+        """
+        if getattr(self, "_tracking_env_idx", None) is None:
+            return None
+        if getattr(self, "_tracking_motion_ids", None) is None:
+            return None
+        fp = getattr(expert_buffer, "_flat_priv", None)
+        jp_buf = getattr(expert_buffer, "joint_pos_buffer", None)
+        jv_buf = getattr(expert_buffer, "joint_vel_buffer", None)
+        if fp is None or jp_buf is None or jv_buf is None:
+            return None
+        self._ensure_buffer_cache(expert_buffer)
+        N = step_count.shape[0]
+        traj_len = self.cfg.rollout_expert_trajectories_length
+        local_t = step_count[self._tracking_env_idx] % traj_len
+        usable = (self._tracking_motion_lens - 1).clamp_min(1)
+        frame = (self._tracking_starts + local_t.view(-1) + 1) % usable
+        obs_starts = self._cached_obs_starts_dev[self._tracking_motion_ids]
+        global_idx = (obs_starts + frame).long()
+
+        ref_priv = torch.zeros(N, fp.shape[-1], device=self.device)
+        ref_jp = torch.zeros(N, jp_buf.shape[-1], device=self.device)
+        ref_jv = torch.zeros(N, jv_buf.shape[-1], device=self.device)
+        mask = torch.zeros(N, dtype=torch.bool, device=self.device)
+        idx = global_idx.to(fp.device)
+        ref_priv[self._tracking_env_idx] = fp[idx].to(self.device)
+        ref_jp[self._tracking_env_idx] = jp_buf[idx].to(self.device)
+        ref_jv[self._tracking_env_idx] = jv_buf[idx].to(self.device)
+        mask[self._tracking_env_idx] = True
+        return ref_priv, ref_jp, ref_jv, mask
+
     @staticmethod
     def _yaw_from_quat(quat: torch.Tensor) -> torch.Tensor:
         """Extract yaw from wxyz quaternion. Returns [N]."""

@@ -592,6 +592,18 @@ class FBCprRunner:
                             xy, yaw, active, t_ids = targets
                             env_u.set_global_fb_targets(xy, yaw, active, tracking_env_ids=t_ids)
 
+                    # Push whole-body reference (heading-frame priv + joint
+                    # pos/vel) for the explicit imitation aux reward.
+                    if hasattr(env_u, "set_tracking_ref_whole_body"):
+                        wb = self.alg.get_tracking_ref_whole_body(
+                            step_count, self.expert_buffer,
+                        )
+                        if wb is not None:
+                            ref_priv, ref_jp, ref_jv, wb_mask = wb
+                            env_u.set_tracking_ref_whole_body(
+                                ref_priv, ref_jp, ref_jv, wb_mask,
+                            )
+
                     new_obs, rewards, dones, infos = self.env.step(actions.to(self.env.device))
                     new_obs = self._obs_to_device(new_obs, infos)
                     rewards = rewards.to(self.device)
