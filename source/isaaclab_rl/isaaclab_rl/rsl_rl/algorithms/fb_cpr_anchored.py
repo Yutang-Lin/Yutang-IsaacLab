@@ -175,15 +175,9 @@ class AnchoredFBCprAux(FBCprAux):
         c = self.cfg
         cached = {
             "clamp": float(getattr(c, "anchor_pose_clamp", 10.0)),
+            # p(anchor = current pose g_t); remainder -> random anchor around g_t.
             "alpha_gt": float(getattr(c, "anchor_alpha_gt", 0.34)),
-            "beta_gh": float(getattr(c, "anchor_beta_gh", 0.33)),
-            # remainder -> random anchor
             "rand_xy": float(getattr(c, "anchor_random_xy_range", 10.0)),
-            "goal_future": float(getattr(c, "goal_future_ratio", 0.4)),
-            "goal_nearby": float(getattr(c, "goal_nearby_ratio", 0.2)),
-            "goal_replay": float(getattr(c, "goal_replay_ratio", 0.2)),
-            "goal_composed": float(getattr(c, "goal_composed_ratio", 0.2)),
-            "nearby_radius": float(getattr(c, "goal_nearby_radius", 2.0)),
             "key": str(getattr(c, "anchored_pose_key", "anchored_pose")),
         }
         self._anchor_cfg_cache = cached
@@ -197,8 +191,15 @@ class AnchoredFBCprAux(FBCprAux):
         """Encode A^-1 g for SE(2) poses g, A.
 
         ``g_*``: world pose to encode; ``a_*``: anchor pose. Returns
-        ``[clamp(px,±R), clamp(py,±R), cos(theta), sin(theta)]`` where
+        ``[clamp(px,±R)/R, clamp(py,±R)/R, cos(theta), sin(theta)]`` where
         (px,py,theta) = A^-1 g (g expressed in anchor frame).
+
+        The xy is divided by the clamp R so all four dims live in [-1, 1] —
+        a fixed, stationary, analytically-normalized encoding. This replaces
+        BatchNorm on anchored_pose (whose running stats were fit on the narrow
+        rollout distribution but applied to the broad relabel distribution — a
+        train/eval mismatch that destabilized training). Must stay byte-identical
+        to the env's _obs_anchored_pose and the expert buffer's _anchored_pose_at.
         """
         if g_yaw.dim() == 2:
             g_yaw = g_yaw.squeeze(-1)
@@ -209,8 +210,8 @@ class AnchoredFBCprAux(FBCprAux):
         px = ca * d[:, 0] - sa * d[:, 1]
         py = sa * d[:, 0] + ca * d[:, 1]
         theta = g_yaw - a_yaw
-        px = px.clamp(-clamp, clamp)
-        py = py.clamp(-clamp, clamp)
+        px = px.clamp(-clamp, clamp) / clamp
+        py = py.clamp(-clamp, clamp) / clamp
         c, s = torch.cos(theta), torch.sin(theta)
         return torch.stack([px, py, c, s], dim=-1)
 
@@ -229,97 +230,92 @@ class AnchoredFBCprAux(FBCprAux):
     # ------------------------------------------------------------------ #
     def _anchor_relabel(self, train_batch, train_obs, train_next_obs, train_z,
                         mixed_z, expert_z):
+        """Consistent + augmented anchoring on TOP of original BFM.
+
+        We do NOT change BFM's resampling / FB loss / z-mixing. The only thing
+        added is a per-row SE(2) anchor A_i, applied CONSISTENTLY so the FB loss
+        is identical-but-augmented (anchor-equivariant): for each row i, the
+        actor/critic/F obs (A_i^-1 g_t), the FB-diagonal goal B(A_i^-1 g_{t+1}),
+        AND the spatial block of z all live in the SAME frame A_i.
+
+        Original BFM z (``mixed_z``, from sample_mixed_z on next_obs) is reused
+        verbatim, EXCEPT its spatial block must be re-expressed in A_i: the
+        goal-encoded branch of sample_mixed_z used a shuffled next_obs whose
+        ``anchored_pose`` was the rollout frame, not A_i. We recompute that
+        spatial block as B_spatial(A_i^-1 g_j) where j is the same shuffle. The
+        local block (anchor-invariant) is left exactly as BFM produced it.
+        """
         cfg = self._anchor_cfg()
         dev = self.device
         B = train_z.shape[0]
         key = cfg["key"]
+        p = self.policy
 
         extras = train_batch.get("extras", None)
         if extras is None or "root_xy" not in extras:
-            # No world pose stored — behave like the base (identity). This
-            # path should not hit in the anchored task (store_world_pose=True).
             return train_obs, train_next_obs, train_next_obs, train_z
 
-        # Raw world SE(2) poses (current g_t, next g_{t+1}) from replay.
+        # World SE(2) poses for this transition (g_t) and its next (g_{t+1}).
         gt_xy = extras["root_xy"].to(dev).float()
         gt_yaw = extras["root_yaw"].to(dev).float().view(-1)
         nx = train_batch["next"].get("extras", {})
         gtn_xy = nx.get("root_xy", extras["root_xy"]).to(dev).float()
         gtn_yaw = nx.get("root_yaw", extras["root_yaw"]).to(dev).float().view(-1)
 
-        # ---- Task goal s_h ~ p_goal (mix future/nearby/replay/composed) ---
-        # All four modes resolve to (goal world pose g_h, goal obs dict for the
-        # LOCAL body part). We draw goal *body* states + goal *poses*, possibly
-        # from different samples (composed).
-        gh_xy, gh_yaw, goal_obs = self._sample_goal(train_batch, train_obs, gt_xy, gt_yaw, cfg)
+        # ---- Per-row anchor A_i ~ p_A (augmentation): current pose / random.
+        a_xy, a_yaw = self._sample_anchor(gt_xy, gt_yaw, dev)
 
-        # ---- Sample coordinate anchor A ~ p_A (shared per sample) ----------
-        a_xy, a_yaw = self._sample_anchor(gt_xy, gt_yaw, gh_xy, gh_yaw, cfg, B, dev)
-
-        # ---- Inject anchored_pose into every obs dict under anchor A -------
-        def _set_anchored(obs_dict, g_xy, g_yaw):
+        def _anchored_obs(obs_dict, g_xy, g_yaw):
             ap = self._encode_anchored_pose(g_xy, g_yaw, a_xy, a_yaw, cfg["clamp"])
             ap = self._normalize_key(key, ap)
-            new = dict(obs_dict)
-            new[key] = ap
-            return new
+            d = dict(obs_dict); d[key] = ap
+            return d
 
-        train_obs = _set_anchored(train_obs, gt_xy, gt_yaw)
-        train_next_obs = _set_anchored(train_next_obs, gtn_xy, gtn_yaw)
-        goal_obs = _set_anchored(goal_obs, gh_xy, gh_yaw)
+        # Obs F/actor/critic see, and the FB-diagonal goal — all in frame A_i.
+        train_obs = _anchored_obs(train_obs, gt_xy, gt_yaw)
+        train_next_obs = _anchored_obs(train_next_obs, gtn_xy, gtn_yaw)
+        fb_goal = train_next_obs   # FB diagonal = actual next state, in A_i.
 
-        # ---- FB successor goal = the (anchored) NEXT obs. The FB loss uses a
-        # batch-matrix contrastive trick (Ms = F @ B.T): the DIAGONAL pairs
-        # F(s_i,a_i,z_i) with B(next_obs_i) — the actual transition reward — and
-        # the OFF-DIAGONAL rows are already the independent rho/successor-query
-        # negatives. So ``goal`` MUST be next_obs (NOT a separate permutation;
-        # an unrelated goal destroys the diagonal signal and F never learns →
-        # Q_fb collapses to ~0). The independent-s_+ the spec asks for is the
-        # off-diagonal batch, supplied for free here.
-        fb_goal = train_next_obs
-
-        # ---- z: built FRESH under anchor A, both blocks treated identically.
-        # z = mix( goal-encoded B(goal_obs) , expert_z , random ), exactly like
-        # the base sample_mixed_z but (a) over the FULL two-head B so the LOCAL
-        # and SPATIAL blocks come from the SAME relabeled goal s_h under the
-        # SAME anchor A (the only spatial-specific thing is the A^-1 transform
-        # already baked into goal_obs[anchored_pose]), and (b) on the anchored
-        # goal — so we don't carry stale rollout-frame z. ``mixed_z`` (the
-        # base mix on next_obs) is discarded; we rebuild coherently here.
-        train_z = self._build_anchored_z(goal_obs, expert_z)
-
-        # NOTE: no anchor-consistency (KL / Q) losses. Anchor invariance is
-        # learned automatically: z = B(goal) is equivariant under the anchor,
-        # and F is trained by TD over anchor-relabeled transitions spanning all
-        # anchors — the Bellman backup makes Q=<F,z> and the policy consistent
-        # across anchors without an explicit penalty. (The explicit terms were
-        # also the main divergence source — unnormalized squared-Q + extra
-        # DDP forward passes — so dropping them simplifies AND stabilizes.)
+        # ---- z: original-BFM mix (random / goal-encoded / expert), but with
+        # the SPATIAL block built under A_i so z is frame-consistent with the
+        # obs and the FB diagonal. See _build_anchored_z.
+        train_z = self._build_anchored_z(train_obs, train_next_obs, gtn_xy,
+                                         gtn_yaw, a_xy, a_yaw, expert_z, cfg)
         return train_obs, train_next_obs, fb_goal, train_z
 
     # ------------------------------------------------------------------ #
-    def _build_anchored_z(self, goal_obs, expert_z):
-        """Build z UNDER anchor A, treating the local and spatial blocks
-        identically (the only spatial difference is the A^-1 transform already
-        in ``goal_obs[anchored_pose]``).
+    def _build_anchored_z(self, train_obs, train_next_obs, gtn_xy, gtn_yaw,
+                          a_xy, a_yaw, expert_z, cfg):
+        """Original-BFM ``sample_mixed_z`` mix, frame-consistent under A_i.
 
-        Mirrors the base ``sample_mixed_z`` mixture, but encodes the whole
-        two-head B on the SAME anchored goal so both z-blocks describe the same
-        relabeled goal s_h:
-            train_goal_ratio  -> goal-encoded  B(goal_obs)
-            expert_asm_ratio  -> expert_z      (self-anchored at its motion start)
-            remainder         -> uniform random z (per-block sphere)
+        Replicates BFM exactly — per row, z is one of:
+          * random        (prob 1 - p_goal - p_expert): uniform per-block sphere
+          * goal-encoded   (prob train_goal_ratio): B(shuffled next_obs)
+          * expert-encoded (prob expert_asm_ratio):  expert_z
+
+        The ONLY anchoring change: the goal-encoded branch's SPATIAL block is
+        B_spatial(A_i^-1 g_j) where j is the shuffle — i.e. the shuffled goal
+        state's pose expressed in ROW i's anchor A_i (so z_i lives in the same
+        frame as F(obs_i) and the diagonal B(next_obs_i)). The local block is
+        anchor-invariant and uses B_local(shuffled next_obs) verbatim, as BFM.
+        Random and expert z keep their own spatial blocks (random sphere /
+        expert's own frame) — unchanged from BFM, never overwritten.
         """
         p = self.policy
-        B = next(iter(goal_obs.values())).shape[0]
         dev = self.device
-        # Random z (per-block sphere via the anchored policy's sample_z).
+        B = next(iter(train_next_obs.values())).shape[0]
+        key = cfg["key"]
+        # random z (per-block sphere) — BFM's base draw.
         z = p.sample_z(B, device=dev)
-        # Goal-encoded z = full two-head B on the anchored goal (both blocks).
-        # DDP/compile proxy __call__, so _backward_map(obs) works directly
-        # (only sub-attribute access like .spatial needs unwrapping).
+        # goal-encoded z: shuffle next_obs (BFM's perm), but rewrite the spatial
+        # key to the shuffled pose expressed in THIS row's anchor A_i.
+        perm = torch.randperm(B, device=dev)
+        shuffled = {k: v[perm] for k, v in train_next_obs.items()}
         with torch.no_grad():
-            z_goal = p.project_z(p._backward_map(goal_obs))
+            ap = self._encode_anchored_pose(gtn_xy[perm], gtn_yaw[perm],
+                                            a_xy, a_yaw, cfg["clamp"])
+            shuffled[key] = self._normalize_key(key, ap)
+            z_goal = p.project_z(p._backward_map(shuffled))
         p_goal = float(getattr(self.cfg, "train_goal_ratio", 0.2))
         p_expert = float(getattr(self.cfg, "expert_asm_ratio", 0.6))
         probs = torch.tensor([p_goal, p_expert, max(0.0, 1.0 - p_goal - p_expert)],
@@ -331,65 +327,22 @@ class AnchoredFBCprAux(FBCprAux):
             z = torch.where(mix == 1, expert_z[idx], z)
         return z
 
-    def _sample_anchor(self, gt_xy, gt_yaw, gh_xy, gh_yaw, cfg, B, dev):
-        """p_A = alpha·delta_{g_t} + beta·delta_{g_h} + (1-..)·random."""
+    def _sample_anchor(self, gt_xy, gt_yaw, dev):
+        """Per-row anchor A_i ~ p_A: alpha at the current pose g_t (so
+        A_i^-1 g_t ~ 0), the rest random around g_t for translation/rotation
+        augmentation. (No g_h branch — there is no separate goal state; z's
+        spatial goal is the row's own next pose, per original-BFM mixing.)"""
+        B = gt_xy.shape[0]
         a_xy = gt_xy.clone()
         a_yaw = gt_yaw.clone()
-        u = torch.rand(B, device=dev)
-        alpha, beta = cfg["alpha_gt"], cfg["beta_gh"]
-        is_gh = (u >= alpha) & (u < alpha + beta)
-        is_rand = u >= (alpha + beta)
-        # g_h anchor
-        a_xy = torch.where(is_gh.unsqueeze(-1), gh_xy, a_xy)
-        a_yaw = torch.where(is_gh, gh_yaw, a_yaw)
-        # random anchor (around g_t)
-        r = cfg["rand_xy"]
+        alpha = float(self._anchor_cfg()["alpha_gt"])
+        is_rand = torch.rand(B, device=dev) >= alpha
+        r = float(self._anchor_cfg()["rand_xy"])
         rand_xy = gt_xy + (torch.rand(B, 2, device=dev) * 2 - 1) * r
         rand_yaw = (torch.rand(B, device=dev) * 2 - 1) * math.pi
         a_xy = torch.where(is_rand.unsqueeze(-1), rand_xy, a_xy)
         a_yaw = torch.where(is_rand, rand_yaw, a_yaw)
         return a_xy, a_yaw
-
-    def _sample_goal(self, train_batch, train_obs, gt_xy, gt_yaw, cfg):
-        """Return (goal world xy, goal world yaw, goal LOCAL-body obs dict).
-
-        Mix of future / nearby / replay / composed. With per-transition replay
-        we approximate ``future`` and ``replay`` by permutations of the current
-        batch (the batch is i.i.d. across the buffer), ``nearby`` by selecting
-        spatially-close rows, and ``composed`` by pairing a body state from one
-        row with a spatial pose from another.
-        """
-        dev = self.device
-        B = gt_xy.shape[0]
-        probs = torch.tensor(
-            [cfg["goal_future"], cfg["goal_nearby"], cfg["goal_replay"], cfg["goal_composed"]],
-            device=dev, dtype=torch.float32,
-        )
-        probs = probs / probs.clamp_min(1e-8).sum()
-        mode = torch.multinomial(probs, B, replacement=True)  # [B] in {0,1,2,3}
-
-        # Base permutations.
-        perm_body = torch.randperm(B, device=dev)     # body source
-        perm_pose = torch.randperm(B, device=dev)     # spatial source (composed)
-
-        # nearby: pick, per row, the spatially-closest OTHER row in the batch.
-        with torch.no_grad():
-            d = torch.cdist(gt_xy, gt_xy)              # [B,B]
-            d.fill_diagonal_(float("inf"))
-            nearby_idx = torch.argmin(d, dim=1)        # [B]
-
-        # body source index per mode:
-        #  future/replay -> perm_body (any other row); nearby -> nearby_idx;
-        #  composed -> perm_body for body, perm_pose for pose.
-        body_idx = perm_body.clone()
-        body_idx = torch.where(mode == 1, nearby_idx, body_idx)
-        pose_idx = body_idx.clone()
-        pose_idx = torch.where(mode == 3, perm_pose, pose_idx)
-
-        goal_obs = {k: v[body_idx] for k, v in train_obs.items()}
-        gh_xy = gt_xy[pose_idx]
-        gh_yaw = gt_yaw[pose_idx]
-        return gh_xy, gh_yaw, goal_obs
 
     # NOTE: no anchor-consistency losses. Anchor invariance emerges from
     # standard FB TD over anchor-relabeled transitions (z = B(goal) is

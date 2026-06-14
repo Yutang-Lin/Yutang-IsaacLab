@@ -603,6 +603,22 @@ class FBCprRunner:
                     else:
                         actions = self.policy.act(obs_dict, z_context, mean=False)
 
+                    # Anchored variant: capture the world-frame SE(2) root pose
+                    # NOW — BEFORE env.step — so it matches ``obs_dict`` (the
+                    # pre-step obs this transition stores). Reading it after the
+                    # step would store g_{t+1} glued onto the g_t obs (off-by-one),
+                    # corrupting the spatial<->body correspondence at relabel time.
+                    prestep_extras = None
+                    if self._store_world_pose and _robot is not None:
+                        _rq0 = _robot.data.root_quat_w.to(self.device)
+                        _w, _x, _y, _z = _rq0[:, 0], _rq0[:, 1], _rq0[:, 2], _rq0[:, 3]
+                        _yaw0 = torch.atan2(2 * (_w * _z + _x * _y),
+                                            1 - 2 * (_y * _y + _z * _z)).unsqueeze(-1)
+                        prestep_extras = {
+                            "root_xy": _robot.data.root_pos_w[:, :2].to(self.device).clone(),
+                            "root_yaw": _yaw0.clone(),
+                        }
+
                     # Push tracking reference positions to env for debug viz.
                     env_u = self.env.unwrapped
                     if hasattr(env_u, "set_ref_motion_keypoints"):
@@ -667,18 +683,10 @@ class FBCprRunner:
                         "truncated": prev_truncated,
                         "aux_rewards": aux_rewards_dict,
                     }
-                    # Anchored variant: store the world-frame SE(2) root pose
-                    # matching ``obs_dict`` (captured pre-step, same instant the
-                    # obs was computed from). Enables anchor-relabeling later.
-                    if self._store_world_pose and _robot is not None:
-                        rq = _robot.data.root_quat_w.to(self.device)
-                        w, x, y, zc = rq[:, 0], rq[:, 1], rq[:, 2], rq[:, 3]
-                        root_yaw = torch.atan2(2 * (w * zc + x * y),
-                                               1 - 2 * (y * y + zc * zc)).unsqueeze(-1)
-                        batch["extras"] = {
-                            "root_xy": _robot.data.root_pos_w[:, :2].to(self.device),
-                            "root_yaw": root_yaw,
-                        }
+                    # Anchored variant: attach the PRE-step world pose captured
+                    # above (matches obs_dict's instant — not the post-step pose).
+                    if prestep_extras is not None:
+                        batch["extras"] = prestep_extras
                     # Safety net: periodic NaN check.
                     if (self.tot_timesteps // self.env.num_envs) % 500 == 0:
                         for k, v in obs_dict.items():

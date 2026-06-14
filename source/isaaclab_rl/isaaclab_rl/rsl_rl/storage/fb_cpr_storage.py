@@ -1279,8 +1279,10 @@ class FBCprExpertBuffer:
         d = g_xy - a_xy
         ca, sa = torch.cos(-a_yaw), torch.sin(-a_yaw)
         R = self._anchored_pose_clamp
-        px = (ca * d[:, 0] - sa * d[:, 1]).clamp(-R, R)
-        py = (sa * d[:, 0] + ca * d[:, 1]).clamp(-R, R)
+        # xy clamped to ±R then divided by R -> [-1,1] (analytic normalization;
+        # matches env _obs_anchored_pose + algo _encode_anchored_pose).
+        px = (ca * d[:, 0] - sa * d[:, 1]).clamp(-R, R) / R
+        py = (sa * d[:, 0] + ca * d[:, 1]).clamp(-R, R) / R
         theta = g_yaw - a_yaw
         return torch.stack([px, py, torch.cos(theta), torch.sin(theta)], dim=-1)
 
@@ -1308,7 +1310,11 @@ class FBCprExpertBuffer:
         # per batch). Keeps the N × seq_length contiguous layout.
         big = self.sample(batch_size * num_chunks, seq_length=seq_length)
 
-        obs_keys = ("state", "privileged_state", "last_action", "history_actor")
+        # Propagate EVERY obs key sample() produced — not a hardcoded subset.
+        # In particular ``anchored_pose`` (emitted when emit_anchored_pose=True)
+        # must survive to the disc / encode_expert so B_spatial sees a REAL
+        # expert pose rather than a zero-filled constant.
+        obs_keys = tuple(big["observation"].keys())
         obs_flat = {k: _move(big["observation"][k]) for k in obs_keys}
         next_obs_flat = {k: _move(big["next"]["observation"][k]) for k in obs_keys}
         action_flat = _move(big["action"])
