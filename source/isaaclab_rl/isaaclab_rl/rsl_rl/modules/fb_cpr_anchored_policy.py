@@ -203,7 +203,25 @@ class AnchoredFBCprPolicy(FBCprAuxPolicy):
     def backward_spatial(self, obs) -> torch.Tensor:
         """Run ONLY the spatial backward head (B_spatial) + its sphere
         projection, returning the [B, z_spatial_dim] block. Avoids the wasted
-        B_local forward when only the spatial goal latent is needed."""
+        B_local forward when only the spatial goal latent is needed.
+
+        ``_backward_map`` may be wrapped by DDP (``.module``) and/or
+        torch.compile (``._orig_mod``) during training; those wrappers proxy
+        ``__call__`` but NOT sub-attribute access (``.spatial``), so unwrap to
+        the real TwoHeadBackwardMap first. Both callers run under no_grad, so
+        bypassing the DDP forward hook is fine (no gradient sync needed here).
+        """
         bm = self._backward_map
+        # Wrap order is compile(DDP(net)); peel any combination/order until we
+        # reach the real TwoHeadBackwardMap that exposes ``.spatial``.
+        for _ in range(4):
+            if hasattr(bm, "spatial"):
+                break
+            if hasattr(bm, "_orig_mod"):      # torch.compile OptimizedModule
+                bm = bm._orig_mod
+            elif hasattr(bm, "module"):       # DDP
+                bm = bm.module
+            else:
+                break
         zs = bm.spatial(obs)
         return bm._r_spatial * zs / zs.norm(dim=-1, keepdim=True).clamp(min=1e-6)
