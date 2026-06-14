@@ -926,6 +926,17 @@ class FBCprNetworkCfg:
     norm_z: bool = True
     """If True, project ``z`` to the sphere of radius ``sqrt(z_dim)``."""
 
+    # --- Anchored variant (Global-through-Anchoring) only ---
+    # Split of z into [local | spatial] blocks for the two-head backward map.
+    # Must sum to z_dim. Ignored by the standard single-head policy.
+    z_local_dim: int = 256
+    """Local-body block dimension of z (AnchoredFBCprPolicy)."""
+    z_spatial_dim: int = 0
+    """Spatial (anchored-pose) block dimension of z (AnchoredFBCprPolicy).
+    0 = disabled (standard single-head behaviour)."""
+    spatial_input_keys: tp.Sequence[str] = ("anchored_pose",)
+    """Obs keys feeding B_spatial (the anchored SE(2) pose A^-1 g)."""
+
     # Backward map (B)
     backward_hidden_dim: int = 256
     backward_hidden_layers: int = 1

@@ -73,6 +73,24 @@ class FBCprAuxAlgorithmCfg:
 
     class_name: str = "FBCprAux"
 
+    # --- Global-through-Anchoring (BFM-One-Anchored) ----------------------
+    # Consumed only by AnchoredFBCprAux; ignored by the base. ``store_world_pose``
+    # tells the runner to record per-transition world SE(2) pose for relabeling.
+    store_world_pose: bool = False
+    anchored_pose_key: str = "anchored_pose"
+    anchor_pose_clamp: float = 10.0          # ±metres clamp on A^-1 g xy
+    anchor_alpha_gt: float = 0.34            # p(anchor = g_t)
+    anchor_beta_gh: float = 0.33             # p(anchor = g_h); rest -> random
+    anchor_random_xy_range: float = 10.0     # random anchor xy ± around g_t
+    anchor_kl_coef: float = 0.0              # lambda_A on two-anchor policy KL
+    anchor_q_coef: float = 0.0               # lambda on two-anchor Q consistency
+    spatial_cpr_coeff: float = 1.0           # weight of spatial CPR reward vs local
+    goal_future_ratio: float = 0.4
+    goal_nearby_ratio: float = 0.2
+    goal_replay_ratio: float = 0.2
+    goal_composed_ratio: float = 0.2
+    goal_nearby_radius: float = 2.0
+
     # Learning rates
     lr_f: float = 3e-4
     lr_b: float = 1e-5
@@ -615,7 +633,7 @@ class FBCprAux:
             **adam_kwargs,
         )
         self.discriminator_optimizer = torch.optim.Adam(
-            p._discriminator.parameters(),
+            self._discriminator_opt_params(),
             lr=cfg.lr_discriminator,
             weight_decay=cfg.weight_decay_discriminator,
             **adam_kwargs,
@@ -1576,6 +1594,24 @@ class FBCprAux:
             ) <= self.cfg.relabel_ratio
             train_z = torch.where(mask, z, train_z)
 
+        # --- Anchoring seam (Global-through-Anchoring) -----------------
+        # Default is identity: ``fb_goal`` is the transition's own next obs
+        # (the FB successor-query state s_+) and obs/z pass through unchanged,
+        # so non-anchored tasks are byte-identical. The anchored subclass
+        # overrides ``_anchor_relabel`` to: sample a coordinate anchor A and an
+        # INDEPENDENT successor query s_+, inject the anchored pose A^-1 g into
+        # obs/next_obs/goal, sample the task goal s_h ~ p_goal, and set z's
+        # spatial block = B_spatial(anchored s_h).
+        fb_goal = train_next_obs
+        train_obs, train_next_obs, fb_goal, train_z = self._anchor_relabel(
+            train_batch=train_batch,
+            train_obs=train_obs,
+            train_next_obs=train_next_obs,
+            train_z=train_z,
+            mixed_z=z,
+            expert_z=expert_z,
+        )
+
         q_loss_coef = self.cfg.q_loss_coef if self.cfg.q_loss_coef > 0 else None
         clip_grad_norm = self.cfg.clip_grad_norm if self.cfg.clip_grad_norm > 0 else None
 
@@ -1698,7 +1734,7 @@ class FBCprAux:
                         action=train_action,
                         discount=discount,
                         next_obs=train_next_obs,
-                        goal=train_next_obs,
+                        goal=fb_goal,
                         z=train_z,
                         q_loss_coef=q_loss_coef,
                     )
@@ -1717,7 +1753,7 @@ class FBCprAux:
                     action=train_action,
                     discount=discount,
                     next_obs=train_next_obs,
-                    goal=train_next_obs,
+                    goal=fb_goal,
                     z=train_z,
                     q_loss_coef=q_loss_coef,
                 )
@@ -2073,6 +2109,29 @@ class FBCprAux:
         cat_g = torch.cat(grads, dim=1)
         return ((cat_g.norm(2, dim=1) - 1) ** 2).mean()
 
+    def _discriminator_opt_params(self):
+        """Parameters optimized by the discriminator optimizer. Base returns
+        the single CPR discriminator; the anchored subclass appends the
+        spatial discriminator's params."""
+        return self.policy._discriminator.parameters()
+
+    def _cpr_reward(self, obs, z):
+        """CPR (style) reward fed to the disc-reward critic. Base = the single
+        discriminator's log-odds reward. The anchored subclass adds a spatial
+        discriminator channel."""
+        return self.policy._discriminator.compute_reward(obs, z)
+
+    def _anchor_relabel(self, train_batch, train_obs, train_next_obs, train_z,
+                        mixed_z, expert_z):
+        """Anchoring seam (no-op in the base FB-CPR-Aux).
+
+        The anchored subclass overrides this to relabel coordinate anchors,
+        the FB successor-query state, and the task goal. The base returns
+        ``(obs, next_obs, fb_goal=next_obs, z)`` unchanged so non-anchored
+        tasks are byte-identical.
+        """
+        return train_obs, train_next_obs, train_next_obs, train_z
+
     def backward_fb(
         self,
         obs: torch.Tensor | dict[str, torch.Tensor],
@@ -2212,7 +2271,7 @@ class FBCprAux:
         num_parallel = self._unwrap(p._critic).num_parallel
         _ma_reward = None
         with torch.no_grad():
-            reward = p._discriminator.compute_reward(obs, z)
+            reward = self._cpr_reward(obs, z)
             # Manifold attractor: add unconditional state reward.
             if self.cfg.manifold_attractor and p._manifold_attractor is not None:
                 _ma_reward = p._manifold_attractor.compute_reward(obs)
@@ -2488,6 +2547,15 @@ class FBCprAux:
                 - Q_fb.mean()
             )
 
+        # Anchoring seam: extra actor-side losses (e.g. two-anchor policy-KL
+        # consistency). No-op in the base FB-CPR-Aux (returns 0, {}). The
+        # A1-anchor dist / action / FB-Q are already computed above — pass them
+        # so the seam doesn't recompute the actor+F forwards for anchor A1.
+        extra_loss, extra_logs = self._actor_extra_loss(
+            obs, z, dist=dist, sampled_action=sampled_action,
+        )
+        actor_loss = actor_loss + extra_loss
+
         self.actor_optimizer.zero_grad(set_to_none=True)
         actor_loss.backward()
         # DDP handled reduce inside backward.
@@ -2501,10 +2569,21 @@ class FBCprAux:
                 "Q_fb": Q_fb.mean(),
             }
             out.update(act_stats)
+            out.update(extra_logs)
             if hasattr(self, "_soft_fb_actor_logs"):
                 out.update(self._soft_fb_actor_logs)
                 del self._soft_fb_actor_logs
         return out, handle
+
+    def _actor_extra_loss(self, obs, z, dist=None, sampled_action=None):
+        """Extra actor-side loss seam (no-op base). Returns ``(loss, logs)``.
+
+        ``dist`` / ``sampled_action`` are the A1-anchor actor distribution and
+        its sampled action already computed in ``backward_actor`` — passed so
+        subclasses can avoid recomputing the actor forward / re-sampling for
+        anchor A1.
+        """
+        return torch.zeros((), device=self.device), {}
 
     def step_actor(
         self, handle: Any, clip_grad_norm: float | None,

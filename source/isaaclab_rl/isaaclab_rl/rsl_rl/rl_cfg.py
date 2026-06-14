@@ -1408,6 +1408,32 @@ class RslRlFBCprAlgorithmCfg:
     expert_dataset_device: str = "cuda"
     """Device to hold the expert buffer on."""
 
+    expert_keypoint_names: list[str] | None = None
+    """Optional keypoint-list override for the load-time privileged_state
+    compose of a *minimal* expert dataset. When ``None`` the buffer uses the
+    precompute script's 31-body ``KEYPOINT_NAMES``. A variant (BFM-One) passes
+    a shorter list (e.g. MI's 26-body ``EEF_LINKS``) to drop redundant
+    intermediate links from the B-encode priv — the raw motion data is
+    keypoint-agnostic, so the same dataset is reused with a smaller priv dim.
+    MUST match the env's ``priv_max_local_self`` ``body_names`` exactly."""
+
+    # --- Global-through-Anchoring (BFM-One-Anchored) only ---
+    store_world_pose: bool = False
+    """Store per-transition world SE(2) root pose in replay (anchor relabel)."""
+    anchored_pose_key: str = "anchored_pose"
+    anchor_pose_clamp: float = 10.0
+    anchor_alpha_gt: float = 0.34
+    anchor_beta_gh: float = 0.33
+    anchor_random_xy_range: float = 10.0
+    anchor_kl_coef: float = 0.0
+    anchor_q_coef: float = 0.0
+    spatial_cpr_coeff: float = 1.0
+    goal_future_ratio: float = 0.4
+    goal_nearby_ratio: float = 0.2
+    goal_replay_ratio: float = 0.2
+    goal_composed_ratio: float = 0.2
+    goal_nearby_radius: float = 2.0
+
     # BFM-style tracking eval (fires every ``eval_every_steps`` env-steps).
     eval_every_steps: int = 9_600_000
     """Env-step interval between tracking evals. BFM production: 9.6M.

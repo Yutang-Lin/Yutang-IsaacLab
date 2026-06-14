@@ -10,5 +10,6 @@ from .ppo_ou import PPOOU
 from .rdppo import RDPPO
 from .sparse_successor import SparseSuccessor
 from .fb_cpr import FBCprAux
+from .fb_cpr_anchored import AnchoredFBCprAux
 
-__all__ = ["PPO", "PPOKL", "Distillation", "HRPO", "AmpReward", "TD3", "DoublePPO", "PPOOU", "RDPPO", "FlowDAgger", "SparseSuccessor", "FBCprAux"]
+__all__ = ["PPO", "PPOKL", "Distillation", "HRPO", "AmpReward", "TD3", "DoublePPO", "PPOOU", "RDPPO", "FlowDAgger", "SparseSuccessor", "FBCprAux", "AnchoredFBCprAux"]

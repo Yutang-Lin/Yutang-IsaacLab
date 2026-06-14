@@ -31,18 +31,20 @@ from isaaclab_rl.rsl_rl.algorithms.fb_cpr import (
     FBCprCond,
     FBCprCondAlgorithmCfg,
 )
+from isaaclab_rl.rsl_rl.algorithms.fb_cpr_anchored import AnchoredFBCprAux
 from isaaclab_rl.rsl_rl.modules.fb_cpr_policy import (
     FBCprAuxPolicy,
     FBCprCondNetworkCfg,
     FBCprCondPolicy,
     FBCprNetworkCfg,
 )
+from isaaclab_rl.rsl_rl.modules.fb_cpr_anchored_policy import AnchoredFBCprPolicy
 from isaaclab_rl.rsl_rl.storage.fb_cpr_storage import (
     FBCprExpertBuffer,
     FBCprReplayBuffer,
 )
 
-__all__ = ["FBCprRunner", "FBCprCondRunner"]
+__all__ = ["FBCprRunner", "FBCprCondRunner", "AnchoredFBCprRunner"]
 
 
 def _replay_sibling_path(ckpt_path: str) -> str:
@@ -193,6 +195,15 @@ class FBCprRunner:
             shard_rank=self.gpu_global_rank,
             shard_world_size=self.gpu_world_size,
             shard_seed=int(self.cfg.get("seed", 42)),
+            # Optional keypoint-list override (BFM-One: 26-body priv). When
+            # None the buffer falls back to the precompute script's
+            # KEYPOINT_NAMES (31-body). Must match the env's
+            # priv_max_local_self body_names so B sees the same layout.
+            keypoint_names=self.alg_cfg.get("expert_keypoint_names", None),
+            # Anchored variant: emit expert anchored_pose for the spatial CPR
+            # discriminator (anchor = each motion's first frame).
+            emit_anchored_pose=bool(self.alg_cfg.get("store_world_pose", False)),
+            anchored_pose_clamp=float(self.alg_cfg.get("anchor_pose_clamp", 10.0)),
         )
         # Forward to the env so RSI can pull from it.
         if hasattr(self.env_unwrapped, "set_expert_buffer"):
@@ -200,6 +211,14 @@ class FBCprRunner:
 
         # --- Replay buffer ---------------------------------------------
         aux_reward_names = list(algo_cfg.aux_rewards_scaling.keys())
+        # Anchored variant (Global-through-Anchoring) needs the world-frame
+        # SE(2) root pose per transition so anchor-relabeling can transform
+        # g_t by an arbitrary A at update time. Gated on a cfg flag so the
+        # standard tasks store nothing extra.
+        self._store_world_pose = bool(self.alg_cfg.get("store_world_pose", False))
+        extra_field_shapes = (
+            {"root_xy": (2,), "root_yaw": (1,)} if self._store_world_pose else None
+        )
         self.replay_buffer = FBCprReplayBuffer(
             capacity=int(self.alg_cfg.get("replay_capacity", 5_120_000)),
             num_envs=self.env.num_envs,
@@ -208,6 +227,7 @@ class FBCprRunner:
             z_dim=self.policy.z_dim,
             aux_reward_names=aux_reward_names,
             device=self.alg_cfg.get("replay_device", "cpu"),
+            extra_field_shapes=extra_field_shapes,
         )
 
         # --- Seed / rhythm controls ------------------------------------
@@ -474,6 +494,17 @@ class FBCprRunner:
                     _robot.data.root_quat_w.to(self.device),
                 )
 
+        # Anchored variant: set the initial per-episode anchor for ALL envs to
+        # their spawn pose at the start of rollout.
+        if (self._store_world_pose and _robot is not None
+                and hasattr(self.env_unwrapped, "set_anchor")):
+            rq0 = _robot.data.root_quat_w.to(self.device)
+            w0, x0, y0, z0 = rq0[:, 0], rq0[:, 1], rq0[:, 2], rq0[:, 3]
+            yaw0 = torch.atan2(2 * (w0 * z0 + x0 * y0), 1 - 2 * (y0 * y0 + z0 * z0))
+            self.env_unwrapped.set_anchor(
+                _robot.data.root_pos_w[:, :2].to(self.device), yaw0, env_ids=None,
+            )
+
         rewbuffer: deque[float] = deque(maxlen=500)
         lenbuffer: deque[float] = deque(maxlen=500)
         cur_reward_sum = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
@@ -636,6 +667,18 @@ class FBCprRunner:
                         "truncated": prev_truncated,
                         "aux_rewards": aux_rewards_dict,
                     }
+                    # Anchored variant: store the world-frame SE(2) root pose
+                    # matching ``obs_dict`` (captured pre-step, same instant the
+                    # obs was computed from). Enables anchor-relabeling later.
+                    if self._store_world_pose and _robot is not None:
+                        rq = _robot.data.root_quat_w.to(self.device)
+                        w, x, y, zc = rq[:, 0], rq[:, 1], rq[:, 2], rq[:, 3]
+                        root_yaw = torch.atan2(2 * (w * zc + x * y),
+                                               1 - 2 * (y * y + zc * zc)).unsqueeze(-1)
+                        batch["extras"] = {
+                            "root_xy": _robot.data.root_pos_w[:, :2].to(self.device),
+                            "root_yaw": root_yaw,
+                        }
                     # Safety net: periodic NaN check.
                     if (self.tot_timesteps // self.env.num_envs) % 500 == 0:
                         for k, v in obs_dict.items():
@@ -668,6 +711,23 @@ class FBCprRunner:
                     # Update per-env step_count (reset on done).
                     step_count = step_count + 1
                     step_count = torch.where(dones.bool(), torch.zeros_like(step_count), step_count)
+
+                    # Anchored variant: (re)set the per-episode SE(2) anchor A
+                    # for envs that just reset, to their fresh spawn pose, so
+                    # ``anchored_pose`` (A^-1 g_t) starts near origin and grows
+                    # as the robot moves toward the goal.
+                    if (self._store_world_pose and _robot is not None
+                            and hasattr(self.env_unwrapped, "set_anchor")):
+                        done_ids = dones.bool().nonzero(as_tuple=False).squeeze(-1)
+                        if done_ids.numel() > 0:
+                            rq = _robot.data.root_quat_w.to(self.device)
+                            w_, x_, y_, z_ = rq[:, 0], rq[:, 1], rq[:, 2], rq[:, 3]
+                            yaw = torch.atan2(2 * (w_ * z_ + x_ * y_),
+                                              1 - 2 * (y_ * y_ + z_ * z_))
+                            self.env_unwrapped.set_anchor(
+                                _robot.data.root_pos_w[:, :2].to(self.device),
+                                yaw, env_ids=done_ids,
+                            )
 
                     # Update z context for next step.
                     z_context, terrain_reset = self.alg.maybe_update_rollout_context(
@@ -1576,4 +1636,23 @@ class FBCprCondRunner(FBCprRunner):
     _BFM_KEY_GROUPS_DEFAULT: dict[str, tuple[str, ...]] = {
         **FBCprRunner._BFM_KEY_GROUPS_DEFAULT,
         "measure_cond": ("measure_cond",),
+    }
+
+
+class AnchoredFBCprRunner(FBCprRunner):
+    """FB-CPR runner for BFM-One-Anchored (Global-through-Anchoring).
+
+    Swaps in the two-head policy + anchored algorithm and adds the
+    ``anchored_pose`` obs-key group (the env emits an ``anchored_pose`` term
+    that carries the robot's pose under the per-episode anchor A^-1 g_t).
+    """
+
+    _POLICY_CLS = AnchoredFBCprPolicy
+    _ALGO_CLS = AnchoredFBCprAux
+    _NET_CFG_CLS = FBCprNetworkCfg
+    _ALGO_CFG_CLS = FBCprAuxAlgorithmCfg
+
+    _BFM_KEY_GROUPS_DEFAULT: dict[str, tuple[str, ...]] = {
+        **FBCprRunner._BFM_KEY_GROUPS_DEFAULT,
+        "anchored_pose": ("anchored_pose",),
     }

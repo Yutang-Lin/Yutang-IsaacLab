@@ -76,6 +76,7 @@ class FBCprReplayBuffer:
         aux_reward_names: list[str],
         device: str | torch.device = "cpu",
         pin_memory: bool | None = None,
+        extra_field_shapes: dict[str, tuple[int, ...]] | None = None,
     ) -> None:
         self.num_envs = int(num_envs)
         self.time_capacity = int(capacity) // self.num_envs
@@ -110,6 +111,14 @@ class FBCprReplayBuffer:
         self._truncated = self._alloc((self.time_capacity, self.num_envs, 1), dtype=torch.bool)
         self._aux_rewards: dict[str, torch.Tensor] = {
             name: self._alloc((self.time_capacity, self.num_envs, 1)) for name in self.aux_reward_names
+        }
+        # Optional extra per-timestep fields (e.g. world SE(2) pose for the
+        # anchored variant). Gathered at BOTH current and next indices on
+        # sample (like obs). Empty by default — existing tasks unaffected.
+        self._extra_field_shapes: dict[str, tuple[int, ...]] = dict(extra_field_shapes or {})
+        self._extras: dict[str, torch.Tensor] = {
+            k: self._alloc((self.time_capacity, self.num_envs, *shape))
+            for k, shape in self._extra_field_shapes.items()
         }
 
         self._idx = 0
@@ -149,6 +158,7 @@ class FBCprReplayBuffer:
             "_terminated": self._terminated.clone(),
             "_truncated": self._truncated.clone(),
             "_aux_rewards": {k: v.clone() for k, v in self._aux_rewards.items()},
+            "_extras": {k: v.clone() for k, v in self._extras.items()},
             "_idx": int(self._idx),
             "_is_full": bool(self._is_full),
             "time_capacity": self.time_capacity,
@@ -176,6 +186,9 @@ class FBCprReplayBuffer:
                 self._aux_rewards[name].copy_(
                     sd["_aux_rewards"][name].to(self._aux_rewards[name].device),
                 )
+        for name in self._extra_field_shapes:
+            if name in sd.get("_extras", {}):
+                self._extras[name].copy_(sd["_extras"][name].to(self._extras[name].device))
         self._idx = int(sd["_idx"])
         self._is_full = bool(sd["_is_full"])
         self._recompute_traj_info = True
@@ -223,6 +236,14 @@ class FBCprReplayBuffer:
             if v.dim() == 1:
                 v = v.unsqueeze(-1)
             _copy(self._aux_rewards[name][t], v)
+        extras = batch_dict.get("extras", {})
+        for name in self._extra_field_shapes:
+            if name not in extras:
+                continue
+            v = extras[name]
+            if v.dim() == 1 and len(self._extra_field_shapes[name]) == 1:
+                v = v.unsqueeze(-1)
+            _copy(self._extras[name][t], v)
 
         self._idx = t + 1
         if self._idx >= self.time_capacity:
@@ -345,7 +366,7 @@ class FBCprReplayBuffer:
                 time_idx_next: torch.Tensor) -> dict:
         obs = {k: v[time_idx, env_idx] for k, v in self._obs.items()}
         next_obs = {k: v[time_idx_next, env_idx] for k, v in self._obs.items()}
-        return {
+        out = {
             "observation": obs,
             "action": self._action[time_idx, env_idx],
             "z": self._z[time_idx, env_idx],
@@ -358,6 +379,14 @@ class FBCprReplayBuffer:
                 for name in self.aux_reward_names
             },
         }
+        if self._extras:
+            out["extras"] = {
+                k: v[time_idx, env_idx] for k, v in self._extras.items()
+            }
+            out["next"]["extras"] = {
+                k: v[time_idx_next, env_idx] for k, v in self._extras.items()
+            }
+        return out
 
     def sample_chunks(self, batch_size: int, num_chunks: int, target_device: str | torch.device) -> list[dict]:
         """Sample ``num_chunks`` batches in ONE call, then transfer to ``target_device``.
@@ -378,11 +407,15 @@ class FBCprReplayBuffer:
         z_flat = _move(big["z"])
         term_flat = _move(big["next"]["terminated"])
         aux_flat = {name: _move(big["aux_rewards"][name]) for name in self.aux_reward_names}
+        has_extras = "extras" in big
+        if has_extras:
+            extras_flat = {k: _move(v) for k, v in big["extras"].items()}
+            next_extras_flat = {k: _move(v) for k, v in big["next"]["extras"].items()}
 
         chunks: list[dict] = []
         for i in range(num_chunks):
             s = slice(i * batch_size, (i + 1) * batch_size)
-            chunks.append({
+            chunk = {
                 "observation": {k: obs_flat[k][s] for k in obs_flat},
                 "action": action_flat[s],
                 "z": z_flat[s],
@@ -391,7 +424,11 @@ class FBCprReplayBuffer:
                     "terminated": term_flat[s],
                 },
                 "aux_rewards": {name: aux_flat[name][s] for name in self.aux_reward_names},
-            })
+            }
+            if has_extras:
+                chunk["extras"] = {k: extras_flat[k][s] for k in extras_flat}
+                chunk["next"]["extras"] = {k: next_extras_flat[k][s] for k in next_extras_flat}
+            chunks.append(chunk)
         return chunks
 
 
@@ -429,6 +466,9 @@ class FBCprExpertBuffer:
         shard_rank: int = 0,
         shard_world_size: int = 1,
         shard_seed: int = 0,
+        keypoint_names: list[str] | None = None,
+        emit_anchored_pose: bool = False,
+        anchored_pose_clamp: float = 10.0,
     ) -> None:
         """Expert motion buffer.
 
@@ -447,6 +487,10 @@ class FBCprExpertBuffer:
         self.seq_length = int(seq_length)
         self._length_proportional_priors = bool(length_proportional_priors)
         self.device = torch.device(device)
+        # Anchored variant: emit an ``anchored_pose`` obs (A^-1 g) for the
+        # spatial CPR discriminator, anchored at each motion's first frame.
+        self._emit_anchored_pose = bool(emit_anchored_pose)
+        self._anchored_pose_clamp = float(anchored_pose_clamp)
 
         raw = torch.load(pt_path, weights_only=False, map_location="cpu")
         if not isinstance(raw, dict) or "motions" not in raw:
@@ -494,6 +538,23 @@ class FBCprExpertBuffer:
             sys.modules["_bfm_precompute_loader"] = mod
             spec.loader.exec_module(mod)
             self._minimal_mod = mod
+            # Keypoint list for the load-time priv compose. A variant (e.g.
+            # BFM-One) can pass a SHORTER list to drop redundant intermediate
+            # links from the B-encode privileged_state — the raw motion data
+            # is keypoint-agnostic, so the same minimal dataset is reused with
+            # a different keypoint set (priv dim shrinks accordingly). The
+            # dataset's stored ``keypoint_names`` is informational only; the
+            # caller-provided override (or ``mod.KEYPOINT_NAMES``) wins.
+            self._minimal_keypoint_names = list(
+                keypoint_names if keypoint_names is not None else mod.KEYPOINT_NAMES
+            )
+            if keypoint_names is not None:
+                print(
+                    f"[FBCprExpertBuffer] using OVERRIDE keypoint list "
+                    f"(K={len(self._minimal_keypoint_names)}, "
+                    f"vs default K={len(mod.KEYPOINT_NAMES)}) for priv compose.",
+                    flush=True,
+                )
             urdf = raw.get("urdf_path") or mod.DEFAULT_URDF
             # Build the FK chain on the buffer's device so per-motion
             # compose runs entirely on GPU — ~20-40x faster than CPU on
@@ -614,7 +675,7 @@ class FBCprExpertBuffer:
                 flush=True,
             )
             cat_wp, cat_wq = mod._world_fk(
-                self._minimal_chain, cat_jp, cat_rp, cat_rq, mod.KEYPOINT_NAMES,
+                self._minimal_chain, cat_jp, cat_rp, cat_rq, self._minimal_keypoint_names,
             )
             # Split back into per-motion FK outputs.
             offs = 0
@@ -673,7 +734,7 @@ class FBCprExpertBuffer:
                     root_pos=rp, root_quat=rq, joint_pos=jp,
                     world_pos_src=wp_src, world_quat_src=wq_src,
                     src_fps=src_fps_i, dt_min=1e-3,
-                    keypoint_names=mod.KEYPOINT_NAMES,
+                    keypoint_names=self._minimal_keypoint_names,
                     default_q=self._minimal_default_q,
                     gravity_world=self._minimal_gravity,
                     history_length=self._minimal_history_len,
@@ -916,7 +977,8 @@ class FBCprExpertBuffer:
         jp = self.joint_pos_buffer[idx]
         rp = self.root_pos_buffer[idx]
         rq = self.root_quat_buffer[idx]
-        wp, _ = mod._world_fk(chain, jp, rp, rq, mod.KEYPOINT_NAMES)
+        kp = getattr(self, "_minimal_keypoint_names", None) or mod.KEYPOINT_NAMES
+        wp, _ = mod._world_fk(chain, jp, rp, rq, kp)
         return wp  # [N, K, 3]
 
     # -- RSI -------------------------------------------------------------- #
@@ -1034,6 +1096,14 @@ class FBCprExpertBuffer:
             "last_action": self._flat_last_action[global_nxt],
             "history_actor": self._flat_history_actor[global_nxt],
         }
+        # Anchored variant: attach expert anchored_pose A^-1 g (anchor = each
+        # motion's first frame) so the rollout tracking-z encoder's spatial
+        # head sees a REAL pose. The shared T-window mean then windows the
+        # spatial z identically to the local z (frame_cur/frame_nxt are
+        # motion-local indices; root buffers use the RSI flat space).
+        if self._emit_anchored_pose and getattr(self, "root_pos_buffer", None) is not None:
+            obs["anchored_pose"] = self._anchored_pose_at(frame_cur, motion_flat)
+            next_obs["anchored_pose"] = self._anchored_pose_at(frame_nxt, motion_flat)
         return {
             "observation": obs,
             "next_observation": next_obs,
@@ -1152,25 +1222,67 @@ class FBCprExpertBuffer:
         # implementation uses the agent's own z-sampler to overwrite this
         # before the discriminator step.
 
+        obs_dict = {
+            "state": out_state,
+            "privileged_state": out_priv,
+            "last_action": out_act,
+            "history_actor": out_hist,
+        }
+        next_obs_dict = {
+            "state": out_state_n,
+            "privileged_state": out_priv_n,
+            "last_action": out_act_n,
+            "history_actor": out_hist_n,
+        }
+        # Anchored variant: attach the expert's anchored pose A^-1 g for the
+        # spatial CPR discriminator. Anchor = each motion's first frame, so the
+        # expert's spatial latent reflects how far it has progressed from start
+        # (matching the rollout convention where A = spawn pose).
+        if self._emit_anchored_pose and getattr(self, "root_pos_buffer", None) is not None:
+            obs_dict["anchored_pose"] = self._anchored_pose_at(frame_cur, motion_flat)
+            next_obs_dict["anchored_pose"] = self._anchored_pose_at(frame_nxt, motion_flat)
+
         return {
-            "observation": {
-                "state": out_state,
-                "privileged_state": out_priv,
-                "last_action": out_act,
-                "history_actor": out_hist,
-            },
+            "observation": obs_dict,
             "action": out_act,   # reconstructed "last_action" doubles as the demo action
             "z": z_dummy,
             "next": {
-                "observation": {
-                    "state": out_state_n,
-                    "privileged_state": out_priv_n,
-                    "last_action": out_act_n,
-                    "history_actor": out_hist_n,
-                },
+                "observation": next_obs_dict,
                 "terminated": terminated,
             },
         }
+
+    def _anchored_pose_at(self, frame_local: torch.Tensor, motion_flat: torch.Tensor) -> torch.Tensor:
+        """Encode A^-1 g for expert frames, anchor = each motion's first frame.
+
+        ``frame_local`` is the motion-local frame index; root buffers are
+        indexed via ``_motion_starts`` (the RSI flat space, T frames/motion),
+        NOT ``_motion_obs_starts`` (obs space, T-1/motion). Matches
+        ``AnchoredFBCprAux._encode_anchored_pose`` / the env's
+        ``_obs_anchored_pose``: [clamp(px,±R), clamp(py,±R), cosθ, sinθ].
+        """
+        base = self._motion_starts[motion_flat]
+        # Clamp the local frame to the motion's RSI length (root buffer space).
+        lens = self._motion_lengths_rsi[motion_flat]
+        fl = torch.minimum(frame_local, (lens - 1).clamp_min(0))
+        global_idx = base + fl
+        g_xy = self.root_pos_buffer[global_idx][:, :2]
+        gq = self.root_quat_buffer[global_idx]
+        gw, gx, gy, gz = gq[:, 0], gq[:, 1], gq[:, 2], gq[:, 3]
+        g_yaw = torch.atan2(2 * (gw * gz + gx * gy), 1 - 2 * (gy * gy + gz * gz))
+        # Anchor = motion's first flat frame.
+        a_idx = base
+        a_xy = self.root_pos_buffer[a_idx][:, :2]
+        aq = self.root_quat_buffer[a_idx]
+        aw, ax, ay, az = aq[:, 0], aq[:, 1], aq[:, 2], aq[:, 3]
+        a_yaw = torch.atan2(2 * (aw * az + ax * ay), 1 - 2 * (ay * ay + az * az))
+        d = g_xy - a_xy
+        ca, sa = torch.cos(-a_yaw), torch.sin(-a_yaw)
+        R = self._anchored_pose_clamp
+        px = (ca * d[:, 0] - sa * d[:, 1]).clamp(-R, R)
+        py = (sa * d[:, 0] + ca * d[:, 1]).clamp(-R, R)
+        theta = g_yaw - a_yaw
+        return torch.stack([px, py, torch.cos(theta), torch.sin(theta)], dim=-1)
 
     @torch.no_grad()
     def sample_chunks(self, batch_size: int, num_chunks: int,
