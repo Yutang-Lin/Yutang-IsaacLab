@@ -240,13 +240,6 @@ class AnchoredFBCprAux(FBCprAux):
         # from different samples (composed).
         gh_xy, gh_yaw, goal_obs = self._sample_goal(train_batch, train_obs, gt_xy, gt_yaw, cfg)
 
-        # ---- Independent successor query s_+ ~ rho (a different replay row) -
-        # Use a fresh permutation of the current batch as the query state.
-        perm_q = torch.randperm(B, device=dev)
-        query_obs = {k: v[perm_q] for k, v in train_obs.items()}
-        q_xy = gt_xy[perm_q]
-        q_yaw = gt_yaw[perm_q]
-
         # ---- Sample coordinate anchor A ~ p_A (shared per sample) ----------
         a_xy, a_yaw = self._sample_anchor(gt_xy, gt_yaw, gh_xy, gh_yaw, cfg, B, dev)
 
@@ -261,10 +254,19 @@ class AnchoredFBCprAux(FBCprAux):
         train_obs = _set_anchored(train_obs, gt_xy, gt_yaw)
         train_next_obs = _set_anchored(train_next_obs, gtn_xy, gtn_yaw)
         goal_obs = _set_anchored(goal_obs, gh_xy, gh_yaw)
-        fb_goal = _set_anchored(query_obs, q_xy, q_yaw)  # s_+ : the FB query
+
+        # ---- FB successor goal = the (anchored) NEXT obs. The FB loss uses a
+        # batch-matrix contrastive trick (Ms = F @ B.T): the DIAGONAL pairs
+        # F(s_i,a_i,z_i) with B(next_obs_i) — the actual transition reward — and
+        # the OFF-DIAGONAL rows are already the independent rho/successor-query
+        # negatives. So ``goal`` MUST be next_obs (NOT a separate permutation;
+        # an unrelated goal destroys the diagonal signal and F never learns →
+        # Q_fb collapses to ~0). The independent-s_+ the spec asks for is the
+        # off-diagonal batch, supplied for free here.
+        fb_goal = train_next_obs
 
         # ---- z: local block keeps relabeled train_z's local part; spatial
-        # block = B_spatial(anchored goal). z = Normalize per-block. ----------
+        # block = B_spatial(anchored task goal). z = Normalize per-block. ----
         train_z = self._set_spatial_z(train_z, goal_obs)
 
         # Stash anchor context for the actor's anchor-consistency loss.
@@ -350,39 +352,25 @@ class AnchoredFBCprAux(FBCprAux):
         return gh_xy, gh_yaw, goal_obs
 
     # ------------------------------------------------------------------ #
-    # Anchor/gauge consistency (actor seam)
+    # Anchor/gauge consistency (spec §7) — split across the two updates that
+    # actually own the relevant parameters:
+    #   * policy-KL consistency  -> actor update (_actor_extra_loss)
+    #   * value (Q) consistency  -> F update     (_fb_extra_loss)
+    # Putting the Q term in the actor update would be a NO-OP: it depends only
+    # on F (Q=<F,z> on a detached action) and step_actor only steps the actor.
     # ------------------------------------------------------------------ #
-    def _actor_extra_loss(self, obs, z, dist=None, sampled_action=None, q_fb=None):
-        """Two-anchor policy-KL + value consistency (spec §7).
-
-        For the SAME physical task, draw a SECOND anchor A2 (the first, A1, is
-        the one used to build ``obs``/``z`` this update). Behavior + value must
-        match across anchors, though the latent representations differ:
-
-          L_pi = KL[ pi(.|y^A1, z^A1) || pi(.|y^A2, z^A2) ]
-          L_Q  = ( Q_{z^A1}(y^A1,a) - Q_{z^A2}(y^A2,a) )^2 ,  Q = <F, z>
-
-        Reuses the A1 actor dist / action / FB-Q already computed in
-        ``backward_actor`` (passed in) — only the A2 branch is forwarded here.
-        """
+    def _build_second_anchor(self, z):
+        """Build the A2 branch (obs2, z2) for the SAME physical task as the
+        A1-anchored ``obs``/``z`` baked this update. Returns (obs2, z2) or None
+        when there's no stashed anchor context. Does NOT clear the context."""
         ctx = getattr(self, "_anchor_ctx", None)
-        lam_pi = float(getattr(self.cfg, "anchor_kl_coef", 0.0))
-        lam_q = float(getattr(self.cfg, "anchor_q_coef", 0.0))
-        if ctx is None or (lam_pi <= 0.0 and lam_q <= 0.0):
-            self._anchor_ctx = None
-            return torch.zeros((), device=self.device), {}
-
+        if ctx is None:
+            return None
         p = self.policy
-        cfg = ctx["cfg"]
-        key = cfg["key"]
-        dev = self.device
+        cfg = ctx["cfg"]; key = cfg["key"]; dev = self.device
         B = z.shape[0]
-        base = ctx["base_obs"]          # obs WITHOUT anchored_pose (already normalized)
-        goal_local = ctx["goal_obs_local"]
         gt_xy, gt_yaw = ctx["gt_xy"], ctx["gt_yaw"]
         gh_xy, gh_yaw = ctx["gh_xy"], ctx["gh_yaw"]
-
-        # A1 is the anchor already baked into `obs`/`z`. Draw A2 independently.
         a2_xy, a2_yaw = self._sample_anchor(gt_xy, gt_yaw, gh_xy, gh_yaw, cfg, B, dev)
 
         def _anchored(obs_local, g_xy, g_yaw):
@@ -391,41 +379,63 @@ class AnchoredFBCprAux(FBCprAux):
             d = dict(obs_local); d[key] = ap
             return d
 
-        obs2 = _anchored(base, gt_xy, gt_yaw)
-        goal2 = _anchored(goal_local, gh_xy, gh_yaw)
-        # z2: local block from z (anchor-invariant body goal), spatial from A2
-        # goal — spatial head only (B_local would be discarded).
+        obs2 = _anchored(ctx["base_obs"], gt_xy, gt_yaw)
+        goal2 = _anchored(ctx["goal_obs_local"], gh_xy, gh_yaw)
         with torch.no_grad():
-            zs2 = p.backward_spatial(goal2)
+            zs2 = p.backward_spatial(goal2)            # spatial head only
         z2 = torch.cat([z[:, : p.z_local_dim], zs2], dim=-1)
+        return obs2, z2
 
-        # A1 dist reused from backward_actor; only A2 needs a fresh forward.
+    def _fb_extra_loss(self, obs, z):
+        """Two-anchor VALUE consistency (spec §7), in the F update.
+
+          L_Q = ( Q_{z^A1}(y^A1,a) - Q_{z^A2}(y^A2,a) )^2 ,  Q = <F, z>
+
+        on a detached action shared across anchors, so gradient flows only
+        through F (this is the update that steps F)."""
+        lam_q = float(getattr(self.cfg, "anchor_q_coef", 0.0))
+        if lam_q <= 0.0:
+            return torch.zeros((), device=self.device), {}
+        built = self._build_second_anchor(z)
+        if built is None:
+            return torch.zeros((), device=self.device), {}
+        obs2, z2 = built
+        p = self.policy
+        with torch.no_grad():
+            a = p._actor(obs, z, p.actor_std).sample(clip=self.cfg.stddev_clip).detach()
+        q1 = (p._forward_map(obs, z, a) * z).sum(dim=-1)
+        q2 = (p._forward_map(obs2, z2, a) * z2).sum(dim=-1)
+        q_consist = (q1.mean(dim=0) - q2.mean(dim=0)).pow(2).mean()
+        return lam_q * q_consist, {"anchor/q_consist": q_consist.detach()}
+
+    def _actor_extra_loss(self, obs, z, dist=None, sampled_action=None):
+        """Two-anchor POLICY-KL consistency (spec §7), in the actor update.
+
+          L_pi = KL[ pi(.|y^A1, z^A1) || pi(.|y^A2, z^A2) ]
+
+        Reuses the A1 actor dist from ``backward_actor`` (only A2 is forwarded).
+        Clears the anchor context here — the actor is the LAST phase that uses
+        it, so it must outlive the F update (_fb_extra_loss) which runs first.
+        """
+        lam_pi = float(getattr(self.cfg, "anchor_kl_coef", 0.0))
+        if lam_pi <= 0.0:
+            self._anchor_ctx = None
+            return torch.zeros((), device=self.device), {}
+        built = self._build_second_anchor(z)
+        if built is None:
+            self._anchor_ctx = None
+            return torch.zeros((), device=self.device), {}
+        obs2, z2 = built
+        p = self.policy
         dist1 = dist if dist is not None else p._actor(obs, z, p.actor_std)
         dist2 = p._actor(obs2, z2, p.actor_std)
-        # Gaussian KL between the two TruncatedNormal cores (loc/scale).
         m1, s1 = dist1.loc, dist1.scale
         m2, s2 = dist2.loc, dist2.scale
         var1, var2 = s1.pow(2) + 1e-8, s2.pow(2) + 1e-8
         kl = (torch.log(s2 / s1.clamp_min(1e-8)) + (var1 + (m1 - m2).pow(2)) / (2 * var2) - 0.5)
         kl = kl.sum(dim=-1).mean()
-
-        # Value consistency: Q=<F,z> on the SAME *detached* action under both
-        # anchors (grad flows only through F/z, not the actor — so the
-        # consistency term shapes the value heads, not the policy's action).
-        # Reuse backward_actor's sampled_action to save a re-sample; we do NOT
-        # reuse its q_fb (that used the grad-carrying action — different path).
-        a = (sampled_action if sampled_action is not None
-             else dist1.sample(clip=self.cfg.stddev_clip)).detach()
-        q1 = (p._forward_map(obs, z, a) * z).sum(dim=-1)
-        q2 = (p._forward_map(obs2, z2, a) * z2).sum(dim=-1)
-        # collapse parallel-ensemble dim (mean) before the consistency MSE.
-        q_consist = (q1.mean(dim=0) - q2.mean(dim=0)).pow(2).mean()
-
-        loss = lam_pi * kl + lam_q * q_consist
-        logs = {
-            "anchor/kl": kl.detach(),
-            "anchor/q_consist": q_consist.detach(),
-        }
-        # Clear ctx so a stale anchor frame can't leak into the next update.
+        loss = lam_pi * kl
+        logs = {"anchor/kl": kl.detach()}
+        # Actor is the last phase using the anchor ctx — clear it now.
         self._anchor_ctx = None
         return loss, logs

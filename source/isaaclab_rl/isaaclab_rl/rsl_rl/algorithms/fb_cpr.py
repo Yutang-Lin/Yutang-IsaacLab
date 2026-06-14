@@ -1595,13 +1595,16 @@ class FBCprAux:
             train_z = torch.where(mask, z, train_z)
 
         # --- Anchoring seam (Global-through-Anchoring) -----------------
-        # Default is identity: ``fb_goal`` is the transition's own next obs
-        # (the FB successor-query state s_+) and obs/z pass through unchanged,
-        # so non-anchored tasks are byte-identical. The anchored subclass
-        # overrides ``_anchor_relabel`` to: sample a coordinate anchor A and an
-        # INDEPENDENT successor query s_+, inject the anchored pose A^-1 g into
-        # obs/next_obs/goal, sample the task goal s_h ~ p_goal, and set z's
-        # spatial block = B_spatial(anchored s_h).
+        # Default is identity: ``fb_goal`` is the transition's own next obs and
+        # obs/z pass through unchanged, so non-anchored tasks are byte-identical.
+        # The anchored subclass overrides ``_anchor_relabel`` to: sample a
+        # coordinate anchor A, inject the anchored pose A^-1 g into
+        # obs/next_obs, hindsight-relabel z's spatial block = B_spatial(task
+        # goal s_h ~ p_goal). NOTE: ``fb_goal`` stays = next_obs — the FB loss
+        # is a batch-matrix contrastive (Ms = F @ B.T) whose DIAGONAL is the
+        # actual-transition reward (needs B(next_obs)) and whose OFF-DIAGONAL
+        # rows are the independent rho/successor negatives. Passing a separate
+        # query as goal breaks the diagonal and F never learns.
         fb_goal = train_next_obs
         train_obs, train_next_obs, fb_goal, train_z = self._anchor_relabel(
             train_batch=train_batch,
@@ -2209,6 +2212,13 @@ class FBCprAux:
             q_loss = 0.5 * Fs.shape[0] * F.mse_loss(Qs, expanded)
             fb_loss = fb_loss + q_loss_coef * q_loss
 
+        # FB-side extra-loss seam (no-op base). The anchored subclass puts its
+        # two-anchor VALUE-consistency here — it depends only on F (Q=<F,z> on
+        # a detached action), so it MUST be optimized in the F update, not the
+        # actor update (which only steps the actor optimizer).
+        fb_extra, fb_extra_logs = self._fb_extra_loss(obs, z)
+        fb_loss = fb_loss + fb_extra
+
         self.forward_optimizer.zero_grad(set_to_none=True)
         self.backward_optimizer.zero_grad(set_to_none=True)
         fb_loss.backward()
@@ -2235,7 +2245,14 @@ class FBCprAux:
                 "q_loss": q_loss,
                 "recon_loss": recon_loss,
             }
+            out.update(fb_extra_logs)
         return out, F_handle, B_handle
+
+    def _fb_extra_loss(self, obs, z):
+        """FB-side extra-loss seam (no-op base). Returns ``(loss, logs)``.
+        Subclasses add F-dependent regularisers (e.g. anchor value
+        consistency) here so they're optimized in the F update."""
+        return torch.zeros((), device=self.device), {}
 
     def step_fb(
         self, F_handle: Any, B_handle: Any, clip_grad_norm: float | None,
