@@ -59,6 +59,19 @@ class AnchoredFBCprAux(FBCprAux):
             params += list(ds.parameters())
         return params
 
+    def _q_fb_split(self, Fs, z):
+        """Split the implicit Q = <F, z> into the LOCAL (z_local) and SPATIAL
+        (z_spatial) block contributions and log each (mean over the ensemble
+        + batch). Q_fb = Q_fb_local + Q_fb_spatial by construction."""
+        dl = self.policy.z_local_dim
+        with torch.no_grad():
+            q_local = (Fs[..., :dl] * z[..., :dl]).sum(dim=-1)       # [num_par, B]
+            q_spatial = (Fs[..., dl:] * z[..., dl:]).sum(dim=-1)     # [num_par, B]
+            return {
+                "Q_fb_local": q_local.mean().detach(),
+                "Q_fb_spatial": q_spatial.mean().detach(),
+            }
+
     def _cpr_reward(self, obs, z):
         p = self.policy
         r_local = p._discriminator.compute_reward(obs, p.z_local(z))

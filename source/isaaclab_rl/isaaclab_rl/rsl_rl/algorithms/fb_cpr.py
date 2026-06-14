@@ -2507,6 +2507,9 @@ class FBCprAux:
         Fs = p._forward_map(obs, z, sampled_action)
         Qs_fb = (Fs * z).sum(dim=-1)
         _, _, Q_fb = self._pessimistic_value(Qs_fb, self.cfg.actor_pessimism_penalty)
+        # Optional per-block Q split (anchored variant: local vs spatial z).
+        # No-op in the base. Stash for the metrics dict below.
+        self._q_fb_split_logs = self._q_fb_split(Fs, z)
 
         if self.cfg.soft_fb:
             R = 1.0  # soft FB uses unit ball
@@ -2587,10 +2590,19 @@ class FBCprAux:
             }
             out.update(act_stats)
             out.update(extra_logs)
+            if getattr(self, "_q_fb_split_logs", None):
+                out.update(self._q_fb_split_logs)
+                self._q_fb_split_logs = None
             if hasattr(self, "_soft_fb_actor_logs"):
                 out.update(self._soft_fb_actor_logs)
                 del self._soft_fb_actor_logs
         return out, handle
+
+    def _q_fb_split(self, Fs, z):
+        """Per-block Q_fb split seam (no-op base). The anchored variant logs
+        the local (<F,z>_local) and spatial (<F,z>_spatial) contributions to
+        the implicit Q separately."""
+        return {}
 
     def _actor_extra_loss(self, obs, z, dist=None, sampled_action=None):
         """Extra actor-side loss seam (no-op base). Returns ``(loss, logs)``.
