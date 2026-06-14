@@ -275,16 +275,13 @@ class AnchoredFBCprAux(FBCprAux):
         # base mix on next_obs) is discarded; we rebuild coherently here.
         train_z = self._build_anchored_z(goal_obs, expert_z)
 
-        # Stash anchor context for the actor's anchor-consistency loss.
-        self._anchor_ctx = {
-            "a_xy": a_xy, "a_yaw": a_yaw,
-            "gt_xy": gt_xy, "gt_yaw": gt_yaw,
-            "gh_xy": gh_xy, "gh_yaw": gh_yaw,
-            "goal_obs_local": {k: v for k, v in goal_obs.items() if k != key},
-            "base_obs": {k: v for k, v in train_obs.items() if k != key},
-            "z": train_z,
-            "cfg": cfg,
-        }
+        # NOTE: no anchor-consistency (KL / Q) losses. Anchor invariance is
+        # learned automatically: z = B(goal) is equivariant under the anchor,
+        # and F is trained by TD over anchor-relabeled transitions spanning all
+        # anchors — the Bellman backup makes Q=<F,z> and the policy consistent
+        # across anchors without an explicit penalty. (The explicit terms were
+        # also the main divergence source — unnormalized squared-Q + extra
+        # DDP forward passes — so dropping them simplifies AND stabilizes.)
         return train_obs, train_next_obs, fb_goal, train_z
 
     # ------------------------------------------------------------------ #
@@ -381,91 +378,11 @@ class AnchoredFBCprAux(FBCprAux):
         gh_yaw = gt_yaw[pose_idx]
         return gh_xy, gh_yaw, goal_obs
 
-    # ------------------------------------------------------------------ #
-    # Anchor/gauge consistency (spec §7) — split across the two updates that
-    # actually own the relevant parameters:
-    #   * policy-KL consistency  -> actor update (_actor_extra_loss)
-    #   * value (Q) consistency  -> F update     (_fb_extra_loss)
-    # Putting the Q term in the actor update would be a NO-OP: it depends only
-    # on F (Q=<F,z> on a detached action) and step_actor only steps the actor.
-    # ------------------------------------------------------------------ #
-    def _build_second_anchor(self, z):
-        """Build the A2 branch (obs2, z2) for the SAME physical task as the
-        A1-anchored ``obs``/``z`` baked this update. Returns (obs2, z2) or None
-        when there's no stashed anchor context. Does NOT clear the context."""
-        ctx = getattr(self, "_anchor_ctx", None)
-        if ctx is None:
-            return None
-        p = self.policy
-        cfg = ctx["cfg"]; key = cfg["key"]; dev = self.device
-        B = z.shape[0]
-        gt_xy, gt_yaw = ctx["gt_xy"], ctx["gt_yaw"]
-        gh_xy, gh_yaw = ctx["gh_xy"], ctx["gh_yaw"]
-        a2_xy, a2_yaw = self._sample_anchor(gt_xy, gt_yaw, gh_xy, gh_yaw, cfg, B, dev)
-
-        def _anchored(obs_local, g_xy, g_yaw):
-            ap = self._encode_anchored_pose(g_xy, g_yaw, a2_xy, a2_yaw, cfg["clamp"])
-            ap = self._normalize_key(key, ap)
-            d = dict(obs_local); d[key] = ap
-            return d
-
-        obs2 = _anchored(ctx["base_obs"], gt_xy, gt_yaw)
-        goal2 = _anchored(ctx["goal_obs_local"], gh_xy, gh_yaw)
-        with torch.no_grad():
-            zs2 = p.backward_spatial(goal2)            # spatial head only
-        z2 = torch.cat([z[:, : p.z_local_dim], zs2], dim=-1)
-        return obs2, z2
-
-    def _fb_extra_loss(self, obs, z):
-        """Two-anchor VALUE consistency (spec §7), in the F update.
-
-          L_Q = ( Q_{z^A1}(y^A1,a) - Q_{z^A2}(y^A2,a) )^2 ,  Q = <F, z>
-
-        on a detached action shared across anchors, so gradient flows only
-        through F (this is the update that steps F)."""
-        lam_q = float(getattr(self.cfg, "anchor_q_coef", 0.0))
-        if lam_q <= 0.0:
-            return torch.zeros((), device=self.device), {}
-        built = self._build_second_anchor(z)
-        if built is None:
-            return torch.zeros((), device=self.device), {}
-        obs2, z2 = built
-        p = self.policy
-        with torch.no_grad():
-            a = p._actor(obs, z, p.actor_std).sample(clip=self.cfg.stddev_clip).detach()
-        q1 = (p._forward_map(obs, z, a) * z).sum(dim=-1)
-        q2 = (p._forward_map(obs2, z2, a) * z2).sum(dim=-1)
-        q_consist = (q1.mean(dim=0) - q2.mean(dim=0)).pow(2).mean()
-        return lam_q * q_consist, {"anchor/q_consist": q_consist.detach()}
-
-    def _actor_extra_loss(self, obs, z, dist=None, sampled_action=None):
-        """Two-anchor POLICY-KL consistency (spec §7), in the actor update.
-
-          L_pi = KL[ pi(.|y^A1, z^A1) || pi(.|y^A2, z^A2) ]
-
-        Reuses the A1 actor dist from ``backward_actor`` (only A2 is forwarded).
-        Clears the anchor context here — the actor is the LAST phase that uses
-        it, so it must outlive the F update (_fb_extra_loss) which runs first.
-        """
-        lam_pi = float(getattr(self.cfg, "anchor_kl_coef", 0.0))
-        if lam_pi <= 0.0:
-            self._anchor_ctx = None
-            return torch.zeros((), device=self.device), {}
-        built = self._build_second_anchor(z)
-        if built is None:
-            self._anchor_ctx = None
-            return torch.zeros((), device=self.device), {}
-        obs2, z2 = built
-        p = self.policy
-        dist1 = dist if dist is not None else p._actor(obs, z, p.actor_std)
-        dist2 = p._actor(obs2, z2, p.actor_std)
-        m1, s1 = dist1.loc, dist1.scale
-        m2, s2 = dist2.loc, dist2.scale
-        var1, var2 = s1.pow(2) + 1e-8, s2.pow(2) + 1e-8
-        kl = (torch.log(s2 / s1.clamp_min(1e-8)) + (var1 + (m1 - m2).pow(2)) / (2 * var2) - 0.5)
-        kl = kl.sum(dim=-1).mean()
-        loss = lam_pi * kl
-        logs = {"anchor/kl": kl.detach()}
-        # Actor is the last phase using the anchor ctx — clear it now.
-        self._anchor_ctx = None
-        return loss, logs
+    # NOTE: no anchor-consistency losses. Anchor invariance emerges from
+    # standard FB TD over anchor-relabeled transitions (z = B(goal) is
+    # equivariant under the anchor; the Bellman backup aligns Q=<F,z> and the
+    # policy across anchors). The base ``_fb_extra_loss`` / ``_actor_extra_loss``
+    # no-op seams are inherited unchanged. This keeps the anchored variant pure
+    # standard FB (local and spatial treated identically up to the A^-1 pose
+    # transform) and avoids the extra F/actor forward passes that destabilised
+    # training under DDP.

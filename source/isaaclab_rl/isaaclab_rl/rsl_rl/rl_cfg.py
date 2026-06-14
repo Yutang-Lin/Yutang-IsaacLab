@@ -1425,8 +1425,6 @@ class RslRlFBCprAlgorithmCfg:
     anchor_alpha_gt: float = 0.34
     anchor_beta_gh: float = 0.33
     anchor_random_xy_range: float = 10.0
-    anchor_kl_coef: float = 0.0
-    anchor_q_coef: float = 0.0
     spatial_cpr_coeff: float = 1.0
     goal_future_ratio: float = 0.4
     goal_nearby_ratio: float = 0.2

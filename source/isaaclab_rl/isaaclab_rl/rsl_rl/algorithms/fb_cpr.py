@@ -82,8 +82,8 @@ class FBCprAuxAlgorithmCfg:
     anchor_alpha_gt: float = 0.34            # p(anchor = g_t)
     anchor_beta_gh: float = 0.33             # p(anchor = g_h); rest -> random
     anchor_random_xy_range: float = 10.0     # random anchor xy ± around g_t
-    anchor_kl_coef: float = 0.0              # lambda_A on two-anchor policy KL
-    anchor_q_coef: float = 0.0               # lambda on two-anchor Q consistency
+    # (anchor KL/Q consistency penalties removed — invariance comes from FB TD
+    # over anchor-relabeled transitions, not an explicit loss.)
     spatial_cpr_coeff: float = 1.0           # weight of spatial CPR reward vs local
     goal_future_ratio: float = 0.4
     goal_nearby_ratio: float = 0.2
