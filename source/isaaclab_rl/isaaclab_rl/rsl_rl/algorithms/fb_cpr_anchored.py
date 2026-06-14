@@ -265,9 +265,15 @@ class AnchoredFBCprAux(FBCprAux):
         # off-diagonal batch, supplied for free here.
         fb_goal = train_next_obs
 
-        # ---- z: local block keeps relabeled train_z's local part; spatial
-        # block = B_spatial(anchored task goal). z = Normalize per-block. ----
-        train_z = self._set_spatial_z(train_z, goal_obs)
+        # ---- z: built FRESH under anchor A, both blocks treated identically.
+        # z = mix( goal-encoded B(goal_obs) , expert_z , random ), exactly like
+        # the base sample_mixed_z but (a) over the FULL two-head B so the LOCAL
+        # and SPATIAL blocks come from the SAME relabeled goal s_h under the
+        # SAME anchor A (the only spatial-specific thing is the A^-1 transform
+        # already baked into goal_obs[anchored_pose]), and (b) on the anchored
+        # goal — so we don't carry stale rollout-frame z. ``mixed_z`` (the
+        # base mix on next_obs) is discarded; we rebuild coherently here.
+        train_z = self._build_anchored_z(goal_obs, expert_z)
 
         # Stash anchor context for the actor's anchor-consistency loss.
         self._anchor_ctx = {
@@ -282,14 +288,38 @@ class AnchoredFBCprAux(FBCprAux):
         return train_obs, train_next_obs, fb_goal, train_z
 
     # ------------------------------------------------------------------ #
-    def _set_spatial_z(self, z, goal_obs):
-        """Set z's spatial block = B_spatial(anchored goal), keep local block.
+    def _build_anchored_z(self, goal_obs, expert_z):
+        """Build z UNDER anchor A, treating the local and spatial blocks
+        identically (the only spatial difference is the A^-1 transform already
+        in ``goal_obs[anchored_pose]``).
 
-        Runs only the spatial backward head (B_local would be discarded)."""
+        Mirrors the base ``sample_mixed_z`` mixture, but encodes the whole
+        two-head B on the SAME anchored goal so both z-blocks describe the same
+        relabeled goal s_h:
+            train_goal_ratio  -> goal-encoded  B(goal_obs)
+            expert_asm_ratio  -> expert_z      (self-anchored at its motion start)
+            remainder         -> uniform random z (per-block sphere)
+        """
         p = self.policy
+        B = next(iter(goal_obs.values())).shape[0]
+        dev = self.device
+        # Random z (per-block sphere via the anchored policy's sample_z).
+        z = p.sample_z(B, device=dev)
+        # Goal-encoded z = full two-head B on the anchored goal (both blocks).
+        # DDP/compile proxy __call__, so _backward_map(obs) works directly
+        # (only sub-attribute access like .spatial needs unwrapping).
         with torch.no_grad():
-            z_spatial = p.backward_spatial(goal_obs)   # [B, z_spatial_dim]
-        return torch.cat([z[:, : p.z_local_dim], z_spatial], dim=-1)
+            z_goal = p.project_z(p._backward_map(goal_obs))
+        p_goal = float(getattr(self.cfg, "train_goal_ratio", 0.2))
+        p_expert = float(getattr(self.cfg, "expert_asm_ratio", 0.6))
+        probs = torch.tensor([p_goal, p_expert, max(0.0, 1.0 - p_goal - p_expert)],
+                             device=dev, dtype=torch.float32)
+        mix = torch.multinomial(probs, B, replacement=True).view(-1, 1)
+        z = torch.where(mix == 0, z_goal, z)
+        if expert_z is not None and expert_z.shape[0] > 0:
+            idx = torch.randint(0, expert_z.shape[0], (B,), device=dev)
+            z = torch.where(mix == 1, expert_z[idx], z)
+        return z
 
     def _sample_anchor(self, gt_xy, gt_yaw, gh_xy, gh_yaw, cfg, B, dev):
         """p_A = alpha·delta_{g_t} + beta·delta_{g_h} + (1-..)·random."""
