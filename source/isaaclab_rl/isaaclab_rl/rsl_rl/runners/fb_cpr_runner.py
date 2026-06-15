@@ -38,7 +38,6 @@ from isaaclab_rl.rsl_rl.modules.fb_cpr_policy import (
     FBCprCondPolicy,
     FBCprNetworkCfg,
 )
-from isaaclab_rl.rsl_rl.modules.fb_cpr_anchored_policy import AnchoredFBCprPolicy
 from isaaclab_rl.rsl_rl.storage.fb_cpr_storage import (
     FBCprExpertBuffer,
     FBCprReplayBuffer,
@@ -204,6 +203,10 @@ class FBCprRunner:
             # discriminator (anchor = each motion's first frame).
             emit_anchored_pose=bool(self.alg_cfg.get("store_world_pose", False)),
             anchored_pose_clamp=float(self.alg_cfg.get("anchor_pose_clamp", 10.0)),
+            # Match the policy's p_A so expert & policy z_spatial share a
+            # distribution (spatial disc must judge motion, not z-region).
+            anchor_alpha_gt=float(self.alg_cfg.get("anchor_alpha_gt", 0.34)),
+            anchor_random_xy_range=float(self.alg_cfg.get("anchor_random_xy_range", 10.0)),
         )
         # Forward to the env so RSI can pull from it.
         if hasattr(self.env_unwrapped, "set_expert_buffer"):
@@ -963,6 +966,14 @@ class FBCprRunner:
                     "last_action": win["last_action"][1:].to(self.device, non_blocking=True),
                     "history_actor": win["history_actor"][1:].to(self.device, non_blocking=True),
                 }
+                # Anchored variant: B also reads ``anchored_pose`` (A^-1 g). For
+                # tracking eval the goal is self-anchored (anchor = each frame's
+                # own pose), i.e. zero displacement -> [0, 0, cos0, sin0]=[0,0,1,0].
+                if "anchored_pose" in getattr(self.policy._backward_map.input_filter, "keys", ()):
+                    n = next_obs_dict["state"].shape[0]
+                    ap = torch.zeros(n, 4, device=self.device)
+                    ap[:, 2] = 1.0  # cos(theta=0)
+                    next_obs_dict["anchored_pose"] = ap
                 z = self.policy.backward_map(next_obs_dict)   # [L-1, z_dim]
                 # Match BFM's eval z-encoding exactly
                 # (humanoidverse_isaac.py:424-427 and tracking_inference.py:72-73):
@@ -1650,12 +1661,14 @@ class FBCprCondRunner(FBCprRunner):
 class AnchoredFBCprRunner(FBCprRunner):
     """FB-CPR runner for BFM-One-Anchored (Global-through-Anchoring).
 
-    Swaps in the two-head policy + anchored algorithm and adds the
-    ``anchored_pose`` obs-key group (the env emits an ``anchored_pose`` term
-    that carries the robot's pose under the per-episode anchor A^-1 g_t).
+    Single-B formulation: uses the STANDARD policy (one backward map B that
+    additionally reads ``anchored_pose`` via its backward_input_keys), plus the
+    anchored algorithm (per-row anchor relabel of the obs) and world-pose replay
+    storage / per-episode anchor setting. Adds the ``anchored_pose`` obs-key
+    group (the env emits A^-1 g_t).
     """
 
-    _POLICY_CLS = AnchoredFBCprPolicy
+    _POLICY_CLS = FBCprAuxPolicy
     _ALGO_CLS = AnchoredFBCprAux
     _NET_CFG_CLS = FBCprNetworkCfg
     _ALGO_CFG_CLS = FBCprAuxAlgorithmCfg

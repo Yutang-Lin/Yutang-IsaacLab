@@ -29,6 +29,7 @@ the batch to the training device.
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 import numpy as np
@@ -469,6 +470,8 @@ class FBCprExpertBuffer:
         keypoint_names: list[str] | None = None,
         emit_anchored_pose: bool = False,
         anchored_pose_clamp: float = 10.0,
+        anchor_alpha_gt: float = 0.34,
+        anchor_random_xy_range: float = 10.0,
     ) -> None:
         """Expert motion buffer.
 
@@ -487,10 +490,15 @@ class FBCprExpertBuffer:
         self.seq_length = int(seq_length)
         self._length_proportional_priors = bool(length_proportional_priors)
         self.device = torch.device(device)
-        # Anchored variant: emit an ``anchored_pose`` obs (A^-1 g) for the
-        # spatial CPR discriminator, anchored at each motion's first frame.
+        # Anchored variant: emit an ``anchored_pose`` obs (A^-1 g). The anchor
+        # is sampled from the SAME p_A as the policy (alpha at the frame's own
+        # current pose, else random around it) so expert and policy z_spatial
+        # share a distribution — otherwise the spatial discriminator shortcuts
+        # on the z-region instead of judging the motion.
         self._emit_anchored_pose = bool(emit_anchored_pose)
         self._anchored_pose_clamp = float(anchored_pose_clamp)
+        self._anchor_alpha_gt = float(anchor_alpha_gt)
+        self._anchor_random_xy_range = float(anchor_random_xy_range)
 
         raw = torch.load(pt_path, weights_only=False, map_location="cpu")
         if not isinstance(raw, dict) or "motions" not in raw:
@@ -1253,16 +1261,19 @@ class FBCprExpertBuffer:
         }
 
     def _anchored_pose_at(self, frame_local: torch.Tensor, motion_flat: torch.Tensor) -> torch.Tensor:
-        """Encode A^-1 g for expert frames, anchor = each motion's first frame.
+        """Encode A^-1 g for expert frames, with the anchor A sampled from the
+        SAME p_A as the policy (per ``AnchoredFBCprAux._sample_anchor``): with
+        prob ``alpha`` the anchor is the frame's OWN current pose (so A^-1 g ≈ 0),
+        otherwise a random anchor around it (±range xy, ±π yaw). This makes the
+        expert z_spatial distribution match the policy's so the spatial
+        discriminator must judge the MOTION rather than shortcut on the
+        z-distribution. Output matches the env/algo encoders:
+        [clamp(px,±R)/R, clamp(py,±R)/R, cosθ, sinθ].
 
         ``frame_local`` is the motion-local frame index; root buffers are
-        indexed via ``_motion_starts`` (the RSI flat space, T frames/motion),
-        NOT ``_motion_obs_starts`` (obs space, T-1/motion). Matches
-        ``AnchoredFBCprAux._encode_anchored_pose`` / the env's
-        ``_obs_anchored_pose``: [clamp(px,±R), clamp(py,±R), cosθ, sinθ].
+        indexed via ``_motion_starts`` (RSI flat space).
         """
         base = self._motion_starts[motion_flat]
-        # Clamp the local frame to the motion's RSI length (root buffer space).
         lens = self._motion_lengths_rsi[motion_flat]
         fl = torch.minimum(frame_local, (lens - 1).clamp_min(0))
         global_idx = base + fl
@@ -1270,17 +1281,22 @@ class FBCprExpertBuffer:
         gq = self.root_quat_buffer[global_idx]
         gw, gx, gy, gz = gq[:, 0], gq[:, 1], gq[:, 2], gq[:, 3]
         g_yaw = torch.atan2(2 * (gw * gz + gx * gy), 1 - 2 * (gy * gy + gz * gz))
-        # Anchor = motion's first flat frame.
-        a_idx = base
-        a_xy = self.root_pos_buffer[a_idx][:, :2]
-        aq = self.root_quat_buffer[a_idx]
-        aw, ax, ay, az = aq[:, 0], aq[:, 1], aq[:, 2], aq[:, 3]
-        a_yaw = torch.atan2(2 * (aw * az + ax * ay), 1 - 2 * (ay * ay + az * az))
+
+        # Anchor A ~ p_A relative to THIS frame's own pose (matches policy).
+        N = g_xy.shape[0]
+        dev = g_xy.device
+        a_xy = g_xy.clone()
+        a_yaw = g_yaw.clone()
+        is_rand = torch.rand(N, device=dev) >= self._anchor_alpha_gt
+        r = self._anchor_random_xy_range
+        rand_xy = g_xy + (torch.rand(N, 2, device=dev) * 2 - 1) * r
+        rand_yaw = (torch.rand(N, device=dev) * 2 - 1) * math.pi
+        a_xy = torch.where(is_rand.unsqueeze(-1), rand_xy, a_xy)
+        a_yaw = torch.where(is_rand, rand_yaw, a_yaw)
+
         d = g_xy - a_xy
         ca, sa = torch.cos(-a_yaw), torch.sin(-a_yaw)
         R = self._anchored_pose_clamp
-        # xy clamped to ±R then divided by R -> [-1,1] (analytic normalization;
-        # matches env _obs_anchored_pose + algo _encode_anchored_pose).
         px = (ca * d[:, 0] - sa * d[:, 1]).clamp(-R, R) / R
         py = (sa * d[:, 0] + ca * d[:, 1]).clamp(-R, R) / R
         theta = g_yaw - a_yaw

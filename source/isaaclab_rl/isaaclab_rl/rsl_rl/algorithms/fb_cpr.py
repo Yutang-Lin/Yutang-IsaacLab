@@ -1451,6 +1451,14 @@ class FBCprAux:
         """
         return net.module if hasattr(net, "module") else net
 
+    def _extra_phase1_reduce_nets(self):
+        """Extra non-DDP-wrapped nets to include in the merged phase-1 grad
+        all-reduce (no-op base). Subclasses (anchored: the spatial
+        discriminator) return modules whose grads must reduce in the SAME
+        collective, in rank-consistent order, rather than via a separate reduce
+        that could race the phase-1 streams."""
+        return []
+
     # --- update surface ----------------------------------------------------- #
 
     def broadcast_parameters(self) -> None:
@@ -1576,6 +1584,14 @@ class FBCprAux:
             train_next_obs = self.policy._obs_normalizer(train_next_obs)
             expert_obs = self.policy._obs_normalizer(expert_obs)
             expert_next_obs = self.policy._obs_normalizer(expert_next_obs)
+
+        # Anchoring preamble (Global-through-Anchoring): no-op in the base.
+        # The anchored subclass overwrites the ``anchored_pose`` obs of
+        # train_obs / train_next_obs under a per-row anchor A BEFORE z is built,
+        # so sample_mixed_z (B(train_next_obs)) and the FB loss all see the SAME
+        # anchored frame — the whole objective is then anchor-equivariant.
+        train_obs, train_next_obs = self._anchor_obs_preamble(
+            train_batch, train_obs, train_next_obs)
 
         # Encode expert → z_expert (+ disc validity mask for variable T)
         expert_z, expert_disc_mask = self.encode_expert(next_obs=expert_next_obs)
@@ -1781,7 +1797,7 @@ class FBCprAux:
         # One merged all_reduce across {disc, F, B, aux_critic} grads
         # (only when merge strategy is enabled).
         if self._merge_phase1_reduce:
-            merged_handle = reduce_gradients_merged_async([
+            merged_nets = [
                 self.policy._discriminator,  # not DDP-wrapped; use manually
                 # For DDP-wrapped nets iterate .module so we target the real
                 # parameters (grads live on the same tensors either way, but
@@ -1789,7 +1805,13 @@ class FBCprAux:
                 self._unwrap(self.policy._forward_map),
                 self._unwrap(self.policy._backward_map),
                 self._unwrap(self.policy._aux_critic),
-            ])
+            ]
+            # Subclasses (anchored: spatial discriminator) add their own
+            # phase-1 nets so they reduce in the SAME merged collective, in a
+            # rank-consistent order — NOT a separate ad-hoc reduce that can
+            # race the phase-1 streams / desync the NCCL op order.
+            merged_nets += self._extra_phase1_reduce_nets()
+            merged_handle = reduce_gradients_merged_async(merged_nets)
             finish_merged_async_reduce(merged_handle)
             disc_handle = None  # merged reduce covered disc too
 
@@ -2124,15 +2146,20 @@ class FBCprAux:
         discriminator channel."""
         return self.policy._discriminator.compute_reward(obs, z)
 
+    def _anchor_obs_preamble(self, train_batch, train_obs, train_next_obs):
+        """Anchoring preamble (no-op base). Runs BEFORE z is built. The anchored
+        subclass overwrites the ``anchored_pose`` obs under a per-row anchor A so
+        z (sample_mixed_z on B(train_next_obs)) and the FB loss share the frame.
+        Returns the (possibly relabeled) ``(train_obs, train_next_obs)``."""
+        return train_obs, train_next_obs
+
     def _anchor_relabel(self, train_batch, train_obs, train_next_obs, train_z,
                         mixed_z, expert_z):
-        """Anchoring seam (no-op in the base FB-CPR-Aux).
-
-        The anchored subclass overrides this to relabel coordinate anchors,
-        the FB successor-query state, and the task goal. The base returns
+        """Anchoring seam (no-op in the base FB-CPR-Aux). The base returns
         ``(obs, next_obs, fb_goal=next_obs, z)`` unchanged so non-anchored
-        tasks are byte-identical.
-        """
+        tasks are byte-identical. (Anchoring is now done in
+        ``_anchor_obs_preamble`` before z is built; this seam is kept for
+        back-compat / additional relabels.)"""
         return train_obs, train_next_obs, train_next_obs, train_z
 
     def backward_fb(
