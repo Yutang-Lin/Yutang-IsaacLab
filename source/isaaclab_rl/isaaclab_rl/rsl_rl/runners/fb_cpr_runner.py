@@ -969,7 +969,7 @@ class FBCprRunner:
                 # Anchored variant: B also reads ``anchored_pose`` (A^-1 g). For
                 # tracking eval the goal is self-anchored (anchor = each frame's
                 # own pose), i.e. zero displacement -> [0, 0, cos0, sin0]=[0,0,1,0].
-                if "anchored_pose" in getattr(self.policy._backward_map.input_filter, "keys", ()):
+                if "anchored_pose" in tuple(self.policy_cfg.get("backward_input_keys", ())):
                     n = next_obs_dict["state"].shape[0]
                     ap = torch.zeros(n, 4, device=self.device)
                     ap[:, 2] = 1.0  # cos(theta=0)
