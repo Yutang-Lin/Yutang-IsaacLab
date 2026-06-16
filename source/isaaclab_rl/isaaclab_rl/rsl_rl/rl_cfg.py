@@ -1425,6 +1425,9 @@ class RslRlFBCprAlgorithmCfg:
     anchor_alpha_gt: float = 0.34
     anchor_beta_gh: float = 0.33
     anchor_random_xy_range: float = 10.0
+    anchor_frame_body: bool = False
+    """Reframe privileged_state body POS/ROT6D into the per-row anchor frame
+    (train+expert) so B/F/critic/disc encode globally-positioned body pose."""
     spatial_cpr_coeff: float = 1.0
     goal_future_ratio: float = 0.4
     goal_nearby_ratio: float = 0.2

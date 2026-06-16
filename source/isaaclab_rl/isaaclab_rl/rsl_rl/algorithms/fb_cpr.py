@@ -78,8 +78,14 @@ class FBCprAuxAlgorithmCfg:
     # tells the runner to record per-transition world SE(2) pose for relabeling.
     store_world_pose: bool = False
     anchored_pose_key: str = "anchored_pose"
-    anchor_pose_clamp: float = 10.0          # ±metres clamp on A^-1 g xy
+    anchor_pose_clamp: float = 10.0          # ±metres clamp / signed-log full-scale R
     anchor_alpha_gt: float = 0.34            # p(anchor = g_t)
+    # Anchor-frame body pose: reframe privileged_state body POS/ROT6D into the
+    # per-row anchor A_i (train+expert) so B/F/critic/disc see globally-
+    # positioned body. MUST be a declared field — _build_algo_cfg only copies
+    # cfg keys for which hasattr(cfg, k) is True, so an undeclared flag is
+    # silently dropped and the feature never activates.
+    anchor_frame_body: bool = False
     anchor_beta_gh: float = 0.33             # p(anchor = g_h); rest -> random
     anchor_random_xy_range: float = 10.0     # random anchor xy ± around g_t
     # (anchor KL/Q consistency penalties removed — invariance comes from FB TD
@@ -1644,7 +1650,15 @@ class FBCprAux:
         # BFM order: disc sees ORIGINAL train_z (from rollout), THEN relabel.
         # The discriminator must train on the actual (s, z) pairs from the
         # replay — not freshly sampled z's that were never rolled out.
-        disc_train_z = train_z
+        #
+        # Anchored seam: the rollout z was encoded under the SPAWN anchor, but
+        # expert_z is encoded under the buffer's random p_A anchor — so the
+        # disc could shortcut on the (anchor-correlated) z distribution instead
+        # of judging motion style. The anchored subclass re-encodes the policy
+        # disc-z as B(train_next_obs), which the preamble already anchored under
+        # a per-row RANDOM A_i ~ p_A — matching expert_z's random anchor so the
+        # anchor component is i.i.d. for both. Base = identity (rollout z).
+        disc_train_z = self._disc_train_z(train_next_obs, train_z)
 
         z = self.sample_mixed_z(train_goal=train_next_obs, expert_encodings=expert_z).clone()
         self._zbuf_add(z)
@@ -2189,6 +2203,13 @@ class FBCprAux:
         discriminator's log-odds reward. The anchored subclass adds a spatial
         discriminator channel."""
         return self.policy._discriminator.compute_reward(obs, z)
+
+    def _disc_train_z(self, train_next_obs, train_z):
+        """Policy disc-z seam (no-op base = the rollout z). The anchored subclass
+        re-encodes B(train_next_obs) so the disc's policy-z is drawn under the
+        SAME random p_A anchor as expert_z — preventing the disc from shortcutting
+        on the anchor-correlated z distribution."""
+        return train_z
 
     def _anchor_priv_pre_normalize(self, train_batch, expert_batch,
                                    train_obs, train_next_obs,

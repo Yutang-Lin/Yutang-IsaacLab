@@ -140,7 +140,7 @@ class AnchoredFBCprAux(FBCprAux):
         if not bool(getattr(self.cfg, "anchor_frame_body", False)):
             return train_obs, train_next_obs, expert_obs, expert_next_obs
 
-        K = self._priv_K()
+        K = self._priv_K(train_obs.get("privileged_state"))
         if K is None:
             return train_obs, train_next_obs, expert_obs, expert_next_obs
         R = cfg["clamp"]
@@ -164,15 +164,20 @@ class AnchoredFBCprAux(FBCprAux):
         train_obs = _reframe(train_obs, gt_xy, gt_yaw)
         train_next_obs = _reframe(train_next_obs, gtn_xy, gtn_yaw)
 
-        # Expert: reframe per-row to a FRESH A_i drawn from the same p_A around
-        # the expert's own (canonical) root pose, so the disc sees the same
-        # 'body in random-anchor frame' marginal. The expert canonical root pose
-        # rides at expert_batch['canon_pose'] / ['next']['canon_pose'].
+        # Expert: reframe per-row to a FRESH A_e drawn from the same p_A around
+        # the expert's own (canonical) root pose, so BOTH the body POS/ROT6D and
+        # the anchored_pose obs are expressed in ONE consistent random anchor.
+        # This makes expert_z = B(expert) drawn under a random p_A anchor, just
+        # like the policy disc-z (B(train_next_obs)) — so the disc cannot
+        # shortcut on the anchor-correlated z distribution. The expert canonical
+        # root pose rides at expert_batch['canon_pose']/['next']['canon_pose'].
+        key = cfg["key"]
         ecp = expert_batch.get("canon_pose", None)
         ecp_n = expert_batch.get("next", {}).get("canon_pose", None)
         if ecp is not None:
             ecp = ecp.to(dev).float()
             e_xy, e_yaw = ecp[:, :2], ecp[:, 2]
+            # ONE random anchor A_e per expert row, shared by cur+next frames.
             ea_xy, ea_yaw = self._sample_anchor(e_xy, e_yaw, dev)
 
             def _ecr(g_xy, g_yaw):
@@ -183,31 +188,63 @@ class AnchoredFBCprAux(FBCprAux):
                 dth = torch.atan2(torch.sin(g_yaw - ea_yaw), torch.cos(g_yaw - ea_yaw))
                 return cr, dth
 
-            cr, dth = _ecr(e_xy, e_yaw)
-            ed = dict(expert_obs)
-            ed["privileged_state"] = FBCprExpertBuffer.reframe_priv_body(
-                expert_obs["privileged_state"], cr, dth, K, R, True)
-            expert_obs = ed
+            def _reframe_expert(obs_dict, g_xy, g_yaw):
+                cr, dth = _ecr(g_xy, g_yaw)
+                d = dict(obs_dict)
+                d["privileged_state"] = FBCprExpertBuffer.reframe_priv_body(
+                    obs_dict["privileged_state"], cr, dth, K, R, True)
+                # Re-anchor the anchored_pose obs to the SAME A_e (the buffer
+                # emitted it under a different draw). Write it RAW — this runs
+                # BEFORE the normalizer pass in update(), which then normalizes
+                # priv AND anchored_pose exactly once (same as priv). Do NOT
+                # pre-normalize here or it would be double-normalized.
+                if key in obs_dict:
+                    d[key] = self._encode_anchored_pose(g_xy, g_yaw, ea_xy, ea_yaw, R)
+                return d
+
+            expert_obs = _reframe_expert(expert_obs, e_xy, e_yaw)
             if ecp_n is not None:
                 ecp_n = ecp_n.to(dev).float()
-                crn, dthn = _ecr(ecp_n[:, :2], ecp_n[:, 2])
-                edn = dict(expert_next_obs)
-                edn["privileged_state"] = FBCprExpertBuffer.reframe_priv_body(
-                    expert_next_obs["privileged_state"], crn, dthn, K, R, True)
-                expert_next_obs = edn
+                expert_next_obs = _reframe_expert(expert_next_obs, ecp_n[:, :2], ecp_n[:, 2])
 
         return train_obs, train_next_obs, expert_obs, expert_next_obs
 
-    def _priv_K(self):
-        """Number of keypoints in the priv body block, from the policy cfg's
-        recon/keypoint info. Cached. Returns None if unknown."""
+    def _priv_K(self, priv: torch.Tensor | None = None):
+        """Number of keypoints K in the priv body block. Derived from the priv
+        DIMENSION (robust — no cfg dependency, which is fragile: cfg keys not
+        declared on the algo-cfg class are silently dropped by the runner's
+        hasattr filter). Layout with root_height_obs=True:
+          dim = 1 + (K-1)*3 + K*6 + K*3 + K*3 = 15K - 2  ->  K = (dim + 2) / 15.
+        Falls back to cfg.expert_keypoint_names if priv is None. Cached."""
         K = getattr(self, "_priv_K_cache", "unset")
         if K != "unset":
             return K
-        names = getattr(self.cfg, "expert_keypoint_names", None)
-        K = len(names) if names else None
+        K = None
+        if priv is not None:
+            dim = int(priv.shape[-1])
+            if (dim + 2) % 15 == 0:
+                K = (dim + 2) // 15
+        if K is None:
+            names = getattr(self.cfg, "expert_keypoint_names", None)
+            K = len(names) if names else None
         self._priv_K_cache = K
         return K
+
+    def _disc_train_z(self, train_next_obs, train_z):
+        """Policy disc-z under a RANDOM p_A anchor: re-encode B(train_next_obs).
+        By the time this runs, the preamble has anchored train_next_obs
+        (anchored_pose + priv body) under the per-row A_i ~ p_A, so this z is
+        drawn from the same random-anchor distribution as expert_z = B(expert
+        reframed under A_e ~ p_A). The disc therefore sees i.i.d. random-anchor
+        z on both sides and must judge MOTION STYLE, not the anchor. (Falls back
+        to the rollout z if no per-row anchor was sampled this update.)"""
+        if getattr(self, "_row_anchor_xy", None) is None:
+            return train_z
+        with torch.no_grad():
+            # train_next_obs is ALREADY normalized (preamble ran post-normalizer),
+            # so use the raw module ``_backward_map`` directly — matching
+            # sample_mixed_z / encode_expert, which do NOT re-normalize.
+            return self.policy.project_z(self.policy._backward_map(train_next_obs))
 
     # ------------------------------------------------------------------ #
     # The anchoring preamble (overrides FBCprAux no-op seam, runs BEFORE z)
