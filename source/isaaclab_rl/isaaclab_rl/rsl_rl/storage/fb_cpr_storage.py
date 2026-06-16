@@ -1104,14 +1104,14 @@ class FBCprExpertBuffer:
             "last_action": self._flat_last_action[global_nxt],
             "history_actor": self._flat_history_actor[global_nxt],
         }
-        # Anchored variant: attach expert anchored_pose A^-1 g (anchor = each
-        # motion's first frame) so the rollout tracking-z encoder's spatial
-        # head sees a REAL pose. The shared T-window mean then windows the
-        # spatial z identically to the local z (frame_cur/frame_nxt are
-        # motion-local indices; root buffers use the RSI flat space).
+        # Anchored variant: attach expert anchored_pose A^-1 g, each row's pose
+        # canonicalised to its OWN window-start frame (start_flat) so it
+        # self-zeros like a rollout episode. The shared T-window mean then
+        # windows the spatial z identically to the local z.
         if self._emit_anchored_pose and getattr(self, "root_pos_buffer", None) is not None:
-            obs["anchored_pose"] = self._anchored_pose_at(frame_cur, motion_flat)
-            next_obs["anchored_pose"] = self._anchored_pose_at(frame_nxt, motion_flat)
+            start_flat = starts.unsqueeze(1).expand(-1, traj_length).reshape(-1)
+            obs["anchored_pose"] = self._anchored_pose_at(frame_cur, motion_flat, start_flat)
+            next_obs["anchored_pose"] = self._anchored_pose_at(frame_nxt, motion_flat, start_flat)
         return {
             "observation": obs,
             "next_observation": next_obs,
@@ -1242,15 +1242,14 @@ class FBCprExpertBuffer:
             "last_action": out_act_n,
             "history_actor": out_hist_n,
         }
-        # Anchored variant: attach the expert's anchored pose A^-1 g for the
-        # spatial CPR discriminator. Anchor = each motion's first frame, so the
-        # expert's spatial latent reflects how far it has progressed from start
-        # (matching the rollout convention where A = spawn pose).
-        if self._emit_anchored_pose and getattr(self, "root_pos_buffer", None) is not None:
-            obs_dict["anchored_pose"] = self._anchored_pose_at(frame_cur, motion_flat)
-            next_obs_dict["anchored_pose"] = self._anchored_pose_at(frame_nxt, motion_flat)
-
-        return {
+        # Anchored variant: attach the expert's anchored pose A^-1 g. Each row's
+        # pose is canonicalised to its OWN window-start frame (start_flat), then
+        # an anchor A ~ p_A is applied — so expert windows self-zero like rollout
+        # episodes. We also return the RAW canonical next-pose (x,y,yaw), which
+        # the expert-z re-anchor needs to rebuild anchored_pose under an
+        # arbitrary destination anchor A_i (the normalizer would drop it from the
+        # obs dict, so it rides at the top level of ``next``).
+        out_dict = {
             "observation": obs_dict,
             "action": out_act,   # reconstructed "last_action" doubles as the demo action
             "z": z_dummy,
@@ -1259,30 +1258,83 @@ class FBCprExpertBuffer:
                 "terminated": terminated,
             },
         }
+        if self._emit_anchored_pose and getattr(self, "root_pos_buffer", None) is not None:
+            start_flat = starts.unsqueeze(1).expand(-1, seq_length).reshape(-1)
+            obs_dict["anchored_pose"] = self._anchored_pose_at(frame_cur, motion_flat, start_flat)
+            next_obs_dict["anchored_pose"] = self._anchored_pose_at(frame_nxt, motion_flat, start_flat)
+            nxy, nyaw = self._canon_pose_at(frame_nxt, start_flat, motion_flat)
+            out_dict["next"]["canon_pose"] = torch.cat([nxy, nyaw.unsqueeze(-1)], dim=-1)  # [B,3]
+        return out_dict
 
-    def _anchored_pose_at(self, frame_local: torch.Tensor, motion_flat: torch.Tensor) -> torch.Tensor:
-        """Encode A^-1 g for expert frames, with the anchor A sampled from the
-        SAME p_A as the policy (per ``AnchoredFBCprAux._sample_anchor``): with
-        prob ``alpha`` the anchor is the frame's OWN current pose (so A^-1 g ≈ 0),
-        otherwise a random anchor around it (±range xy, ±π yaw). This makes the
-        expert z_spatial distribution match the policy's so the spatial
-        discriminator must judge the MOTION rather than shortcut on the
-        z-distribution. Output matches the env/algo encoders:
-        [clamp(px,±R)/R, clamp(py,±R)/R, cosθ, sinθ].
+    def _canon_pose_at(self, frame_local: torch.Tensor, start_local: torch.Tensor,
+                       motion_flat: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Canonical (sub-trajectory-start-relative) SE(2) pose of an expert
+        frame: ``g_canon = [Rot(-s_yaw)(g_xy - s_xy), wrap(g_yaw - s_yaw)]``
+        where ``s`` is the window's OWN start frame (``start_local``). This makes
+        each expert window self-zero exactly like a rollout episode (which zeros
+        at its spawn pose) — so expert and policy poses live in one comparable
+        frame, and cross-row anchor subtraction stays bounded by per-window
+        travel rather than the motion's mocap-world origin.
 
-        ``frame_local`` is the motion-local frame index; root buffers are
-        indexed via ``_motion_starts`` (RSI flat space).
+        ``frame_local`` / ``start_local`` are motion-local frame indices; root
+        buffers are indexed via ``_motion_starts`` (RSI flat space).
+        Returns ``(g_xy_canon [N,2], g_yaw_canon [N])``.
         """
         base = self._motion_starts[motion_flat]
         lens = self._motion_lengths_rsi[motion_flat]
         fl = torch.minimum(frame_local, (lens - 1).clamp_min(0))
-        global_idx = base + fl
-        g_xy = self.root_pos_buffer[global_idx][:, :2]
-        gq = self.root_quat_buffer[global_idx]
-        gw, gx, gy, gz = gq[:, 0], gq[:, 1], gq[:, 2], gq[:, 3]
-        g_yaw = torch.atan2(2 * (gw * gz + gx * gy), 1 - 2 * (gy * gy + gz * gz))
+        sl = torch.minimum(start_local, (lens - 1).clamp_min(0))
 
-        # Anchor A ~ p_A relative to THIS frame's own pose (matches policy).
+        def _pose(idx_local):
+            gi = base + idx_local
+            xy = self.root_pos_buffer[gi][:, :2]
+            q = self.root_quat_buffer[gi]
+            yaw = torch.atan2(2 * (q[:, 0] * q[:, 3] + q[:, 1] * q[:, 2]),
+                              1 - 2 * (q[:, 2] * q[:, 2] + q[:, 3] * q[:, 3]))
+            return xy, yaw
+
+        g_xy, g_yaw = _pose(fl)
+        s_xy, s_yaw = _pose(sl)
+        d = g_xy - s_xy
+        ca, sa = torch.cos(-s_yaw), torch.sin(-s_yaw)
+        rel_x = ca * d[:, 0] - sa * d[:, 1]
+        rel_y = sa * d[:, 0] + ca * d[:, 1]
+        rel_xy = torch.stack([rel_x, rel_y], dim=-1)
+        rel_yaw = torch.atan2(torch.sin(g_yaw - s_yaw), torch.cos(g_yaw - s_yaw))
+        return rel_xy, rel_yaw
+
+    @staticmethod
+    def encode_anchored_pose(g_xy: torch.Tensor, g_yaw: torch.Tensor,
+                             a_xy: torch.Tensor, a_yaw: torch.Tensor,
+                             clamp: float) -> torch.Tensor:
+        """``A^-1 g -> [clamp(px,±R)/R, clamp(py,±R)/R, cosθ, sinθ]`` (in [-1,1]).
+        Byte-identical to env ``_obs_anchored_pose`` and
+        ``AnchoredFBCprAux._encode_anchored_pose``. ``g_*`` and ``a_*`` must be in
+        the SAME frame (here: canonical sub-traj-start frame)."""
+        d = g_xy - a_xy
+        ca, sa = torch.cos(-a_yaw), torch.sin(-a_yaw)
+        px = (ca * d[:, 0] - sa * d[:, 1]).clamp(-clamp, clamp) / clamp
+        py = (sa * d[:, 0] + ca * d[:, 1]).clamp(-clamp, clamp) / clamp
+        theta = g_yaw - a_yaw
+        return torch.stack([px, py, torch.cos(theta), torch.sin(theta)], dim=-1)
+
+    def _anchored_pose_at(self, frame_local: torch.Tensor, motion_flat: torch.Tensor,
+                          start_local: torch.Tensor | None = None) -> torch.Tensor:
+        """Encode A^-1 g for expert frames under an anchor A ~ p_A sampled from
+        the SAME mixture as the policy (prob ``alpha`` at the frame's own pose,
+        else random ±range xy / ±π yaw). Poses are first canonicalised to the
+        window's own start frame (``_canon_pose_at``), so expert and policy share
+        one frame. ``start_local`` defaults to the per-row window start; if None
+        (legacy callers) we self-zero each frame (start == frame), which reduces
+        to the old origin-invariant single-row behaviour.
+
+        Returns the anchored_pose obs ``[px, py, cosθ, sinθ]``.
+        """
+        if start_local is None:
+            start_local = frame_local
+        g_xy, g_yaw = self._canon_pose_at(frame_local, start_local, motion_flat)
+
+        # Anchor A ~ p_A relative to THIS frame's own (canonical) pose.
         N = g_xy.shape[0]
         dev = g_xy.device
         a_xy = g_xy.clone()
@@ -1293,14 +1345,7 @@ class FBCprExpertBuffer:
         rand_yaw = (torch.rand(N, device=dev) * 2 - 1) * math.pi
         a_xy = torch.where(is_rand.unsqueeze(-1), rand_xy, a_xy)
         a_yaw = torch.where(is_rand, rand_yaw, a_yaw)
-
-        d = g_xy - a_xy
-        ca, sa = torch.cos(-a_yaw), torch.sin(-a_yaw)
-        R = self._anchored_pose_clamp
-        px = (ca * d[:, 0] - sa * d[:, 1]).clamp(-R, R) / R
-        py = (sa * d[:, 0] + ca * d[:, 1]).clamp(-R, R) / R
-        theta = g_yaw - a_yaw
-        return torch.stack([px, py, torch.cos(theta), torch.sin(theta)], dim=-1)
+        return self.encode_anchored_pose(g_xy, g_yaw, a_xy, a_yaw, self._anchored_pose_clamp)
 
     @torch.no_grad()
     def sample_chunks(self, batch_size: int, num_chunks: int,
@@ -1336,18 +1381,24 @@ class FBCprExpertBuffer:
         action_flat = _move(big["action"])
         z_flat = _move(big["z"])
         term_flat = _move(big["next"]["terminated"])
+        # Raw canonical next-pose (x,y,yaw), if the anchored sample emitted it —
+        # the expert-z re-anchor needs it to rebuild anchored_pose under A_i.
+        canon_flat = _move(big["next"]["canon_pose"]) if "canon_pose" in big["next"] else None
 
         chunks: list[dict] = []
         for i in range(num_chunks):
             s = slice(i * batch_size, (i + 1) * batch_size)
+            nxt = {
+                "observation": {k: next_obs_flat[k][s] for k in obs_keys},
+                "terminated": term_flat[s],
+            }
+            if canon_flat is not None:
+                nxt["canon_pose"] = canon_flat[s]
             chunks.append({
                 "observation": {k: obs_flat[k][s] for k in obs_keys},
                 "action": action_flat[s],
                 "z": z_flat[s],
-                "next": {
-                    "observation": {k: next_obs_flat[k][s] for k in obs_keys},
-                    "terminated": term_flat[s],
-                },
+                "next": nxt,
             })
         return chunks
 

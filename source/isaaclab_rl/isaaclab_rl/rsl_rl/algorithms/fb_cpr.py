@@ -764,6 +764,10 @@ class FBCprAux:
         # Goal-encoded z's
         perm = torch.randperm(batch, device=self.device)
         shuffled = self._permute_obs(train_goal, perm)
+        # Anchoring seam (no-op base): re-anchor the shuffled goal's spatial
+        # channel to the DESTINATION row's anchor A_i so z[i] and obs_i share a
+        # frame (matching deployment). Base leaves ``shuffled`` unchanged.
+        shuffled = self._reanchor_goal_z(shuffled, perm)
         goals = self.policy._backward_map(shuffled)
         goals = self.policy.project_z(goals)
         z = torch.where(mix_idxs == 0, goals, z)
@@ -772,9 +776,22 @@ class FBCprAux:
         # can differ from main batch size.
         n_expert = expert_encodings.shape[0]
         idx = torch.randint(0, n_expert, (batch,), device=self.device)
-        expert_z = expert_encodings[idx]
+        # Anchoring seam (no-op base): re-encode the picked expert window under
+        # A_i (rebuild its anchored_pose), so the expert-seeded z is in row i's
+        # frame too. Base just gathers the precomputed expert_encodings[idx].
+        expert_z = self._reanchor_expert_z(expert_encodings, idx)
         z = torch.where(mix_idxs == 1, expert_z, z)
         return z
+
+    def _reanchor_goal_z(self, shuffled, perm):
+        """Goal-z re-anchor seam (no-op base). Returns ``shuffled`` unchanged so
+        the base goal-encoded z = B(shuffled next_obs) is byte-identical."""
+        return shuffled
+
+    def _reanchor_expert_z(self, expert_encodings, idx):
+        """Expert-z re-anchor seam (no-op base). Returns the precomputed
+        ``expert_encodings[idx]`` (vanilla expert-encoded z)."""
+        return expert_encodings[idx]
 
     @staticmethod
     def _permute_obs(
@@ -852,6 +869,13 @@ class FBCprAux:
             z_expert = self.policy.project_z(z_expert)
 
         z_expert = torch.repeat_interleave(z_expert, seq_length, dim=0)
+        # Stash window structure for the anchored expert-z re-anchor seam
+        # (no-op / unused in the base). ``_expert_next_obs_ref`` is the
+        # already-normalized expert body obs; ``_expert_T_per_seq`` the per-
+        # sub-sequence T-window; both [N_seq]-aligned with seq_length blocks.
+        self._expert_next_obs_ref = next_obs
+        self._expert_T_per_seq = T_per_seq
+        self._expert_seq_length = seq_length
         return z_expert, disc_mask
 
     @torch.no_grad()
@@ -1592,6 +1616,15 @@ class FBCprAux:
         # anchored frame — the whole objective is then anchor-equivariant.
         train_obs, train_next_obs = self._anchor_obs_preamble(
             train_batch, train_obs, train_next_obs)
+
+        # Stash the expert's RAW canonical next-pose (x,y,yaw) for the anchored
+        # expert-z re-anchor seam (base ignores it). Sits at next.canon_pose
+        # (the normalizer drops non-registered obs keys, so the buffer rides it
+        # at the top level of ``next``).
+        _ecp = expert_batch.get("next", {}).get("canon_pose", None)
+        self._expert_canon_pose = (
+            _ecp.to(self.device, non_blocking=True) if _ecp is not None else None
+        )
 
         # Encode expert → z_expert (+ disc validity mask for variable T)
         expert_z, expert_disc_mask = self.encode_expert(next_obs=expert_next_obs)

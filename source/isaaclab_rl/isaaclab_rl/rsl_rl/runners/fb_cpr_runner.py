@@ -606,20 +606,46 @@ class FBCprRunner:
                     else:
                         actions = self.policy.act(obs_dict, z_context, mean=False)
 
-                    # Anchored variant: capture the world-frame SE(2) root pose
-                    # NOW — BEFORE env.step — so it matches ``obs_dict`` (the
-                    # pre-step obs this transition stores). Reading it after the
-                    # step would store g_{t+1} glued onto the g_t obs (off-by-one),
-                    # corrupting the spatial<->body correspondence at relabel time.
+                    # Anchored variant: capture the CANONICAL (start-relative)
+                    # SE(2) root pose NOW — BEFORE env.step — so it matches
+                    # ``obs_dict`` (the pre-step obs this transition stores).
+                    # We express the world pose g_t in the env's per-episode
+                    # SPAWN frame (env._anchor_xy/_anchor_yaw, which the runner
+                    # sets to the spawn pose at every reset): g_canon =
+                    # [Rot(-s_yaw)(g_xy - s_xy), wrap(g_yaw - s_yaw)]. Storing
+                    # start-relative (instead of absolute world) keeps every
+                    # transition's pose bounded by per-episode travel (~a few m)
+                    # rather than the sim-terrain world (hundreds of m), so the
+                    # per-row anchor re-sampling and the cross-row goal-z
+                    # re-anchor (preamble) stay in a single, comparable frame
+                    # shared with the expert (which self-zeros at its sub-traj
+                    # start). Reading after the step would store g_{t+1} on the
+                    # g_t obs (off-by-one), corrupting the spatial<->body map.
                     prestep_extras = None
                     if self._store_world_pose and _robot is not None:
                         _rq0 = _robot.data.root_quat_w.to(self.device)
                         _w, _x, _y, _z = _rq0[:, 0], _rq0[:, 1], _rq0[:, 2], _rq0[:, 3]
                         _yaw0 = torch.atan2(2 * (_w * _z + _x * _y),
-                                            1 - 2 * (_y * _y + _z * _z)).unsqueeze(-1)
+                                            1 - 2 * (_y * _y + _z * _z))
+                        _g_xy = _robot.data.root_pos_w[:, :2].to(self.device)
+                        _eu = self.env_unwrapped
+                        _s_xy = getattr(_eu, "_anchor_xy", None)
+                        _s_yaw = getattr(_eu, "_anchor_yaw", None)
+                        if _s_xy is not None and _s_yaw is not None:
+                            _d = _g_xy - _s_xy
+                            _ca, _sa = torch.cos(-_s_yaw), torch.sin(-_s_yaw)
+                            _rel_x = _ca * _d[:, 0] - _sa * _d[:, 1]
+                            _rel_y = _sa * _d[:, 0] + _ca * _d[:, 1]
+                            _rel_xy = torch.stack([_rel_x, _rel_y], dim=-1)
+                            _rel_yaw = torch.atan2(torch.sin(_yaw0 - _s_yaw),
+                                                   torch.cos(_yaw0 - _s_yaw))
+                        else:
+                            # No spawn frame available — fall back to world pose.
+                            _rel_xy = _g_xy
+                            _rel_yaw = _yaw0
                         prestep_extras = {
-                            "root_xy": _robot.data.root_pos_w[:, :2].to(self.device).clone(),
-                            "root_yaw": _yaw0.clone(),
+                            "root_xy": _rel_xy.clone(),
+                            "root_yaw": _rel_yaw.unsqueeze(-1).clone(),
                         }
 
                     # Push tracking reference positions to env for debug viz.

@@ -115,6 +115,13 @@ class AnchoredFBCprAux(FBCprAux):
         gtn_yaw = nx.get("root_yaw", extras["root_yaw"]).to(dev).float().view(-1)
 
         a_xy, a_yaw = self._sample_anchor(gt_xy, gt_yaw, dev)
+        # Stash the per-row anchor A_i and the train batch's CANONICAL next-pose
+        # (g_t+1 in each row's own spawn frame) for the cross-row z re-anchor
+        # seams (_reanchor_goal_z / _reanchor_expert_z), which run later in this
+        # same update() and must express OTHER rows' goal poses in row i's frame.
+        self._row_anchor_xy = a_xy
+        self._row_anchor_yaw = a_yaw
+        self._train_next_canon = torch.cat([gtn_xy, gtn_yaw.view(-1, 1)], dim=-1)  # [B,3]
 
         def _anchored(obs_dict, g_xy, g_yaw):
             ap = self._encode_anchored_pose(g_xy, g_yaw, a_xy, a_yaw, cfg["clamp"])
@@ -123,3 +130,86 @@ class AnchoredFBCprAux(FBCprAux):
             return d
 
         return _anchored(train_obs, gt_xy, gt_yaw), _anchored(train_next_obs, gtn_xy, gtn_yaw)
+
+    # ------------------------------------------------------------------ #
+    # Cross-row z re-anchoring (fix: z's anchor must match obs's anchor)
+    # ------------------------------------------------------------------ #
+    def _reanchor_goal_z(self, shuffled, perm):
+        """Re-anchor the shuffled goal's spatial channel to the DESTINATION
+        row's anchor A_i. The goal-encoded z is z[i] = B(shuffled_body[i],
+        anchored_pose = enc(A_i^-1 g_canon[perm[i]])). Body keys stay from
+        perm[i] (the body goal); only anchored_pose is re-framed to row i, so
+        z[i] and obs_i share frame A_i (matching deployment). Needs the
+        shuffled goal's CANONICAL next-pose, recovered by inverting the anchored
+        next-obs that the preamble already wrote (anchor there was A_{perm[i]}).
+        """
+        cfg = self._anchor_cfg()
+        key = cfg["key"]
+        a_xy = getattr(self, "_row_anchor_xy", None)
+        a_yaw = getattr(self, "_row_anchor_yaw", None)
+        gcanon = getattr(self, "_train_next_canon", None)
+        if a_xy is None or gcanon is None or not isinstance(shuffled, dict):
+            return shuffled  # nothing to re-anchor (non-anchored / missing pose)
+        # g_canon[perm[i]] : canonical next-pose of the shuffled goal row.
+        g = gcanon[perm]
+        g_xy, g_yaw = g[:, :2], g[:, 2]
+        ap = self._encode_anchored_pose(g_xy, g_yaw, a_xy, a_yaw, cfg["clamp"])
+        ap = self._normalize_key(key, ap)
+        d = dict(shuffled); d[key] = ap
+        return d
+
+    def _reanchor_expert_z(self, expert_encodings, idx):
+        """Re-encode the picked expert window under the destination row's anchor
+        A_i. Expert z is a T-window mean of B, so we rebuild anchored_pose_t =
+        enc(A_i^-1 g_expert_canon_t) per frame, re-run B over the window's body
+        obs, T-window-mean, project. Falls back to the precomputed
+        expert_encodings[idx] if the canonical poses / window refs are absent.
+        """
+        cfg = self._anchor_cfg()
+        key = cfg["key"]
+        a_xy = getattr(self, "_row_anchor_xy", None)
+        a_yaw = getattr(self, "_row_anchor_yaw", None)
+        next_obs = getattr(self, "_expert_next_obs_ref", None)
+        canon = getattr(self, "_expert_canon_pose", None)
+        seq = getattr(self, "_expert_seq_length", None)
+        T_per_seq = getattr(self, "_expert_T_per_seq", None)
+        if (a_xy is None or next_obs is None or canon is None or seq is None
+                or not isinstance(next_obs, dict) or key not in next_obs):
+            return expert_encodings[idx]
+
+        B = a_xy.shape[0]
+        N_seq = canon.shape[0] // seq
+        # Map each destination row i -> a sampled expert SUB-SEQUENCE. idx is
+        # per-frame [batch]; collapse to the sub-sequence id (// seq).
+        seq_of_row = (idx // seq).clamp_(max=N_seq - 1)  # [B]
+        # Per-(row, frame-in-window) canonical expert pose, anchored under A_i.
+        # canon: [N_seq*seq, 3]; gather the chosen sub-seq's frames for each row.
+        frame_base = seq_of_row * seq                          # [B]
+        fr = torch.arange(seq, device=a_xy.device).view(1, seq)  # [1,seq]
+        gather_idx = (frame_base.view(B, 1) + fr).reshape(-1)    # [B*seq]
+        g = canon[gather_idx]                                    # [B*seq, 3]
+        # Repeat A_i across the window so each frame is anchored to row i.
+        ax = a_xy.repeat_interleave(seq, dim=0)
+        ay = a_yaw.repeat_interleave(seq, dim=0)
+        ap = self._encode_anchored_pose(g[:, :2], g[:, 2], ax, ay, cfg["clamp"])
+        ap = self._normalize_key(key, ap)
+        # Rebuild the body obs for the chosen sub-seqs, frame-aligned.
+        body = {}
+        for k, v in next_obs.items():
+            if k == key:
+                continue
+            vv = v.view(N_seq, seq, *v.shape[1:])[seq_of_row]    # [B, seq, ...]
+            body[k] = vv.reshape(B * seq, *v.shape[1:])
+        body[key] = ap
+        Bz = self.policy._backward_map(body).view(B, seq, -1)    # [B, seq, d]
+        # T-window mean (per chosen sub-seq's T), matching encode_expert.
+        if T_per_seq is not None:
+            T = T_per_seq[seq_of_row].clamp(min=1, max=seq)      # [B]
+            cumz = torch.cat([torch.zeros(B, 1, Bz.shape[-1], device=Bz.device),
+                              torch.cumsum(Bz, dim=1)], dim=1)
+            ar = torch.arange(B, device=Bz.device)
+            z_sum = cumz[ar, T]
+            z_re = z_sum / T.float().unsqueeze(-1)
+        else:
+            z_re = Bz.mean(dim=1)
+        return self.policy.project_z(z_re)
