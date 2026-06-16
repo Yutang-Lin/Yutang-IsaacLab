@@ -207,6 +207,9 @@ class FBCprRunner:
             # distribution (spatial disc must judge motion, not z-region).
             anchor_alpha_gt=float(self.alg_cfg.get("anchor_alpha_gt", 0.34)),
             anchor_random_xy_range=float(self.alg_cfg.get("anchor_random_xy_range", 10.0)),
+            # Reframe expert priv body-pose into the anchor frame (matches the
+            # env's anchor_frame_body=True). Same flag drives both sides.
+            anchor_frame_body=bool(self.alg_cfg.get("anchor_frame_body", False)),
         )
         # Forward to the env so RSI can pull from it.
         if hasattr(self.env_unwrapped, "set_expert_buffer"):
@@ -594,6 +597,14 @@ class FBCprRunner:
 
         for it in range(start_iter, tot_iter):
             start = time.time()
+            # Per-iteration global-tracking deviation accumulators (tracking
+            # envs only): sum of |robot_xy - target_xy| and |wrap(robot_yaw -
+            # target_yaw)| measured each step AFTER env.step against the global
+            # FB target that was active for that step. Logged as
+            # Track/global_xy_dev_m and Track/global_yaw_dev_deg.
+            _trk_xy_sum = 0.0
+            _trk_yaw_sum = 0.0
+            _trk_count = 0
             # ----- rollout -----
             with torch.inference_mode():
                 self.policy.eval()
@@ -658,6 +669,7 @@ class FBCprRunner:
                             env_u.set_ref_motion_keypoints(ref_pos.unsqueeze(1))
 
                     # Push global FB targets (XY + yaw) to env before step.
+                    _trk_target = None
                     if hasattr(env_u, "set_global_fb_targets"):
                         targets = self.alg.get_global_fb_targets(
                             step_count, self.expert_buffer,
@@ -667,6 +679,9 @@ class FBCprRunner:
                         if targets is not None:
                             xy, yaw, active, t_ids = targets
                             env_u.set_global_fb_targets(xy, yaw, active, tracking_env_ids=t_ids)
+                            # Stash the (world) target + active mask to score the
+                            # post-step deviation over the tracking envs.
+                            _trk_target = (xy, yaw, active)
 
                     # Push whole-body reference (heading-frame priv + joint
                     # pos/vel) for the explicit imitation aux reward.
@@ -684,6 +699,26 @@ class FBCprRunner:
                     new_obs = self._obs_to_device(new_obs, infos)
                     rewards = rewards.to(self.device)
                     dones = dones.to(self.device)
+
+                    # Global-tracking deviation (tracking envs only): robot's
+                    # post-step world pose vs the global FB target pushed for
+                    # this step. Averaged per iter into Track/global_*_dev.
+                    if _trk_target is not None and _robot is not None:
+                        _txy, _tyaw, _tactive = _trk_target
+                        _am = _tactive.bool() if _tactive is not None else None
+                        if _am is not None and bool(_am.any()):
+                            _rxy = _robot.data.root_pos_w[:, :2].to(self.device)
+                            _rq = _robot.data.root_quat_w.to(self.device)
+                            _ry = torch.atan2(
+                                2 * (_rq[:, 0] * _rq[:, 3] + _rq[:, 1] * _rq[:, 2]),
+                                1 - 2 * (_rq[:, 2] * _rq[:, 2] + _rq[:, 3] * _rq[:, 3]))
+                            _xy_dev = torch.norm(_rxy[_am] - _txy[_am], dim=-1)
+                            _yaw_dev = torch.atan2(
+                                torch.sin(_ry[_am] - _tyaw[_am]),
+                                torch.cos(_ry[_am] - _tyaw[_am])).abs()
+                            _trk_xy_sum += float(_xy_dev.sum().item())
+                            _trk_yaw_sum += float(_yaw_dev.sum().item())
+                            _trk_count += int(_am.sum().item())
 
                     aux_rewards_dict = self._extract_aux_rewards(infos)
                     # BFM: terminated excludes time_outs. Isaac Lab exposes
@@ -850,6 +885,12 @@ class FBCprRunner:
                     loss_dict[k] = float(v.mean().item()) / max(num_metrics_updates, 1)
                 total_metrics = None
                 num_metrics_updates = 0
+
+            # Per-iteration global-tracking deviation (tracking envs only).
+            if _trk_count > 0:
+                loss_dict["Track/global_xy_dev_m"] = _trk_xy_sum / _trk_count
+                loss_dict["Track/global_yaw_dev_deg"] = (
+                    _trk_yaw_sum / _trk_count) * 180.0 / math.pi
 
             # ----- tracking eval (BFM-style, prioritization feedback) -----
             # Fires every ``eval_every_steps`` env-steps once warmup is done
@@ -1356,6 +1397,9 @@ class FBCprRunner:
             # Eval
             "Eval/mpjpe_mm",
             "Eval/tracking_success",
+            # Global-tracking deviation (tracking envs)
+            "Track/global_xy_dev_m",
+            "Track/global_yaw_dev_deg",
         )
         for k in loss_keys_to_print:
             if k in loss_dict:

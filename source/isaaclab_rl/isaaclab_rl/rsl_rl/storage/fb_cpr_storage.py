@@ -472,6 +472,7 @@ class FBCprExpertBuffer:
         anchored_pose_clamp: float = 10.0,
         anchor_alpha_gt: float = 0.34,
         anchor_random_xy_range: float = 10.0,
+        anchor_frame_body: bool = False,
     ) -> None:
         """Expert motion buffer.
 
@@ -499,6 +500,10 @@ class FBCprExpertBuffer:
         self._anchored_pose_clamp = float(anchored_pose_clamp)
         self._anchor_alpha_gt = float(anchor_alpha_gt)
         self._anchor_random_xy_range = float(anchor_random_xy_range)
+        # Anchor-frame body pose: reframe the expert priv body-pose POS+ROT6D
+        # from heading frame -> sub-trajectory-start anchor frame at sample time
+        # (matches the env's anchor_frame_body=True and the algo per-row reframe).
+        self._anchor_frame_body = bool(anchor_frame_body)
 
         raw = torch.load(pt_path, weights_only=False, map_location="cpu")
         if not isinstance(raw, dict) or "motions" not in raw:
@@ -1264,6 +1269,13 @@ class FBCprExpertBuffer:
             next_obs_dict["anchored_pose"] = self._anchored_pose_at(frame_nxt, motion_flat, start_flat)
             nxy, nyaw = self._canon_pose_at(frame_nxt, start_flat, motion_flat)
             out_dict["next"]["canon_pose"] = torch.cat([nxy, nyaw.unsqueeze(-1)], dim=-1)  # [B,3]
+            # Also expose the CURRENT-frame canonical pose (sub-traj-start frame)
+            # so the preamble can reframe the (heading-frame) expert priv body
+            # block to the per-row anchor A_i. The priv itself stays heading-frame
+            # here; reframing for BOTH train and expert happens in the preamble
+            # under the same p_A, so the disc sees one consistent distribution.
+            cxy, cyaw = self._canon_pose_at(frame_cur, start_flat, motion_flat)
+            out_dict["canon_pose"] = torch.cat([cxy, cyaw.unsqueeze(-1)], dim=-1)  # [B,3]
         return out_dict
 
     def _canon_pose_at(self, frame_local: torch.Tensor, start_local: torch.Tensor,
@@ -1304,17 +1316,61 @@ class FBCprExpertBuffer:
         return rel_xy, rel_yaw
 
     @staticmethod
+    def _signed_log_unit(v: torch.Tensor, R: float, s0: float = 1.0) -> torch.Tensor:
+        """Signed-log range compression (byte-identical to
+        ``AnchoredFBCprAux._signed_log_unit`` and the env encoder)."""
+        return torch.sign(v) * torch.log1p(v.abs() / s0) / math.log1p(R / s0)
+
+    @staticmethod
+    def reframe_priv_body(priv: torch.Tensor, cr_xy: torch.Tensor,
+                          dtheta: torch.Tensor, K: int, R: float,
+                          root_height_obs: bool = True) -> torch.Tensor:
+        """Re-express the BODY-POSE block of a heading-frame ``privileged_state``
+        into an anchor frame. POS (xy) + ROT6D only; height, lin/ang vel
+        untouched. ``(cr_xy, dθ)`` is the ROOT pose in the target anchor frame
+        (cr_xy metres, dθ = root_yaw - anchor_yaw). BYTE-IDENTICAL to the env's
+        ``reframe_priv_body_anchor`` and the algo's reframer.
+
+        Layout: ``[root_h(1)? | pos((K-1)*3, pelvis dropped) | rot6d(K*6) |
+        vel(K*3) | ang(K*3)]``."""
+        out = priv.clone()
+        off = 1 if root_height_obs else 0
+        npos = (K - 1) * 3
+        nrot = K * 6
+        c = torch.cos(dtheta).unsqueeze(-1)
+        s = torch.sin(dtheta).unsqueeze(-1)
+        crx = cr_xy[:, 0:1]
+        cry = cr_xy[:, 1:2]
+        pos = out[:, off:off + npos].view(-1, K - 1, 3)
+        hx, hy = pos[..., 0], pos[..., 1]
+        rx = c * hx - s * hy + crx
+        ry = s * hx + c * hy + cry
+        pos = torch.stack(
+            [FBCprExpertBuffer._signed_log_unit(rx, R),
+             FBCprExpertBuffer._signed_log_unit(ry, R), pos[..., 2]], dim=-1)
+        out[:, off:off + npos] = pos.reshape(out.shape[0], -1)
+        rs = off + npos
+        rot = out[:, rs:rs + nrot].view(-1, K, 6).clone()
+        for base in (0, 3):
+            vx = rot[..., base + 0].clone()
+            vy = rot[..., base + 1].clone()
+            rot[..., base + 0] = c * vx - s * vy
+            rot[..., base + 1] = s * vx + c * vy
+        out[:, rs:rs + nrot] = rot.reshape(out.shape[0], -1)
+        return out
+
+    @staticmethod
     def encode_anchored_pose(g_xy: torch.Tensor, g_yaw: torch.Tensor,
                              a_xy: torch.Tensor, a_yaw: torch.Tensor,
                              clamp: float) -> torch.Tensor:
-        """``A^-1 g -> [clamp(px,±R)/R, clamp(py,±R)/R, cosθ, sinθ]`` (in [-1,1]).
-        Byte-identical to env ``_obs_anchored_pose`` and
-        ``AnchoredFBCprAux._encode_anchored_pose``. ``g_*`` and ``a_*`` must be in
-        the SAME frame (here: canonical sub-traj-start frame)."""
+        """``A^-1 g -> [signed_log(px,R), signed_log(py,R), cosθ, sinθ]`` (in
+        (-1,1)). ``clamp`` is the full-scale range R (m). Byte-identical to env
+        ``_obs_anchored_pose`` and ``AnchoredFBCprAux._encode_anchored_pose``.
+        ``g_*`` and ``a_*`` must be in the SAME frame (canonical sub-traj-start)."""
         d = g_xy - a_xy
         ca, sa = torch.cos(-a_yaw), torch.sin(-a_yaw)
-        px = (ca * d[:, 0] - sa * d[:, 1]).clamp(-clamp, clamp) / clamp
-        py = (sa * d[:, 0] + ca * d[:, 1]).clamp(-clamp, clamp) / clamp
+        px = FBCprExpertBuffer._signed_log_unit(ca * d[:, 0] - sa * d[:, 1], clamp)
+        py = FBCprExpertBuffer._signed_log_unit(sa * d[:, 0] + ca * d[:, 1], clamp)
         theta = g_yaw - a_yaw
         return torch.stack([px, py, torch.cos(theta), torch.sin(theta)], dim=-1)
 
@@ -1384,6 +1440,9 @@ class FBCprExpertBuffer:
         # Raw canonical next-pose (x,y,yaw), if the anchored sample emitted it —
         # the expert-z re-anchor needs it to rebuild anchored_pose under A_i.
         canon_flat = _move(big["next"]["canon_pose"]) if "canon_pose" in big["next"] else None
+        # Current-frame canonical pose (top level) — preamble uses it to reframe
+        # the expert priv body block to the per-row anchor A_i.
+        canon_cur_flat = _move(big["canon_pose"]) if "canon_pose" in big else None
 
         chunks: list[dict] = []
         for i in range(num_chunks):
@@ -1394,12 +1453,15 @@ class FBCprExpertBuffer:
             }
             if canon_flat is not None:
                 nxt["canon_pose"] = canon_flat[s]
-            chunks.append({
+            chunk = {
                 "observation": {k: obs_flat[k][s] for k in obs_keys},
                 "action": action_flat[s],
                 "z": z_flat[s],
                 "next": nxt,
-            })
+            }
+            if canon_cur_flat is not None:
+                chunk["canon_pose"] = canon_cur_flat[s]
+            chunks.append(chunk)
         return chunks
 
 

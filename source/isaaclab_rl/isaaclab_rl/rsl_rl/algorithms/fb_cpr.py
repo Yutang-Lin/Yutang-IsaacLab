@@ -1598,6 +1598,17 @@ class FBCprAux:
         expert_obs = self._to_device(expert_batch["observation"])
         expert_next_obs = self._to_device(expert_batch["next"]["observation"])
 
+        # Anchor-frame body-pose reframe (no-op base). Runs on the RAW priv —
+        # BEFORE the normalizer — so BN running-stats are accumulated on the
+        # reframed (anchor-frame) privileged_state, not the heading frame. The
+        # anchored subclass reframes train + expert priv body POS/ROT6D into a
+        # per-row anchor A_i (sampled here and reused by the anchored_pose
+        # preamble below), keeping B/F/critic/disc on one consistent frame.
+        train_obs, train_next_obs, expert_obs, expert_next_obs = (
+            self._anchor_priv_pre_normalize(
+                train_batch, expert_batch,
+                train_obs, train_next_obs, expert_obs, expert_next_obs))
+
         # Update obs-normalizer running stats on the train batch.
         self.policy._obs_normalizer(train_obs)
         self.policy._obs_normalizer(train_next_obs)
@@ -2178,6 +2189,16 @@ class FBCprAux:
         discriminator's log-odds reward. The anchored subclass adds a spatial
         discriminator channel."""
         return self.policy._discriminator.compute_reward(obs, z)
+
+    def _anchor_priv_pre_normalize(self, train_batch, expert_batch,
+                                   train_obs, train_next_obs,
+                                   expert_obs, expert_next_obs):
+        """Anchor-frame body-pose reframe (no-op base). Runs on RAW priv before
+        the normalizer. The anchored subclass reframes train + expert
+        ``privileged_state`` body POS/ROT6D into a per-row anchor A_i. Returns
+        the (possibly reframed) ``(train_obs, train_next_obs, expert_obs,
+        expert_next_obs)`` unchanged in the base."""
+        return train_obs, train_next_obs, expert_obs, expert_next_obs
 
     def _anchor_obs_preamble(self, train_batch, train_obs, train_next_obs):
         """Anchoring preamble (no-op base). Runs BEFORE z is built. The anchored
