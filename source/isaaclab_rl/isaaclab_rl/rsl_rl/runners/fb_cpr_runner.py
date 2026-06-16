@@ -15,7 +15,10 @@ from __future__ import annotations
 
 import math
 import os
+import shutil
 import statistics
+import subprocess
+import threading
 import time
 from collections import deque
 from typing import Any, Dict
@@ -241,6 +244,26 @@ class FBCprRunner:
         self.num_agent_updates = int(self.alg_cfg.get("num_agent_updates", 16))
         self.update_agent_every = int(self.alg_cfg.get("update_agent_every", 1024))
         self.save_interval = int(self.cfg.get("save_interval", 50))
+
+        # --- Async S3 checkpoint mirror ------------------------------- #
+        # If set, every light checkpoint is uploaded (head rank only) to this
+        # S3 prefix in a BACKGROUND daemon thread — non-blocking, training
+        # never waits on the network and never crashes on upload failure. We
+        # maintain ONE rolling object (overwrite the same key each time) so S3
+        # holds the latest checkpoint, not a growing pile. Configurable via
+        #   cfg.s3_ckpt_uri  = "s3://bucket/prefix"   (None/"" disables)
+        #   cfg.s3_ckpt_name = "model_latest.pt"      (the single rolling key)
+        #   cfg.s3_profile   = "default"              (aws --profile)
+        # Env override: BFM_S3_CKPT_URI takes precedence over the cfg value.
+        self.s3_ckpt_uri = str(
+            os.environ.get("BFM_S3_CKPT_URI", self.cfg.get("s3_ckpt_uri", "")) or "").rstrip("/")
+        self.s3_ckpt_name = str(self.cfg.get("s3_ckpt_name", "model_latest.pt"))
+        self.s3_profile = str(self.cfg.get("s3_profile", "default"))
+        self._s3_thread: threading.Thread | None = None
+        if self.s3_ckpt_uri and shutil.which("aws") is None:
+            print("[FBCprRunner] WARN: s3_ckpt_uri set but 'aws' CLI not found — "
+                  "S3 checkpoint mirroring disabled.", flush=True)
+            self.s3_ckpt_uri = ""
 
         # --- Tracking-eval schedule (BFM-style) ---------------------- #
         # ``eval_every_steps``: env-step interval between evals (0 = off).
@@ -935,6 +958,9 @@ class FBCprRunner:
                     n_between = int(self.alg_cfg.get("save_replay_every_n", 10))
                     save_replay = n_between > 0 and ((it // self.save_interval) % n_between == 0)
                     self.save(save_iter_path, save_replay=save_replay)
+                    # Mirror the light checkpoint to S3 in the background
+                    # (rolling single object). No-op if s3_ckpt_uri unset.
+                    self._mirror_checkpoint_to_s3(save_iter_path)
                     # Ring-buffer pruning: keep only the last
                     # ``keep_last_n_checkpoints`` model_<iter>.pt files (and
                     # their optional .replay.pt siblings). Each light ckpt
@@ -954,10 +980,18 @@ class FBCprRunner:
         if self._is_head and self.log_dir is not None:
             # Final save: always include replay so the next resume can
             # warm-start without rebuilding the buffer from scratch.
-            self.save(
-                os.path.join(self.log_dir, f"model_{self.current_learning_iteration}.pt"),
-                save_replay=True,
-            )
+            final_path = os.path.join(
+                self.log_dir, f"model_{self.current_learning_iteration}.pt")
+            self.save(final_path, save_replay=True)
+            # Final S3 mirror. Wait for any in-flight upload to finish first so
+            # this last checkpoint isn't skipped, then BLOCK on it (bounded) so
+            # the process doesn't exit mid-upload.
+            if self.s3_ckpt_uri:
+                if self._s3_thread is not None and self._s3_thread.is_alive():
+                    self._s3_thread.join(timeout=600)
+                self._mirror_checkpoint_to_s3(final_path)
+                if self._s3_thread is not None:
+                    self._s3_thread.join(timeout=600)
 
     # --- tracking eval --------------------------------------------------- #
 
@@ -1485,6 +1519,57 @@ class FBCprRunner:
                 except OSError as e:
                     print(f"[FBCprRunner] WARN: could not remove {replay_p}: {e}",
                           flush=True)
+
+    def _mirror_checkpoint_to_s3(self, local_path: str) -> None:
+        """Upload ``local_path`` to the configured S3 prefix in a BACKGROUND
+        daemon thread, maintaining ONE rolling object (``s3_ckpt_name``). The
+        file is COPIED to a temp path first so the in-flight upload is immune to
+        the checkpoint being pruned/overwritten by later iters. Non-blocking;
+        upload failures are logged, never raised. If a previous upload is still
+        running, this one is skipped (the next save will catch up) so threads
+        don't pile up on a slow link.
+        """
+        if not self.s3_ckpt_uri or not self._is_head:
+            return
+        if self._s3_thread is not None and self._s3_thread.is_alive():
+            print("[FBCprRunner] S3 mirror: previous upload still running — "
+                  f"skipping {os.path.basename(local_path)} (will catch up next save).",
+                  flush=True)
+            return
+        if not os.path.exists(local_path):
+            return
+        # Snapshot the file so the upload is decoupled from disk churn.
+        staged = local_path + ".s3upload.tmp"
+        try:
+            shutil.copy2(local_path, staged)
+        except Exception as e:  # pragma: no cover - defensive
+            print(f"[FBCprRunner] WARN: S3 mirror stage copy failed: {e}", flush=True)
+            return
+        dest = f"{self.s3_ckpt_uri}/{self.s3_ckpt_name}"
+        profile = self.s3_profile
+
+        def _worker():
+            t0 = time.time()
+            try:
+                subprocess.run(
+                    ["aws", "s3", "cp", staged, dest, "--profile", profile],
+                    check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                )
+                print(f"[FBCprRunner] S3 mirror: uploaded -> {dest} "
+                      f"({time.time() - t0:.1f}s)", flush=True)
+            except subprocess.CalledProcessError as e:
+                err = (e.stderr or b"").decode(errors="replace")[-400:]
+                print(f"[FBCprRunner] WARN: S3 mirror upload failed: {err}", flush=True)
+            except Exception as e:  # pragma: no cover - defensive
+                print(f"[FBCprRunner] WARN: S3 mirror upload error: {e}", flush=True)
+            finally:
+                try:
+                    os.remove(staged)
+                except OSError:
+                    pass
+
+        self._s3_thread = threading.Thread(target=_worker, name="s3-ckpt-mirror", daemon=True)
+        self._s3_thread.start()
 
     def load(
         self,
