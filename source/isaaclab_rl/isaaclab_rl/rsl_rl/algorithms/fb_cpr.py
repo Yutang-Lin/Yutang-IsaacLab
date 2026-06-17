@@ -98,6 +98,12 @@ class FBCprAuxAlgorithmCfg:
     # origin/+x (shared world frame). For isolating whether plain world-frame
     # tracking works without the anchoring machinery.
     anchor_disable: bool = False
+    # Reset EVERY resampled tracking env (not just terrain-tied) to the new
+    # motion's RSI frame on a mid-episode tracking resample. Needed under
+    # origin-spawn / no-anchor: the robot drifts from origin within a window but
+    # the new origin-anchored tracking-z assumes it's at the motion's frame-0,
+    # so without a reset the z goal frame and the robot pose jump-mismatch.
+    reset_tracking_on_resample: bool = False
     anchor_beta_gh: float = 0.33             # p(anchor = g_h); rest -> random
     anchor_random_xy_range: float = 10.0     # random anchor xy ± around g_t
     # Two-frame rollout anchor: per tracking window, sample ONE offset A_anchor
@@ -1085,16 +1091,28 @@ class FBCprAux:
             terrain_z_fn=terrain_z_fn,
             batch=batch,
         )
-        # Return terrain env indices for caller to reset.
+        # Return env indices for the caller to RSI-reset to the new motion's
+        # frame. Normally ONLY terrain-tied motions need a reset (flat motions
+        # keep their current physical pose and just swap z). But under
+        # ``reset_tracking_on_resample`` we reset EVERY resampled tracking env so
+        # the new tracking-z window starts from a clean RSI pose — required for
+        # the no-anchor / origin-spawn setup, where the robot has DRIFTED from
+        # origin mid-episode but the new origin-anchored z assumes it's back at
+        # the motion's frame-0. Without the reset the new z's goal frame and the
+        # robot's actual pose would be discontinuously mismatched.
         rt = self._tracking_requires_terrain
-        if rt is not None and rt.any():
+        reset_all = bool(getattr(self.cfg, "reset_tracking_on_resample", False))
+        if reset_all:
+            mask = torch.ones_like(self._tracking_env_idx, dtype=torch.bool)
+        elif rt is not None and rt.any():
             mask = rt
-            return {
-                "env_ids": self._tracking_env_idx[mask],
-                "motion_ids": self._tracking_motion_ids[mask],
-                "starts": self._tracking_starts[mask],
-            }
-        return None
+        else:
+            return None
+        return {
+            "env_ids": self._tracking_env_idx[mask],
+            "motion_ids": self._tracking_motion_ids[mask],
+            "starts": self._tracking_starts[mask],
+        }
 
     def update_tracking_pose_after_reset(
         self,

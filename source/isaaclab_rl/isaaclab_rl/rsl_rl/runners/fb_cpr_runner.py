@@ -1465,6 +1465,15 @@ class FBCprRunner:
         jv_usd = torch.zeros_like(jp_usd)
         jp_usd[:, joint_order_t] = jp_canon
         jv_usd[:, joint_order_t] = jv_canon
+        # No-anchor / origin-spawn: force the RSI root to world origin (XY=0)
+        # facing +x, keeping the motion's joint pose + z. This matches the env's
+        # spawn_at_origin reset so a mid-episode tracking resample restarts the
+        # new motion's z window from the SAME canonical origin frame the z was
+        # encoded in (anchor pinned at origin). Velocities zeroed (start at rest).
+        if bool(getattr(eu.cfg, "spawn_at_origin", False)):
+            rp = rp.clone(); rp[:, :2] = 0.0
+            rq = torch.zeros_like(rq); rq[:, 0] = 1.0
+            rlv = torch.zeros_like(rlv); rav = torch.zeros_like(rav)
         eu.robot.write_joint_position_to_sim(jp_usd, env_ids=env_ids)
         eu.robot.write_joint_velocity_to_sim(jv_usd, env_ids=env_ids)
         eu.robot.write_root_pose_to_sim(
