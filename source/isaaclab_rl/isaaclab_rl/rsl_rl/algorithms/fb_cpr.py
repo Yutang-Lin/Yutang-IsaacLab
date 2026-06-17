@@ -88,6 +88,17 @@ class FBCprAuxAlgorithmCfg:
     anchor_frame_body: bool = False
     anchor_beta_gh: float = 0.33             # p(anchor = g_h); rest -> random
     anchor_random_xy_range: float = 10.0     # random anchor xy ± around g_t
+    # Tracking-rollout knobs — MUST be declared here (FBCprAuxAlgorithmCfg is the
+    # anchored runner's _ALGO_CFG_CLS). Read via getattr(self.cfg, ...) in
+    # _resample_tracking, so if undeclared the runner's hasattr-filter drops the
+    # cfg's set value and the DEFAULT silently applies. (This bit
+    # global_fb_zero_prob=1.0 -> ran at 0.5, and terrain_variant_root_h_prob.)
+    global_fb_zero_prob: float = 0.5         # p(tracking env's global-FB obs zeroed)
+    terrain_variant_root_h_prob: float = 0.0  # p(use absolute root_h variant); 0 for BFM-One
+    # Keypoint list — declared so it survives the runner's hasattr-filter into
+    # self.cfg (object-read by _priv_K's fallback). Primary K derivation is from
+    # the priv dim, but keep this consistent to avoid the silent-drop footgun.
+    expert_keypoint_names: list | None = None
     # (anchor KL/Q consistency penalties removed — invariance comes from FB TD
     # over anchor-relabeled transitions, not an explicit loss.)
     spatial_cpr_coeff: float = 1.0           # weight of spatial CPR reward vs local
@@ -960,7 +971,7 @@ class FBCprAux:
         self._tracking_env_idx = torch.randint(0, n_envs, (n_elem,), device=self.device)
         traj_len = self.cfg.rollout_expert_trajectories_length
         # Decide global root_h flag BEFORE z encoding.
-        grh_prob = getattr(self.cfg, "terrain_variant_root_h_prob", 0.25)
+        grh_prob = getattr(self.cfg, "terrain_variant_root_h_prob", 0.0)
         use_global = torch.rand(n_elem, device=self.device) < grh_prob
         global_rh = torch.zeros(n_envs, dtype=torch.bool, device=self.device)
         global_rh[self._tracking_env_idx] = use_global

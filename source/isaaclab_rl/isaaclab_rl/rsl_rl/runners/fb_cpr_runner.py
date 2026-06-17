@@ -620,11 +620,12 @@ class FBCprRunner:
 
         for it in range(start_iter, tot_iter):
             start = time.time()
-            # Per-iteration global-tracking deviation accumulators (tracking
-            # envs only): sum of |robot_xy - target_xy| and |wrap(robot_yaw -
-            # target_yaw)| measured each step AFTER env.step against the global
-            # FB target that was active for that step. Logged as
-            # Track/global_xy_dev_m and Track/global_yaw_dev_deg.
+            # Per-iteration anchored-goal-following accumulators (tracking envs):
+            # sum of |robot_xy - ref_xy| and |wrap(robot_yaw - ref_yaw)| each
+            # step AFTER env.step, where ref_* is the reference motion's
+            # intrinsic world pose (the anchored global goal). Mean -> Track/
+            # global_xy_dev_m, Track/global_yaw_dev_deg. Masked by the tracking-
+            # env set (NOT the legacy global-FB-visible flag).
             _trk_xy_sum = 0.0
             _trk_yaw_sum = 0.0
             _trk_count = 0
@@ -702,9 +703,20 @@ class FBCprRunner:
                         if targets is not None:
                             xy, yaw, active, t_ids = targets
                             env_u.set_global_fb_targets(xy, yaw, active, tracking_env_ids=t_ids)
-                            # Stash the (world) target + active mask to score the
-                            # post-step deviation over the tracking envs.
-                            _trk_target = (xy, yaw, active)
+                            # Stash the (world) ref-path target + the TRACKING-env
+                            # mask to score post-step deviation. NOTE: we mask by
+                            # the tracking-env set (t_ids), NOT the ``active``
+                            # (global-FB-visible) flag — ``active`` only controls
+                            # legacy obs visibility and is mostly off under
+                            # global_fb_zero_prob=1.0. ``xy/yaw`` is the
+                            # reference motion's intrinsic world pose (heading-
+                            # rotated + spawn-offset), i.e. exactly the anchored
+                            # global goal the robot should be following.
+                            _trk_mask = torch.zeros(
+                                self.env.num_envs, dtype=torch.bool, device=self.device)
+                            if t_ids is not None and t_ids.numel() > 0:
+                                _trk_mask[t_ids] = True
+                            _trk_target = (xy, yaw, _trk_mask)
 
                     # Push whole-body reference (heading-frame priv + joint
                     # pos/vel) for the explicit imitation aux reward.
@@ -723,9 +735,12 @@ class FBCprRunner:
                     rewards = rewards.to(self.device)
                     dones = dones.to(self.device)
 
-                    # Global-tracking deviation (tracking envs only): robot's
-                    # post-step world pose vs the global FB target pushed for
-                    # this step. Averaged per iter into Track/global_*_dev.
+                    # Anchored-goal-following deviation (tracking envs): robot's
+                    # post-step world pose vs the REFERENCE motion's intrinsic
+                    # world pose at this step (the anchored global goal). Mean
+                    # per iter -> Track/global_xy_dev_m, Track/global_yaw_dev_deg.
+                    # This is what the anchored policy should track: does the
+                    # robot follow the reference's global path?
                     if _trk_target is not None and _robot is not None:
                         _txy, _tyaw, _tactive = _trk_target
                         _am = _tactive.bool() if _tactive is not None else None
