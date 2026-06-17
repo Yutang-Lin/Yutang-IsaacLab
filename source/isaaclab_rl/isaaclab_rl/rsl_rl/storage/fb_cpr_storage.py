@@ -484,6 +484,7 @@ class FBCprExpertBuffer:
         anchor_alpha_gt: float = 0.34,
         anchor_random_xy_range: float = 10.0,
         anchor_frame_body: bool = False,
+        priv_include_heading_body: bool = False,
     ) -> None:
         """Expert motion buffer.
 
@@ -515,6 +516,11 @@ class FBCprExpertBuffer:
         # from heading frame -> sub-trajectory-start anchor frame at sample time
         # (matches the env's anchor_frame_body=True and the algo per-row reframe).
         self._anchor_frame_body = bool(anchor_frame_body)
+        # Append a heading-frame body (pos+rot6d) tail to composed priv so the
+        # expert priv layout matches the env's _obs_max_local_self(
+        # include_heading_body=True). MUST agree with the env or B sees a
+        # layout mismatch between expert and rollout priv.
+        self._priv_include_heading_body = bool(priv_include_heading_body)
 
         raw = torch.load(pt_path, weights_only=False, map_location="cpu")
         if not isinstance(raw, dict) or "motions" not in raw:
@@ -770,6 +776,7 @@ class FBCprExpertBuffer:
                         all_motions[name]["terrain_z"]
                         if "terrain_z" in all_motions[name] else None
                     ),
+                    include_heading_body=self._priv_include_heading_body,
                 )
                 if m is None:
                     raise RuntimeError(

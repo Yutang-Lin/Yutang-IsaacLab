@@ -86,6 +86,18 @@ class FBCprAuxAlgorithmCfg:
     # cfg keys for which hasattr(cfg, k) is True, so an undeclared flag is
     # silently dropped and the feature never activates.
     anchor_frame_body: bool = False
+    # Append a heading-frame body (pos+rot6d) tail to privileged_state so B/F/
+    # critic/disc see anchor-INVARIANT local shape alongside the anchor-framed
+    # (global-position) leading block. Drives both the env obs term and the
+    # expert buffer compose; layout becomes 24K-5. Declared here so the runner's
+    # hasattr-filter forwards it to the buffer.
+    priv_include_heading_body: bool = False
+    # No-anchor control: pin all anchors at the world origin (no per-row relabel,
+    # no equivariance augmentation). anchored_pose == true world pose; priv body
+    # reframe to origin is a no-op. Requires the env to spawn all robots at
+    # origin/+x (shared world frame). For isolating whether plain world-frame
+    # tracking works without the anchoring machinery.
+    anchor_disable: bool = False
     anchor_beta_gh: float = 0.33             # p(anchor = g_h); rest -> random
     anchor_random_xy_range: float = 10.0     # random anchor xy ± around g_t
     # Two-frame rollout anchor: per tracking window, sample ONE offset A_anchor
@@ -1034,6 +1046,11 @@ class FBCprAux:
         a_alpha = float(getattr(self.cfg, "anchor_alpha_gt", 0.34))
         a_range = float(getattr(self.cfg, "rollout_anchor_xy_range",
                                 getattr(self.cfg, "anchor_random_xy_range", 0.0)))
+        # No-anchor control: never displace the rollout anchor (A_anchor=0), so
+        # tracking-z stays spawn(=origin)-anchored and the robot tracks the
+        # reference's intrinsic world path directly from origin/+x.
+        if bool(getattr(self.cfg, "anchor_disable", False)):
+            a_alpha, a_range = 1.0, 0.0
         is_zero = torch.rand(n_elem, device=self.device) < a_alpha
         aA_xy = (torch.rand(n_elem, 2, device=self.device) * 2 - 1) * a_range
         aA_yaw = (torch.rand(n_elem, device=self.device) * 2 - 1) * math.pi

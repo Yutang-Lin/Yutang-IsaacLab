@@ -87,7 +87,19 @@ class AnchoredFBCprAux(FBCprAux):
 
     def _sample_anchor(self, gt_xy, gt_yaw, dev):
         """Per-row anchor A ~ p_A: prob ``alpha`` at the current pose g_t (so
-        A^-1 g_t ~ 0), else random around g_t (±range xy, ±π yaw)."""
+        A^-1 g_t ~ 0), else random around g_t (±range xy, ±π yaw).
+
+        ``anchor_disable``: pin every anchor at the WORLD ORIGIN (0,0,0) — no
+        relabel, no equivariance augmentation. anchored_pose then equals the
+        robot's true world pose g_t, and the priv body reframe to origin is a
+        no-op (world == anchor frame). Used by the no-anchor control task to
+        test whether plain world-frame tracking works without the anchoring
+        machinery. Requires the env to spawn all robots at origin/+x so the
+        world frame is a shared canonical frame.
+        """
+        if bool(getattr(self.cfg, "anchor_disable", False)):
+            B = gt_xy.shape[0]
+            return (torch.zeros(B, 2, device=dev), torch.zeros(B, device=dev))
         cfg = self._anchor_cfg()
         B = gt_xy.shape[0]
         a_xy = gt_xy.clone()
@@ -241,7 +253,14 @@ class AnchoredFBCprAux(FBCprAux):
         K = None
         if priv is not None:
             dim = int(priv.shape[-1])
-            if (dim + 2) % 15 == 0:
+            # Layout A (no heading-body tail): 1 + (K-1)*3 + K*6 + K*3 + K*3 = 15K-2.
+            # Layout B (with appended heading pos+rot6d tail): 15K-2 + (K-1)*3 +
+            # K*6 = 24K-5. Disambiguate by integer divisibility; prefer the
+            # larger-layout match when both could fit a plausible K (they don't
+            # collide for the layouts we use, but check B first to be safe).
+            if (dim + 5) % 24 == 0:
+                K = (dim + 5) // 24
+            elif (dim + 2) % 15 == 0:
                 K = (dim + 2) // 15
         if K is None:
             names = getattr(self.cfg, "expert_keypoint_names", None)

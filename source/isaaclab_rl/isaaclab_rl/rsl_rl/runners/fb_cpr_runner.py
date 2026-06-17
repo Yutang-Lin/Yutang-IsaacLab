@@ -213,6 +213,11 @@ class FBCprRunner:
             # Reframe expert priv body-pose into the anchor frame (matches the
             # env's anchor_frame_body=True). Same flag drives both sides.
             anchor_frame_body=bool(self.alg_cfg.get("anchor_frame_body", False)),
+            # Append a heading-frame body tail to composed priv (matches the
+            # env's _obs_max_local_self include_heading_body=True). Same flag
+            # drives env + expert so the priv layout (24K-5) agrees.
+            priv_include_heading_body=bool(
+                self.alg_cfg.get("priv_include_heading_body", False)),
         )
         # Forward to the env so RSI can pull from it.
         if hasattr(self.env_unwrapped, "set_expert_buffer"):
