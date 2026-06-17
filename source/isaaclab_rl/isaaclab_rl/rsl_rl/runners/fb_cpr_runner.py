@@ -245,6 +245,19 @@ class FBCprRunner:
         self.update_agent_every = int(self.alg_cfg.get("update_agent_every", 1024))
         self.save_interval = int(self.cfg.get("save_interval", 50))
 
+        # --- Per-env exploration-std gradient (BEHAVIOR only) ----------
+        # Each env rolls out with its own exploration std, drawn per episode
+        # uniformly in [explore_std_min, explore_std_max], giving the replay a
+        # gradient of exploration scales (better (s,a) coverage -> easier actor
+        # extraction). The TD target / actor objective still use the FIXED
+        # cfg.actor_std, so Q fits a single well-defined policy (the per-env std
+        # only diversifies data collection, not the value target). Disabled
+        # (falls back to scalar actor_std) when min==max or the knobs are unset.
+        self.explore_std_min = float(self.alg_cfg.get("explore_std_min", 0.0))
+        self.explore_std_max = float(self.alg_cfg.get("explore_std_max", 0.0))
+        self._use_explore_std_grad = self.explore_std_max > self.explore_std_min > 0.0
+        self._explore_std: torch.Tensor | None = None
+
         # --- Async S3 checkpoint mirror ------------------------------- #
         # If set, every light checkpoint is uploaded (head rank only) to this
         # S3 prefix in a BACKGROUND daemon thread — non-blocking, training
@@ -471,6 +484,12 @@ class FBCprRunner:
                 setattr(cfg, k, v)
         return cfg
 
+    def _sample_explore_std(self, n: int) -> torch.Tensor:
+        """``n`` per-env exploration stds, uniform in [explore_std_min,
+        explore_std_max]. Behavior-policy only; the TD target uses actor_std."""
+        lo, hi = self.explore_std_min, self.explore_std_max
+        return torch.rand(n, device=self.device) * (hi - lo) + lo
+
     # --- training loop ------------------------------------------------- #
 
     def learn(self, num_learning_iterations: int, init_at_random_ep_len: bool = False):
@@ -533,6 +552,11 @@ class FBCprRunner:
             self.env_unwrapped.set_anchor(
                 _robot.data.root_pos_w[:, :2].to(self.device), yaw0, env_ids=None,
             )
+
+        # Per-env exploration std: init all envs with a fresh draw in
+        # [explore_std_min, explore_std_max]. Resampled per episode on done.
+        if self._use_explore_std_grad:
+            self._explore_std = self._sample_explore_std(self.env.num_envs)
 
         rewbuffer: deque[float] = deque(maxlen=500)
         lenbuffer: deque[float] = deque(maxlen=500)
@@ -639,7 +663,9 @@ class FBCprRunner:
                             self.env.num_envs, self.action_dim, device=self.device
                         ).uniform_(-1.0, 1.0)
                     else:
-                        actions = self.policy.act(obs_dict, z_context, mean=False)
+                        actions = self.policy.act(
+                            obs_dict, z_context, mean=False,
+                            std=self._explore_std if self._use_explore_std_grad else None)
 
                     # Anchored variant: capture the CANONICAL (start-relative)
                     # SE(2) root pose NOW — BEFORE env.step — so it matches
@@ -821,6 +847,14 @@ class FBCprRunner:
                     # Update per-env step_count (reset on done).
                     step_count = step_count + 1
                     step_count = torch.where(dones.bool(), torch.zeros_like(step_count), step_count)
+
+                    # Resample per-env exploration std for envs that just reset,
+                    # so each new episode draws a fresh std in [min, max].
+                    if self._use_explore_std_grad and self._explore_std is not None:
+                        _dmask = dones.bool()
+                        if bool(_dmask.any()):
+                            n_d = int(_dmask.sum().item())
+                            self._explore_std[_dmask] = self._sample_explore_std(n_d)
 
                     # Anchored variant: (re)set the per-episode SE(2) anchor A
                     # for envs that just reset, to their fresh spawn pose, so

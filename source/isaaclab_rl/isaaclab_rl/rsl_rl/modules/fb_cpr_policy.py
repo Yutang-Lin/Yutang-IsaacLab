@@ -795,7 +795,14 @@ class Actor(nn.Module):
             return SquashedNormal(mu_raw, std_tensor)
         else:
             mu = torch.tanh(out)
-            std_tensor = torch.ones_like(mu) * std
+            if torch.is_tensor(std):
+                # Per-env std: accept [N] or [N,1], broadcast over action dims.
+                s = std.to(mu.device, mu.dtype)
+                if s.dim() == 1:
+                    s = s.unsqueeze(-1)
+                std_tensor = torch.ones_like(mu) * s
+            else:
+                std_tensor = torch.ones_like(mu) * std
             return TruncatedNormal(mu, std_tensor)
 
 
@@ -1374,8 +1381,14 @@ class FBCprAuxPolicy(nn.Module):
         obs: torch.Tensor | dict[str, torch.Tensor],
         z: torch.Tensor,
         mean: bool = True,
+        std: "float | torch.Tensor | None" = None,
     ) -> torch.Tensor:
-        dist = self.actor(obs, z, self.actor_std)
+        # ``std`` overrides the scalar ``self.actor_std`` for exploration. A
+        # per-env tensor (shape [N] or [N,1]) broadcasts against the action mean
+        # so each env can roll out with its own exploration scale. mean=True
+        # (deterministic) ignores std.
+        act_std = self.actor_std if std is None else std
+        dist = self.actor(obs, z, act_std)
         if mean:
             return dist.mean.float()
         return dist.sample().float()

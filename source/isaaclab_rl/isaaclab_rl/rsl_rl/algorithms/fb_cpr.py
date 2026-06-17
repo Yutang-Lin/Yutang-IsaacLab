@@ -99,6 +99,11 @@ class FBCprAuxAlgorithmCfg:
     # self.cfg (object-read by _priv_K's fallback). Primary K derivation is from
     # the priv dim, but keep this consistent to avoid the silent-drop footgun.
     expert_keypoint_names: list | None = None
+    # Per-env exploration-std gradient (BEHAVIOR policy only; TD target uses
+    # actor_std). Each env draws a fresh std in [min, max] per episode for
+    # broader (s,a) coverage. Disabled when max<=min (falls back to actor_std).
+    explore_std_min: float = 0.0
+    explore_std_max: float = 0.0
     # (anchor KL/Q consistency penalties removed — invariance comes from FB TD
     # over anchor-relabeled transitions, not an explicit loss.)
     spatial_cpr_coeff: float = 1.0           # weight of spatial CPR reward vs local
