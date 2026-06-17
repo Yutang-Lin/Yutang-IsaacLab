@@ -95,6 +95,14 @@ class FBCprAuxAlgorithmCfg:
     # the spatial goal so the actor practices reaching far targets (fills the
     # displaced-goal coverage hole). Defaults to anchor_random_xy_range if unset.
     rollout_anchor_xy_range: float = 0.0
+    # Goal-z displaced practice (update-time): for this fraction of goal-z rows,
+    # replace the (travel-bounded) goal displacement with a FRESH wide random
+    # draw (uniform ±goal_z_displace_xy_range xy, ±π yaw), applied coherently to
+    # BOTH anchored_pose and the priv body. Decouples far-reaching actor practice
+    # from current rollout coverage (fixes the self-reinforcing drift trap). 0 =
+    # off (goal displacement = real cross-row travel only).
+    goal_z_displace_prob: float = 0.0
+    goal_z_displace_xy_range: float = 0.0    # defaults to rollout_anchor_xy_range
     # Tracking-rollout knobs — MUST be declared here (FBCprAuxAlgorithmCfg is the
     # anchored runner's _ALGO_CFG_CLS). Read via getattr(self.cfg, ...) in
     # _resample_tracking, so if undeclared the runner's hasattr-filter drops the

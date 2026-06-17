@@ -116,6 +116,10 @@ class AnchoredFBCprAux(FBCprAux):
         """
         cfg = self._anchor_cfg()
         dev = self.device
+        # Reset per-update raw-priv stashes (the goal/expert-z frame-consistency
+        # seams read these; stale values across updates would corrupt the reframe).
+        self._raw_train_next_priv = None
+        self._raw_expert_next_priv = None
         extras = train_batch.get("extras", None)
         if extras is None or "root_xy" not in extras:
             self._row_anchor_xy = None  # signal: no anchoring this update
@@ -161,6 +165,17 @@ class AnchoredFBCprAux(FBCprAux):
                 obs_dict["privileged_state"], cr, dth, K, R, True)
             return d
 
+        # Stash the RAW (heading-frame, pre-reframe, pre-normalize) train-next
+        # priv body block + K/R so the goal-z re-anchor seam can rebuild the body
+        # block in row i's anchor A_i. reframe_priv_body's signed-log compression
+        # is NON-LINEAR, so re-anchoring an already-reframed priv is impossible —
+        # the seam MUST start from raw heading-frame priv. (Bug fix: goal-z was
+        # feeding B a frame-INCONSISTENT (body in A_perm[i], anchored_pose in A_i)
+        # pair; eval builds a consistent pair, so the actor trained off-manifold.)
+        self._raw_train_next_priv = train_next_obs.get("privileged_state")
+        self._anchor_priv_K = K
+        self._anchor_priv_R = R
+
         train_obs = _reframe(train_obs, gt_xy, gt_yaw)
         train_next_obs = _reframe(train_next_obs, gtn_xy, gtn_yaw)
 
@@ -177,6 +192,10 @@ class AnchoredFBCprAux(FBCprAux):
         if ecp is not None:
             ecp = ecp.to(dev).float()
             e_xy, e_yaw = ecp[:, :2], ecp[:, 2]
+            # Stash RAW heading-frame expert-next priv (pre-reframe) so the
+            # expert-z re-anchor seam can rebuild the body block under row i's
+            # anchor A_i (same frame-consistency fix as the goal-z path).
+            self._raw_expert_next_priv = expert_next_obs.get("privileged_state")
             # ONE random anchor A_e per expert row, shared by cur+next frames.
             ea_xy, ea_yaw = self._sample_anchor(e_xy, e_yaw, dev)
 
@@ -292,12 +311,61 @@ class AnchoredFBCprAux(FBCprAux):
         gcanon = getattr(self, "_train_next_canon", None)
         if a_xy is None or gcanon is None or not isinstance(shuffled, dict):
             return shuffled  # nothing to re-anchor (non-anchored / missing pose)
+        R = cfg["clamp"]
+        dev = a_xy.device
         # g_canon[perm[i]] : canonical next-pose of the shuffled goal row.
         g = gcanon[perm]
         g_xy, g_yaw = g[:, :2], g[:, 2]
-        ap = self._encode_anchored_pose(g_xy, g_yaw, a_xy, a_yaw, cfg["clamp"])
+        # cr = goal expressed in row i's anchor A_i (the displacement the actor
+        # must walk); dth = goal heading in A_i. This is exactly what both
+        # anchored_pose AND the priv body reframe consume, so deriving them from
+        # ONE (cr, dth) guarantees the frame-coherent (body, pose) pair the eval
+        # path (_build_goal_z) uses.
+        dd = g_xy - a_xy
+        ca, sa = torch.cos(-a_yaw), torch.sin(-a_yaw)
+        cr = torch.stack([ca * dd[:, 0] - sa * dd[:, 1],
+                          sa * dd[:, 0] + ca * dd[:, 1]], dim=-1)
+        dth = torch.atan2(torch.sin(g_yaw - a_yaw), torch.cos(g_yaw - a_yaw))
+
+        # Bug-2 fix (travel-gated displaced practice): the real cr above is
+        # bounded by how far the policy travels from spawn, so a drifting policy
+        # never trains the actor on FAR goals. For a fraction of goal-z rows,
+        # replace cr/dth with a FRESH wide random displacement (uniform ±range
+        # xy, ±π yaw) so the actor gets far-reaching practice independent of
+        # current rollout coverage. Off by default (prob 0). Applied to BOTH
+        # channels so the (body, pose) pair stays coherent.
+        # Only displace when the priv body can follow (anchor_frame_body); else
+        # anchored_pose and the (un-reframable) body block would disagree.
+        disp_prob = float(getattr(self.cfg, "goal_z_displace_prob", 0.0))
+        if disp_prob > 0.0 and bool(getattr(self.cfg, "anchor_frame_body", False)) \
+                and getattr(self, "_raw_train_next_priv", None) is not None:
+            disp_range = float(getattr(self.cfg, "goal_z_displace_xy_range",
+                                       getattr(self.cfg, "rollout_anchor_xy_range", 0.0)))
+            B = cr.shape[0]
+            use_rand = torch.rand(B, device=dev) < disp_prob
+            rand_cr = (torch.rand(B, 2, device=dev) * 2 - 1) * disp_range
+            rand_dth = (torch.rand(B, device=dev) * 2 - 1) * math.pi
+            cr = torch.where(use_rand.unsqueeze(-1), rand_cr, cr)
+            dth = torch.where(use_rand, rand_dth, dth)
+
+        # anchored_pose = [signed_log(cr_x,R), signed_log(cr_y,R), cos dth, sin dth].
+        ap = torch.stack([self._signed_log_unit(cr[:, 0], R),
+                          self._signed_log_unit(cr[:, 1], R),
+                          torch.cos(dth), torch.sin(dth)], dim=-1)
         ap = self._normalize_key(key, ap)
         d = dict(shuffled); d[key] = ap
+        # Frame-consistency fix (Bug 1): re-express the goal row's priv BODY block
+        # in the SAME anchor frame (cr, dth). Rebuild from the stashed RAW
+        # heading-frame priv — reframe_priv_body's signed-log is non-linear, so
+        # re-anchoring already-reframed priv is impossible.
+        raw_priv = getattr(self, "_raw_train_next_priv", None)
+        K = getattr(self, "_anchor_priv_K", None)
+        if (bool(getattr(self.cfg, "anchor_frame_body", False))
+                and raw_priv is not None and K is not None
+                and "privileged_state" in shuffled):
+            raw_goal_priv = raw_priv[perm]
+            priv_i = FBCprExpertBuffer.reframe_priv_body(raw_goal_priv, cr, dth, K, R, True)
+            d["privileged_state"] = self._normalize_key("privileged_state", priv_i)
         return d
 
     def _reanchor_expert_z(self, expert_encodings, idx):
@@ -343,6 +411,26 @@ class AnchoredFBCprAux(FBCprAux):
             vv = v.view(N_seq, seq, *v.shape[1:])[seq_of_row]    # [B, seq, ...]
             body[k] = vv.reshape(B * seq, *v.shape[1:])
         body[key] = ap
+        # Frame-consistency fix: the priv body in next_obs was reframed under the
+        # buffer's A_e, but anchored_pose above is under row i's A_i. Re-express
+        # the priv BODY block under A_i too, rebuilt from RAW heading-frame expert
+        # priv (signed-log reframe is non-linear -> cannot re-anchor reframed
+        # priv). cr = A_i^-1 g_expert_canon_t per (row, frame).
+        raw_e_priv = getattr(self, "_raw_expert_next_priv", None)
+        K = getattr(self, "_anchor_priv_K", None)
+        R = getattr(self, "_anchor_priv_R", None)
+        if (bool(getattr(self.cfg, "anchor_frame_body", False))
+                and raw_e_priv is not None and K is not None
+                and "privileged_state" in body):
+            raw_win = raw_e_priv.view(N_seq, seq, -1)[seq_of_row].reshape(B * seq, -1)
+            dd = g[:, :2] - ax
+            ca, sa = torch.cos(-ay), torch.sin(-ay)
+            cr = torch.stack([ca * dd[:, 0] - sa * dd[:, 1],
+                              sa * dd[:, 0] + ca * dd[:, 1]], dim=-1)
+            dth = torch.atan2(torch.sin(g[:, 2] - ay), torch.cos(g[:, 2] - ay))
+            priv_i = FBCprExpertBuffer.reframe_priv_body(raw_win, cr, dth, K, R, True)
+            # next_obs body keys are normalized -> normalize the reframed priv too.
+            body["privileged_state"] = self._normalize_key("privileged_state", priv_i)
         Bz = self.policy._backward_map(body).view(B, seq, -1)    # [B, seq, d]
         # T-window mean (per chosen sub-seq's T), matching encode_expert.
         if T_per_seq is not None:
