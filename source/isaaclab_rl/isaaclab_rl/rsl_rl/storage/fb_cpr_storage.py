@@ -346,17 +346,28 @@ class FBCprReplayBuffer:
         if len(self) == 0:
             raise RuntimeError("FBCprReplayBuffer.sample_flat() called on empty buffer")
         self._ensure_traj_info()
-        eligible = self._lengths >= 2  # need at least one valid (obs, next_obs) pair
+        # Need length>=3: a valid NON-boundary pair (obs, next_obs) requires the
+        # next-obs to be a pre-reset row (<= start+length-2), so rel in [0,L-3].
+        eligible = self._lengths >= 3
         if not bool(eligible.any().item()):
-            raise RuntimeError("No trajectories with length >= 2.")
+            raise RuntimeError("No trajectories with length >= 3.")
         eligible_idx = eligible.nonzero(as_tuple=False).squeeze(-1)
         eligible_lengths = self._lengths[eligible_idx]
         eligible_starts = self._start_idx[eligible_idx]
         traj_sel = torch.randint(eligible_idx.shape[0], (batch_size,), device=self.device)
         sel_lengths = eligible_lengths[traj_sel]
         sel_starts = eligible_starts[traj_sel]
-        # Pick a random transition index in [0, length-2].
-        end_point = (sel_lengths - 2).clamp_min(0).to(torch.float32)
+        # Pick a random transition index ``rel`` in [0, length-3] so that the
+        # next-obs ``start+rel+1`` is at most ``start+length-2`` — the LAST
+        # PRE-RESET obs. The final row of a segment (``start+length-1``) is the
+        # truncated row = the POST-RESET spawn; sampling rel=length-2 would form
+        # the cross-boundary transition (last-pre-reset -> fresh-spawn), a ~tens-
+        # of-metres teleport in the (anchored) global pose. That timeout boundary
+        # is ``truncated`` not ``terminated``, so the FB/critic discount (masks
+        # ``terminated`` only) would NOT zero it -> B/F get trained on a garbage
+        # one-step "reach 50 m" successor target. Excluding it here is the clean
+        # fix (mirrors sample()'s seq-window bound). Needs length>=3 for any pair.
+        end_point = (sel_lengths - 3).clamp_min(0).to(torch.float32)
         rel = (torch.rand(batch_size, device=self.device) * (end_point + 1.0)).floor().to(torch.long)
         time_idx = (sel_starts[:, 0] + rel) % self.time_capacity
         env_idx = sel_starts[:, 1]
@@ -1055,6 +1066,8 @@ class FBCprExpertBuffer:
 
     def sample_tracking_trajectories(
         self, num_trajs: int, traj_length: int,
+        anchor_canon_xy: torch.Tensor | None = None,
+        anchor_canon_yaw: torch.Tensor | None = None,
     ) -> dict:
         """Sample contiguous expert sub-trajectories for tracking.
 
@@ -1113,10 +1126,61 @@ class FBCprExpertBuffer:
         # canonicalised to its OWN window-start frame (start_flat) so it
         # self-zeros like a rollout episode. The shared T-window mean then
         # windows the spatial z identically to the local z.
+        #
+        # CRITICAL — this is the TRACKING-z path (drives rollout tracking envs),
+        # NOT the disc/FB augmentation path. The rollout-z's anchor MUST match
+        # the anchor the env uses for the actor's ``anchored_pose`` obs, else
+        # z = B(.) and the actor obs live in different SE(2) frames and the
+        # implicit reward ⟨B(s),z⟩ never aligns -> the spatial command is noise
+        # and the global tracking deviation can't drop (while the replay-path
+        # Qfb, which is internally anchor-consistent, still rises).
+        #
+        # TWO-FRAME ANCHOR (sim <-> motion). At reset the robot inits at sim
+        # pose A_init <-> motion pose A^m_init (RSI correspondence). The caller
+        # samples ONE offset ``A_anchor`` (in the init-LOCAL frame) and uses it
+        # on BOTH sides: the env sets its ``anchored_pose`` anchor to
+        # A_init·A_anchor (sim space), and we encode z under A^m_init·A_anchor
+        # (motion space). Because each side's init pose cancels in its own
+        # local frame, both reduce to A_anchor and the obs/z frames coincide,
+        # while A_anchor != 0 DISPLACES the spatial goal (filling the displaced-
+        # goal coverage hole). ``anchor_canon_{xy,yaw}`` ARE that A_anchor,
+        # expressed in the window-start canonical frame (the same frame
+        # ``_canon_pose_at`` self-zeros to). A_anchor=0 reduces to the spawn-
+        # anchored special case (== eval ``_build_global_track_z``).
         if self._emit_anchored_pose and getattr(self, "root_pos_buffer", None) is not None:
             start_flat = starts.unsqueeze(1).expand(-1, traj_length).reshape(-1)
-            obs["anchored_pose"] = self._anchored_pose_at(frame_cur, motion_flat, start_flat)
-            next_obs["anchored_pose"] = self._anchored_pose_at(frame_nxt, motion_flat, start_flat)
+            # Per-traj A_anchor (canonical frame), broadcast to each frame row.
+            if anchor_canon_xy is not None:
+                aA_xy = anchor_canon_xy.to(self.device).view(-1, 1, 2).expand(
+                    -1, traj_length, -1).reshape(-1, 2)
+                aA_yaw = anchor_canon_yaw.to(self.device).view(-1, 1).expand(
+                    -1, traj_length).reshape(-1)
+            else:
+                # No offset supplied -> A_anchor = 0 (spawn-anchored).
+                B_T = frame_cur.shape[0]
+                aA_xy = torch.zeros(B_T, 2, device=self.device)
+                aA_yaw = torch.zeros(B_T, device=self.device)
+            gc_xy, gc_yaw = self._canon_pose_at(frame_cur, start_flat, motion_flat)
+            gn_xy, gn_yaw = self._canon_pose_at(frame_nxt, start_flat, motion_flat)
+            obs["anchored_pose"] = self.encode_anchored_pose(
+                gc_xy, gc_yaw, aA_xy, aA_yaw, self._anchored_pose_clamp)
+            next_obs["anchored_pose"] = self.encode_anchored_pose(
+                gn_xy, gn_yaw, aA_xy, aA_yaw, self._anchored_pose_clamp)
+            # Anchor-frame body pose: B was trained on priv body POS/ROT6D
+            # reframed into the SAME anchor. The raw ``_flat_priv`` is heading-
+            # frame, so reframe into the A_anchor frame: root pose in that frame
+            # is (cr = A_anchor^-1·g_canon, dθ = g_canon_yaw - A_anchor_yaw) —
+            # byte-identical to how the env / algo preamble reframe priv.
+            if self._anchor_frame_body:
+                R = self._anchored_pose_clamp
+                K = self._priv_K_for_reframe(obs["privileged_state"])
+                if K is not None:
+                    cr_c, dth_c = self._cr_in_anchor(gc_xy, gc_yaw, aA_xy, aA_yaw)
+                    cr_n, dth_n = self._cr_in_anchor(gn_xy, gn_yaw, aA_xy, aA_yaw)
+                    obs["privileged_state"] = self.reframe_priv_body(
+                        obs["privileged_state"], cr_c, dth_c, K, R, True)
+                    next_obs["privileged_state"] = self.reframe_priv_body(
+                        next_obs["privileged_state"], cr_n, dth_n, K, R, True)
         return {
             "observation": obs,
             "next_observation": next_obs,
@@ -1322,6 +1386,36 @@ class FBCprExpertBuffer:
         return torch.sign(v) * torch.log1p(v.abs() / s0) / math.log1p(R / s0)
 
     @staticmethod
+    def _cr_in_anchor(g_xy: torch.Tensor, g_yaw: torch.Tensor,
+                      a_xy: torch.Tensor, a_yaw: torch.Tensor):
+        """Root pose (cr_xy metres, dθ) expressed in anchor frame A: cr =
+        Rot(-a_yaw)(g_xy - a_xy), dθ = wrap(g_yaw - a_yaw). Byte-identical to
+        ``AnchoredFBCprAux._anchor_priv_pre_normalize._cr`` — the (cr, dθ) fed to
+        ``reframe_priv_body``. Inputs/outputs in the canonical window frame."""
+        d = g_xy - a_xy
+        ca, sa = torch.cos(-a_yaw), torch.sin(-a_yaw)
+        cr = torch.stack([ca * d[:, 0] - sa * d[:, 1],
+                          sa * d[:, 0] + ca * d[:, 1]], dim=-1)
+        dth = torch.atan2(torch.sin(g_yaw - a_yaw), torch.cos(g_yaw - a_yaw))
+        return cr, dth
+
+    def _priv_K_for_reframe(self, priv: torch.Tensor | None) -> int | None:
+        """Keypoint count K from the priv DIMENSION (layout root_height_obs=True:
+        dim = 1 + (K-1)*3 + K*6 + K*3 + K*3 = 15K - 2 -> K = (dim+2)/15). Matches
+        ``AnchoredFBCprAux._priv_K`` so the tracking-z reframe uses the same K as
+        training. Cached."""
+        K = getattr(self, "_priv_K_reframe_cache", "unset")
+        if K != "unset":
+            return K
+        K = None
+        if priv is not None:
+            dim = int(priv.shape[-1])
+            if (dim + 2) % 15 == 0:
+                K = (dim + 2) // 15
+        self._priv_K_reframe_cache = K
+        return K
+
+    @staticmethod
     def reframe_priv_body(priv: torch.Tensor, cr_xy: torch.Tensor,
                           dtheta: torch.Tensor, K: int, R: float,
                           root_height_obs: bool = True) -> torch.Tensor:
@@ -1383,6 +1477,12 @@ class FBCprExpertBuffer:
         one frame. ``start_local`` defaults to the per-row window start; if None
         (legacy callers) we self-zero each frame (start == frame), which reduces
         to the old origin-invariant single-row behaviour.
+
+        DISCRIMINATOR/FB-AUGMENTATION PATH ONLY (called from ``sample()``). The
+        random p_A anchor randomises the spatial-z region so the discriminator
+        cannot shortcut on it. The TRACKING-z path (``sample_tracking_trajectories``)
+        does NOT use this — it encodes under ONE shared rollout anchor A_anchor
+        (matching the env's actor ``anchored_pose`` obs), see there.
 
         Returns the anchored_pose obs ``[px, py, cosθ, sinθ]``.
         """

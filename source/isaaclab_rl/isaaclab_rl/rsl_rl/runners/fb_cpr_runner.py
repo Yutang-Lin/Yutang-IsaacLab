@@ -490,6 +490,45 @@ class FBCprRunner:
         lo, hi = self.explore_std_min, self.explore_std_max
         return torch.rand(n, device=self.device) * (hi - lo) + lo
 
+    def _apply_tracking_sim_anchor(self, robot) -> None:
+        """Two-frame anchor: set the env ``anchored_pose`` anchor for the freshly
+        resampled tracking envs to the DISPLACED sim pose A_init·A_anchor, in
+        WORLD. A_init = the LIVE (post-reset) robot pose of each tracking env;
+        A_anchor = the init-local offset the algo sampled this resample
+        (``_tracking_anchor_canon_{xy,yaw}``). The motion-space counterpart
+        A^m_init·A_anchor was used to encode the tracking-z, so the actor's
+        ``anchored_pose`` obs and the z now live in the SAME frame and the
+        implicit reward ⟨B(s),z⟩ aligns (A_anchor=0 -> spawn-anchored). Must be
+        called AFTER any terrain RSI reset settles so A_init is the post-reset
+        pose. Non-tracking envs and ``_canon_*`` (stored-pose frame) untouched.
+        """
+        if not (self._store_world_pose and robot is not None
+                and hasattr(self.env_unwrapped, "set_anchor")):
+            return
+        t_ids = getattr(self.alg, "_tracking_env_idx", None)
+        aA_xy = getattr(self.alg, "_tracking_anchor_canon_xy", None)
+        aA_yaw = getattr(self.alg, "_tracking_anchor_canon_yaw", None)
+        if t_ids is None or aA_xy is None or t_ids.numel() == 0:
+            return
+        # A_init of the tracking envs (live world pose).
+        r_xy = robot.data.root_pos_w[t_ids, :2].to(self.device)
+        rq = robot.data.root_quat_w[t_ids].to(self.device)
+        w_, x_, y_, z_ = rq[:, 0], rq[:, 1], rq[:, 2], rq[:, 3]
+        r_yaw = torch.atan2(2 * (w_ * z_ + x_ * y_), 1 - 2 * (y_ * y_ + z_ * z_))
+        # A_init · A_anchor: rotate the init-local offset by A_init yaw, translate.
+        aA_xy = aA_xy.to(self.device)
+        aA_yaw = aA_yaw.to(self.device)
+        cy, sy = torch.cos(r_yaw), torch.sin(r_yaw)
+        off_x = cy * aA_xy[:, 0] - sy * aA_xy[:, 1]
+        off_y = sy * aA_xy[:, 0] + cy * aA_xy[:, 1]
+        sim_xy = r_xy + torch.stack([off_x, off_y], dim=-1)
+        sim_yaw = r_yaw + aA_yaw
+        full_xy = self.env_unwrapped._anchor_xy.clone()
+        full_yaw = self.env_unwrapped._anchor_yaw.clone()
+        full_xy[t_ids] = sim_xy
+        full_yaw[t_ids] = sim_yaw
+        self.env_unwrapped.set_anchor(full_xy, full_yaw, env_ids=None)
+
     # --- training loop ------------------------------------------------- #
 
     def learn(self, num_learning_iterations: int, init_at_random_ep_len: bool = False):
@@ -543,15 +582,26 @@ class FBCprRunner:
                 )
 
         # Anchored variant: set the initial per-episode anchor for ALL envs to
-        # their spawn pose at the start of rollout.
+        # their spawn pose at the start of rollout. We ALSO keep a runner-owned
+        # copy of the FIXED spawn origin (``_canon_xy/_canon_yaw``) used to
+        # canonicalize the STORED replay pose. The env's ``_anchor`` may later
+        # move per-resample (displaced rollout anchor A_init·A_anchor for
+        # tracking envs), but ``_canon_*`` stays pinned at spawn so the stored
+        # replay frame never jumps mid-episode.
         if (self._store_world_pose and _robot is not None
                 and hasattr(self.env_unwrapped, "set_anchor")):
             rq0 = _robot.data.root_quat_w.to(self.device)
             w0, x0, y0, z0 = rq0[:, 0], rq0[:, 1], rq0[:, 2], rq0[:, 3]
             yaw0 = torch.atan2(2 * (w0 * z0 + x0 * y0), 1 - 2 * (y0 * y0 + z0 * z0))
-            self.env_unwrapped.set_anchor(
-                _robot.data.root_pos_w[:, :2].to(self.device), yaw0, env_ids=None,
-            )
+            _xy0 = _robot.data.root_pos_w[:, :2].to(self.device)
+            self.env_unwrapped.set_anchor(_xy0, yaw0, env_ids=None)
+            self._canon_xy = _xy0.clone()
+            self._canon_yaw = yaw0.clone()
+            # Apply the displaced sim anchor for the INITIAL tracking window
+            # (the z=None resample above already sampled A_anchor) so the first
+            # window's actor obs matches its displaced tracking-z. canon_* stays
+            # at spawn.
+            self._apply_tracking_sim_anchor(_robot)
 
         # Per-env exploration std: init all envs with a fresh draw in
         # [explore_std_min, explore_std_max]. Resampled per episode on done.
@@ -689,9 +739,16 @@ class FBCprRunner:
                         _yaw0 = torch.atan2(2 * (_w * _z + _x * _y),
                                             1 - 2 * (_y * _y + _z * _z))
                         _g_xy = _robot.data.root_pos_w[:, :2].to(self.device)
-                        _eu = self.env_unwrapped
-                        _s_xy = getattr(_eu, "_anchor_xy", None)
-                        _s_yaw = getattr(_eu, "_anchor_yaw", None)
+                        # Canonicalize the STORED replay pose to the runner-owned
+                        # FIXED per-episode spawn origin (``_canon_xy/_canon_yaw``),
+                        # NOT the env's ``_anchor`` (which now moves per-resample
+                        # with the displaced rollout anchor A_init·A_anchor). The
+                        # FB relabel re-anchors stored poses itself, so it only
+                        # needs ONE stable per-episode frame; decoupling it from
+                        # the moving obs anchor keeps the stored frame fixed
+                        # across mid-episode resamples (no boundary leak).
+                        _s_xy = getattr(self, "_canon_xy", None)
+                        _s_yaw = getattr(self, "_canon_yaw", None)
                         if _s_xy is not None and _s_yaw is not None:
                             _d = _g_xy - _s_xy
                             _ca, _sa = torch.cos(-_s_yaw), torch.sin(-_s_yaw)
@@ -858,8 +915,13 @@ class FBCprRunner:
 
                     # Anchored variant: (re)set the per-episode SE(2) anchor A
                     # for envs that just reset, to their fresh spawn pose, so
-                    # ``anchored_pose`` (A^-1 g_t) starts near origin and grows
-                    # as the robot moves toward the goal.
+                    # ``anchored_pose`` (A^-1 g_t) starts near origin. The
+                    # displaced rollout anchor (A_init·A_anchor) for tracking
+                    # envs is applied just below, after maybe_update_rollout_
+                    # context samples A_anchor. The runner-owned FIXED canon
+                    # origin ``_canon_*`` is updated to spawn here too (the ONLY
+                    # place it moves) so the stored replay frame re-pins at each
+                    # episode boundary but stays put across mid-episode resamples.
                     if (self._store_world_pose and _robot is not None
                             and hasattr(self.env_unwrapped, "set_anchor")):
                         done_ids = dones.bool().nonzero(as_tuple=False).squeeze(-1)
@@ -868,10 +930,11 @@ class FBCprRunner:
                             w_, x_, y_, z_ = rq[:, 0], rq[:, 1], rq[:, 2], rq[:, 3]
                             yaw = torch.atan2(2 * (w_ * z_ + x_ * y_),
                                               1 - 2 * (y_ * y_ + z_ * z_))
-                            self.env_unwrapped.set_anchor(
-                                _robot.data.root_pos_w[:, :2].to(self.device),
-                                yaw, env_ids=done_ids,
-                            )
+                            _rxy = _robot.data.root_pos_w[:, :2].to(self.device)
+                            self.env_unwrapped.set_anchor(_rxy, yaw, env_ids=done_ids)
+                            if getattr(self, "_canon_xy", None) is not None:
+                                self._canon_xy[done_ids] = _rxy[done_ids]
+                                self._canon_yaw[done_ids] = yaw[done_ids]
 
                     # Update z context for next step.
                     z_context, terrain_reset = self.alg.maybe_update_rollout_context(
@@ -906,6 +969,17 @@ class FBCprRunner:
                                     _robot.data.root_pos_w[:, :2].to(self.device),
                                     _robot.data.root_quat_w.to(self.device),
                                 )
+
+                    # Two-frame anchor: a tracking resample sampled A_anchor (the
+                    # init-local offset). Compute the DISPLACED sim-space env
+                    # anchor A_init·A_anchor from the LIVE post-reset robot pose
+                    # (terrain RSI above may have just moved tracking envs, so we
+                    # MUST read the pose here, after resets settle) and set it as
+                    # the env ``anchored_pose`` anchor for tracking envs only —
+                    # so the actor obs is in the SAME frame as the displaced
+                    # tracking-z. Non-tracking envs keep their spawn anchor; the
+                    # runner-owned ``_canon_*`` (stored-pose frame) stays at spawn.
+                    self._apply_tracking_sim_anchor(_robot)
 
                     obs_dict = new_obs
 

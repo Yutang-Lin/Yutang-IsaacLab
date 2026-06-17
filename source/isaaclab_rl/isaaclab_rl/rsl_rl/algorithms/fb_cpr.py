@@ -88,6 +88,13 @@ class FBCprAuxAlgorithmCfg:
     anchor_frame_body: bool = False
     anchor_beta_gh: float = 0.33             # p(anchor = g_h); rest -> random
     anchor_random_xy_range: float = 10.0     # random anchor xy ± around g_t
+    # Two-frame rollout anchor: per tracking window, sample ONE offset A_anchor
+    # (init-local) shared by the env ``anchored_pose`` obs (A_init·A_anchor, sim)
+    # and the tracking-z encode (A^m_init·A_anchor, motion). prob anchor_alpha_gt
+    # -> A_anchor=0 (spawn-anchored); else uniform ±this xy / ±π yaw. Displaces
+    # the spatial goal so the actor practices reaching far targets (fills the
+    # displaced-goal coverage hole). Defaults to anchor_random_xy_range if unset.
+    rollout_anchor_xy_range: float = 0.0
     # Tracking-rollout knobs — MUST be declared here (FBCprAuxAlgorithmCfg is the
     # anchored runner's _ALGO_CFG_CLS). Read via getattr(self.cfg, ...) in
     # _resample_tracking, so if undeclared the runner's hasattr-filter drops the
@@ -1006,8 +1013,37 @@ class FBCprAux:
             self._tracking_robot_xy = robot_root_xy[self._tracking_env_idx].to(self.device).clone()
         else:
             self._tracking_robot_xy = None
+
+        # --- Two-frame rollout anchor A_anchor (sim <-> motion) -------------
+        # Sample ONE offset A_anchor per tracking window, in the init-LOCAL
+        # frame, used on BOTH sides: env ``anchored_pose`` anchor = A_init·
+        # A_anchor (sim space, set by the runner), tracking-z encoded under
+        # A^m_init·A_anchor (motion space, via sample_tracking_trajectories).
+        # Each side's init pose cancels in its own local frame so the obs/z
+        # frames coincide, while A_anchor != 0 DISPLACES the spatial goal.
+        # Distribution mirrors p_A: prob ``anchor_alpha_gt`` at the origin
+        # (A_anchor=0 -> spawn-anchored), else uniform ±range xy / ±π yaw.
+        a_alpha = float(getattr(self.cfg, "anchor_alpha_gt", 0.34))
+        a_range = float(getattr(self.cfg, "rollout_anchor_xy_range",
+                                getattr(self.cfg, "anchor_random_xy_range", 0.0)))
+        is_zero = torch.rand(n_elem, device=self.device) < a_alpha
+        aA_xy = (torch.rand(n_elem, 2, device=self.device) * 2 - 1) * a_range
+        aA_yaw = (torch.rand(n_elem, device=self.device) * 2 - 1) * math.pi
+        aA_xy = torch.where(is_zero.unsqueeze(-1), torch.zeros_like(aA_xy), aA_xy)
+        aA_yaw = torch.where(is_zero, torch.zeros_like(aA_yaw), aA_yaw)
+        self._tracking_anchor_canon_xy = aA_xy
+        self._tracking_anchor_canon_yaw = aA_yaw
+        # The sim-space env anchor (A_init·A_anchor in world) is computed by the
+        # RUNNER, AFTER any terrain RSI reset settles, from the live (post-reset)
+        # robot pose + this canonical offset — see fb_cpr_runner. Computing it
+        # here would use the PRE-reset pose and be stale for terrain envs.
+
         # Sample trajectories first (sets _tracking_motion_ids/starts/lens).
-        batch = expert_buffer.sample_tracking_trajectories(n_elem, traj_len)
+        # Pass A_anchor (canonical frame) so the tracking-z anchored_pose + priv
+        # reframe encode under the SAME offset the env applies to the obs.
+        batch = expert_buffer.sample_tracking_trajectories(
+            n_elem, traj_len,
+            anchor_canon_xy=aA_xy, anchor_canon_yaw=aA_yaw)
         self._tracking_motion_ids = batch["motion_ids"].to(self.device)
         self._tracking_starts = batch["starts"].to(self.device)
         self._tracking_motion_lens = batch["motion_lens"].to(self.device)
