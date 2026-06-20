@@ -649,6 +649,20 @@ class ReconstructionHead(nn.Module):
             return torch.cat([feats, feats * feats], dim=-1)
         return feats
 
+    def gather_base_target(self, obs: dict[str, torch.Tensor]) -> torch.Tensor:
+        """Like ``gather_target`` but ALWAYS returns the base ``x`` features
+        (``[B, base_dim]``, no square augmentation). Used to build the analytic
+        z_bar goal vector ``g`` (the squares are added analytically in c_g)."""
+        parts: list[torch.Tensor] = []
+        for key, s, e in self.targets:
+            if key not in obs:
+                raise KeyError(
+                    f"ReconstructionHead: obs dict missing key '{key}'. "
+                    f"Available keys: {list(obs.keys())}"
+                )
+            parts.append(obs[key][:, s:e])
+        return torch.cat(parts, dim=-1)
+
 
 class ForwardMap(nn.Module):
     """BFM forward map ``F(s, z, a) -> z`` (also reused as the critic / aux-critic)."""
@@ -1313,6 +1327,43 @@ class FBCprAuxPolicy(nn.Module):
         ):
             if target is not None:
                 target.requires_grad_(False)
+
+    # ---- analytic task-embedding from the linear-W feature decoder ----
+
+    @torch.no_grad()
+    def zbar_from_goal(self, goal_x: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
+        """Construct the (projected) FB task embedding ``z_bar_g`` for a tracking
+        goal analytically from the learned linear feature decoder W.
+
+        The W head reconstructs ``y(s) = [x(s), x(s)^2] in R^{2n}`` from B(s) via a
+        no-bias linear map ``W: R^d -> R^{2n}`` (``y ~= W phi(s)``, i.e. the
+        feature decoder is ``D = W``). A diagonal-Lambda tracking reward for goal
+        ``g`` is, up to a state-independent constant,
+            r_g(s) = 2 x^T Lambda g - x^T Lambda x
+                   = c_g^T y(s),   c_g = [2 Lambda g ; -diag(Lambda)] in R^{2n}.
+        Hence the un-normalized task embedding is ``z_bar_g = W^T c_g`` (since
+        ``r_g(s) ~= c_g^T W phi(s) = phi(s)^T (W^T c_g)``). Returned z is
+        ``project_z``'d onto the z-sphere (z is normalized; B is not).
+
+        Args:
+            goal_x: ``[B, n]`` the n base goal features (same slices/order as the
+                W head's targets, NO square augmentation — just ``x(g)``).
+            weights: ``[n]`` diagonal Lambda (per-feature tracking weight).
+        Returns:
+            ``[B, z_dim]`` projected task embeddings, or ``None`` if no linear
+            square-augmented recon head is present.
+        """
+        head = getattr(self, "_reconstruction_head", None)
+        if head is None or not getattr(head, "square_augment", False):
+            return None
+        W = head.net.weight  # [2n, d]  (no bias)
+        n = head.base_dim
+        w = weights.to(goal_x.device, goal_x.dtype).view(1, n)
+        c_linear = 2.0 * w * goal_x          # [B, n]
+        c_square = (-weights.view(1, n)).expand(goal_x.shape[0], n).to(goal_x.device, goal_x.dtype)  # [B, n]
+        c_goal = torch.cat([c_linear, c_square], dim=-1)  # [B, 2n]
+        z_bar = c_goal @ W                    # [B, d]   (= c_goal . W = W^T c_goal per-row)
+        return self.project_z(z_bar)
 
     # ---- latent sampling / projection ----
 

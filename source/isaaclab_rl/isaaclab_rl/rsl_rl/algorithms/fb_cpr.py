@@ -245,6 +245,17 @@ class FBCprAuxAlgorithmCfg:
     rollout_expert_trajectories_length: int = 250
     rollout_expert_trajectories_percentage: float = 0.5
     z_buffer_size: int = 8192
+    # --- Analytic z-bar from the linear-W feature decoder (BFM-0.5) -------
+    # When >0, a fraction of tracking-rollout z's (and of relabel z's) are built
+    # analytically as z_bar_g = W^T c_g from the learned no-bias linear recon
+    # head (requires recon_linear + recon_square_augment), instead of B-encoding
+    # the expert window. c_g = [2*Lambda*g, -diag(Lambda)] for a diagonal-Lambda
+    # tracking reward, g = the W-target features of the goal frame. 0 = off.
+    zbar_tracking_ratio: float = 0.0   # frac of tracking envs using z_bar
+    zbar_relabel_ratio: float = 0.0    # frac of relabel z drawn as z_bar
+    # Per-feature diagonal Lambda (tracking-reward weights). Empty = all-ones
+    # over the W head's base feature dim.
+    zbar_feature_weights: tuple[float, ...] = ()
     tracking_T_min: int = 1
     tracking_T_max: int = 16
     # If non-empty, sample T from this discrete set instead of uniformly
@@ -836,6 +847,16 @@ class FBCprAux:
         # frame too. Base just gathers the precomputed expert_encodings[idx].
         expert_z = self._reanchor_expert_z(expert_encodings, idx)
         z = torch.where(mix_idxs == 1, expert_z, z)
+
+        # Analytic z_bar relabel: for a proportion of rows, overwrite z with the
+        # W-decoder task embedding built from a SHUFFLED goal (perm, so each row
+        # gets a different goal — same hindsight convention as the goal-z path).
+        zbar_ratio = float(getattr(self.cfg, "zbar_relabel_ratio", 0.0))
+        zbar = getattr(self, "_relabel_zbar", None)
+        if zbar_ratio > 0.0 and zbar is not None:
+            zbar_shuf = zbar[perm]
+            use_zbar = (torch.rand(batch, 1, device=self.device) < zbar_ratio)
+            z = torch.where(use_zbar, zbar_shuf, z)
         return z
 
     def _reanchor_goal_z(self, shuffled, perm):
@@ -1419,6 +1440,42 @@ class FBCprAux:
         )
         return robot_yaw - motion_yaw
 
+    def _zbar_lambda(self) -> torch.Tensor | None:
+        """Diagonal Lambda (per-feature tracking weight) for the z_bar map, sized
+        to the recon head's base feature dim. Cfg ``zbar_feature_weights`` or
+        all-ones. Cached. Returns None if no square-augmented linear recon head."""
+        cached = getattr(self, "_zbar_lambda_cache", "unset")
+        if cached != "unset":
+            return cached
+        head = getattr(self.policy, "_reconstruction_head", None)
+        lam = None
+        if head is not None and getattr(head, "square_augment", False):
+            n = int(head.base_dim)
+            w = tuple(getattr(self.cfg, "zbar_feature_weights", ()) or ())
+            if w:
+                assert len(w) == n, f"zbar_feature_weights len {len(w)} != base_dim {n}"
+                lam = torch.tensor(w, dtype=torch.float32, device=self.device)
+            else:
+                lam = torch.ones(n, dtype=torch.float32, device=self.device)
+        self._zbar_lambda_cache = lam
+        return lam
+
+    @torch.no_grad()
+    def _zbar_from_obs(self, obs: dict) -> torch.Tensor | None:
+        """Build projected z_bar for goals given by the W-target features sliced
+        from ``obs`` (an UN-normalized obs dict: the recon targets are read in
+        raw feature units, matching what the W head reconstructs). Returns
+        ``[B, z_dim]`` or None if unavailable."""
+        head = getattr(self.policy, "_reconstruction_head", None)
+        lam = self._zbar_lambda()
+        if head is None or lam is None or not isinstance(obs, dict):
+            return None
+        try:
+            goal_x = head.gather_base_target(obs)  # [B, n] raw features (no squares)
+        except KeyError:
+            return None
+        return self.policy.zbar_from_goal(goal_x, lam)
+
     @torch.no_grad()
     def _sample_tracking_z(
         self,
@@ -1498,6 +1555,12 @@ class FBCprAux:
             priv = priv.clone()
             priv[grh_flat, 0] = new_root_h[grh_flat]
             next_obs["privileged_state"] = priv
+        # Analytic z_bar goal features: capture the W-target features from the
+        # RAW (pre-normalization) next_obs so g is in real feature units, matching
+        # what the W head reconstructs. Built into per-frame z_bar below.
+        _zbar_flat = None
+        if float(getattr(self.cfg, "zbar_tracking_ratio", 0.0)) > 0.0:
+            _zbar_flat = self._zbar_from_obs(next_obs)  # [B*T, d] or None
         next_obs = self.policy._normalize(next_obs)
         z = self.policy._backward_map(next_obs)
         z = z.view(batch_dim, traj_length, z.shape[-1])
@@ -1534,6 +1597,16 @@ class FBCprAux:
                     end_idx = min(step + seq_length, traj_length)
                     z[:, step] = z[:, step:end_idx].mean(dim=1)
                 z = self.policy.project_z(z)
+
+        # Analytic z_bar: for a ratio of tracking ENVS, replace the B-encoded
+        # tracking-z with the per-frame z_bar built from the goal features +
+        # learned W decoder. Per-env (all frames of a chosen env use z_bar) so the
+        # whole rollout window is consistently driven by the analytic embedding.
+        ratio = float(getattr(self.cfg, "zbar_tracking_ratio", 0.0))
+        if ratio > 0.0 and _zbar_flat is not None:
+            zbar = _zbar_flat.view(batch_dim, traj_length, -1)
+            use_zbar = torch.rand(batch_dim, device=z.device) < ratio  # [B]
+            z = torch.where(use_zbar.view(batch_dim, 1, 1), zbar, z)
         return z
 
     def _soft_fb_scale_z(
@@ -1709,6 +1782,13 @@ class FBCprAux:
             self._anchor_priv_pre_normalize(
                 train_batch, expert_batch,
                 train_obs, train_next_obs, expert_obs, expert_next_obs))
+
+        # Analytic z_bar relabel: capture the goal z_bar from the RAW (pre-
+        # normalization) train_next_obs features, so a proportion of the relabel
+        # z can be the W-decoder task embedding. Stashed for sample_mixed_z.
+        self._relabel_zbar = None
+        if float(getattr(self.cfg, "zbar_relabel_ratio", 0.0)) > 0.0:
+            self._relabel_zbar = self._zbar_from_obs(train_next_obs)  # [batch, d] or None
 
         # Update obs-normalizer running stats on the train batch.
         self.policy._obs_normalizer(train_obs)
