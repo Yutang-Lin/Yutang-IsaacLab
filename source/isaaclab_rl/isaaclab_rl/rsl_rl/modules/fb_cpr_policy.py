@@ -601,16 +601,29 @@ class ReconstructionHead(nn.Module):
         targets: tp.Sequence[tuple[str, int, int]],
         hidden_dim: int = 256,
         hidden_layers: int = 2,
+        linear: bool = False,
+        square_augment: bool = False,
     ) -> None:
         super().__init__()
         self.targets = [(str(k), int(s), int(e)) for (k, s, e) in targets]
-        self.output_dim = sum(e - s for _, s, e in self.targets)
-        assert self.output_dim > 0, "ReconstructionHead needs at least one target slice."
-        seq: list[nn.Module] = [nn.Linear(z_dim, hidden_dim), nn.LayerNorm(hidden_dim), nn.Tanh()]
-        for _ in range(max(0, hidden_layers - 1)):
-            seq += [nn.Linear(hidden_dim, hidden_dim), nn.ReLU()]
-        seq += [nn.Linear(hidden_dim, self.output_dim)]
-        self.net = nn.Sequential(*seq)
+        self.square_augment = bool(square_augment)
+        base_dim = sum(e - s for _, s, e in self.targets)
+        assert base_dim > 0, "ReconstructionHead needs at least one target slice."
+        # With square_augment the target (and output) is [features, features^2].
+        self.base_dim = base_dim
+        self.output_dim = base_dim * 2 if self.square_augment else base_dim
+        if linear:
+            # Single linear projection W: z -> R^output_dim, NO BIAS — a pure
+            # linear map so the targets must genuinely lie in the SPAN of B(s)
+            # (a bias would let W fit the feature mean for free, defeating the
+            # span constraint). BFM-0.5 feature-coverage map.
+            self.net = nn.Linear(z_dim, self.output_dim, bias=False)
+        else:
+            seq: list[nn.Module] = [nn.Linear(z_dim, hidden_dim), nn.LayerNorm(hidden_dim), nn.Tanh()]
+            for _ in range(max(0, hidden_layers - 1)):
+                seq += [nn.Linear(hidden_dim, hidden_dim), nn.ReLU()]
+            seq += [nn.Linear(hidden_dim, self.output_dim)]
+            self.net = nn.Sequential(*seq)
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:
         return self.net(z)
@@ -619,7 +632,9 @@ class ReconstructionHead(nn.Module):
         """Pull the concat of slices from ``obs`` matching ``self.targets``.
 
         Expects ``obs`` to be a dict of ``[B, dim_k]`` tensors. Raises
-        ``KeyError`` if any target key is missing.
+        ``KeyError`` if any target key is missing. When ``square_augment`` is
+        set, returns ``[features, features^2]`` so the linear W must also cover
+        the second moments (the tracking reward is quadratic in these features).
         """
         parts: list[torch.Tensor] = []
         for key, s, e in self.targets:
@@ -629,7 +644,10 @@ class ReconstructionHead(nn.Module):
                     f"Available keys: {list(obs.keys())}"
                 )
             parts.append(obs[key][:, s:e])
-        return torch.cat(parts, dim=-1)
+        feats = torch.cat(parts, dim=-1)
+        if self.square_augment:
+            return torch.cat([feats, feats * feats], dim=-1)
+        return feats
 
 
 class ForwardMap(nn.Module):
@@ -1064,6 +1082,12 @@ class FBCprNetworkCfg:
     recon_targets: tp.Sequence[tuple[str, int, int]] = ()
     recon_hidden_dim: int = 256
     recon_hidden_layers: int = 2
+    # BFM-0.5: make the recon head a single LINEAR projection W (no MLP) and
+    # augment the target with elementwise squares ([feats, feats^2]). This is
+    # the feature-coverage map ensuring the tracking-reward features (and their
+    # second moments) lie in the span of B(s) — used with backward_norm=False.
+    recon_linear: bool = False
+    recon_square_augment: bool = False
 
     # --- Manifold attractor ----------------------------------------------
     manifold_attractor: bool = False
@@ -1148,6 +1172,8 @@ class FBCprAuxPolicy(nn.Module):
                 targets=cfg.recon_targets,
                 hidden_dim=cfg.recon_hidden_dim,
                 hidden_layers=cfg.recon_hidden_layers,
+                linear=bool(getattr(cfg, "recon_linear", False)),
+                square_augment=bool(getattr(cfg, "recon_square_augment", False)),
             )
 
         # Forward map (z-output).
