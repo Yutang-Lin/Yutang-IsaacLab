@@ -1829,12 +1829,37 @@ class FBCprRunner:
         if unexpected:
             print(f"[FBCprRunner] WARN unexpected state_dict keys: {unexpected[:8]}"
                   f"{' ...' if len(unexpected) > 8 else ''}", flush=True)
-        # If we dropped MA weights (shape change), don't load its optimizer.
-        ma_reinit = any("manifold_attractor" in k for k in shape_mismatch)
+        # Optimizer state is loaded by param-group POSITION; torch only checks
+        # the param COUNT, not shapes. If a module was reinitialised (any of its
+        # keys landed in missing / unexpected / shape_mismatch — e.g. an arch
+        # swap like MLP->transformer actor, or the 256->384 z / 4->9 history
+        # resize, or the MLP->linear recon head), loading its old optimizer state
+        # by position can silently mismatch moment buffers (or crash on the first
+        # fused step). So skip the optimizer for EVERY reinitialised module, not
+        # just the manifold attractor. Map each optimizer -> the module-key
+        # substrings it owns (backward_optimizer owns B AND the recon head).
+        reinit_keys = set(missing) | set(unexpected) | set(shape_mismatch)
+        _opt_modules = {
+            "actor_optimizer": ("_actor",),
+            "critic_optimizer": ("_critic",),
+            "aux_critic_optimizer": ("_aux_critic",),
+            "forward_optimizer": ("_forward_map",),
+            "backward_optimizer": ("_backward_map", "_reconstruction_head"),
+            "discriminator_optimizer": ("_discriminator",),
+            "entropy_critic_optimizer": ("_entropy_critic",),
+            "manifold_attractor_optimizer": ("_manifold_attractor", "manifold_attractor"),
+        }
+
+        def _opt_reinitialised(opt_name: str) -> bool:
+            subs = _opt_modules.get(opt_name, ())
+            return any(any(s in k for s in subs) for k in reinit_keys)
+
         if load_optimizer and "optimizers" in ckpt:
             for name, sd in ckpt["optimizers"].items():
-                if ma_reinit and name == "manifold_attractor_optimizer":
-                    print(f"[FBCprRunner] skipping {name} (MA reinitialized)", flush=True)
+                if _opt_reinitialised(name):
+                    print(f"[FBCprRunner] skipping {name} (its module was "
+                          f"reinitialised — arch/shape change) — fresh optimizer.",
+                          flush=True)
                     continue
                 opt = getattr(self.alg, name, None)
                 if opt is None:
@@ -1864,6 +1889,8 @@ class FBCprRunner:
                     ("f", getattr(self.alg, "forward_optimizer", None)),
                     ("b", getattr(self.alg, "backward_optimizer", None)),
                     ("discriminator", getattr(self.alg, "discriminator_optimizer", None)),
+                    ("entropy_critic", getattr(self.alg, "entropy_critic_optimizer", None)),
+                    ("manifold_attractor", getattr(self.alg, "manifold_attractor_optimizer", None)),
                 )
                 reapplied: dict[str, float] = {}
                 for name, opt in opts_by_name:

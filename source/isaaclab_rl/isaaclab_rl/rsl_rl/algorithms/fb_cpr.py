@@ -531,6 +531,11 @@ class FBCprAux:
             "f": float(cfg.lr_f),
             "b": float(cfg.lr_b),
             "discriminator": float(cfg.lr_discriminator),
+            # entropy_critic / manifold_attractor included so their LRs are also
+            # re-applied (with current-cfg DDP scaling) on resume — Adam.load_
+            # state_dict would otherwise clobber them with the stale saved LR.
+            "entropy_critic": float(cfg.lr_entropy_critic),
+            "manifold_attractor": float(cfg.lr_manifold_attractor),
         }
 
         # Put the policy on device. The policy holds *all* networks, including
