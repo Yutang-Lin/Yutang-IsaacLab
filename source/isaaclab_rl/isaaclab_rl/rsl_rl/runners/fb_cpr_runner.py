@@ -218,6 +218,13 @@ class FBCprRunner:
             # drives env + expert so the priv layout (24K-5) agrees.
             priv_include_heading_body=bool(
                 self.alg_cfg.get("priv_include_heading_body", False)),
+            # Transformer actor deepens the env history (H 4->9); compose the
+            # expert history_actor at the same H so its dim matches the env
+            # obs-normalizer BatchNorm. None for the MLP actor (dataset default).
+            history_len_override=(
+                int(self.policy_cfg.get("actor_history_len", 9))
+                if str(self.policy_cfg.get("actor_arch", "mlp")) == "transformer"
+                else None),
         )
         # Forward to the env so RSI can pull from it.
         if hasattr(self.env_unwrapped, "set_expert_buffer"):

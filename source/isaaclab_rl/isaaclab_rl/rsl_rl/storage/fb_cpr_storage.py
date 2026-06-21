@@ -555,8 +555,15 @@ class FBCprExpertBuffer:
         anchor_random_xy_range: float = 10.0,
         anchor_frame_body: bool = False,
         priv_include_heading_body: bool = False,
+        history_len_override: int | None = None,
     ) -> None:
         """Expert motion buffer.
+
+        ``history_len_override``: if set, compose the minimal-dataset
+        ``history_actor`` at this many frames instead of the dataset's baked
+        ``history_length``. Needed when the ENV history was deepened (e.g.
+        BFM-0.5: H 4 -> 9) so the expert ``history_actor`` dim matches the env's
+        (the shared obs-normalizer BatchNorm is sized from the env obs space).
 
         Args:
             length_proportional_priors: If True (default), initial
@@ -670,7 +677,13 @@ class FBCprExpertBuffer:
                 list(raw.get("gravity", [0.0, 0.0, -1.0])),
                 dtype=torch.float32, device=self.device,
             )
-            self._minimal_history_len = int(raw.get("history_length", 4))
+            self._minimal_history_len = (
+                int(history_len_override) if history_len_override is not None
+                else int(raw.get("history_length", 4))
+            )
+            if history_len_override is not None:
+                print(f"[FBCprExpertBuffer] history_actor composed at H="
+                      f"{self._minimal_history_len} (env override).", flush=True)
             self._minimal_action_scale = float(raw.get("action_scale", 0.25))
             self._minimal_action_clip = float(raw.get("action_clip", 5.0))
             self._minimal_resample_fps = float(raw.get("resample_fps", 0.0)) or None

@@ -60,9 +60,13 @@ class RotaryEmbedding(nn.Module):
         x1, x2 = x.chunk(2, dim=-1)
         return torch.cat([-x2, x1], dim=-1)
 
-    def apply(self, x: torch.Tensor, positions: torch.Tensor, rope_mask: torch.Tensor) -> torch.Tensor:
+    def rotate(self, x: torch.Tensor, positions: torch.Tensor, rope_mask: torch.Tensor) -> torch.Tensor:
         """x: [B, n_heads, L, head_dim]; positions: [L]; rope_mask: [L] bool
         (True = apply rotary, False = leave token unchanged, e.g. the z token).
+
+        NOTE: named ``rotate`` not ``apply`` — ``nn.Module.apply(fn)`` is a
+        reserved recursive method (used by weight-init traversal); overriding it
+        would break module init/traversal.
         """
         cos, sin = self._cos_sin(positions)            # [L, hd]
         cos = cos.view(1, 1, x.shape[-2], x.shape[-1])
@@ -95,8 +99,8 @@ class RoPECausalSelfAttention(nn.Module):
         q = q.transpose(1, 2)                             # [B, h, L, hd]
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
-        q = self.rope.apply(q, positions, rope_mask)
-        k = self.rope.apply(k, positions, rope_mask)
+        q = self.rope.rotate(q, positions, rope_mask)
+        k = self.rope.rotate(k, positions, rope_mask)
         # attn_mask [L,L] -> additive bias broadcast over [B,h,L,L]
         bias = torch.zeros(L, L, device=x.device, dtype=q.dtype)
         bias = bias.masked_fill(~attn_mask, float("-inf"))
