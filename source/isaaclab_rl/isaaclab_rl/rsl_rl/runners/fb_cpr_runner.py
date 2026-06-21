@@ -799,9 +799,12 @@ class FBCprRunner:
                         if ref_pos is not None:
                             env_u.set_ref_motion_keypoints(ref_pos.unsqueeze(1))
 
-                    # Push global FB targets (XY + yaw) to env before step.
+                    # Push global FB targets (XY + yaw) to env before step, and
+                    # stash the ref path to score Track/global_*_dev. Skipped when
+                    # log_global_track_dev=False (BFM-Zero/0.5: no global goal).
                     _trk_target = None
-                    if hasattr(env_u, "set_global_fb_targets"):
+                    if (bool(self.alg_cfg.get("log_global_track_dev", True))
+                            and hasattr(env_u, "set_global_fb_targets")):
                         targets = self.alg.get_global_fb_targets(
                             step_count, self.expert_buffer,
                             robot_root_xy=_robot.data.root_pos_w[:, :2].to(self.device) if _robot else None,

@@ -262,6 +262,11 @@ class FBCprAuxAlgorithmCfg:
     # left 0 and auto-derived in FBCprAux.__init__ from the policy's
     # actor_history_len when actor_arch=="transformer".
     actor_window_len: int = 0
+    # Log the Track/global_xy_dev_m + global_yaw_dev_deg deviation metrics during
+    # rollout (the robot-vs-reference global-path error). Meaningful only for
+    # global-FB / tracking tasks (BFM-Terrain/One); pointless for BFM-Zero/0.5
+    # (no global goal). Default True (existing tasks unchanged); set False to skip.
+    log_global_track_dev: bool = True
     tracking_T_min: int = 1
     tracking_T_max: int = 16
     # If non-empty, sample T from this discrete set instead of uniformly
