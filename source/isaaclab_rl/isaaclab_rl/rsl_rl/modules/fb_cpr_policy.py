@@ -916,10 +916,36 @@ class TransformerActorWrapper(nn.Module):
         cur = self._current_frame(obs).unsqueeze(1)            # [B, 1, 93]
         return torch.cat([past, cur], dim=1)                  # [B, H+1, 93]
 
-    def _norm_frames(self, frames: torch.Tensor) -> torch.Tensor:
-        """Apply the shared frame BatchNorm to every frame identically."""
+    def _norm_frames(self, frames: torch.Tensor, valid: torch.Tensor | None = None) -> torch.Tensor:
+        """Apply the shared frame BatchNorm to every frame identically.
+
+        ``valid`` ([B, L] bool) marks real frames. In TRAIN mode the actor-loss
+        path zero-fills cross/pre-episode positions; those zeros must NOT enter
+        the BatchNorm batch statistics (else running_mean -> valid_frac*true_mean
+        and running_var is inflated, biasing the SAME stats that rollout/TD-target
+        consume in eval mode). So when training with a mask, update the running
+        stats from the VALID rows only, then normalize the invalid rows with the
+        (now-clean) running stats. Invalid rows are masked out of the loss anyway;
+        normalizing them keeps them finite. In eval mode (rollout/TD target) the
+        running stats are used for all rows and never updated, so no mask needed.
+        """
         B, L, D = frames.shape
-        return self.frame_norm(frames.reshape(B * L, D)).view(B, L, D)
+        flat = frames.reshape(B * L, D)
+        if self.training and valid is not None:
+            vmask = valid.reshape(B * L).bool()
+            # Guard: BatchNorm train mode needs >1 sample for a finite batch var.
+            if vmask.sum() > 1:
+                out = torch.empty_like(flat)
+                out[vmask] = self.frame_norm(flat[vmask])  # updates running stats from valid rows
+                inv = ~vmask
+                if inv.any():
+                    with torch.no_grad():
+                        rm = self.frame_norm.running_mean
+                        rv = self.frame_norm.running_var
+                        eps = self.frame_norm.eps
+                    out[inv] = (flat[inv] - rm) / torch.sqrt(rv + eps)
+                return out.view(B, L, D)
+        return self.frame_norm(flat).view(B, L, D)
 
     # -- forward (rollout / act): last token only --------------------------
     def forward(self, obs, z, std):
@@ -931,10 +957,11 @@ class TransformerActorWrapper(nn.Module):
         return self._dist(mu, std)
 
     # -- training: all H+1 tokens ------------------------------------------
-    def forward_window(self, frames: torch.Tensor, z, std):
+    def forward_window(self, frames: torch.Tensor, z, std, valid: torch.Tensor | None = None):
         """frames = RAW [B, H+1, 93] window (training path). Returns a
-        TruncatedNormal over ALL H+1 token actions ([B, H+1, A])."""
-        means = self.net(self._norm_frames(frames), z)         # [B, H+1, A]
+        TruncatedNormal over ALL H+1 token actions ([B, H+1, A]). ``valid`` masks
+        cross/pre-episode positions out of the frame BatchNorm statistics."""
+        means = self.net(self._norm_frames(frames, valid), z)  # [B, H+1, A]
         return self._dist(means, std)
 
     @staticmethod

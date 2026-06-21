@@ -2849,8 +2849,10 @@ class FBCprAux:
 
         # Actor forward over the window with the SINGLE shared z_t token ([B, d];
         # the net prepends one z token, shared across all H+1 positions) ->
-        # H+1 action means -> sample.
-        dist = actor.forward_window(frames, z, p.actor_std)
+        # H+1 action means -> sample. Pass ``valid`` so the frame BatchNorm
+        # updates its running stats from REAL frames only (the zeroed invalid
+        # positions above must not pollute the stats that rollout/TD-target read).
+        dist = actor.forward_window(frames, z, p.actor_std, valid=valid)
         sampled_action = dist.sample(clip=self.cfg.stddev_clip)   # [B, L, A]
 
         # Flatten (B*L) to score every position with the single-step F/critic
