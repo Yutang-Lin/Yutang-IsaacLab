@@ -978,19 +978,35 @@ class TransformerActorWrapper(nn.Module):
     # -- forward (rollout / act): last token only --------------------------
     def forward(self, obs, z, std):
         """obs = RAW obs dict. Returns a TruncatedNormal over the CURRENT-step
-        action (last token)."""
-        frames = self._norm_frames(self.assemble_frames(obs))
-        means = self.net(frames, z)                            # [B, H+1, A]
-        mu = means[:, -1]                                      # current step
+        action (last token).
+
+        Derives a per-frame ``valid`` mask from the RAW frames so zero-padded
+        history positions (the env zero-fills history_actor at reset; a real
+        93-d frame is never exactly all-zero) are masked OUT as attention keys —
+        the current token therefore never attends to garbage frames during the
+        first H steps of an episode. Matches the train path's storage valid mask.
+        """
+        raw = self.assemble_frames(obs)                        # [B, H+1, 93] RAW
+        valid = raw.abs().sum(dim=-1) > 0                      # [B, H+1] nonzero frame
+        valid[:, -1] = True                                    # current always valid
+        frames = self._norm_frames(raw)
+        mu = self.net(frames, z, valid=valid, last_only=True)  # [B, A] current step
         return self._dist(mu, std)
 
-    # -- training: all H+1 tokens ------------------------------------------
+    # -- training: current token only (last_only) --------------------------
     def forward_window(self, frames: torch.Tensor, z, std, valid: torch.Tensor | None = None):
-        """frames = RAW [B, H+1, 93] window (training path). Returns a
-        TruncatedNormal over ALL H+1 token actions ([B, H+1, A]). ``valid`` masks
-        cross/pre-episode positions out of the frame BatchNorm statistics."""
-        means = self.net(self._norm_frames(frames, valid), z)  # [B, H+1, A]
-        return self._dist(means, std)
+        """frames = RAW [B, H+1, 93] window (training path). ``valid`` ([B, H+1])
+        marks real frames: it masks cross/pre-episode positions out of the frame
+        BatchNorm statistics AND excludes them as attention KEYS (so the scored
+        token never attends to zero-padded frames — train matches rollout).
+
+        Returns a TruncatedNormal over the CURRENT-step action only ([B, A]) —
+        the on-distribution token. Past-token actions are NOT scored: they are
+        produced from a truncated causal context that never occurs at rollout, so
+        scoring them poisoned the shared trunk (see fb_cpr actor loss)."""
+        mu = self.net(self._norm_frames(frames, valid), z,
+                      valid=valid, last_only=True)             # [B, A] current step
+        return self._dist(mu, std)
 
     @staticmethod
     def _dist(mu, std):

@@ -2825,14 +2825,20 @@ class FBCprAux:
     # --- actor --------------------------------------------------------------- #
 
     def _backward_actor_transformer(self, win: dict, z: torch.Tensor):
-        """Parallel actor loss for the RoPE transformer actor.
+        """Actor loss for the RoPE transformer actor — CURRENT TOKEN ONLY.
 
-        The actor runs ONCE over the H+1 frame window and emits H+1 action
-        distributions (one per timestep token). Each position p is scored with
-        the SAME FB actor objective (-Q_fb - reg*Q_disc - reg_aux*Q_aux) using
-        that position's own state ``s_{t-p}`` (from the window) and the SHARED
-        latent ``z = z_t``. Positions that cross an episode boundary (mask) are
-        excluded. One backward; H+1 gradient signals per sample.
+        The actor runs ONCE over the H+1 frame window (so the current-step action
+        gets the full temporal representation via attention), but only the
+        CURRENT-step (last token) action is scored with the FB actor objective
+        (-Q_fb - reg*Q_disc - reg_aux*Q_aux). This is the SAME single-action
+        objective the MLP actor uses; the window only provides context.
+
+        Why not score the past tokens too: each past token's action is produced
+        from a TRUNCATED causal context (frames t-H..t-p) that never occurs at
+        rollout (where every step sees a full H+1 window), so its action is
+        off-distribution and scoring it poisoned the shared trunk. Invalid
+        (zero-padded, post-reset) frames are masked out as attention KEYS inside
+        forward_window so the current token never attends to garbage.
         """
         p = self.policy
         actor = self._unwrap(p._actor)  # TransformerActorWrapper
@@ -2842,77 +2848,43 @@ class FBCprAux:
         B, L = valid.shape                                        # L = H+1
 
         # Raw per-position frames [B, L, 93] = [state | last_action] (training
-        # order matches the wrapper's _current_frame).
+        # order matches the wrapper's _current_frame). Zero the invalid positions
+        # so the BatchNorm-stat path matches rollout (the attention key-mask in
+        # forward_window additionally excludes them from attention).
         frames = torch.cat([win_obs["state"], win_obs["last_action"]], dim=-1)
-        # ZERO the invalid (cross-episode / pre-episode) positions so the actor's
-        # input window matches ROLLOUT: at episode start the env zero-fills the
-        # history buffer, so older-than-episode-start frames are zeros there. The
-        # training window instead carries real STALE frames at invalid positions;
-        # zeroing them here removes that train/serve input-distribution skew for
-        # the first ~H steps after each reset. Current pos (L-1) is always valid.
         frames = frames * valid.unsqueeze(-1).to(frames.dtype)
 
-        # Actor forward over the window with the SINGLE shared z_t token ([B, d];
-        # the net prepends one z token, shared across all H+1 positions) ->
-        # H+1 action means -> sample. Pass ``valid`` so the frame BatchNorm
-        # updates its running stats from REAL frames only (the zeroed invalid
-        # positions above must not pollute the stats that rollout/TD-target read).
+        # Actor forward over the window -> CURRENT-step action dist ([B, A]).
+        # valid masks invalid frames out of both the frame BatchNorm stats and the
+        # attention keys.
         dist = actor.forward_window(frames, z, p.actor_std, valid=valid)
-        sampled_action = dist.sample(clip=self.cfg.stddev_clip)   # [B, L, A]
+        sampled_action = dist.sample(clip=self.cfg.stddev_clip)   # [B, A]
 
-        # Flatten (B*L) to score every position with the single-step F/critic
-        # (MLP). Build a per-position normalized obs dict from the window. z_t is
-        # repeated to every position for the per-position FB-Q evaluation.
-        BL = B * L
-        flat_obs_raw = {k: v.reshape(BL, *v.shape[2:]) for k, v in win_obs.items()}
-        flat_obs = p._normalize(flat_obs_raw)                     # MLP nets want normalized obs
-        flat_z = z.unsqueeze(1).expand(B, L, z.shape[-1]).reshape(BL, z.shape[-1])
-        flat_a = sampled_action.reshape(BL, sampled_action.shape[-1])
+        # Score the single current-step action with the single-step F/critic on
+        # the CURRENT-step (normalized) obs. The current frame is win_obs[...] at
+        # the last position (L-1).
+        cur_obs_raw = {k: v[:, L - 1] for k, v in win_obs.items()}  # [B, dim]
+        cur_obs = p._normalize(cur_obs_raw)
         pol_cfg = self._unwrap(p).cfg
 
-        # All three per-position Q's MUST be the SAME 1-D shape [BL]; otherwise
-        # the combination below broadcasts. The critic/aux-critic return
-        # [num_parallel, BL, 1] -> _pessimistic_value reduces the ensemble axis to
-        # [BL, 1] (2-D), while Q_fb is [BL] (1-D, the (F*z).sum already dropped the
-        # feature axis). Adding [BL] + [BL,1] right-aligns to [BL,BL] and the
-        # masked-mean then computes sum(Q)*sum(vmask)/nval = SUM over positions
-        # (scales with the ~thousands of window slots -> the Q_disc/Q_aux "-2e6"
-        # explosion). Flatten every Q to [BL] so the per-position objective and
-        # the logged means are true per-position values.
-        Qs_disc = p._critic(flat_obs, flat_z, flat_a)
+        Qs_disc = p._critic(cur_obs, z, sampled_action)
         if bool(getattr(pol_cfg, "critic_distributional", False)):
             Qs_disc = Qs_disc.mean(dim=-1, keepdim=True)
         _, _, Q_disc = self._pessimistic_value(Qs_disc, self.cfg.actor_pessimism_penalty)
-        Q_disc = Q_disc.reshape(BL)
-        Qs_aux = p._aux_critic(flat_obs, flat_z, flat_a)
+        Qs_aux = p._aux_critic(cur_obs, z, sampled_action)
         if bool(getattr(pol_cfg, "aux_critic_distributional", False)):
             Qs_aux = Qs_aux.mean(dim=-1, keepdim=True)
         _, _, Q_aux = self._pessimistic_value(Qs_aux, self.cfg.actor_pessimism_penalty)
-        Q_aux = Q_aux.reshape(BL)
-        Fs = p._forward_map(flat_obs, flat_z, flat_a)
-        Qs_fb = (Fs * flat_z).sum(dim=-1)
+        Fs = p._forward_map(cur_obs, z, sampled_action)
+        Qs_fb = (Fs * z).sum(dim=-1)
         _, _, Q_fb = self._pessimistic_value(Qs_fb, self.cfg.actor_pessimism_penalty)
-        Q_fb = Q_fb.reshape(BL)
 
-        # Per-position weight (scale_reg) over VALID positions only.
-        vmask = valid.reshape(BL).float()
-        # ISOLATION TEST: optionally score the actor loss at the CURRENT token
-        # only (position L-1), while STILL running the full H+1 transformer
-        # forward for the temporal representation. This isolates whether the
-        # Q_disc/Q_aux runaway is driven specifically by the parallel/past-token
-        # scoring (truncated-context past-token actions queried against a critic
-        # trained on full-context actions -> over-estimation the actor exploits)
-        # vs the transformer architecture / frame_norm / window itself.
-        if bool(getattr(self.cfg, "actor_score_current_only", False)):
-            cur = torch.zeros(B, L, device=valid.device, dtype=vmask.dtype)
-            cur[:, L - 1] = 1.0                                   # current token only
-            vmask = vmask * cur.reshape(BL)
-        nval = vmask.sum().clamp_min(1.0)
-        weight = (Q_fb.abs() * vmask).sum().detach() / nval if self.cfg.scale_reg else 1.0
-
-        per_pos = -(Q_fb + self.cfg.reg_coeff * weight * Q_disc
-                    + self.cfg.reg_coeff_aux * weight * Q_aux)    # [BL]
-        actor_loss = (per_pos * vmask).sum() / nval
+        weight = Q_fb.abs().mean().detach() if self.cfg.scale_reg else 1.0
+        actor_loss = (
+            -Q_fb.mean()
+            - self.cfg.reg_coeff * weight * Q_disc.mean()
+            - self.cfg.reg_coeff_aux * weight * Q_aux.mean()
+        )
 
         self.actor_optimizer.zero_grad(set_to_none=True)
         actor_loss.backward()
@@ -2925,10 +2897,10 @@ class FBCprAux:
         with torch.no_grad():
             out = {
                 "actor_loss": actor_loss.detach(),
-                "Q_fb": (Q_fb * vmask).sum().detach() / nval,
-                "Q_discriminator": (Q_disc * vmask).sum().detach() / nval,
-                "Q_aux": (Q_aux * vmask).sum().detach() / nval,
-                "actor_tf/valid_frac": vmask.mean().detach(),
+                "Q_fb": Q_fb.mean().detach(),
+                "Q_discriminator": Q_disc.mean().detach(),
+                "Q_aux": Q_aux.mean().detach(),
+                "actor_tf/valid_frac": valid.float().mean().detach(),
                 "act_loc/abs_mean": dist.loc.abs().mean().detach(),
             }
         return out, handle

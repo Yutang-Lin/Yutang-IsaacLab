@@ -91,8 +91,9 @@ class RoPECausalSelfAttention(nn.Module):
 
     def forward(self, x: torch.Tensor, positions: torch.Tensor,
                 rope_mask: torch.Tensor, attn_mask: torch.Tensor) -> torch.Tensor:
-        """x: [B, L, D]; positions/rope_mask: [L]; attn_mask: [L, L] bool
-        (True = allowed to attend). Returns [B, L, D]."""
+        """x: [B, L, D]; positions/rope_mask: [L]; attn_mask bool, True=allowed,
+        either [L, L] (shared causal) or [B, L, L] (per-sample, e.g. when invalid
+        padding frame tokens are masked out as keys). Returns [B, L, D]."""
         B, L, D = x.shape
         qkv = self.qkv(x).view(B, L, 3, self.n_heads, self.head_dim)
         q, k, v = qkv.unbind(dim=2)                       # each [B, L, h, hd]
@@ -101,10 +102,14 @@ class RoPECausalSelfAttention(nn.Module):
         v = v.transpose(1, 2)
         q = self.rope.rotate(q, positions, rope_mask)
         k = self.rope.rotate(k, positions, rope_mask)
-        # attn_mask [L,L] -> additive bias broadcast over [B,h,L,L]
-        bias = torch.zeros(L, L, device=x.device, dtype=q.dtype)
-        bias = bias.masked_fill(~attn_mask, float("-inf"))
-        out = F.scaled_dot_product_attention(q, k, v, attn_mask=bias.view(1, 1, L, L))
+        # -> additive bias broadcast over heads: [1,1,L,L] (shared) or [B,1,L,L].
+        if attn_mask.dim() == 2:
+            bias = torch.zeros(L, L, device=x.device, dtype=q.dtype)
+            bias = bias.masked_fill(~attn_mask, float("-inf")).view(1, 1, L, L)
+        else:
+            bias = torch.zeros(B, L, L, device=x.device, dtype=q.dtype)
+            bias = bias.masked_fill(~attn_mask, float("-inf")).view(B, 1, L, L)
+        out = F.scaled_dot_product_attention(q, k, v, attn_mask=bias)
         out = out.transpose(1, 2).contiguous().view(B, L, D)
         return self.out_proj(out)
 
@@ -162,14 +167,25 @@ class RoPETransformerActor(nn.Module):
         ])
         self.ln_f = nn.LayerNorm(d_model)
         self.action_head = nn.Linear(d_model, action_dim)
-        # Small init on the head so tanh(out) starts near 0 (well inside [-1,1]).
-        self.action_head.weight.data.mul_(0.01)
-        self.action_head.bias.data.zero_()
+        # NOTE: head weights are re-initialized orthogonally by the algorithm's
+        # ``policy.apply(weight_init)`` after construction, so no manual scaling
+        # here (a previous ``*0.01`` was dead — it was overwritten by weight_init).
 
-    def forward(self, frames: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
+    def forward(self, frames: torch.Tensor, z: torch.Tensor,
+                valid: torch.Tensor | None = None,
+                last_only: bool = False) -> torch.Tensor:
         """frames: [B, H+1, frame_dim] (oldest..current); z: [B, z_dim].
-        Returns action MEANS (pre-std) ``tanh(out)`` of shape [B, H+1, action_dim]
-        — one per timestep token (last = current step)."""
+
+        ``valid`` ([B, H+1] bool, optional): marks REAL frame tokens. Invalid
+        positions (zero-padded history at/after an episode reset) are excluded as
+        ATTENTION KEYS so no token attends to garbage frames — fixing both the
+        first-H-steps-of-every-episode regime (history zero-filled at reset) and
+        post-reset recovery. The z token (pos 0) is always a valid key, so every
+        causal query row keeps at least one key (no all-masked row -> no NaN).
+
+        Returns action MEANS (pre-std) ``tanh(out)``: [B, H+1, action_dim] (one
+        per timestep token), or [B, action_dim] for the current step only when
+        ``last_only`` (cheaper rollout path)."""
         B, Tp1, _ = frames.shape
         ftok = self.frame_enc(frames)                    # [B, H+1, D]
         ztok = self.z_enc(z).unsqueeze(1)                # [B, 1, D]
@@ -185,10 +201,23 @@ class RoPETransformerActor(nn.Module):
         # Causal mask [L,L]: token i attends to j<=i. z (col 0) is visible to all
         # (it's position 0, so causal already lets every token attend to it).
         idx = torch.arange(L, device=frames.device)
-        attn_mask = idx.view(1, L) <= idx.view(L, 1)     # [L,L] True=allowed
+        causal = idx.view(1, L) <= idx.view(L, 1)        # [L,L] True=allowed
+        if valid is None:
+            attn_mask = causal                           # shared [L,L]
+        else:
+            # Per-sample key validity over the H+2 tokens: z (col 0) always valid,
+            # then the H+1 frame validities. A key column j is attendable only if
+            # causal AND token j is valid. [B, L, L].
+            key_valid = torch.cat(
+                [torch.ones(B, 1, dtype=torch.bool, device=frames.device),
+                 valid.bool()], dim=1)                   # [B, L]
+            attn_mask = causal.view(1, L, L) & key_valid.view(B, 1, L)
         for blk in self.blocks:
             x = blk(x, positions, rope_mask, attn_mask)
         x = self.ln_f(x)
-        # Drop the z token; action head on the H+1 timestep tokens.
-        a = self.action_head(x[:, 1:])                   # [B, H+1, action_dim]
+        # Drop the z token; action head on the timestep token(s).
+        if last_only:
+            a = self.action_head(x[:, -1])               # [B, action_dim]
+        else:
+            a = self.action_head(x[:, 1:])               # [B, H+1, action_dim]
         return torch.tanh(a)
