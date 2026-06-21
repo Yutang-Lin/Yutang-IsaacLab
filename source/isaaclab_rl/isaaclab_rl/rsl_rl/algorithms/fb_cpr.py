@@ -1823,6 +1823,14 @@ class FBCprAux:
         if float(getattr(self.cfg, "zbar_relabel_ratio", 0.0)) > 0.0:
             self._relabel_zbar = self._zbar_from_obs(train_next_obs)  # [batch, d] or None
 
+        # Stash the RAW (pre-normalization) next_obs for the transformer actor's
+        # TD-target next_action. The transformer actor is a RAW-obs consumer (it
+        # owns its own frame BatchNorm), so feeding it the per-key-NORMALIZED
+        # next_obs (below) would DOUBLE-normalize -> wrong next_action poisoning
+        # every FB/critic/aux/entropy TD target. MLP actor ignores this (its
+        # target path normalizes itself). Shallow-copied dict of the raw tensors.
+        self._raw_train_next_obs = dict(train_next_obs)
+
         # Update obs-normalizer running stats on the train batch.
         self.policy._obs_normalizer(train_obs)
         self.policy._obs_normalizer(train_next_obs)
@@ -2445,6 +2453,28 @@ class FBCprAux:
         back-compat / additional relabels.)"""
         return train_obs, train_next_obs, train_next_obs, train_z
 
+    @torch.no_grad()
+    def _target_next_action(self, next_obs, z):
+        """Sample the TD-target next_action from the actor (clip=stddev_clip).
+
+        MLP actor: call directly on the (already per-key-normalized) ``next_obs``.
+        Transformer actor: it is a RAW-obs consumer (owns its frame BatchNorm), so
+        feed the RAW pre-normalization next_obs (stashed as _raw_train_next_obs)
+        through policy.actor() — which routes raw obs to the transformer — under
+        eval_mode so frame_norm does NOT update its running stats from the target
+        pass. This avoids the double-normalization that would otherwise corrupt
+        every FB/critic/aux/entropy TD target.
+        """
+        p = self.policy
+        if isinstance(self._unwrap(p._actor), TransformerActorWrapper):
+            raw = getattr(self, "_raw_train_next_obs", None)
+            src = raw if raw is not None else next_obs
+            with eval_mode(p._actor):
+                dist = p.actor(src, z, p.actor_std)
+            return dist.sample(clip=self.cfg.stddev_clip)
+        dist = p._actor(next_obs, z, p.actor_std)
+        return dist.sample(clip=self.cfg.stddev_clip)
+
     def backward_fb(
         self,
         obs: torch.Tensor | dict[str, torch.Tensor],
@@ -2461,9 +2491,9 @@ class FBCprAux:
         """
         p = self.policy
         with torch.no_grad():
-            # next_action via actor
-            dist = p._actor(next_obs, z, p.actor_std)
-            next_action = dist.sample(clip=self.cfg.stddev_clip)
+            # next_action via actor (raw obs for the transformer actor — see
+            # _target_next_action; avoids double-normalization in the TD target)
+            next_action = self._target_next_action(next_obs, z)
             target_Fs = p._target_forward_map(next_obs, z, next_action)  # (num_par, B, d)
             target_B = p._target_backward_map(goal)  # (B, d)
             target_Ms = torch.matmul(target_Fs, target_B.T)  # (num_par, B, B)
@@ -2612,8 +2642,7 @@ class FBCprAux:
             if self.cfg.manifold_attractor and p._manifold_attractor is not None:
                 _ma_reward = p._manifold_attractor.compute_reward(obs)
                 reward = reward + self.cfg.manifold_attractor_coeff * _ma_reward
-            dist = p._actor(next_obs, z, p.actor_std)
-            next_action = dist.sample(clip=self.cfg.stddev_clip)
+            next_action = self._target_next_action(next_obs, z)
             next_Qs = p._target_critic(next_obs, z, next_action)
             # Shapes:
             #   scalar critic:       next_Qs = [num_parallel, batch, 1]
@@ -2689,8 +2718,7 @@ class FBCprAux:
         distributional = bool(getattr(pol_cfg, "aux_critic_distributional", False))
         num_parallel = self._unwrap(p._aux_critic).num_parallel
         with torch.no_grad():
-            dist = p._actor(next_obs, z, p.actor_std)
-            next_action = dist.sample(clip=self.cfg.stddev_clip)
+            next_action = self._target_next_action(next_obs, z)
             next_Qs = p._target_aux_critic(next_obs, z, next_action)
             if distributional:
                 next_Qs_scalar = next_Qs.mean(dim=-1)
@@ -2758,7 +2786,15 @@ class FBCprAux:
             return {}
 
         with torch.no_grad():
-            next_dist = p._actor(next_obs, z, p.actor_std)
+            # Transformer actor consumes RAW obs (owns its frame BatchNorm); feed
+            # the raw next_obs under eval_mode to avoid double-normalization +
+            # stat pollution. MLP actor uses the normalized next_obs directly.
+            if isinstance(self._unwrap(p._actor), TransformerActorWrapper):
+                _raw = getattr(self, "_raw_train_next_obs", None)
+                with eval_mode(p._actor):
+                    next_dist = p.actor(_raw if _raw is not None else next_obs, z, p.actor_std)
+            else:
+                next_dist = p._actor(next_obs, z, p.actor_std)
             next_action = next_dist.sample()
             log_pi_next = next_dist.log_prob(next_action).mean(dim=-1)  # [B] per-dim avg
             # _target_entropy_critic returns [1, B, 1] (num_parallel=1)
@@ -2803,6 +2839,13 @@ class FBCprAux:
         # Raw per-position frames [B, L, 93] = [state | last_action] (training
         # order matches the wrapper's _current_frame).
         frames = torch.cat([win_obs["state"], win_obs["last_action"]], dim=-1)
+        # ZERO the invalid (cross-episode / pre-episode) positions so the actor's
+        # input window matches ROLLOUT: at episode start the env zero-fills the
+        # history buffer, so older-than-episode-start frames are zeros there. The
+        # training window instead carries real STALE frames at invalid positions;
+        # zeroing them here removes that train/serve input-distribution skew for
+        # the first ~H steps after each reset. Current pos (L-1) is always valid.
+        frames = frames * valid.unsqueeze(-1).to(frames.dtype)
 
         # Actor forward over the window with the SINGLE shared z_t token ([B, d];
         # the net prepends one z token, shared across all H+1 positions) ->
