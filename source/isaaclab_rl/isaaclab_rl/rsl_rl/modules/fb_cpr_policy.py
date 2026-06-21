@@ -877,18 +877,29 @@ class TransformerActorWrapper(nn.Module):
         return torch.cat([obs["state"], obs["last_action"]], dim=-1)
 
     def _history_frames(self, obs: dict) -> torch.Tensor:
-        """[B, H, 93] past frames, reordered from the alphabetical history_actor
-        blob to the canonical training order. history_actor = [B, H*93] with
-        per-frame fields [act(29), angvel(3), dofpos(29), dofvel(29), grav(3)]."""
+        """[B, H, 93] past frames, reordered from the history_actor blob to the
+        canonical training order [dof_pos, dof_vel, gravity, root_ang_vel, action].
+
+        CRITICAL — history_actor is per-TERM-BLOCKED, NOT per-frame-interleaved.
+        The env builds it by concatenating 5 SEPARATE lagged obs terms, each
+        flattened frame-major within the term:
+            [ act(H*29) | angvel(H*3) | dofpos(H*29) | dofvel(H*29) | grav(H*3) ]
+        (alphabetical term order: actions, base_ang_vel, dof_pos, dof_vel,
+        projected_gravity). So we must split into the 5 contiguous blocks, view
+        each as [B, H, Dk], then stack along the field axis — a plain
+        ``view(B, H, 93)`` would scramble fields across frames.
+        """
         h = obs["history_actor"]
         B = h.shape[0]
         H = self.history_len
-        hf = h.view(B, H, 93)
-        act = hf[..., 0:29]
-        angv = hf[..., 29:32]
-        dofp = hf[..., 32:61]
-        dofv = hf[..., 61:90]
-        grav = hf[..., 90:93]
+        # per-term block widths in alphabetical term order
+        D_act, D_angv, D_dofp, D_dofv, D_grav = 29, 3, 29, 29, 3
+        o = 0
+        act = h[:, o:o + H * D_act].view(B, H, D_act); o += H * D_act
+        angv = h[:, o:o + H * D_angv].view(B, H, D_angv); o += H * D_angv
+        dofp = h[:, o:o + H * D_dofp].view(B, H, D_dofp); o += H * D_dofp
+        dofv = h[:, o:o + H * D_dofv].view(B, H, D_dofv); o += H * D_dofv
+        grav = h[:, o:o + H * D_grav].view(B, H, D_grav); o += H * D_grav
         # training order: [dof_pos, dof_vel, gravity, root_ang_vel, action]
         return torch.cat([dofp, dofv, grav, angv, act], dim=-1)
 

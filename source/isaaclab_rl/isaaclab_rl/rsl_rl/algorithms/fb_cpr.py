@@ -1696,6 +1696,13 @@ class FBCprAux:
         world = float(torch.distributed.get_world_size())
         all_bufs = list(self.policy._obs_normalizer.buffers()) + \
                    list(self.policy._aux_reward_normalizer.buffers())
+        # The transformer actor owns its OWN frame BatchNorm (frame_norm), used
+        # both at rollout (eval-mode act -> fills the per-rank replay) and train.
+        # It's outside _obs_normalizer and DDP broadcast_buffers=False, so sync
+        # its running stats here too (else ranks' running_mean/var drift).
+        _actor = self._unwrap(self.policy._actor)
+        if hasattr(_actor, "frame_norm"):
+            all_bufs += list(_actor.frame_norm.buffers())
 
         float_bufs = [b for b in all_bufs if b is not None and b.dtype != torch.long]
         int_bufs = [b for b in all_bufs if b is not None and b.dtype == torch.long]
@@ -2558,6 +2565,15 @@ class FBCprAux:
         max_norm = float(clip_grad_norm) if clip_grad_norm is not None else float("inf")
         gn_f = torch.nn.utils.clip_grad_norm_(p._forward_map.parameters(), max_norm)
         gn_b = torch.nn.utils.clip_grad_norm_(p._backward_map.parameters(), max_norm)
+        # DDP: the reconstruction head (linear W) is a sibling module, NOT inside
+        # the DDP-wrapped _backward_map, so its grads (from the recon_loss folded
+        # into fb_loss) are LOCAL. Reduce them so W (and the analytic z_bar=W^T c_g
+        # it produces) stays consistent across ranks. backward_optimizer owns both
+        # B and the recon head; reduce before its step.
+        rh = getattr(p, "_reconstruction_head", None)
+        if self.is_distributed and rh is not None:
+            from ..utils import reduce_gradients
+            reduce_gradients(rh)
         self.forward_optimizer.step()
         self.backward_optimizer.step()
         return {
@@ -2815,6 +2831,12 @@ class FBCprAux:
 
         self.actor_optimizer.zero_grad(set_to_none=True)
         actor_loss.backward()
+        # DDP: the transformer actor runs through the UNWRAPPED module
+        # (forward_window is a custom method, not DDP.forward), so DDP's bucket
+        # hooks never fire and the grads are LOCAL. Manually all-reduce them so
+        # ranks stay in sync (the MLP-actor path reduces via DDP.__call__).
+        # step_actor finishes the handle before optimizer.step.
+        handle = reduce_gradients_async(actor) if self.is_distributed else None
         with torch.no_grad():
             out = {
                 "actor_loss": actor_loss.detach(),
@@ -2824,7 +2846,7 @@ class FBCprAux:
                 "actor_tf/valid_frac": vmask.mean().detach(),
                 "act_loc/abs_mean": dist.loc.abs().mean().detach(),
             }
-        return out, None
+        return out, handle
 
     def backward_actor(
         self,
