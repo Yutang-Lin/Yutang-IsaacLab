@@ -993,20 +993,19 @@ class TransformerActorWrapper(nn.Module):
         mu = self.net(frames, z, valid=valid, last_only=True)  # [B, A] current step
         return self._dist(mu, std)
 
-    # -- training: current token only (last_only) --------------------------
+    # -- training: all H+1 tokens (temporal-parallel scoring) --------------
     def forward_window(self, frames: torch.Tensor, z, std, valid: torch.Tensor | None = None):
         """frames = RAW [B, H+1, 93] window (training path). ``valid`` ([B, H+1])
         marks real frames: it masks cross/pre-episode positions out of the frame
-        BatchNorm statistics AND excludes them as attention KEYS (so the scored
-        token never attends to zero-padded frames — train matches rollout).
+        BatchNorm statistics AND excludes them as attention KEYS (so no token
+        attends to zero-padded frames — train matches rollout).
 
-        Returns a TruncatedNormal over the CURRENT-step action only ([B, A]) —
-        the on-distribution token. Past-token actions are NOT scored: they are
-        produced from a truncated causal context that never occurs at rollout, so
-        scoring them poisoned the shared trunk (see fb_cpr actor loss)."""
-        mu = self.net(self._norm_frames(frames, valid), z,
-                      valid=valid, last_only=True)             # [B, A] current step
-        return self._dist(mu, std)
+        Returns a TruncatedNormal over ALL H+1 token actions ([B, H+1, A]) for
+        temporal-parallel actor scoring. NOTE: past tokens attend to a TRUNCATED
+        causal context [t-H..t-p] that does not occur at rollout (where each step
+        sees a full window) — accepted trade-off for the extra gradient signal."""
+        means = self.net(self._norm_frames(frames, valid), z, valid=valid)  # [B, H+1, A]
+        return self._dist(means, std)
 
     @staticmethod
     def _dist(mu, std):
