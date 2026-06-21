@@ -603,10 +603,19 @@ class ReconstructionHead(nn.Module):
         hidden_layers: int = 2,
         linear: bool = False,
         square_augment: bool = False,
+        target_scale: float = 1.0,
     ) -> None:
         super().__init__()
         self.targets = [(str(k), int(s), int(e)) for (k, s, e) in targets]
         self.square_augment = bool(square_augment)
+        # Per-feature divisor applied to the base features BEFORE the square
+        # augment, so the (already BatchNorm-unit-variance) targets land in
+        # ~[-1,1] and their squares in ~[0,1] — representable by the
+        # sphere-bounded B via the linear W. Applied identically in
+        # gather_target (recon-loss target) and gather_base_target (z_bar goal
+        # features), so z_bar = W^T c_g stays unit-consistent (the scale is a
+        # global factor that project_z removes for uniform target_scale).
+        self.target_scale = float(target_scale)
         base_dim = sum(e - s for _, s, e in self.targets)
         assert base_dim > 0, "ReconstructionHead needs at least one target slice."
         # With square_augment the target (and output) is [features, features^2].
@@ -645,6 +654,8 @@ class ReconstructionHead(nn.Module):
                 )
             parts.append(obs[key][:, s:e])
         feats = torch.cat(parts, dim=-1)
+        if self.target_scale != 1.0:
+            feats = feats / self.target_scale
         if self.square_augment:
             return torch.cat([feats, feats * feats], dim=-1)
         return feats
@@ -661,7 +672,10 @@ class ReconstructionHead(nn.Module):
                     f"Available keys: {list(obs.keys())}"
                 )
             parts.append(obs[key][:, s:e])
-        return torch.cat(parts, dim=-1)
+        feats = torch.cat(parts, dim=-1)
+        if self.target_scale != 1.0:
+            feats = feats / self.target_scale
+        return feats
 
 
 class ForwardMap(nn.Module):
@@ -1267,6 +1281,10 @@ class FBCprNetworkCfg:
     # second moments) lie in the span of B(s) — used with backward_norm=False.
     recon_linear: bool = False
     recon_square_augment: bool = False
+    # Per-feature divisor applied to the base recon/z_bar target features so the
+    # (BatchNorm-unit-variance) targets land in ~[-1,1] and their squares in
+    # ~[0,1] — representable by the sphere-bounded B. 1.0 = no scaling.
+    recon_target_scale: float = 1.0
 
     # --- Manifold attractor ----------------------------------------------
     manifold_attractor: bool = False
@@ -1353,6 +1371,7 @@ class FBCprAuxPolicy(nn.Module):
                 hidden_layers=cfg.recon_hidden_layers,
                 linear=bool(getattr(cfg, "recon_linear", False)),
                 square_augment=bool(getattr(cfg, "recon_square_augment", False)),
+                target_scale=float(getattr(cfg, "recon_target_scale", 1.0)),
             )
 
         # Forward map (z-output).
