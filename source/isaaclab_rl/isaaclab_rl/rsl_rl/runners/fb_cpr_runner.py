@@ -218,13 +218,14 @@ class FBCprRunner:
             # drives env + expert so the priv layout (24K-5) agrees.
             priv_include_heading_body=bool(
                 self.alg_cfg.get("priv_include_heading_body", False)),
-            # Transformer actor deepens the env history (H 4->9); compose the
-            # expert history_actor at the same H so its dim matches the env
-            # obs-normalizer BatchNorm. None for the MLP actor (dataset default).
-            history_len_override=(
-                int(self.policy_cfg.get("actor_history_len", 9))
-                if str(self.policy_cfg.get("actor_arch", "mlp")) == "transformer"
-                else None),
+            # Compose the expert history_actor at the SAME history length the env
+            # uses, so its dim matches the env obs-normalizer BatchNorm. Derive H
+            # directly from the env's history_actor obs dim (= H * 93) rather than
+            # from actor_arch: the deepened (H=9) env may be paired with EITHER the
+            # transformer OR the MLP actor (e.g. the BFM-0.5 mlp-actor bisection),
+            # and both need the expert history at the env's H. None -> dataset
+            # default only when the env carries no history_actor group.
+            history_len_override=self._expert_history_len_override(),
         )
         # Forward to the env so RSI can pull from it.
         if hasattr(self.env_unwrapped, "set_expert_buffer"):
@@ -507,6 +508,21 @@ class FBCprRunner:
         if str(self.policy_cfg.get("actor_arch", "mlp")) != "transformer":
             return 0
         return int(self.policy_cfg.get("actor_history_len", 9))
+
+    def _expert_history_len_override(self) -> int | None:
+        """H at which to compose the expert ``history_actor`` so its dim matches
+        the env obs-normalizer BatchNorm. Derived from the env's actual
+        history_actor obs dim (= H * frame_dim) so it is correct for ANY actor
+        (transformer or MLP) running on a deepened-history env. Returns None when
+        the env carries no history_actor group (dataset default applies)."""
+        ha = self.obs_space.spaces.get("history_actor", None) if hasattr(self.obs_space, "spaces") else None
+        if ha is None:
+            return None
+        frame_dim = int(self.policy_cfg.get("actor_frame_dim", 93))
+        dim = int(ha.shape[0])
+        if frame_dim <= 0 or dim % frame_dim != 0:
+            return None
+        return dim // frame_dim
 
     def _sample_explore_std(self, n: int) -> torch.Tensor:
         """``n`` per-env exploration stds, uniform in [explore_std_min,
