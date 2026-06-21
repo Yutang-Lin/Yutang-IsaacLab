@@ -900,8 +900,15 @@ class TransformerActorWrapper(nn.Module):
         dofp = h[:, o:o + H * D_dofp].view(B, H, D_dofp); o += H * D_dofp
         dofv = h[:, o:o + H * D_dofv].view(B, H, D_dofv); o += H * D_dofv
         grav = h[:, o:o + H * D_grav].view(B, H, D_grav); o += H * D_grav
-        # training order: [dof_pos, dof_vel, gravity, root_ang_vel, action]
-        return torch.cat([dofp, dofv, grav, angv, act], dim=-1)
+        # field order: [dof_pos, dof_vel, gravity, root_ang_vel, action]
+        frames = torch.cat([dofp, dofv, grav, angv, act], dim=-1)  # [B, H, 93]
+        # TIME ORDER: the lagged history buffer is RECENT-FIRST — _LaggedHistory
+        # Wrapper returns [t-1, t-2, ..., t-H] (forward-roll inserts current at 0,
+        # older frames at higher idx). But the TRAINING window (_gather_actor_window,
+        # offsets [-H..0]) is OLDEST-FIRST [t-H, ..., t-1]. The RoPE actor assigns
+        # position by token index, so the orders MUST match or past tokens land on
+        # reversed positions at inference vs training. Flip to oldest-first.
+        return frames.flip(1)
 
     def assemble_frames(self, obs: dict) -> torch.Tensor:
         """[B, H+1, 93] raw frames oldest..current (history then current)."""

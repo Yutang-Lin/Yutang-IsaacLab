@@ -1473,16 +1473,23 @@ class FBCprAux:
 
     @torch.no_grad()
     def _zbar_from_obs(self, obs: dict) -> torch.Tensor | None:
-        """Build projected z_bar for goals given by the W-target features sliced
-        from ``obs`` (an UN-normalized obs dict: the recon targets are read in
-        raw feature units, matching what the W head reconstructs). Returns
-        ``[B, z_dim]`` or None if unavailable."""
+        """Build projected z_bar for goals given by the W-target features.
+
+        CRITICAL — the W head is trained to reconstruct the W-target slices from
+        the NORMALIZED goal obs (backward_fb's recon_loss runs gather_target on
+        ``fb_goal = train_next_obs`` AFTER the obs-normalizer). So the goal
+        features ``g`` fed into z_bar = W^T c_g MUST be in the SAME normalized
+        space, or c_g (raw) and W (normalized) are unit-inconsistent and the
+        z_bar direction is wrong (project_z only fixes norm, not direction).
+        We therefore NORMALIZE the obs here before slicing the goal features.
+        ``obs`` arrives RAW (callers pass pre-normalization obs)."""
         head = getattr(self.policy, "_reconstruction_head", None)
         lam = self._zbar_lambda()
         if head is None or lam is None or not isinstance(obs, dict):
             return None
+        obs_n = self.policy._normalize(obs)   # match W's training space
         try:
-            goal_x = head.gather_base_target(obs)  # [B, n] raw features (no squares)
+            goal_x = head.gather_base_target(obs_n)  # [B, n] normalized features
         except KeyError:
             return None
         return self.policy.zbar_from_goal(goal_x, lam)

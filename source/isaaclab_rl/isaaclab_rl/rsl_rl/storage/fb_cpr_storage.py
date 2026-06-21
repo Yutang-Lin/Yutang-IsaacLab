@@ -430,7 +430,6 @@ class FBCprReplayBuffer:
         # Per-position obs windows (state/priv/last_action/history_actor and any
         # other stored obs key), z, and the per-position truncated flag.
         obs_w = {k: v[tw, ew] for k, v in self._obs.items()}     # each [B, H+1, dim]
-        z_w = self._z[tw, ew]                                    # [B, H+1, z_dim]
         trunc_w = self._truncated[tw, ew].squeeze(-1)            # [B, H+1] bool
         # Validity: a boundary at position p (truncated row = post-reset spawn of
         # a NEW episode) invalidates that position AND everything OLDER than it.
@@ -452,9 +451,28 @@ class FBCprReplayBuffer:
             # after_any[:, p] corresponds to "any trunc in pos (p+1)..H" for p in 0..H-1
             valid[:, :H] = ~after_any.bool()
         valid[:, H] = True
+        # Also invalidate window positions that reach into the UNWRITTEN / stale
+        # region (no real truncation marker there, so the cummax mask alone would
+        # keep them valid):
+        #  - not full: rows >= self._idx were never written (zeros from _alloc).
+        #  - full: the write cursor (_idx-1) is a synthetic episode boundary not
+        #    flagged in _truncated; positions that wrapped PAST it (older than the
+        #    cursor) belong to a Tcap-steps-old, soon-overwritten episode.
+        cur_t = time_idx.unsqueeze(1)                            # [B,1]
+        if not self._is_full:
+            # valid only if the gathered row index is within written data AND not
+            # ahead of the current step (offsets are <=0 so tw<=time_idx unless wrapped).
+            valid &= (tw <= cur_t)
+        else:
+            cursor = (self._idx - 1) % Tcap
+            # "steps back from current" for each window pos (0..H), and steps from
+            # current back to the cursor; invalidate positions older than the cursor.
+            steps_back = (cur_t - tw) % Tcap                     # [B,H+1] in 0..Tcap-1
+            steps_to_cursor = (cur_t.squeeze(1) - cursor) % Tcap # [B]
+            valid &= (steps_back <= steps_to_cursor.unsqueeze(1))
+        valid[:, H] = True                                       # current always valid
         return {
             "obs": obs_w,            # dict key -> [B, H+1, dim]
-            "z": z_w,                # [B, H+1, z_dim]
             "valid": valid,          # [B, H+1] bool
         }
 
@@ -485,7 +503,6 @@ class FBCprReplayBuffer:
         if has_window:
             aw = big["actor_window"]
             aw_obs_flat = {k: _move(v) for k, v in aw["obs"].items()}
-            aw_z_flat = _move(aw["z"])
             aw_valid_flat = _move(aw["valid"])
 
         chunks: list[dict] = []
@@ -507,7 +524,6 @@ class FBCprReplayBuffer:
             if has_window:
                 chunk["actor_window"] = {
                     "obs": {k: aw_obs_flat[k][s] for k in aw_obs_flat},
-                    "z": aw_z_flat[s],
                     "valid": aw_valid_flat[s],
                 }
             chunks.append(chunk)

@@ -175,7 +175,10 @@ class RoPETransformerActor(nn.Module):
         ztok = self.z_enc(z).unsqueeze(1)                # [B, 1, D]
         x = torch.cat([ztok, ftok], dim=1)               # [B, H+2, D]  (z first)
         L = Tp1 + 1
-        # Positions: z at index 0 is RoPE-exempt; timesteps get 0..H.
+        # Positions: z at index 0 is RoPE-exempt; the H+1 frame tokens occupy
+        # indices 1..H+1 and get those rotary positions (relative deltas are what
+        # matter for frame-frame attention; the absolute offset is consistent
+        # between train and rollout).
         positions = torch.arange(L, device=frames.device, dtype=torch.float32)
         rope_mask = torch.ones(L, dtype=torch.bool, device=frames.device)
         rope_mask[0] = False                             # z token: no rotary
