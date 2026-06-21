@@ -838,6 +838,99 @@ class Actor(nn.Module):
             return TruncatedNormal(mu, std_tensor)
 
 
+class TransformerActorWrapper(nn.Module):
+    """Adapts :class:`RoPETransformerActor` to the policy's actor interface.
+
+    Consumes the RAW (un-normalized) obs dict and owns a SINGLE shared frame
+    normalizer (BatchNorm1d over the ``frame_dim`` per-frame vector) applied
+    identically to every one of the H+1 frame tokens — so the shared per-frame
+    encoder sees a consistent scale whether a frame is "current" or "past", and
+    whether it came from the training window or the rollout history.
+
+    Per-frame token = ``[state | last_action]`` in the canonical TRAINING order
+    ``[dof_pos_dev(29), dof_vel(29), gravity(3), root_ang_vel(3), action(29)]``
+    (= 93). The env's ``history_actor`` packs the same fields per past frame in
+    ALPHABETICAL group order ``[actions(29), base_ang_vel(3), dof_pos(29),
+    dof_vel(29), projected_gravity(3)]``; ``_assemble_frames`` reorders them to
+    the training order so train/rollout frames are byte-identical.
+    """
+
+    # canonical training frame layout (dim ranges within the 93-d frame)
+    _N_DOFP, _N_DOFV, _N_GRAV, _N_ANGV, _N_ACT = 29, 29, 3, 3, 29
+
+    def __init__(self, obs_space, z_dim, action_dim, frame_dim=93,
+                 history_len=9, d_model=512, n_layers=6, n_heads=8, mlp_ratio=4):
+        super().__init__()
+        from isaaclab_rl.rsl_rl.networks.rope_transformer_actor import RoPETransformerActor
+        self.frame_dim = int(frame_dim)
+        self.history_len = int(history_len)
+        self.action_dim = int(action_dim)
+        self.frame_norm = nn.BatchNorm1d(self.frame_dim, affine=False, momentum=0.01)
+        self.net = RoPETransformerActor(
+            frame_dim=self.frame_dim, z_dim=z_dim, action_dim=action_dim,
+            n_layers=n_layers, d_model=d_model, n_heads=n_heads, mlp_ratio=mlp_ratio,
+        )
+
+    # -- frame assembly ----------------------------------------------------
+    def _current_frame(self, obs: dict) -> torch.Tensor:
+        """[B, 93] current-step frame = [state(64) | last_action(29)]."""
+        return torch.cat([obs["state"], obs["last_action"]], dim=-1)
+
+    def _history_frames(self, obs: dict) -> torch.Tensor:
+        """[B, H, 93] past frames, reordered from the alphabetical history_actor
+        blob to the canonical training order. history_actor = [B, H*93] with
+        per-frame fields [act(29), angvel(3), dofpos(29), dofvel(29), grav(3)]."""
+        h = obs["history_actor"]
+        B = h.shape[0]
+        H = self.history_len
+        hf = h.view(B, H, 93)
+        act = hf[..., 0:29]
+        angv = hf[..., 29:32]
+        dofp = hf[..., 32:61]
+        dofv = hf[..., 61:90]
+        grav = hf[..., 90:93]
+        # training order: [dof_pos, dof_vel, gravity, root_ang_vel, action]
+        return torch.cat([dofp, dofv, grav, angv, act], dim=-1)
+
+    def assemble_frames(self, obs: dict) -> torch.Tensor:
+        """[B, H+1, 93] raw frames oldest..current (history then current)."""
+        past = self._history_frames(obs)                       # [B, H, 93]
+        cur = self._current_frame(obs).unsqueeze(1)            # [B, 1, 93]
+        return torch.cat([past, cur], dim=1)                  # [B, H+1, 93]
+
+    def _norm_frames(self, frames: torch.Tensor) -> torch.Tensor:
+        """Apply the shared frame BatchNorm to every frame identically."""
+        B, L, D = frames.shape
+        return self.frame_norm(frames.reshape(B * L, D)).view(B, L, D)
+
+    # -- forward (rollout / act): last token only --------------------------
+    def forward(self, obs, z, std):
+        """obs = RAW obs dict. Returns a TruncatedNormal over the CURRENT-step
+        action (last token)."""
+        frames = self._norm_frames(self.assemble_frames(obs))
+        means = self.net(frames, z)                            # [B, H+1, A]
+        mu = means[:, -1]                                      # current step
+        return self._dist(mu, std)
+
+    # -- training: all H+1 tokens ------------------------------------------
+    def forward_window(self, frames: torch.Tensor, z, std):
+        """frames = RAW [B, H+1, 93] window (training path). Returns a
+        TruncatedNormal over ALL H+1 token actions ([B, H+1, A])."""
+        means = self.net(self._norm_frames(frames), z)         # [B, H+1, A]
+        return self._dist(means, std)
+
+    @staticmethod
+    def _dist(mu, std):
+        if torch.is_tensor(std):
+            s = std.to(mu.device, mu.dtype)
+            while s.dim() < mu.dim():
+                s = s.unsqueeze(-1)
+            std_tensor = torch.ones_like(mu) * s
+        else:
+            std_tensor = torch.ones_like(mu) * std
+        return TruncatedNormal(mu, std_tensor)
+
+
 class Discriminator(nn.Module):
     """BFM CPR discriminator ``D(s, z)`` for style matching vs. expert motions."""
 
@@ -1002,6 +1095,19 @@ class FBCprNetworkCfg:
     actor_embedding_layers: int = 2
     actor_std: float = 0.05
     actor_input_keys: tp.Sequence[str] = ("state", "last_action", "history_actor")
+    # Actor architecture: "mlp" (default residual MLP, Actor) or "transformer"
+    # (RoPE causal transformer over per-timestep tokens, RoPETransformerActor).
+    # The transformer actor tokenizes each of the H+1 frames (current + H past)
+    # via a shared per-frame linear encoder, prepends a RoPE-exempt z token, runs
+    # a causal transformer, and emits H+1 actions in parallel. Each frame =
+    # [state (joint_state_dev+gravity+root_ang_vel) | last_action] = frame_dim.
+    actor_arch: str = "mlp"
+    actor_tf_d_model: int = 512
+    actor_tf_layers: int = 6
+    actor_tf_heads: int = 8
+    actor_tf_mlp_ratio: int = 4
+    actor_history_len: int = 9          # H (number of PAST frames; window = H+1)
+    actor_frame_dim: int = 93           # per-frame token feature dim (state 64 + last_action 29)
 
     # Critic (twin Q for discriminator reward); re-uses ForwardMap with
     # ``output_dim = 1`` (scalar Q) or ``output_dim = critic_n_quantiles``
@@ -1208,19 +1314,32 @@ class FBCprAuxPolicy(nn.Module):
 
         # Actor.
         _learned_std = self.soft_fb or bool(getattr(cfg, "actor_learned_std", False))
-        self._actor = Actor(
-            obs_space,
-            z_dim=cfg.z_dim,
-            action_dim=action_dim,
-            hidden_dim=cfg.actor_hidden_dim,
-            model=cfg.actor_model,
-            hidden_layers=cfg.actor_hidden_layers,
-            embedding_layers=cfg.actor_embedding_layers,
-            input_keys=cfg.actor_input_keys,
-            learned_std=_learned_std,
-            min_std=float(getattr(cfg, "actor_min_std", 0.01)),
-            max_std=float(getattr(cfg, "actor_max_std", 1.0)),
-        )
+        if str(getattr(cfg, "actor_arch", "mlp")) == "transformer":
+            self._actor = TransformerActorWrapper(
+                obs_space,
+                z_dim=cfg.z_dim,
+                action_dim=action_dim,
+                frame_dim=int(cfg.actor_frame_dim),
+                history_len=int(cfg.actor_history_len),
+                d_model=int(cfg.actor_tf_d_model),
+                n_layers=int(cfg.actor_tf_layers),
+                n_heads=int(cfg.actor_tf_heads),
+                mlp_ratio=int(cfg.actor_tf_mlp_ratio),
+            )
+        else:
+            self._actor = Actor(
+                obs_space,
+                z_dim=cfg.z_dim,
+                action_dim=action_dim,
+                hidden_dim=cfg.actor_hidden_dim,
+                model=cfg.actor_model,
+                hidden_layers=cfg.actor_hidden_layers,
+                embedding_layers=cfg.actor_embedding_layers,
+                input_keys=cfg.actor_input_keys,
+                learned_std=_learned_std,
+                min_std=float(getattr(cfg, "actor_min_std", 0.01)),
+                max_std=float(getattr(cfg, "actor_max_std", 1.0)),
+            )
 
         # Discriminator.
         self._discriminator = Discriminator(
@@ -1426,6 +1545,10 @@ class FBCprAuxPolicy(nn.Module):
         z: torch.Tensor,
         std: float | torch.Tensor,
     ) -> TruncatedNormal:
+        # The transformer actor consumes RAW obs (it owns a shared per-frame
+        # BatchNorm); the MLP actor uses the per-key obs normalizer.
+        if isinstance(self._actor, TransformerActorWrapper):
+            return self._actor(obs, z, std)
         return self._actor(self._normalize(obs), z, std)
 
     @torch.no_grad()

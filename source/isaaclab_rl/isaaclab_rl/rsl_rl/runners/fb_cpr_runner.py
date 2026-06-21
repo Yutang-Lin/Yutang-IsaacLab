@@ -242,6 +242,10 @@ class FBCprRunner:
             aux_reward_names=aux_reward_names,
             device=self.alg_cfg.get("replay_device", "cpu"),
             extra_field_shapes=extra_field_shapes,
+            # Transformer actor: ask the buffer to also return the H+1 timestep
+            # window for the parallel actor loss (0 = off / MLP actor). Derived
+            # from the policy's actor_history_len when actor_arch=="transformer".
+            actor_window_len=self._actor_window_len(),
         )
 
         # --- Seed / rhythm controls ------------------------------------
@@ -488,6 +492,14 @@ class FBCprRunner:
             if hasattr(cfg, k):
                 setattr(cfg, k, v)
         return cfg
+
+    def _actor_window_len(self) -> int:
+        """H (number of PAST frames) the buffer must gather for the transformer
+        actor's parallel loss; the window is H+1 (offsets -H..0). Equals the
+        policy's actor_history_len when actor_arch=="transformer", else 0 (MLP)."""
+        if str(self.policy_cfg.get("actor_arch", "mlp")) != "transformer":
+            return 0
+        return int(self.policy_cfg.get("actor_history_len", 9))
 
     def _sample_explore_std(self, n: int) -> torch.Tensor:
         """``n`` per-env exploration stds, uniform in [explore_std_min,

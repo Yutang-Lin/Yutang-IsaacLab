@@ -78,7 +78,12 @@ class FBCprReplayBuffer:
         device: str | torch.device = "cpu",
         pin_memory: bool | None = None,
         extra_field_shapes: dict[str, tuple[int, ...]] | None = None,
+        actor_window_len: int = 0,
     ) -> None:
+        # >0 -> sample() also returns an ``actor_window`` (the transformer actor's
+        # per-timestep H+1 frame window + per-position obs + a valid mask), gathered
+        # in-place from the 2D [time,env] storage. 0 -> off (MLP actor; no window).
+        self.actor_window_len = int(actor_window_len)
         self.num_envs = int(num_envs)
         self.time_capacity = int(capacity) // self.num_envs
         self.capacity = self.time_capacity  # __len__ counts time-steps
@@ -398,7 +403,60 @@ class FBCprReplayBuffer:
             out["next"]["extras"] = {
                 k: v[time_idx_next, env_idx] for k, v in self._extras.items()
             }
+        if self.actor_window_len > 0:
+            out["actor_window"] = self._gather_actor_window(time_idx, env_idx)
         return out
+
+    @torch.no_grad()
+    def _gather_actor_window(self, time_idx: torch.Tensor, env_idx: torch.Tensor) -> dict:
+        """Gather the transformer actor's H+1 timestep window ending at the
+        sampled ``time_idx`` (current step). Returns per-position obs windows and
+        a ``valid`` mask. No extra storage — gathered from the 2D [time,env] buffer.
+
+        Layout: offsets ``[-H, ..., 0]`` (oldest -> current). A past offset is
+        INVALID (mask False) when an episode boundary (``_truncated``) lies
+        strictly between it and the current step — i.e. that past frame belongs
+        to a different episode and must be excluded from the parallel loss.
+        ``valid[:, H]`` (current) is always True.
+        """
+        H = self.actor_window_len
+        B = time_idx.shape[0]
+        Tcap = self.time_capacity
+        # offsets oldest..current: [-H, ..., 0]  -> shape [H+1]
+        offs = torch.arange(-H, 1, device=self.device)
+        # time index per (sample, pos): wrap circularly. [B, H+1]
+        tw = (time_idx.unsqueeze(1) + offs.unsqueeze(0)) % Tcap
+        ew = env_idx.unsqueeze(1).expand(-1, H + 1)
+        # Per-position obs windows (state/priv/last_action/history_actor and any
+        # other stored obs key), z, and the per-position truncated flag.
+        obs_w = {k: v[tw, ew] for k, v in self._obs.items()}     # each [B, H+1, dim]
+        z_w = self._z[tw, ew]                                    # [B, H+1, z_dim]
+        trunc_w = self._truncated[tw, ew].squeeze(-1)            # [B, H+1] bool
+        # Validity: a boundary at position p (truncated row = post-reset spawn of
+        # a NEW episode) invalidates that position AND everything OLDER than it.
+        # Walk from current (pos H) backwards: once we hit a truncated row, all
+        # earlier positions are out-of-episode. truncated marks the FIRST frame of
+        # a new episode, so positions <= that index are invalid.
+        # boundary[:, p] = True if frame at pos p is a fresh-episode (truncated) row.
+        valid = torch.ones(B, H + 1, dtype=torch.bool, device=self.device)
+        # cumulative-OR of truncation scanning from oldest..current, but a
+        # truncation at pos p means frames at pos < p (older) belong to a prior
+        # episode; pos p itself is the new episode's first frame (valid, same
+        # episode as current as long as no LATER truncation). So: invalid[p] =
+        # any truncated at positions p+1..H (a later reset started a new episode
+        # after p, cutting p off from current). Reverse-cumsum over p+1..H.
+        if H > 0:
+            later = trunc_w[:, 1:]                                # [B, H] (pos 1..H)
+            # flip, cumsum-or, flip back -> "any truncation strictly after pos p"
+            after_any = torch.flip(torch.cummax(torch.flip(later, dims=[1]), dim=1).values, dims=[1])
+            # after_any[:, p] corresponds to "any trunc in pos (p+1)..H" for p in 0..H-1
+            valid[:, :H] = ~after_any.bool()
+        valid[:, H] = True
+        return {
+            "obs": obs_w,            # dict key -> [B, H+1, dim]
+            "z": z_w,                # [B, H+1, z_dim]
+            "valid": valid,          # [B, H+1] bool
+        }
 
     def sample_chunks(self, batch_size: int, num_chunks: int, target_device: str | torch.device) -> list[dict]:
         """Sample ``num_chunks`` batches in ONE call, then transfer to ``target_device``.
@@ -423,6 +481,12 @@ class FBCprReplayBuffer:
         if has_extras:
             extras_flat = {k: _move(v) for k, v in big["extras"].items()}
             next_extras_flat = {k: _move(v) for k, v in big["next"]["extras"].items()}
+        has_window = "actor_window" in big
+        if has_window:
+            aw = big["actor_window"]
+            aw_obs_flat = {k: _move(v) for k, v in aw["obs"].items()}
+            aw_z_flat = _move(aw["z"])
+            aw_valid_flat = _move(aw["valid"])
 
         chunks: list[dict] = []
         for i in range(num_chunks):
@@ -440,6 +504,12 @@ class FBCprReplayBuffer:
             if has_extras:
                 chunk["extras"] = {k: extras_flat[k][s] for k in extras_flat}
                 chunk["next"]["extras"] = {k: next_extras_flat[k][s] for k in next_extras_flat}
+            if has_window:
+                chunk["actor_window"] = {
+                    "obs": {k: aw_obs_flat[k][s] for k in aw_obs_flat},
+                    "z": aw_z_flat[s],
+                    "valid": aw_valid_flat[s],
+                }
             chunks.append(chunk)
         return chunks
 

@@ -41,6 +41,7 @@ from isaaclab.utils import configclass
 from ..modules.fb_cpr_policy import (
     FBCprAuxPolicy,
     FBCprNetworkCfg,
+    TransformerActorWrapper,
     _soft_update_params,
     eval_mode,
     weight_init,
@@ -256,6 +257,11 @@ class FBCprAuxAlgorithmCfg:
     # Per-feature diagonal Lambda (tracking-reward weights). Empty = all-ones
     # over the W head's base feature dim.
     zbar_feature_weights: tuple[float, ...] = ()
+    # Transformer actor: H = number of PAST frames in the parallel actor window
+    # (window = H+1 incl. current). 0 = MLP actor (no window gathered). Normally
+    # left 0 and auto-derived in FBCprAux.__init__ from the policy's
+    # actor_history_len when actor_arch=="transformer".
+    actor_window_len: int = 0
     tracking_T_min: int = 1
     tracking_T_max: int = 16
     # If non-empty, sample T from this discrete set instead of uniformly
@@ -1760,6 +1766,9 @@ class FBCprAux:
         train_obs = self._to_device(train_batch["observation"])
         train_next_obs = self._to_device(train_batch["next"]["observation"])
         train_action = train_batch["action"].to(self.device, non_blocking=True)
+        # Transformer actor: stash the H+1 timestep window (per-position obs + z +
+        # valid mask) for the parallel actor loss in backward_actor. None for MLP.
+        self._train_actor_window = train_batch.get("actor_window", None)
         train_terminated = train_batch["next"]["terminated"].to(self.device, non_blocking=True)
         not_term = (~train_terminated.bool()).float()
         discount = self.cfg.discount * not_term
@@ -2741,12 +2750,87 @@ class FBCprAux:
 
     # --- actor --------------------------------------------------------------- #
 
+    def _backward_actor_transformer(self, win: dict, z: torch.Tensor):
+        """Parallel actor loss for the RoPE transformer actor.
+
+        The actor runs ONCE over the H+1 frame window and emits H+1 action
+        distributions (one per timestep token). Each position p is scored with
+        the SAME FB actor objective (-Q_fb - reg*Q_disc - reg_aux*Q_aux) using
+        that position's own state ``s_{t-p}`` (from the window) and the SHARED
+        latent ``z = z_t``. Positions that cross an episode boundary (mask) are
+        excluded. One backward; H+1 gradient signals per sample.
+        """
+        p = self.policy
+        actor = self._unwrap(p._actor)  # TransformerActorWrapper
+        dev = self.device
+        win_obs = {k: v.to(dev, non_blocking=True) for k, v in win["obs"].items()}
+        valid = win["valid"].to(dev)                              # [B, L]
+        B, L = valid.shape                                        # L = H+1
+
+        # Raw per-position frames [B, L, 93] = [state | last_action] (training
+        # order matches the wrapper's _current_frame).
+        frames = torch.cat([win_obs["state"], win_obs["last_action"]], dim=-1)
+
+        # Actor forward over the window with the SINGLE shared z_t token ([B, d];
+        # the net prepends one z token, shared across all H+1 positions) ->
+        # H+1 action means -> sample.
+        dist = actor.forward_window(frames, z, p.actor_std)
+        sampled_action = dist.sample(clip=self.cfg.stddev_clip)   # [B, L, A]
+
+        # Flatten (B*L) to score every position with the single-step F/critic
+        # (MLP). Build a per-position normalized obs dict from the window. z_t is
+        # repeated to every position for the per-position FB-Q evaluation.
+        BL = B * L
+        flat_obs_raw = {k: v.reshape(BL, *v.shape[2:]) for k, v in win_obs.items()}
+        flat_obs = p._normalize(flat_obs_raw)                     # MLP nets want normalized obs
+        flat_z = z.unsqueeze(1).expand(B, L, z.shape[-1]).reshape(BL, z.shape[-1])
+        flat_a = sampled_action.reshape(BL, sampled_action.shape[-1])
+        pol_cfg = self._unwrap(p).cfg
+
+        Qs_disc = p._critic(flat_obs, flat_z, flat_a)
+        if bool(getattr(pol_cfg, "critic_distributional", False)):
+            Qs_disc = Qs_disc.mean(dim=-1, keepdim=True)
+        _, _, Q_disc = self._pessimistic_value(Qs_disc, self.cfg.actor_pessimism_penalty)
+        Qs_aux = p._aux_critic(flat_obs, flat_z, flat_a)
+        if bool(getattr(pol_cfg, "aux_critic_distributional", False)):
+            Qs_aux = Qs_aux.mean(dim=-1, keepdim=True)
+        _, _, Q_aux = self._pessimistic_value(Qs_aux, self.cfg.actor_pessimism_penalty)
+        Fs = p._forward_map(flat_obs, flat_z, flat_a)
+        Qs_fb = (Fs * flat_z).sum(dim=-1)
+        _, _, Q_fb = self._pessimistic_value(Qs_fb, self.cfg.actor_pessimism_penalty)
+
+        # Per-position weight (scale_reg) over VALID positions only.
+        vmask = valid.reshape(BL).float()
+        nval = vmask.sum().clamp_min(1.0)
+        weight = (Q_fb.abs() * vmask).sum().detach() / nval if self.cfg.scale_reg else 1.0
+
+        per_pos = -(Q_fb + self.cfg.reg_coeff * weight * Q_disc
+                    + self.cfg.reg_coeff_aux * weight * Q_aux)    # [BL]
+        actor_loss = (per_pos * vmask).sum() / nval
+
+        self.actor_optimizer.zero_grad(set_to_none=True)
+        actor_loss.backward()
+        with torch.no_grad():
+            out = {
+                "actor_loss": actor_loss.detach(),
+                "Q_fb": (Q_fb * vmask).sum().detach() / nval,
+                "Q_discriminator": (Q_disc * vmask).sum().detach() / nval,
+                "Q_aux": (Q_aux * vmask).sum().detach() / nval,
+                "actor_tf/valid_frac": vmask.mean().detach(),
+                "act_loc/abs_mean": dist.loc.abs().mean().detach(),
+            }
+        return out, None
+
     def backward_actor(
         self,
         obs: torch.Tensor | dict[str, torch.Tensor],
         action: torch.Tensor,
         z: torch.Tensor,
     ) -> Tuple[Dict[str, torch.Tensor], Any]:
+        # Transformer actor: parallel FB -Q over all H+1 timestep positions.
+        win = getattr(self, "_train_actor_window", None)
+        if win is not None and isinstance(self._unwrap(self.policy._actor), TransformerActorWrapper):
+            return self._backward_actor_transformer(win, z)
         p = self.policy
         dist = p._actor(obs, z, p.actor_std)
         sampled_action = dist.sample(clip=self.cfg.stddev_clip)
