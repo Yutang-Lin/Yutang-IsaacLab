@@ -1278,6 +1278,12 @@ class RslRlFBCprAlgorithmCfg:
     # TD3-style action-noise clip
     stddev_clip: float = 0.3
 
+    # ISOLATION TEST (transformer actor): score the parallel actor loss at the
+    # CURRENT token only, while still running the full H+1 transformer forward.
+    # Isolates whether the Q_disc/Q_aux runaway is the past-token (parallel)
+    # scoring vs the transformer/frame_norm/window. Default False.
+    actor_score_current_only: bool = False
+
     # FB loss regularizers
     ortho_coef: float = 100.0
     q_loss_coef: float = 0.0

@@ -262,6 +262,11 @@ class FBCprAuxAlgorithmCfg:
     # left 0 and auto-derived in FBCprAux.__init__ from the policy's
     # actor_history_len when actor_arch=="transformer".
     actor_window_len: int = 0
+    # ISOLATION TEST (transformer actor): score the parallel actor loss at the
+    # CURRENT token only, while still running the full H+1 transformer forward.
+    # Isolates whether the Q_disc/Q_aux runaway comes from the past-token scoring
+    # (parallel loss) vs the transformer/frame_norm/window. Default False.
+    actor_score_current_only: bool = False
     # Log the Track/global_xy_dev_m + global_yaw_dev_deg deviation metrics during
     # rollout (the robot-vs-reference global-path error). Meaningful only for
     # global-FB / tracking tasks (BFM-Terrain/One); pointless for BFM-Zero/0.5
@@ -2865,20 +2870,43 @@ class FBCprAux:
         flat_a = sampled_action.reshape(BL, sampled_action.shape[-1])
         pol_cfg = self._unwrap(p).cfg
 
+        # All three per-position Q's MUST be the SAME 1-D shape [BL]; otherwise
+        # the combination below broadcasts. The critic/aux-critic return
+        # [num_parallel, BL, 1] -> _pessimistic_value reduces the ensemble axis to
+        # [BL, 1] (2-D), while Q_fb is [BL] (1-D, the (F*z).sum already dropped the
+        # feature axis). Adding [BL] + [BL,1] right-aligns to [BL,BL] and the
+        # masked-mean then computes sum(Q)*sum(vmask)/nval = SUM over positions
+        # (scales with the ~thousands of window slots -> the Q_disc/Q_aux "-2e6"
+        # explosion). Flatten every Q to [BL] so the per-position objective and
+        # the logged means are true per-position values.
         Qs_disc = p._critic(flat_obs, flat_z, flat_a)
         if bool(getattr(pol_cfg, "critic_distributional", False)):
             Qs_disc = Qs_disc.mean(dim=-1, keepdim=True)
         _, _, Q_disc = self._pessimistic_value(Qs_disc, self.cfg.actor_pessimism_penalty)
+        Q_disc = Q_disc.reshape(BL)
         Qs_aux = p._aux_critic(flat_obs, flat_z, flat_a)
         if bool(getattr(pol_cfg, "aux_critic_distributional", False)):
             Qs_aux = Qs_aux.mean(dim=-1, keepdim=True)
         _, _, Q_aux = self._pessimistic_value(Qs_aux, self.cfg.actor_pessimism_penalty)
+        Q_aux = Q_aux.reshape(BL)
         Fs = p._forward_map(flat_obs, flat_z, flat_a)
         Qs_fb = (Fs * flat_z).sum(dim=-1)
         _, _, Q_fb = self._pessimistic_value(Qs_fb, self.cfg.actor_pessimism_penalty)
+        Q_fb = Q_fb.reshape(BL)
 
         # Per-position weight (scale_reg) over VALID positions only.
         vmask = valid.reshape(BL).float()
+        # ISOLATION TEST: optionally score the actor loss at the CURRENT token
+        # only (position L-1), while STILL running the full H+1 transformer
+        # forward for the temporal representation. This isolates whether the
+        # Q_disc/Q_aux runaway is driven specifically by the parallel/past-token
+        # scoring (truncated-context past-token actions queried against a critic
+        # trained on full-context actions -> over-estimation the actor exploits)
+        # vs the transformer architecture / frame_norm / window itself.
+        if bool(getattr(self.cfg, "actor_score_current_only", False)):
+            cur = torch.zeros(B, L, device=valid.device, dtype=vmask.dtype)
+            cur[:, L - 1] = 1.0                                   # current token only
+            vmask = vmask * cur.reshape(BL)
         nval = vmask.sum().clamp_min(1.0)
         weight = (Q_fb.abs() * vmask).sum().detach() / nval if self.cfg.scale_reg else 1.0
 

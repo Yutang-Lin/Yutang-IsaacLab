@@ -931,21 +931,35 @@ class TransformerActorWrapper(nn.Module):
         """
         B, L, D = frames.shape
         flat = frames.reshape(B * L, D)
+        bn = self.frame_norm
+        # ALWAYS normalize with the RUNNING stats, never batch stats. A vanilla
+        # BatchNorm in train mode normalizes its output with the current BATCH
+        # mean/var, but at rollout / TD-target it runs in eval mode and uses
+        # RUNNING stats — a train/serve normalization skew (the action the actor
+        # is TRAINED to emit under batch-norm differs slightly from the action it
+        # emits at rollout under running-norm). Normalizing with running stats in
+        # BOTH modes makes train == rollout == TD-target, while still UPDATING the
+        # running stats from the VALID frames only (the zeroed invalid positions
+        # must not corrupt the statistics). NOTE: this removes a genuine but
+        # BOUNDED skew; it is NOT the cause of the Q_disc/Q_aux runaway (that was
+        # a [BL] vs [BL,1] broadcast bug in the actor loss — see fb_cpr.py).
         if self.training and valid is not None:
             vmask = valid.reshape(B * L).bool()
-            # Guard: BatchNorm train mode needs >1 sample for a finite batch var.
             if vmask.sum() > 1:
-                out = torch.empty_like(flat)
-                out[vmask] = self.frame_norm(flat[vmask])  # updates running stats from valid rows
-                inv = ~vmask
-                if inv.any():
-                    with torch.no_grad():
-                        rm = self.frame_norm.running_mean
-                        rv = self.frame_norm.running_var
-                        eps = self.frame_norm.eps
-                    out[inv] = (flat[inv] - rm) / torch.sqrt(rv + eps)
-                return out.view(B, L, D)
-        return self.frame_norm(flat).view(B, L, D)
+                with torch.no_grad():
+                    v = flat[vmask]
+                    batch_mean = v.mean(0)
+                    batch_var = v.var(0, unbiased=False)
+                    m = bn.momentum if bn.momentum is not None else 0.01
+                    bn.running_mean.mul_(1.0 - m).add_(m * batch_mean)
+                    bn.running_var.mul_(1.0 - m).add_(m * batch_var)
+                    if bn.num_batches_tracked is not None:
+                        bn.num_batches_tracked.add_(1)
+        with torch.no_grad():
+            rm = bn.running_mean
+            rv = bn.running_var
+            eps = bn.eps
+        return ((flat - rm) / torch.sqrt(rv + eps)).view(B, L, D)
 
     # -- forward (rollout / act): last token only --------------------------
     def forward(self, obs, z, std):
