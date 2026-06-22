@@ -44,6 +44,23 @@ def broadcast_parameters(policy):
     # load the model parameters on all GPUs from source GPU
     policy.load_state_dict(model_params[0])
 
+def _ensure_grads(params):
+    """Materialize a zero grad for any param whose ``.grad`` is None.
+
+    CRITICAL for collective gradient sync: the all_reduce buffer is built from
+    the per-parameter grads, so its SIZE must be identical on every rank. If a
+    param receives a grad on one rank but not another (e.g. masked / data-
+    dependent paths in the transformer actor, where some positions or the z
+    token contribute no gradient on a given rank's batch), filtering on
+    ``grad is not None`` yields different-sized buffers and the collective
+    DEADLOCKS. Zero-filling makes every rank iterate the SAME fixed parameter
+    set, so the buffer size and order are rank-consistent.
+    """
+    for p in params:
+        if p.grad is None:
+            p.grad = torch.zeros_like(p)
+
+
 def reduce_gradients(network):
     """Collect gradients from all GPUs and average them.
 
@@ -51,10 +68,12 @@ def reduce_gradients(network):
     Uses SUM + manual division so it's compatible with both NCCL and Gloo backends
     (Gloo does not support ReduceOp.AVG).
     """
-    grads = [param.grad.view(-1) for param in network.parameters() if param.grad is not None]
-    if len(grads) == 0:
+    params = list(network.parameters())
+    if len(params) == 0:
         return
-    all_grads = torch.cat(grads)
+    # Zero-fill missing grads so the buffer is rank-consistent (see _ensure_grads).
+    _ensure_grads(params)
+    all_grads = torch.cat([p.grad.view(-1) for p in params])
 
     # Sum gradients across all ranks then divide by world_size for the average
     torch.distributed.all_reduce(all_grads, op=torch.distributed.ReduceOp.SUM)
@@ -62,11 +81,10 @@ def reduce_gradients(network):
 
     # Write averaged gradients back into each parameter's grad buffer
     offset = 0
-    for param in network.parameters():
-        if param.grad is not None:
-            numel = param.numel()
-            param.grad.data.copy_(all_grads[offset: offset + numel].view_as(param.grad.data))
-            offset += numel
+    for param in params:
+        numel = param.numel()
+        param.grad.data.copy_(all_grads[offset: offset + numel].view_as(param.grad.data))
+        offset += numel
 
 
 def reduce_gradients_async(network):
@@ -90,14 +108,20 @@ def reduce_gradients_async(network):
     """
     if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
         return None
-    params_with_grad = [p for p in network.parameters() if p.grad is not None]
-    if not params_with_grad:
+    params = list(network.parameters())
+    if not params:
         return None
-    flat = torch.cat([p.grad.view(-1) for p in params_with_grad])
+    # Zero-fill missing grads so the all_reduce buffer is the SAME size/order on
+    # every rank — otherwise data-dependent grad-None sets deadlock the
+    # collective (see _ensure_grads). This is the path the transformer actor
+    # uses (its forward_window bypasses DDP's hooks), where masked positions /
+    # the z token can leave a param grad-None on some ranks but not others.
+    _ensure_grads(params)
+    flat = torch.cat([p.grad.view(-1) for p in params])
     handle = torch.distributed.all_reduce(
         flat, op=torch.distributed.ReduceOp.SUM, async_op=True
     )
-    return (handle, flat, params_with_grad)
+    return (handle, flat, params)
 
 
 def finish_async_reduce(handle_tuple):
@@ -132,18 +156,20 @@ def reduce_gradients_merged_async(networks):
     """
     if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
         return None
-    params_with_grad = []
+    params = []
     for net in networks:
-        for p in net.parameters():
-            if p.grad is not None:
-                params_with_grad.append(p)
-    if not params_with_grad:
+        params.extend(net.parameters())
+    if not params:
         return None
-    flat = torch.cat([p.grad.view(-1) for p in params_with_grad])
+    # Zero-fill missing grads so the merged buffer is rank-consistent in size
+    # and order (see _ensure_grads) — a grad-None param on only some ranks would
+    # otherwise deadlock the single fused collective.
+    _ensure_grads(params)
+    flat = torch.cat([p.grad.view(-1) for p in params])
     handle = torch.distributed.all_reduce(
         flat, op=torch.distributed.ReduceOp.SUM, async_op=True
     )
-    return (handle, flat, params_with_grad)
+    return (handle, flat, params)
 
 
 def finish_merged_async_reduce(handle_tuple):
