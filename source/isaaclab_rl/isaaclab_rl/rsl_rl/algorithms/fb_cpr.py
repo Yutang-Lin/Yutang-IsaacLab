@@ -2549,15 +2549,17 @@ class FBCprAux:
 
         # Reconstruction regulariser: decode end-effector (or any
         # configured) slices of ``goal`` from ``z = B(goal)`` and minimise
-        # MSE. Pushes B to preserve task-relevant spatial info that the
-        # bare FB loss may collapse out of z.
+        # L1. Pushes B to preserve task-relevant spatial info that the
+        # bare FB loss may collapse out of z. L1 (vs MSE) is more robust to
+        # the square-augmented targets' large-magnitude outliers and yields a
+        # uniform per-feature gradient.
         recon_loss = torch.zeros((), device=z.device, dtype=z.dtype)
         recon_head = getattr(p, "_reconstruction_head", None)
         recons_coeff = float(self.cfg.recons_coeff)
         if recon_head is not None and recons_coeff > 0 and isinstance(goal, dict):
             pred = recon_head(B)
             target = recon_head.gather_target(goal).detach()
-            recon_loss = F.mse_loss(pred, target)
+            recon_loss = F.l1_loss(pred, target)
             fb_loss = fb_loss + recons_coeff * recon_loss
 
         q_loss = torch.zeros(1, device=z.device, dtype=z.dtype)

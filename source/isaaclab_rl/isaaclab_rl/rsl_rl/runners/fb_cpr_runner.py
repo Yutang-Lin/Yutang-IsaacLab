@@ -1159,6 +1159,95 @@ class FBCprRunner:
                 if self._s3_thread is not None:
                     self._s3_thread.join(timeout=600)
 
+    # --- B-spectrum diagnostic ------------------------------------------- #
+
+    @torch.inference_mode()
+    def _backward_spectrum_metrics(self, num_samples: int = 10_000) -> Dict[str, float] | None:
+        """Eigen-spectrum of the backward-feature gram E[B(s)^T B(s)].
+
+        Draws ~``num_samples`` i.i.d. obs from the replay buffer, encodes them
+        through the (sphere-projected) backward map ``B(s) -> R^{z_dim}``, and
+        forms the second-moment matrix ``M = (1/N) B^T B`` (z_dim x z_dim).
+        Its eigenvalues describe how B spreads its representation across the
+        z_dim directions — a collapsed B concentrates mass in a few eigenvalues
+        (low effective rank), a well-conditioned one spreads it out.
+
+        Returns ``Eval/B_*`` scalars (effective rank + spectrum summary), or
+        ``None`` if the buffer is empty / B is unavailable. Under DDP each rank
+        samples its own local replay; the head rank's numbers are logged.
+        """
+        if len(self.replay_buffer) == 0:
+            return None
+        policy = self.policy
+        if not hasattr(policy, "backward_map"):
+            return None
+
+        # Gather ~num_samples B(s) vectors in chunks (cap chunk so a single
+        # backward forward-pass stays well within memory).
+        chunk = 4096
+        feats: list[torch.Tensor] = []
+        collected = 0
+        was_training = policy.training
+        policy.eval()
+        try:
+            while collected < num_samples:
+                bs = min(chunk, num_samples - collected)
+                try:
+                    batch = self.replay_buffer.sample_flat(bs)
+                except RuntimeError:
+                    break
+                z = policy.backward_map(batch["observation"])  # [bs, z_dim]
+                feats.append(z.float())
+                collected += int(z.shape[0])
+        finally:
+            if was_training:
+                policy.train()
+        if not feats:
+            return None
+
+        B = torch.cat(feats, dim=0)                      # [N, z_dim]
+        N, z_dim = B.shape
+        gram = (B.transpose(0, 1) @ B) / float(N)        # [z_dim, z_dim] = E[B^T B]
+        # Symmetrize for numerical safety, then real symmetric eigvals (ascending).
+        gram = 0.5 * (gram + gram.transpose(0, 1))
+        eigvals = torch.linalg.eigvalsh(gram).clamp_min(0.0)   # ascending
+        eig_desc = torch.flip(eigvals, dims=(0,))              # descending
+
+        total = eig_desc.sum().clamp_min(1e-12)
+        # Effective rank (a.k.a. "erank"): exp of the spectral entropy of the
+        # normalized eigenvalue distribution. Ranges in [1, z_dim]; equals
+        # z_dim for a flat (white) spectrum, ->1 for full collapse.
+        p = (eig_desc / total).clamp_min(1e-12)
+        spectral_entropy = -(p * p.log()).sum()
+        effective_rank = float(spectral_entropy.exp().item())
+        # Participation ratio: (sum λ)^2 / sum(λ^2) — a second, threshold-free
+        # rank proxy (heavier-tailed than erank).
+        participation_ratio = float((total * total / (eig_desc * eig_desc).sum().clamp_min(1e-12)).item())
+        # Numerical rank: # eigenvalues above 1% of the largest.
+        lam_max = float(eig_desc[0].item())
+        thresh = 0.01 * lam_max
+        numerical_rank = float((eig_desc > thresh).sum().item())
+        condition_number = float((lam_max / eig_desc[eig_desc > 1e-12].min().clamp_min(1e-12)).item())
+
+        out = {
+            "Eval/B_effective_rank": effective_rank,
+            "Eval/B_participation_ratio": participation_ratio,
+            "Eval/B_numerical_rank": numerical_rank,
+            "Eval/B_eig_max": lam_max,
+            "Eval/B_eig_min": float(eig_desc[-1].item()),
+            "Eval/B_eig_mean": float((total / z_dim).item()),
+            "Eval/B_condition_number": condition_number,
+            "Eval/B_spectrum_samples": float(N),
+        }
+        # Spectrum shape: log the cumulative energy captured by the top-k
+        # eigenvalues (k as a fraction of z_dim) — a scalar-friendly summary of
+        # the full spectrum that wandb can curve over training.
+        cum = torch.cumsum(eig_desc, dim=0) / total
+        for frac in (0.01, 0.05, 0.10, 0.25, 0.50):
+            k = max(1, int(round(frac * z_dim)))
+            out[f"Eval/B_energy_top{int(frac * 100):02d}pct"] = float(cum[min(k, z_dim) - 1].item())
+        return out
+
     # --- tracking eval --------------------------------------------------- #
 
     @torch.inference_mode()
@@ -1465,6 +1554,17 @@ class FBCprRunner:
                 for i, k in enumerate(metric_names):
                     out[k] = float((packed[i] / total_n).item())
                 out["Eval/num_motions"] = float(packed[-1].item())
+
+            # Backward-feature eigen-spectrum (E[B^T B]) — local replay, head
+            # rank's numbers are the ones logged. Not all-reduced: it's a
+            # rank-local diagnostic of B's representation spread.
+            try:
+                spec = self._backward_spectrum_metrics()
+                if spec is not None:
+                    out.update(spec)
+            except Exception as e:  # never let a diagnostic kill eval
+                if self._is_head:
+                    print(f"[FBCprRunner] B-spectrum diagnostic failed: {e}", flush=True)
             return out
         finally:
             if hasattr(env_u, "_eval_mode"):
