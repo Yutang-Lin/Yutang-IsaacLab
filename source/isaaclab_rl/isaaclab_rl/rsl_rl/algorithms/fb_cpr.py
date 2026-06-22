@@ -626,11 +626,28 @@ class FBCprAux:
             self.policy._aux_critic = torch.compile(self.policy._aux_critic, **compile_kwargs)
             if self.policy._entropy_critic is not None:
                 self.policy._entropy_critic = torch.compile(self.policy._entropy_critic, **compile_kwargs)
+            # Transformer actor: the outer compile above only wraps __call__/
+            # forward (the ROLLOUT path). The TRAINING actor loss calls the
+            # custom method ``forward_window`` via ``_unwrap`` (which peels the
+            # compile + DDP wrappers), so that path ran EAGER — the dominant cost
+            # of a wide transformer actor (eager attention at d_model 2048, x16
+            # updates/step -> seconds/iter). Compile ``forward_window`` as a
+            # separate bound-method handle stored on the bare wrapper; the
+            # training loop uses it when present. This adds an attribute (a
+            # compiled callable), NOT a submodule, so the state_dict / checkpoint
+            # key layout is unchanged.
+            _bare_actor = self._unwrap(self.policy._actor)
+            if isinstance(_bare_actor, TransformerActorWrapper):
+                _bare_actor._compiled_forward_window = torch.compile(
+                    _bare_actor.forward_window, **compile_kwargs)
             # Disc uses autograd.grad(create_graph=True) for WGAN-GP, which
             # is known to hit graph breaks with torch.compile — leave it
             # eager. Target networks never need compile (no backward).
             print(f"[FBCprAux] torch.compile mode={compile_mode} applied to "
-                  f"F/B/actor/critic/aux_critic (disc stays eager)", flush=True)
+                  f"F/B/actor/critic/aux_critic (disc stays eager)"
+                  + ("; actor.forward_window compiled (training path)"
+                     if isinstance(_bare_actor, TransformerActorWrapper) else ""),
+                  flush=True)
 
         # --- Stream-parallel phase-1 backward setup -------------------- #
         # When enabled, phase-1 backward passes (disc + F/B + aux_critic)
@@ -2859,8 +2876,11 @@ class FBCprAux:
 
         # Actor forward over the window with the SINGLE shared z_t token ->
         # H+1 action means -> sample. valid masks invalid frames out of both the
-        # frame BatchNorm stats and the attention keys.
-        dist = actor.forward_window(frames, z, p.actor_std, valid=valid)
+        # frame BatchNorm stats and the attention keys. Use the COMPILED
+        # forward_window when available (set up in __init__ under compile_mode) —
+        # the eager wide-transformer forward here is the dominant per-step cost.
+        fw = getattr(actor, "_compiled_forward_window", None) or actor.forward_window
+        dist = fw(frames, z, p.actor_std, valid=valid)
         sampled_action = dist.sample(clip=self.cfg.stddev_clip)   # [B, L, A]
 
         # Flatten (B*L) to score every position with the single-step F/critic.
