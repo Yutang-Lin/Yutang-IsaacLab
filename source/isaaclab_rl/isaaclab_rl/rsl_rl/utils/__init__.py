@@ -55,10 +55,24 @@ def _ensure_grads(params):
     ``grad is not None`` yields different-sized buffers and the collective
     DEADLOCKS. Zero-filling makes every rank iterate the SAME fixed parameter
     set, so the buffer size and order are rank-consistent.
+
+    Reuses a PERSISTENT per-param zero buffer (``_zero_grad_buf``) instead of
+    allocating a fresh ``zeros_like`` each step. Allocating a new grad tensor
+    every iteration (params are zeroed with ``set_to_none=True``) changes the
+    grad tensor identity/address each step, which churns ``torch.compile`` /
+    CUDA-graph guards and triggers recompiles — exploding learn time. The
+    persistent buffer keeps a stable address; we only zero it in place when it
+    is actually reused (a param whose grad genuinely flowed keeps its own grad).
     """
     for p in params:
         if p.grad is None:
-            p.grad = torch.zeros_like(p)
+            buf = getattr(p, "_zero_grad_buf", None)
+            if buf is None or buf.shape != p.shape or buf.device != p.device:
+                buf = torch.zeros_like(p)
+                p._zero_grad_buf = buf
+            else:
+                buf.zero_()
+            p.grad = buf
 
 
 def reduce_gradients(network):
