@@ -157,14 +157,29 @@ class FBCprReplayBuffer:
 
     @torch.no_grad()
     def state_dict(self) -> dict:
+        # Snapshot to CPU (not a same-device clone). The buffer lives on GPU
+        # under ``replay_device="cuda"``, so a device-local ``.clone()`` would
+        # transiently DOUBLE the ~37 GB buffer in VRAM — a large spike on every
+        # rank now that all ranks persist their replay. Copying straight to host
+        # RAM lands the snapshot off the GPU: no VRAM spike, and it stays a real
+        # copy (safe even if the save is ever made asynchronous). ``.to("cpu")``
+        # on a CUDA tensor always allocates a new host tensor, so the returned
+        # dict never aliases the live ring buffer.
+        def _snap(t: torch.Tensor) -> torch.Tensor:
+            # CUDA -> CPU always allocates a fresh host tensor. If the buffer is
+            # already on CPU (replay_device="cpu"), ``.to("cpu")`` is a no-op that
+            # returns the SAME tensor, so clone there to keep the snapshot a real
+            # copy (never aliases the live ring buffer).
+            return t.clone() if t.device.type == "cpu" else t.to("cpu")
+
         return {
-            "_obs": {k: v.clone() for k, v in self._obs.items()},
-            "_action": self._action.clone(),
-            "_z": self._z.clone(),
-            "_terminated": self._terminated.clone(),
-            "_truncated": self._truncated.clone(),
-            "_aux_rewards": {k: v.clone() for k, v in self._aux_rewards.items()},
-            "_extras": {k: v.clone() for k, v in self._extras.items()},
+            "_obs": {k: _snap(v) for k, v in self._obs.items()},
+            "_action": _snap(self._action),
+            "_z": _snap(self._z),
+            "_terminated": _snap(self._terminated),
+            "_truncated": _snap(self._truncated),
+            "_aux_rewards": {k: _snap(v) for k, v in self._aux_rewards.items()},
+            "_extras": {k: _snap(v) for k, v in self._extras.items()},
             "_idx": int(self._idx),
             "_is_full": bool(self._is_full),
             "time_capacity": self.time_capacity,
