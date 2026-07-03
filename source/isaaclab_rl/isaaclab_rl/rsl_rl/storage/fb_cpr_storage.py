@@ -65,6 +65,19 @@ class FBCprReplayBuffer:
 
     ``capacity`` is the total number of transitions (= ``time_steps * num_envs``).
     The time-axis length is ``capacity // num_envs``.
+
+    ``history_recompose`` (opt-in): store only the newest ``history_actor`` frame
+    and rebuild the full ``H*frame`` window on sample by gathering the previous
+    ``H`` stored frames (byte-exact to the env's blob — frames are stored not
+    re-derived, so the already-noisy proprio is preserved; verified in
+    ``test/test_history_recompose.py`` across wraparound + resets + H=4/9). Cuts
+    the ``history_actor`` footprint ``H×``.
+    Eviction edge: for the oldest ``H`` time-rows of a WRAPPED (full) buffer, the
+    deep-history frames those rows referenced have already been overwritten, so
+    recompose returns a zero-truncated (shorter) history there — identical to a
+    just-started episode. That is ``H / time_capacity`` of the buffer (~0.36% at
+    the production shape) and only the deepest frames of about-to-be-evicted
+    rows; benign for the FB/actor targets.
     """
 
     def __init__(
@@ -79,11 +92,22 @@ class FBCprReplayBuffer:
         pin_memory: bool | None = None,
         extra_field_shapes: dict[str, tuple[int, ...]] | None = None,
         actor_window_len: int = 0,
+        history_recompose: dict | None = None,
     ) -> None:
         # >0 -> sample() also returns an ``actor_window`` (the transformer actor's
         # per-timestep H+1 frame window + per-position obs + a valid mask), gathered
         # in-place from the 2D [time,env] storage. 0 -> off (MLP actor; no window).
         self.actor_window_len = int(actor_window_len)
+        # history_actor recompose-on-sample (memory saving). When set, the
+        # ``history_actor`` obs key is stored at ONE frame width instead of the
+        # full ``H*frame`` blob: ``extend()`` keeps only the newest frame and
+        # ``_gather`` rebuilds the full per-term-blocked, newest-first window
+        # from the 2D [time,env] storage with episode-boundary zeroing. Byte-
+        # exact to what the env writes (frames are stored not re-derived, so the
+        # already-noisy proprio is preserved). None -> off (store full blob).
+        #   spec = {"H": int, "blocks": [("act",29),("angv",3),("dofp",29),
+        #           ("dofv",29),("grav",3)]}  # order = env storage order
+        self._hist_recompose = self._init_history_recompose(history_recompose)
         self.num_envs = int(num_envs)
         self.time_capacity = int(capacity) // self.num_envs
         self.capacity = self.time_capacity  # __len__ counts time-steps
@@ -106,6 +130,28 @@ class FBCprReplayBuffer:
         else:
             self._obs_shapes = {k: tuple(v) for k, v in dict(obs_space).items()}
 
+        # Sampled ``history_actor`` width the CONSUMER expects (full H*frame).
+        # Storage is narrowed to one frame below when recompose is on; _gather
+        # rebuilds this width so the rest of the pipeline is unchanged.
+        self._hist_full_shape: tuple[int, ...] | None = None
+        if self._hist_recompose is not None:
+            key = self._hist_recompose["key"]
+            if key not in self._obs_shapes:
+                raise KeyError(
+                    f"history_recompose set for key '{key}' but it is not an obs "
+                    f"key (have {list(self._obs_shapes)})."
+                )
+            full = self._obs_shapes[key]
+            exp = (self._hist_recompose["H"] * self._hist_recompose["frame_dim"],)
+            if tuple(full) != exp:
+                raise ValueError(
+                    f"history_recompose: obs '{key}' has shape {tuple(full)} but "
+                    f"H*frame_dim={exp}. Check H / block widths vs the env obs."
+                )
+            self._hist_full_shape = tuple(full)
+            # Narrow the STORED shape to a single frame.
+            self._obs_shapes[key] = (self._hist_recompose["frame_dim"],)
+
         # 2D storage: [time_capacity, num_envs, ...]
         self._obs: dict[str, torch.Tensor] = {
             k: self._alloc((self.time_capacity, self.num_envs, *shape))
@@ -127,6 +173,16 @@ class FBCprReplayBuffer:
             for k, shape in self._extra_field_shapes.items()
         }
 
+        # The transformer actor-window path re-gathers ``history_actor`` from
+        # ``_obs`` at full width; with recompose the stored key is narrowed to
+        # one frame, so the two are incompatible. Canonical BFM-0.5 (the only
+        # config that enables recompose) is the MLP actor (actor_window_len=0).
+        if self._hist_recompose is not None and self.actor_window_len > 0:
+            raise ValueError(
+                "history_recompose is incompatible with actor_window_len>0 "
+                "(transformer actor). Use the MLP actor, or disable recompose."
+            )
+
         self._idx = 0
         self._is_full = False
         self._recompute_traj_info = True
@@ -141,6 +197,120 @@ class FBCprReplayBuffer:
             t = torch.empty(shape, dtype=dtype, device=self.device)
         t.zero_()
         return t
+
+    @staticmethod
+    def _init_history_recompose(spec: dict | None) -> dict | None:
+        """Validate/normalize the history-recompose spec.
+
+        Input ``spec``: ``{"key": str, "H": int, "blocks": [(name, width), ...]}``
+        where ``blocks`` is the per-frame sub-block layout IN ENV STORAGE ORDER
+        (e.g. ``[("act",29),("angv",3),("dofp",29),("dofv",29),("grav",3)]``).
+        Returns an enriched dict with ``frame_dim`` and per-block newest-first
+        source-column slices into the FULL ``H*frame`` blob, or None if disabled.
+        """
+        if not spec:
+            return None
+        key = str(spec.get("key", "history_actor"))
+        H = int(spec["H"])
+        blocks = [(str(n), int(w)) for n, w in spec["blocks"]]
+        if H <= 0 or any(w <= 0 for _, w in blocks):
+            raise ValueError(f"history_recompose: bad H/blocks: H={H}, blocks={blocks}")
+        frame_dim = sum(w for _, w in blocks)
+        # Column offset of each block's start within the full H*frame blob (the
+        # blob is per-block-major: [blk0(H*w0) | blk1(H*w1) | ...]).
+        starts: list[int] = []
+        acc = 0
+        for _, w in blocks:
+            starts.append(acc)
+            acc += H * w
+        return {"key": key, "H": H, "blocks": blocks,
+                "frame_dim": frame_dim, "block_starts": starts}
+
+    def _extract_newest_frame(self, full: torch.Tensor) -> torch.Tensor:
+        """Full ``[..., H*frame]`` blob -> newest single frame ``[..., frame]``.
+
+        The blob is per-block-major and each block is frame-major NEWEST-FIRST,
+        so the newest frame is the first ``w`` columns of each block. The stored
+        frame concatenates those in block order:
+        ``[act(w0) | angv(w1) | dofp(w2) | dofv(w3) | grav(w4)]``.
+        """
+        spec = self._hist_recompose
+        cols: list[torch.Tensor] = []
+        for (_, w), s in zip(spec["blocks"], spec["block_starts"]):
+            cols.append(full[..., s:s + w])   # newest frame of this block
+        return torch.cat(cols, dim=-1)
+
+    @torch.no_grad()
+    def _recompose_history(self, time_idx: torch.Tensor, env_idx: torch.Tensor) -> torch.Tensor:
+        """Rebuild the full ``[B, H*frame]`` history blob for sampled rows from
+        the stored single-frame storage, with episode-boundary zeroing.
+
+        Key identity (frames only shift index as the ring rolls):
+        ``history_actor[t]``'s slot ``j`` (j=0 newest lag t-1 .. j=H-1 lag t-H)
+        equals the STORED newest frame at SOURCE ROW ``t-j`` — because we store
+        slot-0 of each row, and slot ``j`` of row ``t`` is slot-0 of row ``t-j``.
+        So ``stored[t-j] == history_actor[t][:, j]``.
+
+        Boundary zeroing: ``stored[r]`` holds the proprio frame the env pushed at
+        the END of step r-1 (its slot-0 at row r is the lag-1 frame). That frame
+        is zero (env zeroed the ring on reset) exactly when a ``truncated`` row
+        lies in the closed interval ``[r, t]`` — i.e. a new episode began at or
+        after the source row, so it's out of the sample's current episode. Since
+        ``truncated[r]`` marks the FIRST row of a new episode, scanning newest
+        (j=0)->oldest with a cummax over the gathered ``truncated`` flags gives
+        the invalid set. Plus unwritten/stale masking as in _gather_actor_window.
+        """
+        spec = self._hist_recompose
+        H = spec["H"]
+        Tcap = self.time_capacity
+        B = time_idx.shape[0]
+        stored = self._obs[spec["key"]]                       # [T, E, frame]
+        frame_dim = spec["frame_dim"]
+
+        # Source rows for offsets j=0..H-1: row (t - j). offs [H]; rows [B, H].
+        offs = torch.arange(H, device=self.device)
+        rows = (time_idx.unsqueeze(1) - offs.unsqueeze(0)) % Tcap       # [B, H]
+        ew = env_idx.unsqueeze(1).expand(-1, H)                          # [B, H]
+        frames = stored[rows, ew]                                        # [B, H, frame]
+
+        # --- boundary / stale zeroing (matches env reset ring-zeroing) ---
+        # valid[j] = NO truncated row in [t-j, t] = NOT any(truncated at gathered
+        # rows 0..j). cummax over offset j (newest->oldest) gives that prefix-OR.
+        trunc_rows = self._truncated[rows, ew].squeeze(-1)              # [B, H] bool
+        boundary = torch.cummax(trunc_rows.long(), dim=1).values.bool()  # [B, H]
+        valid = ~boundary
+
+        # Unwritten / evicted-region masking. Reaching back offset ``j`` (source
+        # row t-j) is recoverable iff that row still holds the frame from j
+        # env-steps before ``t`` — i.e. we have not stepped past the OLDEST
+        # still-stored row. Steps from cur_t back to the oldest row:
+        #   not full: oldest row = 0            -> max_back = cur_t
+        #   full:     oldest row = self._idx    -> max_back = (cur_t - _idx) % Tcap
+        # A frame at j > max_back was either never written (not full) or
+        # overwritten by a newer wrap (full); the env DID feed a real frame
+        # there at rollout, but it is no longer in the buffer, so recompose
+        # zeros it (see the class note on the eviction boundary).
+        cur_t = time_idx.unsqueeze(1)                                    # [B, 1]
+        steps_back = (cur_t - rows) % Tcap                               # [B, H] == j
+        oldest = 0 if not self._is_full else self._idx
+        max_back = (cur_t.squeeze(1) - oldest) % Tcap                    # [B]
+        valid &= (steps_back <= max_back.unsqueeze(1))
+        frames = frames * valid.unsqueeze(-1).to(frames.dtype)           # [B, H, frame]
+
+        # --- re-block to the full per-term-blocked, newest-first layout ---
+        # frames[:, o] is one frame in block order [act|angv|dofp|dofv|grav].
+        # Full blob is [act(H*w0) | angv(H*w1) | ...], each block frame-major
+        # newest-first. So for each block, take its slice of every frame and
+        # flatten over (offset, width).
+        out = torch.empty(B, H * frame_dim, device=frames.device, dtype=frames.dtype)
+        col_in = 0
+        col_out = 0
+        for (_, w) in spec["blocks"]:
+            blk = frames[:, :, col_in:col_in + w]        # [B, H, w] newest-first
+            out[:, col_out:col_out + H * w] = blk.reshape(B, H * w)
+            col_in += w
+            col_out += H * w
+        return out
 
     def __len__(self) -> int:
         return self.time_capacity if self._is_full else self._idx
@@ -234,7 +404,13 @@ class FBCprReplayBuffer:
                 dst.copy_(src, non_blocking=False)
 
         for k in self._obs_shapes:
-            _copy(self._obs[k][t], obs[k])
+            src = obs[k]
+            if self._hist_recompose is not None and k == self._hist_recompose["key"]:
+                # Store ONLY the newest frame (frame-0). In the full blob each
+                # per-term block is frame-major newest-first, so frame-0 is the
+                # first ``w`` cols of each block, concatenated in block order.
+                src = self._extract_newest_frame(src)
+            _copy(self._obs[k][t], src)
         _copy(self._action[t], batch_dict["action"])
         _copy(self._z[t], batch_dict["z"])
         term = batch_dict["terminated"]
@@ -398,6 +574,13 @@ class FBCprReplayBuffer:
                 time_idx_next: torch.Tensor) -> dict:
         obs = {k: v[time_idx, env_idx] for k, v in self._obs.items()}
         next_obs = {k: v[time_idx_next, env_idx] for k, v in self._obs.items()}
+        # Recompose the full history_actor window from the stored single frame
+        # (obs at t, next_obs at t+1). Replaces the narrowed per-frame slice with
+        # the full [B, H*frame] blob the consumer expects.
+        if self._hist_recompose is not None:
+            key = self._hist_recompose["key"]
+            obs[key] = self._recompose_history(time_idx, env_idx)
+            next_obs[key] = self._recompose_history(time_idx_next, env_idx)
         out = {
             "observation": obs,
             "action": self._action[time_idx, env_idx],

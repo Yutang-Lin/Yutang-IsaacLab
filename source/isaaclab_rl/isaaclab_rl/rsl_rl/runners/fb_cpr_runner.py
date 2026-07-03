@@ -241,6 +241,12 @@ class FBCprRunner:
         extra_field_shapes = (
             {"root_xy": (2,), "root_yaw": (1,)} if self._store_world_pose else None
         )
+        # history_actor recompose-on-sample (memory saving). When enabled, the
+        # replay stores only the newest per-step history frame and rebuilds the
+        # full [H*93] window on sample (byte-exact; see FBCprReplayBuffer). Off
+        # by default; the spec (H + per-term block widths) is derived from the
+        # env's history_actor obs dim so it self-adapts to H.
+        history_recompose = self._history_recompose_spec()
         self.replay_buffer = FBCprReplayBuffer(
             capacity=int(self.alg_cfg.get("replay_capacity", 5_120_000)),
             num_envs=self.env.num_envs,
@@ -254,6 +260,7 @@ class FBCprRunner:
             # window for the parallel actor loss (0 = off / MLP actor). Derived
             # from the policy's actor_history_len when actor_arch=="transformer".
             actor_window_len=self._actor_window_len(),
+            history_recompose=history_recompose,
         )
 
         # --- Seed / rhythm controls ------------------------------------
@@ -508,6 +515,46 @@ class FBCprRunner:
         if str(self.policy_cfg.get("actor_arch", "mlp")) != "transformer":
             return 0
         return int(self.policy_cfg.get("actor_history_len", 9))
+
+    # Per-frame block layout of the ``history_actor`` obs, in ENV STORAGE ORDER
+    # (the flat blob is per-block-major, each block frame-major newest-first):
+    #   history_actions | history_base_ang_vel | history_dof_pos
+    #   | history_dof_vel | history_projected_gravity
+    # Matches BFMZeroEnvCfg.observations term order. Sum = frame_dim (93).
+    _HISTORY_ACTOR_BLOCKS: tuple[tuple[str, int], ...] = (
+        ("act", 29), ("angv", 3), ("dofp", 29), ("dofv", 29), ("grav", 3),
+    )
+
+    def _history_recompose_spec(self) -> dict | None:
+        """Build the replay ``history_recompose`` spec, or None if disabled.
+
+        Enabled by ``alg_cfg['recompose_history_actor']`` (default False). Stores
+        only the newest history frame and rebuilds the full window on sample;
+        byte-exact to the env's blob (verified in test_history_recompose.py).
+        H is derived from the env's history_actor obs dim / frame_dim so it
+        self-adapts. Requires the MLP actor (the transformer actor-window path
+        re-reads full-width history — the buffer raises if both are set)."""
+        if not bool(self.alg_cfg.get("recompose_history_actor", False)):
+            return None
+        ha = self.obs_space.spaces.get("history_actor", None) if hasattr(self.obs_space, "spaces") else None
+        if ha is None:
+            print("[FBCprRunner] recompose_history_actor set but no history_actor "
+                  "obs group — disabling recompose.", flush=True)
+            return None
+        blocks = list(self._HISTORY_ACTOR_BLOCKS)
+        frame_dim = sum(w for _, w in blocks)
+        dim = int(ha.shape[0])
+        if dim % frame_dim != 0:
+            raise ValueError(
+                f"recompose_history_actor: history_actor dim {dim} is not a "
+                f"multiple of frame_dim {frame_dim} (blocks {blocks}). The env's "
+                f"history term widths must match _HISTORY_ACTOR_BLOCKS."
+            )
+        H = dim // frame_dim
+        print(f"[FBCprRunner] history_actor recompose-on-sample ENABLED "
+              f"(H={H}, frame_dim={frame_dim}, storing 1 frame vs {H} -> "
+              f"replay history_actor {H}x smaller).", flush=True)
+        return {"key": "history_actor", "H": H, "blocks": blocks}
 
     def _expert_history_len_override(self) -> int | None:
         """H at which to compose the expert ``history_actor`` so its dim matches

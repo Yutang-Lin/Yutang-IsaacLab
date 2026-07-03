@@ -1396,6 +1396,12 @@ class RslRlFBCprAlgorithmCfg:
     replay_device: str = "cpu"
     """Device to hold the replay buffer on."""
 
+    recompose_history_actor: bool = False
+    """Store only the newest ``history_actor`` frame in replay and rebuild the
+    full ``H*frame`` window on sample (byte-exact; see FBCprReplayBuffer). Cuts
+    the replay's history_actor footprint ~H×. Requires the MLP actor
+    (incompatible with the transformer actor-window path). Default off."""
+
     num_seed_steps: int = 10_240
     """Total env transitions collected with random actions before updates
     begin. Matches BFM's ``num_seed_steps=10240``."""
