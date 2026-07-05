@@ -185,6 +185,16 @@ class FBCprRunner:
             cvd = os.environ.get("CUDA_VISIBLE_DEVICES", "")
             _exp_idx = 0 if (cvd and "," not in cvd) else self.gpu_local_rank
             expert_device = f"cuda:{_exp_idx}"
+        # The one-time load-time FK compose runs on GPU (fast) even when the
+        # buffer is STORED on CPU (expert_dataset_device="cpu" — the big dataset
+        # off the VRAM-constrained GPU). Resolve a GPU for compose; when the
+        # buffer is already on GPU, compose there too (compose_device == device).
+        if str(expert_device).startswith("cpu"):
+            cvd = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+            _cmp_idx = 0 if (cvd and "," not in cvd) else self.gpu_local_rank
+            expert_compose_device = f"cuda:{_cmp_idx}" if torch.cuda.is_available() else "cpu"
+        else:
+            expert_compose_device = expert_device
         distributed_expert = bool(self.alg_cfg.get("distributed_expert", False))
         self.expert_buffer = FBCprExpertBuffer(
             pt_path=expert_path,
@@ -226,6 +236,8 @@ class FBCprRunner:
             # and both need the expert history at the env's H. None -> dataset
             # default only when the env carries no history_actor group.
             history_len_override=self._expert_history_len_override(),
+            # FK compose on GPU even when stored on CPU (see above).
+            compose_device=expert_compose_device,
         )
         # Forward to the env so RSI can pull from it.
         if hasattr(self.env_unwrapped, "set_expert_buffer"):

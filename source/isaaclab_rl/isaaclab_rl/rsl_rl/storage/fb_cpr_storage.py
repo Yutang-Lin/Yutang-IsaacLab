@@ -770,6 +770,7 @@ class FBCprExpertBuffer:
         anchor_frame_body: bool = False,
         priv_include_heading_body: bool = False,
         history_len_override: int | None = None,
+        compose_device: str | torch.device | None = None,
     ) -> None:
         """Expert motion buffer.
 
@@ -794,6 +795,14 @@ class FBCprExpertBuffer:
         self.seq_length = int(seq_length)
         self._length_proportional_priors = bool(length_proportional_priors)
         self.device = torch.device(device)
+        # Device for the ONE-TIME load-time FK compose (chain build + batched
+        # FK). Defaults to the storage device. Set to a GPU when the buffer
+        # itself is stored on CPU (device="cpu") so the compose stays fast
+        # (~20-40x vs CPU FK) while the persistent per-motion feature buffers
+        # live in host RAM — off the VRAM-constrained GPU. Composed features are
+        # moved to ``self.device`` when appended, so sampling/indexing (all on
+        # ``self.device``) is unaffected.
+        self._compose_device = torch.device(compose_device) if compose_device is not None else self.device
         # Anchored variant: emit an ``anchored_pose`` obs (A^-1 g). The anchor
         # is sampled from the SAME p_A as the policy (alpha at the frame's own
         # current pose, else random around it) so expert and policy z_spatial
@@ -877,19 +886,19 @@ class FBCprExpertBuffer:
                     flush=True,
                 )
             urdf = raw.get("urdf_path") or mod.DEFAULT_URDF
-            # Build the FK chain on the buffer's device so per-motion
-            # compose runs entirely on GPU — ~20-40x faster than CPU on
-            # a big dataset. When self.device is "cuda", pytorch_kinematics
-            # moves its internal state to the same device.
-            compose_device = str(self.device)
+            # Build the FK chain on the COMPOSE device (GPU) so per-motion
+            # compose runs entirely on GPU — ~20-40x faster than CPU on a big
+            # dataset — even when the buffer is STORED on CPU. pytorch_kinematics
+            # moves its internal state to that device.
+            compose_device = str(self._compose_device)
             self._minimal_chain = mod._build_chain(urdf, device=compose_device)
             self._minimal_default_q = torch.tensor(
                 [float(x) for x in raw.get("default_dof_pos", mod.DEFAULT_DOF_POS)],
-                dtype=torch.float32, device=self.device,
+                dtype=torch.float32, device=self._compose_device,
             )
             self._minimal_gravity = torch.tensor(
                 list(raw.get("gravity", [0.0, 0.0, -1.0])),
-                dtype=torch.float32, device=self.device,
+                dtype=torch.float32, device=self._compose_device,
             )
             self._minimal_history_len = (
                 int(history_len_override) if history_len_override is not None
@@ -978,7 +987,9 @@ class FBCprExpertBuffer:
         batched_fk_outputs: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
         if self._minimal:
             mod = self._minimal_mod
-            dev = self.device
+            # FK compose runs on the compose device (GPU); results are moved to
+            # self.device (CPU storage) when appended to the per-motion buffers.
+            dev = self._compose_device
             # Collect raw tensors + lengths.
             raw_rp: list[torch.Tensor] = []
             raw_rq: list[torch.Tensor] = []
@@ -1302,12 +1313,16 @@ class FBCprExpertBuffer:
         if mod is None or chain is None:
             return None
         idx = global_frames.to(self.joint_pos_buffer.device)
-        jp = self.joint_pos_buffer[idx]
-        rp = self.root_pos_buffer[idx]
-        rq = self.root_quat_buffer[idx]
+        # The FK chain lives on the compose device (may differ from the storage
+        # device when the buffer is on CPU); run FK there, then return on the
+        # storage device for downstream indexing consistency.
+        cdev = self._compose_device
+        jp = self.joint_pos_buffer[idx].to(cdev)
+        rp = self.root_pos_buffer[idx].to(cdev)
+        rq = self.root_quat_buffer[idx].to(cdev)
         kp = getattr(self, "_minimal_keypoint_names", None) or mod.KEYPOINT_NAMES
         wp, _ = mod._world_fk(chain, jp, rp, rq, kp)
-        return wp  # [N, K, 3]
+        return wp.to(self.device)  # [N, K, 3]
 
     # -- RSI -------------------------------------------------------------- #
 
