@@ -1712,9 +1712,27 @@ class FBCprAux:
         """
         if not self.is_distributed:
             return
-        objs = [self.policy.state_dict()]
-        torch.distributed.broadcast_object_list(objs, src=0)
-        self.policy.load_state_dict(objs[0])
+        # In-place per-tensor broadcast, NOT broadcast_object_list.
+        #
+        # broadcast_object_list pickles rank-0's state_dict WITH each tensor's
+        # device (cuda:0) and every receiving rank deserializes via torch.load,
+        # restoring to that SAVED device -> all N ranks-per-node materialize the
+        # payload on cuda:0 -> OOM on GPU 0 (observed: one ~103 GB process +
+        # the other 7 ranks piling ~10 GB each on GPU 0, while their own GPUs
+        # sit idle). At XL scale (~1.7B params) this is fatal.
+        #
+        # Each rank's params/buffers already live on ITS OWN correct device, so
+        # broadcast them in place: torch.distributed.broadcast overwrites the
+        # dst tensor from src rank 0 GPU->GPU, no pickle, no torch.load, no
+        # device restore. Iterate the state_dict in the same sorted key order on
+        # every rank so the collective sequence matches (deterministic count).
+        sd = self.policy.state_dict()
+        for k in sorted(sd.keys()):
+            t = sd[k]
+            if isinstance(t, torch.Tensor):
+                torch.distributed.broadcast(t.data, src=0)
+        # state_dict() returns live references to the module's params/buffers,
+        # so the in-place broadcast already updated the module on every rank.
 
     @torch.no_grad()
     def _sync_running_stats(self) -> None:
