@@ -1403,7 +1403,11 @@ class FBCprRunner:
                     end = min(s + 1, z.shape[0])
                     z[s] = z[s:end].mean(dim=0)
                 z = self.policy.project_z(z)
-                z_per_motion.append(z)
+                # Stash on CPU: the full z_per_motion list is [num_motions x
+                # (L-1) x z_dim] and with the mirrored dataset that's ~5 GB/rank
+                # held on GPU for the whole rollout. Keep it in host RAM and move
+                # each motion's slice to the GPU on demand in the rollout loop.
+                z_per_motion.append(z.to("cpu"))
 
             # --- reset envs to each motion's frame-0 state ---
             # Build aligned per-env buffers.
@@ -1495,7 +1499,9 @@ class FBCprRunner:
                     idx = min(t - 1, zm.shape[0] - 1)
                     mask = motion_of_env == m
                     if mask.any():
-                        z_batch[mask] = zm[idx]
+                        # zm is on CPU (see z_per_motion stash); move the single
+                        # indexed frame to the GPU for the assignment.
+                        z_batch[mask] = zm[idx].to(self.device)
                 action = self.policy.act(obs_dict, z_batch, mean=True)
                 new_obs, _, _, infos = self.env.step(action.to(self.env.device))
                 obs_dict = self._obs_to_device(new_obs, infos)
@@ -1629,6 +1635,14 @@ class FBCprRunner:
             if hasattr(env_u, "_eval_mode"):
                 env_u._eval_mode = False
             env_u.restore_state(snap)
+            # Reclaim the transient GPU allocations from the per-motion eval
+            # rollout. torch.compile recompiles per motion-window shape and
+            # leaves reserved-but-unallocated fragmentation; the eval scratch
+            # (jp/dpd logs, z_batch) is freed as this frame unwinds, so an
+            # empty_cache here returns those blocks to the allocator before the
+            # next training update instead of fragmenting its headroom.
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
     # --- utilities ------------------------------------------------------- #
 
