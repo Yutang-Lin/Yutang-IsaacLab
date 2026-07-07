@@ -1406,6 +1406,14 @@ class RslRlFBCprAlgorithmCfg:
     """Total env transitions collected with random actions before updates
     begin. Matches BFM's ``num_seed_steps=10240``."""
 
+    resume_num_seed_steps: int | None = None
+    """Seed-collection budget when RESUMING without a restored replay buffer
+    (load_replay=False or the sibling .replay.pt is missing). The buffer starts
+    empty, so a larger random-action warmup refills it with diverse experience
+    before updates begin -> a more stable restart. ``None`` -> fall back to
+    ``num_seed_steps``. Only affects the resume-without-replay path; fresh runs
+    and replay-restored resumes use ``num_seed_steps``."""
+
     num_agent_updates: int = 16
     """Number of gradient updates per rollout-collection trigger. BFM's 16."""
 

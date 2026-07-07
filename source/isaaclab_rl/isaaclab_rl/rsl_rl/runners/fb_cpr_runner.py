@@ -2121,6 +2121,20 @@ class FBCprRunner:
             # wandb x-axis continues smoothly.
             self._local_timesteps = 0
             self._last_eval_step = 0
+            # Optionally collect MORE seed steps than a fresh run: the buffer
+            # starts empty on a no-replay resume, so a larger random-action
+            # warmup refills it with diverse experience before updates begin,
+            # giving a more stable restart. Falls back to num_seed_steps.
+            _resume_seed = self.alg_cfg.get("resume_num_seed_steps", None)
+            if _resume_seed is not None and int(_resume_seed) > self.num_seed_steps:
+                _old = self.num_seed_steps
+                self.num_seed_steps = int(_resume_seed)
+                print(
+                    f"[FBCprRunner] no-replay resume: raising seed-collection "
+                    f"{_old} -> {self.num_seed_steps} per-rank env-steps for a "
+                    f"stabler restart (resume_num_seed_steps).",
+                    flush=True,
+                )
             print(
                 f"[FBCprRunner] Replay not restored — rewinding "
                 f"local_timesteps=0 and _last_eval_step=0 so warmup "
