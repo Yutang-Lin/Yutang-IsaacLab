@@ -1712,27 +1712,25 @@ class FBCprAux:
         """
         if not self.is_distributed:
             return
-        # In-place per-tensor broadcast, NOT broadcast_object_list.
-        #
-        # broadcast_object_list pickles rank-0's state_dict WITH each tensor's
-        # device (cuda:0) and every receiving rank deserializes via torch.load,
+        # broadcast_object_list, but with the payload moved to CPU on the source
+        # FIRST. The stock path pickles rank-0's state_dict WITH each tensor's
+        # device (cuda:0); every receiving rank deserializes via torch.load,
         # restoring to that SAVED device -> all N ranks-per-node materialize the
-        # payload on cuda:0 -> OOM on GPU 0 (observed: one ~103 GB process +
-        # the other 7 ranks piling ~10 GB each on GPU 0, while their own GPUs
-        # sit idle). At XL scale (~1.7B params) this is fatal.
-        #
-        # Each rank's params/buffers already live on ITS OWN correct device, so
-        # broadcast them in place: torch.distributed.broadcast overwrites the
-        # dst tensor from src rank 0 GPU->GPU, no pickle, no torch.load, no
-        # device restore. Iterate the state_dict in the same sorted key order on
-        # every rank so the collective sequence matches (deterministic count).
-        sd = self.policy.state_dict()
-        for k in sorted(sd.keys()):
-            t = sd[k]
-            if isinstance(t, torch.Tensor):
-                torch.distributed.broadcast(t.data, src=0)
-        # state_dict() returns live references to the module's params/buffers,
-        # so the in-place broadcast already updated the module on every rank.
+        # payload on cuda:0 -> OOM on GPU 0 (observed at XL: one ~103 GB process
+        # + 7 ranks piling ~10 GB each on cuda:0). Moving the state_dict to CPU
+        # before the broadcast makes the pickle carry device='cpu', so the
+        # deserialize lands in host RAM; load_state_dict then copies into each
+        # rank's own (correct-device) params. ONE collective (fast, can't
+        # desync) + no GPU pileup. Verified with a 4-rank gloo test.
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        if rank == 0:
+            cpu_sd = {k: (v.detach().cpu() if isinstance(v, torch.Tensor) else v)
+                      for k, v in self.policy.state_dict().items()}
+            objs = [cpu_sd]
+        else:
+            objs = [None]
+        torch.distributed.broadcast_object_list(objs, src=0)
+        self.policy.load_state_dict(objs[0])
 
     @torch.no_grad()
     def _sync_running_stats(self) -> None:
