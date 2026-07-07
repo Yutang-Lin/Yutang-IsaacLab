@@ -1407,12 +1407,15 @@ class RslRlFBCprAlgorithmCfg:
     begin. Matches BFM's ``num_seed_steps=10240``."""
 
     resume_num_seed_steps: int | None = None
-    """Seed-collection budget when RESUMING without a restored replay buffer
-    (load_replay=False or the sibling .replay.pt is missing). The buffer starts
-    empty, so a larger random-action warmup refills it with diverse experience
-    before updates begin -> a more stable restart. ``None`` -> fall back to
+    """Pre-update collection budget (per-rank env-steps) when RESUMING without a
+    restored replay buffer (load_replay=False or the sibling .replay.pt is
+    missing). The buffer starts empty; updates are held off until this many
+    transitions are collected — but ON-POLICY, using the resumed policy's normal
+    training rollout (exploration + z-context), NOT uniform-random actions (the
+    policy is already trained, so random actions would pollute the buffer). Gives
+    a more stable restart on a well-filled buffer. ``None`` -> fall back to
     ``num_seed_steps``. Only affects the resume-without-replay path; fresh runs
-    and replay-restored resumes use ``num_seed_steps``."""
+    and replay-restored resumes are unchanged."""
 
     num_agent_updates: int = 16
     """Number of gradient updates per rollout-collection trigger. BFM's 16."""

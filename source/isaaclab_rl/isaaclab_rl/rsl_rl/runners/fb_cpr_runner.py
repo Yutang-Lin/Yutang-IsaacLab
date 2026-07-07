@@ -277,6 +277,18 @@ class FBCprRunner:
 
         # --- Seed / rhythm controls ------------------------------------
         self.num_seed_steps = int(self.alg_cfg.get("num_seed_steps", 10_240))
+        # Per-rank local-step threshold below which agent UPDATES are held off
+        # (buffer still fills via rollout). Normally == num_seed_steps; raised on
+        # a no-replay resume (see load()) so the resumed policy refills the empty
+        # buffer on-policy before updates begin. The random-action warmup is
+        # gated separately by num_seed_steps.
+        self._delay_updates_until = self.num_seed_steps
+        # Per-rank local-step threshold below which the rollout uses UNIFORM-
+        # RANDOM actions (== num_seed_steps on a fresh run, where the policy is
+        # untrained). On a no-replay resume the policy is already trained, so
+        # this is set to 0 (see load()) — the refill collection is fully on-
+        # policy, not random.
+        self._random_seed_until = self.num_seed_steps
         self.num_agent_updates = int(self.alg_cfg.get("num_agent_updates", 16))
         self.update_agent_every = int(self.alg_cfg.get("update_agent_every", 1024))
         self.save_interval = int(self.cfg.get("save_interval", 50))
@@ -806,7 +818,7 @@ class FBCprRunner:
             with torch.inference_mode():
                 self.policy.eval()
                 for _ in range(self.num_steps_per_env):
-                    warmup = local_timesteps < self.num_seed_steps
+                    warmup = local_timesteps < self._random_seed_until
                     if warmup:
                         actions = torch.zeros(
                             self.env.num_envs, self.action_dim, device=self.device
@@ -1096,7 +1108,12 @@ class FBCprRunner:
 
             # ----- updates -----
             loss_dict: Dict[str, float] = {}
-            warmup_flag = local_timesteps < self.num_seed_steps
+            # Hold off updates until _delay_updates_until (== num_seed_steps on
+            # a fresh run; larger on a no-replay resume so the resumed policy
+            # refills the empty buffer on-policy first). Note the random-action
+            # rollout branch above is gated separately by num_seed_steps, so the
+            # extended pre-update collection uses the trained policy, not random.
+            warmup_flag = local_timesteps < self._delay_updates_until
             if (
                 len(self.replay_buffer) > 0
                 and not warmup_flag
@@ -2114,33 +2131,35 @@ class FBCprRunner:
                       flush=True)
 
         if not replay_restored:
-            # Replay is empty. Rewind the cadence gates so warmup re-runs
-            # with uniform-random actions (filling the replay with the
-            # post-resume policy's state distribution + explicit noise),
-            # and eval fires again early. Keep self.tot_timesteps so the
-            # wandb x-axis continues smoothly.
+            # Replay is empty. Rewind the cadence gates so warmup re-runs and
+            # eval fires again early. Keep self.tot_timesteps so the wandb
+            # x-axis continues smoothly.
             self._local_timesteps = 0
             self._last_eval_step = 0
-            # Optionally collect MORE seed steps than a fresh run: the buffer
-            # starts empty on a no-replay resume, so a larger random-action
-            # warmup refills it with diverse experience before updates begin,
-            # giving a more stable restart. Falls back to num_seed_steps.
+            # Refill the empty buffer BEFORE updates begin, using the ACTUAL
+            # TRAINING ROLLOUT (the resumed policy + its exploration/z-context),
+            # NOT uniform-random actions — the policy is already trained, so
+            # random garbage would pollute the buffer. We (a) delay the update
+            # gate (``_delay_updates_until``) to resume_num_seed_steps and (b)
+            # set the random-action window (``_random_seed_until``) to 0. So the
+            # resumed policy collects fully on-policy until resume_num_seed_steps
+            # transitions accumulate, then updates start on a well-filled buffer.
+            # Falls back to num_seed_steps when resume_num_seed_steps is unset.
             _resume_seed = self.alg_cfg.get("resume_num_seed_steps", None)
             if _resume_seed is not None and int(_resume_seed) > self.num_seed_steps:
-                _old = self.num_seed_steps
-                self.num_seed_steps = int(_resume_seed)
+                self._delay_updates_until = int(_resume_seed)
+                # Trained policy -> collect fully on-policy, NO random warmup.
+                self._random_seed_until = 0
                 print(
-                    f"[FBCprRunner] no-replay resume: raising seed-collection "
-                    f"{_old} -> {self.num_seed_steps} per-rank env-steps for a "
-                    f"stabler restart (resume_num_seed_steps).",
+                    f"[FBCprRunner] no-replay resume: on-policy collect (0 random) "
+                    f"until {self._delay_updates_until} per-rank env-steps before "
+                    f"updates begin (resume_num_seed_steps).",
                     flush=True,
                 )
             print(
                 f"[FBCprRunner] Replay not restored — rewinding "
-                f"local_timesteps=0 and _last_eval_step=0 so warmup "
-                f"({self.num_seed_steps} per-rank env-steps) and eval "
-                f"gates fire on resume. tot_timesteps kept at "
-                f"{self.tot_timesteps} for logging continuity.",
+                f"local_timesteps=0 and _last_eval_step=0. tot_timesteps kept "
+                f"at {self.tot_timesteps} for logging continuity.",
                 flush=True,
             )
         # Reset torch.compile cache after loading — prevents compiled graph
