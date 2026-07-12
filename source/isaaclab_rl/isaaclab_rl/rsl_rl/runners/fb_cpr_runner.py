@@ -172,6 +172,17 @@ class FBCprRunner:
         self.policy = self._POLICY_CLS(self.obs_space, action_dim=self.action_dim, cfg=net_cfg)
 
         # --- Algorithm --------------------------------------------------
+        # Optionally tie the training batch_size to num_envs (per-rank). Must be
+        # set BEFORE _build_algo_cfg -> the algorithm bakes batch_size into the
+        # FB off-diagonal mask (torch.eye(batch_size)) and the LR scaling at
+        # construction, so overriding it later would shape-mismatch. Opt-in via
+        # ``batch_size_eq_num_envs``; default keeps the configured batch_size.
+        if bool(self.alg_cfg.get("batch_size_eq_num_envs", False)):
+            _bs = int(self.env.num_envs)
+            _old_bs = int(self.alg_cfg.get("batch_size", 1024))
+            self.alg_cfg["batch_size"] = _bs
+            print(f"[FBCprRunner] batch_size tied to num_envs: {_old_bs} -> {_bs} "
+                  f"(per rank).", flush=True)
         algo_cfg = self._build_algo_cfg(self.alg_cfg)
         self.alg = self._ALGO_CLS(self.policy, cfg=algo_cfg, device=self.device)
 

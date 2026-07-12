@@ -446,7 +446,15 @@ class FBCprAux:
         REF_BATCH_SIZE = 1024
         ws = (int(torch.distributed.get_world_size())
               if self.is_distributed else 1)
-        bs_mult = math.sqrt(max(int(cfg.batch_size), 1) / REF_BATCH_SIZE)
+        # LR (and the coupled momentum/EMA-tau) scaling. By default we scale by
+        # sqrt(world_size) * sqrt(batch_size / 1024). Set
+        # ``lr_scale_with_batch_size=False`` to scale by sqrt(world_size) ONLY
+        # (bs_mult forced to 1) — e.g. when batch_size is intentionally set to
+        # num_envs and you do NOT want the LR to chase it.
+        if bool(getattr(cfg, "lr_scale_with_batch_size", True)):
+            bs_mult = math.sqrt(max(int(cfg.batch_size), 1) / REF_BATCH_SIZE)
+        else:
+            bs_mult = 1.0
         ws_mult = math.sqrt(max(ws, 1))
         combined_mult = ws_mult * bs_mult
         if combined_mult != 1.0:

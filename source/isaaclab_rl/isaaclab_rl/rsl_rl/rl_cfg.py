@@ -1251,6 +1251,13 @@ class RslRlFBCprAlgorithmCfg:
     lr_aux_critic: float = 3e-4
     lr_discriminator: float = 1e-5
 
+    lr_scale_with_batch_size: bool = True
+    """Whether the startup LR (and coupled momentum/EMA-tau) scaling includes the
+    sqrt(batch_size / 1024) factor. When True (default) the multiplier is
+    sqrt(world_size) * sqrt(batch_size/1024). Set False to scale by
+    sqrt(world_size) ONLY — use when batch_size is set to num_envs (or otherwise
+    off the 1024 reference) and you do NOT want the LR to chase batch_size."""
+
     # LR anneling. When ``lr_anneal_enable=True`` and ``lr_anneal_steps>0``,
     # every optimizer's LR linearly decays from the DDP-scaled start
     # (``sqrt(world_size) * base_lr``) to the un-scaled ``base_lr`` over
@@ -1319,6 +1326,10 @@ class RslRlFBCprAlgorithmCfg:
     # Main batch for FB / actor / critic / aux_critic. Rounded down to
     # a multiple of seq_length at init.
     batch_size: int = 1024
+    batch_size_eq_num_envs: bool = False
+    """When True, the runner overrides ``batch_size`` with the per-rank
+    ``num_envs`` at construction (before the FB off-diag mask + LR scaling are
+    built from it). Ties the training minibatch to the rollout width."""
     # Disc batch sized as disc_num_slices * seq_length (sampled
     # separately from main batch). When None, disc uses main batch.
     disc_num_slices: int | None = None
