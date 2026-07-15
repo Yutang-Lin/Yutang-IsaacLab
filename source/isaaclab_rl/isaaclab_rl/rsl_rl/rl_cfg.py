@@ -1130,6 +1130,7 @@ class RslRlFBCprPolicyCfg:
         "last_action",
         "history_actor",
     )
+    forward_gamma_embed_dim: int = 0  # >0 => gamma-conditioned F(s,z,a,gamma)
 
     # Actor
     actor_hidden_dim: int = 2048
@@ -1303,6 +1304,11 @@ class RslRlFBCprAlgorithmCfg:
     """MSE weight for the reconstruction head (end-effector pos+rot6d decoded
     from ``z = B(goal)``). Requires ``policy.recon_targets`` to be non-empty.
     Set to 0 to disable even when the head is built."""
+
+    # gamma-conditioned F (requires policy.forward_gamma_embed_dim > 0)
+    fb_gamma_conditioned: bool = False
+    actor_gamma_short: float = 0.8
+    actor_gamma_short_alpha: float = 0.5
 
     length_proportional_priors: bool = True
     """When True, ``FBCprExpertBuffer`` scales the initial uniform priors AND

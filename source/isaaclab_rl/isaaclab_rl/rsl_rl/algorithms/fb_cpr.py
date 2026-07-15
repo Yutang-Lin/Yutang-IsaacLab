@@ -235,6 +235,15 @@ class FBCprAuxAlgorithmCfg:
     # Separate discount for the aux-critic TD target (penalty_xy_tracking
     # etc.). Falls back to ``discount`` when None.
     discount_aux: float | None = None
+    # --- gamma-conditioned F (requires policy.forward_gamma_embed_dim > 0) ---
+    # When on, each FB TD update samples a per-row gamma from a range so the one
+    # F(s,z,a,gamma) fits successor measures across horizons, and the actor's FB
+    # term becomes Q_fb(gamma_L) + (1-gamma_S)/(1-gamma_L)*alpha*Q_fb(gamma_S).
+    fb_gamma_conditioned: bool = False
+    # Short horizon used by the actor's second FB term (long horizon = discount).
+    actor_gamma_short: float = 0.8
+    # Weight alpha on the short-horizon FB term in the actor loss.
+    actor_gamma_short_alpha: float = 0.5
     relabel_ratio: float | None = 0.8
     train_goal_ratio: float = 0.2
     expert_asm_ratio: float = 0.6
@@ -1707,8 +1716,17 @@ class FBCprAux:
         all-reduce (no-op base). Subclasses (anchored: the spatial
         discriminator) return modules whose grads must reduce in the SAME
         collective, in rank-consistent order, rather than via a separate reduce
-        that could race the phase-1 streams."""
-        return []
+        that could race the phase-1 streams.
+
+        The reconstruction head (sibling of B, trained by the folded recon_loss
+        inside backward_fb) is included HERE when merge is on — otherwise its
+        standalone reduce in step_fb races the phase-1 stream collectives and
+        desyncs NCCL op order across ranks (XL-only first-backward hang)."""
+        nets = []
+        rh = getattr(self.policy, "_reconstruction_head", None)
+        if rh is not None:
+            nets.append(rh)
+        return nets
 
     # --- update surface ----------------------------------------------------- #
 
@@ -1841,7 +1859,23 @@ class FBCprAux:
         self._train_actor_window = train_batch.get("actor_window", None)
         train_terminated = train_batch["next"]["terminated"].to(self.device, non_blocking=True)
         not_term = (~train_terminated.bool()).float()
-        discount = self.cfg.discount * not_term
+        # --- gamma-conditioned F: sample a per-row gamma for the FB TD update ---
+        # h = -log(1-gamma) ~ Uniform[h_S, h_L]; gamma = 1-exp(-h). The SAME
+        # per-row gamma feeds F's conditioning input AND the TD-target discount,
+        # so F(.,gamma) fits the successor measure at that horizon. fb_gamma is
+        # None when the feature is off (F stays plain, discount = scalar).
+        self._fb_gamma = None
+        if bool(getattr(self.cfg, "fb_gamma_conditioned", False)):
+            g_l = float(self.cfg.discount)
+            g_s = float(self.cfg.actor_gamma_short)
+            h_l = -math.log(max(1.0 - g_l, 1e-6))
+            h_s = -math.log(max(1.0 - g_s, 1e-6))
+            u = torch.rand(not_term.shape[0], device=self.device)
+            h = h_s + u * (h_l - h_s)
+            self._fb_gamma = 1.0 - torch.exp(-h)          # [B] in [g_s, g_l]
+            discount = self._fb_gamma * not_term
+        else:
+            discount = self.cfg.discount * not_term
         # Separate aux/disc discounts; default to main discount when None.
         _disc_aux = self.cfg.discount if self.cfg.discount_aux is None else self.cfg.discount_aux
         _disc_disc = self.cfg.discount if self.cfg.discount_disc is None else self.cfg.discount_disc
@@ -2536,16 +2570,21 @@ class FBCprAux:
         Returns ``(metrics, F_handle, B_handle)``.
         """
         p = self.policy
+        # gamma-conditioned F: pass the per-row gamma sampled in update() to BOTH
+        # the online and target F. Same gamma the TD target is discounted by
+        # (``discount`` was set from _fb_gamma in update()). None => plain F.
+        fb_gamma = getattr(self, "_fb_gamma", None)
+        f_args = (fb_gamma,) if fb_gamma is not None else ()
         with torch.no_grad():
             # next_action via actor (raw obs for the transformer actor — see
             # _target_next_action; avoids double-normalization in the TD target)
             next_action = self._target_next_action(next_obs, z)
-            target_Fs = p._target_forward_map(next_obs, z, next_action)  # (num_par, B, d)
+            target_Fs = p._target_forward_map(next_obs, z, next_action, *f_args)  # (num_par, B, d)
             target_B = p._target_backward_map(goal)  # (B, d)
             target_Ms = torch.matmul(target_Fs, target_B.T)  # (num_par, B, B)
             _, _, target_M = self._pessimistic_value(target_Ms, self.cfg.fb_pessimism_penalty)
 
-        Fs = p._forward_map(obs, z, action)
+        Fs = p._forward_map(obs, z, action, *f_args)
         B = p._backward_map(goal)
         Ms = torch.matmul(Fs, B.T)
 
@@ -2660,8 +2699,12 @@ class FBCprAux:
         # into fb_loss) are LOCAL. Reduce them so W (and the analytic z_bar=W^T c_g
         # it produces) stays consistent across ranks. backward_optimizer owns both
         # B and the recon head; reduce before its step.
+        # NOTE: when merge_phase1_reduce is on (stream-parallel phase 1), the recon
+        # head is instead folded into the merged collective via
+        # _extra_phase1_reduce_nets() — a SEPARATE reduce here would race the
+        # phase-1 streams and desync NCCL op order (XL-only first-backward hang).
         rh = getattr(p, "_reconstruction_head", None)
-        if self.is_distributed and rh is not None:
+        if self.is_distributed and rh is not None and not getattr(self, "_merge_phase1_reduce", False):
             from ..utils import reduce_gradients
             reduce_gradients(rh)
         self.forward_optimizer.step()
@@ -2931,10 +2974,27 @@ class FBCprAux:
             Qs_aux = Qs_aux.mean(dim=-1, keepdim=True)
         _, _, Q_aux = self._pessimistic_value(Qs_aux, self.cfg.actor_pessimism_penalty)
         Q_aux = Q_aux.reshape(BL)
-        Fs = p._forward_map(flat_obs, flat_z, flat_a)
+        # gamma-conditioned F: main term at gamma_L, plus a gamma_S short-horizon
+        # term (mirrors the MLP actor path). f_gc guards non-conditioned F.
+        _f_gc = bool(getattr(self.cfg, "fb_gamma_conditioned", False)) and \
+            getattr(p, "forward_gamma_conditioned", False)
+        _fbshort_flat = None
+        if _f_gc:
+            _gL = torch.full((flat_z.shape[0],), float(self.cfg.discount), device=flat_z.device)
+            _gS = torch.full((flat_z.shape[0],), float(self.cfg.actor_gamma_short), device=flat_z.device)
+            _FsS = p._forward_map(flat_obs, flat_z, flat_a, _gS)
+            _, _, _QfbS = self._pessimistic_value((_FsS * flat_z).sum(dim=-1), self.cfg.actor_pessimism_penalty)
+            _fbshort_flat = _QfbS.reshape(BL)
+            Fs = p._forward_map(flat_obs, flat_z, flat_a, _gL)
+        else:
+            Fs = p._forward_map(flat_obs, flat_z, flat_a)
         Qs_fb = (Fs * flat_z).sum(dim=-1)
         _, _, Q_fb = self._pessimistic_value(Qs_fb, self.cfg.actor_pessimism_penalty)
         Q_fb = Q_fb.reshape(BL)
+        if _fbshort_flat is not None:
+            _gL = float(self.cfg.discount); _gS = float(self.cfg.actor_gamma_short)
+            _sc = (1.0 - _gS) / max(1.0 - _gL, 1e-6) * float(self.cfg.actor_gamma_short_alpha)
+            Q_fb = Q_fb + _sc * _fbshort_flat  # fold short-horizon into the FB Q used below
 
         # Per-position weight (scale_reg) over VALID positions only, then a
         # valid-masked MEAN over positions (not a sum).
@@ -3008,10 +3068,35 @@ class FBCprAux:
         if bool(getattr(pol_cfg, "aux_critic_distributional", False)):
             Qs_aux = Qs_aux.mean(dim=-1, keepdim=True)
         _, _, Q_aux = self._pessimistic_value(Qs_aux, self.cfg.actor_pessimism_penalty)
-        # Q from FB (implicit Q = F·z)
-        Fs = p._forward_map(obs, z, sampled_action)
+        # Q from FB (implicit Q = F·z). With gamma-conditioning, query F at the
+        # LONG horizon gamma_L (= cfg.discount) for the main term, and add a
+        # short-horizon term at gamma_S:
+        #   Q_fb_L + (1-gamma_S)/(1-gamma_L) * alpha * Q_fb_S
+        # The (1-gamma_S)/(1-gamma_L) factor rescales the short-horizon successor
+        # measure (which sums ~1/(1-gamma) fewer steps) onto the long-horizon scale.
+        fb_gc = bool(getattr(self.cfg, "fb_gamma_conditioned", False)) and \
+            getattr(p, "forward_gamma_conditioned", False)
+        Bsz = z.shape[0]
+        gL_args = ()
+        Q_fb_short = None
+        self._q_fb_short_log = None  # reset each update (only set when conditioned)
+        if fb_gc:
+            gL = torch.full((Bsz,), float(self.cfg.discount), device=z.device)
+            gS = torch.full((Bsz,), float(self.cfg.actor_gamma_short), device=z.device)
+            gL_args = (gL,)
+            Fs_S = p._forward_map(obs, z, sampled_action, gS)
+            _, _, Q_fb_short = self._pessimistic_value((Fs_S * z).sum(dim=-1),
+                                                       self.cfg.actor_pessimism_penalty)
+        Fs = p._forward_map(obs, z, sampled_action, *gL_args)
         Qs_fb = (Fs * z).sum(dim=-1)
         _, _, Q_fb = self._pessimistic_value(Qs_fb, self.cfg.actor_pessimism_penalty)
+        # Short-horizon FB term added to the actor objective (0 when off).
+        fb_short_term = torch.zeros((), device=z.device, dtype=z.dtype)
+        if Q_fb_short is not None:
+            gL = float(self.cfg.discount); gS = float(self.cfg.actor_gamma_short)
+            fb_short_scale = (1.0 - gS) / max(1.0 - gL, 1e-6) * float(self.cfg.actor_gamma_short_alpha)
+            fb_short_term = fb_short_scale * Q_fb_short.mean()
+            self._q_fb_short_log = Q_fb_short.mean().detach()
         # Optional per-block Q split (anchored variant: local vs spatial z).
         # No-op in the base. Stash for the metrics dict below.
         self._q_fb_split_logs = self._q_fb_split(Fs, z)
@@ -3043,6 +3128,7 @@ class FBCprAux:
             actor_loss = (
                 soft_core
                 - Q_fb.mean()
+                - fb_short_term
                 - Q_discriminator.mean() * self.cfg.reg_coeff * weight
                 - Q_aux.mean() * self.cfg.reg_coeff_aux * weight
             )
@@ -3070,6 +3156,7 @@ class FBCprAux:
                 -Q_discriminator.mean() * self.cfg.reg_coeff * weight
                 - Q_aux.mean() * self.cfg.reg_coeff_aux * weight
                 - Q_fb.mean()
+                - fb_short_term
             )
 
         # Anchoring seam: extra actor-side losses (e.g. two-anchor policy-KL
@@ -3093,6 +3180,11 @@ class FBCprAux:
                 "Q_aux": Q_aux.mean(),
                 "Q_fb": Q_fb.mean(),
             }
+            # gamma-conditioned: Q_fb above IS the long-horizon Q_fb_L (also what
+            # scale_reg 'weight' and the Q_aux/Q_disc terms use). Log both.
+            if getattr(self, "_q_fb_short_log", None) is not None:
+                out["Q_fb_L"] = Q_fb.mean()
+                out["Q_fb_S"] = self._q_fb_short_log
             out.update(act_stats)
             out.update(extra_logs)
             if getattr(self, "_q_fb_split_logs", None):

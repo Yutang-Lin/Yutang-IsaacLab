@@ -714,7 +714,17 @@ class ReconstructionHead(nn.Module):
 
 
 class ForwardMap(nn.Module):
-    """BFM forward map ``F(s, z, a) -> z`` (also reused as the critic / aux-critic)."""
+    """BFM forward map ``F(s, z, a) -> z`` (also reused as the critic / aux-critic).
+
+    Optional DISCOUNT CONDITIONING (``gamma_embed_dim > 0``): the map becomes
+    ``F(s, z, a, gamma)``, letting one network represent successor measures at a
+    RANGE of discounts. The conditioning signal is the log effective-horizon
+    ``h = -log(1 - gamma)`` (smoother than raw gamma near 1), passed through a
+    small MLP ``embed_gamma`` (1 -> gamma_embed_dim -> gamma_embed_dim) and
+    concatenated into BOTH embedding-branch inputs. Non-conditioned instances
+    (critic / aux / entropy, and F when the feature is off) are byte-identical
+    to before.
+    """
 
     def __init__(
         self,
@@ -728,6 +738,7 @@ class ForwardMap(nn.Module):
         num_parallel: int = 2,
         input_keys: str | tp.Sequence[str] | None = None,
         output_dim: int | None = None,
+        gamma_embed_dim: int = 0,
     ) -> None:
         super().__init__()
         self.input_filter = build_input_filter(obs_space, input_keys)
@@ -742,6 +753,7 @@ class ForwardMap(nn.Module):
         self.num_parallel = num_parallel
         self.hidden_dim = hidden_dim
         self.model = model
+        self.gamma_embed_dim = int(gamma_embed_dim)
 
         if model == "residual":
             embed_fn = residual_embedding
@@ -750,13 +762,25 @@ class ForwardMap(nn.Module):
         else:
             raise ValueError(f"Unsupported forward_map model {model}")
 
+        # Discount-conditioning embedding: h = -log(1-gamma) -> gamma_embed_dim.
+        # A plain (num_parallel-agnostic) MLP; its output is expanded across the
+        # parallel ensemble in forward() and concatenated into both branches.
+        gdim = self.gamma_embed_dim
+        if gdim > 0:
+            self.embed_gamma = nn.Sequential(
+                nn.Linear(1, gdim), nn.Mish(), nn.Linear(gdim, gdim), nn.Mish(),
+            )
+        else:
+            self.embed_gamma = None
+
         # BFM quirk: the residual variant of ForwardMap/ResidualForwardMap
         # passes ``cfg.hidden_layers`` (not ``cfg.embedding_layers``) as the
         # embedding depth — see BFM-Zero nn_models.py:484-485. The simple
         # variant honours ``embedding_layers``. Keep parity.
         embed_depth = hidden_layers if model == "residual" else embedding_layers
-        self.embed_z = embed_fn(obs_dim + z_dim, hidden_dim, embed_depth, num_parallel)
-        self.embed_sa = embed_fn(obs_dim + action_dim, hidden_dim, embed_depth, num_parallel)
+        # Conditioning widens BOTH branch inputs by gamma_embed_dim (concat).
+        self.embed_z = embed_fn(obs_dim + z_dim + gdim, hidden_dim, embed_depth, num_parallel)
+        self.embed_sa = embed_fn(obs_dim + action_dim + gdim, hidden_dim, embed_depth, num_parallel)
 
         out_dim = output_dim if output_dim is not None else z_dim
         if model == "residual":
@@ -774,14 +798,27 @@ class ForwardMap(nn.Module):
         obs: torch.Tensor | dict[str, torch.Tensor],
         z: torch.Tensor,
         action: torch.Tensor,
+        gamma: torch.Tensor | None = None,
     ) -> torch.Tensor:
         obs = self.input_filter(obs)
+        g_emb = None
+        if self.embed_gamma is not None:
+            if gamma is None:
+                raise ValueError("ForwardMap is gamma-conditioned but no gamma was passed.")
+            # gamma: [B] or [B,1] in (0,1). h = -log(1-gamma), then MLP-embed.
+            g = gamma.reshape(-1, 1).to(obs.dtype)
+            h = -torch.log1p(-g.clamp(max=1 - 1e-6))
+            g_emb = self.embed_gamma(h)                      # [B, gdim]
         if self.num_parallel > 1:
             obs = obs.expand(self.num_parallel, -1, -1)
             z = z.expand(self.num_parallel, -1, -1)
             action = action.expand(self.num_parallel, -1, -1)
-        z_embedding = self.embed_z(torch.cat([obs, z], dim=-1))
-        sa_embedding = self.embed_sa(torch.cat([obs, action], dim=-1))
+            if g_emb is not None:
+                g_emb = g_emb.expand(self.num_parallel, -1, -1)
+        z_in = torch.cat([obs, z], dim=-1) if g_emb is None else torch.cat([obs, z, g_emb], dim=-1)
+        sa_in = torch.cat([obs, action], dim=-1) if g_emb is None else torch.cat([obs, action, g_emb], dim=-1)
+        z_embedding = self.embed_z(z_in)
+        sa_embedding = self.embed_sa(sa_in)
         return self.Fs(torch.cat([sa_embedding, z_embedding], dim=-1))
 
 
@@ -1211,6 +1248,10 @@ class FBCprNetworkCfg:
         "last_action",
         "history_actor",
     )
+    # Discount conditioning of F: 0 = off (plain F(s,z,a)); >0 makes F(s,z,a,gamma)
+    # with a gamma_embed_dim-wide MLP embedding of h=-log(1-gamma). Only the main
+    # forward map is conditioned (critics/aux/entropy stay plain).
+    forward_gamma_embed_dim: int = 0
 
     # Actor
     actor_hidden_dim: int = 2048
@@ -1439,7 +1480,14 @@ class FBCprAuxPolicy(nn.Module):
             embedding_layers=cfg.forward_embedding_layers,
             num_parallel=cfg.forward_num_parallel,
             input_keys=cfg.forward_input_keys,
+            gamma_embed_dim=int(getattr(cfg, "forward_gamma_embed_dim", 0)),
         )
+        # Whether F consumes a gamma argument (drives call sites in the algorithm).
+        self.forward_gamma_conditioned = int(getattr(cfg, "forward_gamma_embed_dim", 0)) > 0
+        # Default gamma for the public forward_map() accessor when a caller omits
+        # it (e.g. play/eval Q-probes). Long horizon; the algorithm always passes
+        # explicit per-row gamma during training so this is inference-only.
+        self.fb_gamma_default = float(getattr(cfg, "fb_gamma_default", 0.98))
 
         # Soft FB flag.
         self.soft_fb: bool = bool(getattr(cfg, "soft_fb", False))
@@ -1667,7 +1715,18 @@ class FBCprAuxPolicy(nn.Module):
         obs: torch.Tensor | dict[str, torch.Tensor],
         z: torch.Tensor,
         action: torch.Tensor,
+        gamma: torch.Tensor | float | None = None,
     ) -> torch.Tensor:
+        if self.forward_gamma_conditioned:
+            # Default to the long horizon (fb_gamma_default) when a caller (e.g.
+            # a play/eval Q-probe) does not supply gamma, so external callers do
+            # not need to know F is conditioned.
+            if gamma is None:
+                gamma = float(getattr(self, "fb_gamma_default", 0.98))
+            if not torch.is_tensor(gamma):
+                n = z.shape[0]
+                gamma = torch.full((n,), float(gamma), device=z.device)
+            return self._forward_map(self._normalize(obs), z, action, gamma)
         return self._forward_map(self._normalize(obs), z, action)
 
     @torch.no_grad()
