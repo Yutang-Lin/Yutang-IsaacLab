@@ -356,6 +356,10 @@ class FBCprAuxAlgorithmCfg:
     # Default "" (disabled). Options: "", "default", "reduce-overhead",
     # "max-autotune".
     compile_mode: str = ""
+    # Compile the online forward map when compile_mode is enabled. Large
+    # stochastic-integral actor batches may disable this selectively while
+    # retaining compilation for B/actor/critics.
+    compile_forward_map: bool = True
 
     # Merge the 4 phase-1 allreduces into one. Helps on slow/high-
     # latency fabrics (EFA without GDR). On NVSwitch this loses the
@@ -675,7 +679,9 @@ class FBCprAux:
             compile_mode = "default"
         if compile_mode:
             compile_kwargs = {"mode": compile_mode, "fullgraph": False}
-            self.policy._forward_map = torch.compile(self.policy._forward_map, **compile_kwargs)
+            compile_forward_map = bool(getattr(cfg, "compile_forward_map", True))
+            if compile_forward_map:
+                self.policy._forward_map = torch.compile(self.policy._forward_map, **compile_kwargs)
             self.policy._backward_map = torch.compile(self.policy._backward_map, **compile_kwargs)
             self.policy._actor = torch.compile(self.policy._actor, **compile_kwargs)
             self.policy._critic = torch.compile(self.policy._critic, **compile_kwargs)
@@ -699,8 +705,13 @@ class FBCprAux:
             # Disc uses autograd.grad(create_graph=True) for WGAN-GP, which
             # is known to hit graph breaks with torch.compile — leave it
             # eager. Target networks never need compile (no backward).
+            compiled_nets = (
+                "F/B/actor/critic/aux_critic"
+                if compile_forward_map
+                else "B/actor/critic/aux_critic (F eager)"
+            )
             print(f"[FBCprAux] torch.compile mode={compile_mode} applied to "
-                  f"F/B/actor/critic/aux_critic (disc stays eager)"
+                  f"{compiled_nets} (disc stays eager)"
                   + ("; actor.forward_window compiled (training path)"
                      if isinstance(_bare_actor, TransformerActorWrapper) else ""),
                   flush=True)

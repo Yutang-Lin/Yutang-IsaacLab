@@ -1395,6 +1395,11 @@ class RslRlFBCprAlgorithmCfg:
     the algorithm auto-downgrades ``reduce-overhead`` → ``default``.
     Use ``"default"`` when pairing with streams on 2.7."""
 
+    compile_forward_map: bool = True
+    """Whether the online F network is included in ``torch.compile``. Disable
+    selectively for workloads whose actor objective expands F to a much larger
+    batch while retaining compilation for B, actor, and both critics."""
+
     merge_phase1_reduce: bool = False
     """Merge the 4 phase-1 allreduces into one. Wins on slow/high-latency
     fabrics (EFA without GDR). Required if ``stream_parallel_phase1=True``.
