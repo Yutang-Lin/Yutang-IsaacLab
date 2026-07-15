@@ -1309,6 +1309,8 @@ class RslRlFBCprAlgorithmCfg:
     fb_gamma_conditioned: bool = False
     actor_gamma_short: float = 0.8
     actor_gamma_short_alpha: float = 0.5
+    fb_stochastic_integral: bool = False  # softmax-weighted horizon integral actor FB term
+    fb_integral_K: int = 8
 
     length_proportional_priors: bool = True
     """When True, ``FBCprExpertBuffer`` scales the initial uniform priors AND

@@ -244,6 +244,12 @@ class FBCprAuxAlgorithmCfg:
     actor_gamma_short: float = 0.8
     # Weight alpha on the short-horizon FB term in the actor loss.
     actor_gamma_short_alpha: float = 0.5
+    # Stochastic-integral FB actor objective (overrides the two-gamma term when on;
+    # requires fb_gamma_conditioned). Stratified-sample fb_integral_K horizons in
+    # [gamma_short, discount], softmax-weight the normalized per-step values, and
+    # integrate. See backward_actor.
+    fb_stochastic_integral: bool = False
+    fb_integral_K: int = 8
     relabel_ratio: float | None = 0.8
     train_goal_ratio: float = 0.2
     expert_asm_ratio: float = 0.6
@@ -3075,39 +3081,81 @@ class FBCprAux:
         # measure (which sums ~1/(1-gamma) fewer steps) onto the long-horizon scale.
         fb_gc = bool(getattr(self.cfg, "fb_gamma_conditioned", False)) and \
             getattr(p, "forward_gamma_conditioned", False)
+        fb_si = fb_gc and bool(getattr(self.cfg, "fb_stochastic_integral", False))
         Bsz = z.shape[0]
         gL_args = ()
         Q_fb_short = None
-        self._q_fb_short_log = None  # reset each update (only set when conditioned)
-        if fb_gc:
-            gL = torch.full((Bsz,), float(self.cfg.discount), device=z.device)
-            gS = torch.full((Bsz,), float(self.cfg.actor_gamma_short), device=z.device)
-            gL_args = (gL,)
-            Fs_S = p._forward_map(obs, z, sampled_action, gS)
-            _, _, Q_fb_short = self._pessimistic_value((Fs_S * z).sum(dim=-1),
-                                                       self.cfg.actor_pessimism_penalty)
-        Fs = p._forward_map(obs, z, sampled_action, *gL_args)
-        Qs_fb = (Fs * z).sum(dim=-1)
-        _, _, Q_fb = self._pessimistic_value(Qs_fb, self.cfg.actor_pessimism_penalty)
-        # Short-horizon FB term added to the actor objective (0 when off).
-        # ``Q_fb_combined`` [B] is the FULL FB objective the actor maximizes:
-        #   Q_fb_L + (1-gamma_S)/(1-gamma_L) * alpha * Q_fb_S
-        # It also drives the scale_reg ``weight`` (so the aux/disc reg terms track
-        # the magnitude of the SUM of both scaled FB Qs, not just Q_fb_L).
         fb_short_term = torch.zeros((), device=z.device, dtype=z.dtype)
-        Q_fb_combined = Q_fb
+        self._q_fb_short_log = None  # reset each update (only set when conditioned)
         self._q_fb_L_log = None
         self._q_fb_S_log = None
-        if Q_fb_short is not None:
+        self._q_fb_integral_log = None
+
+        if fb_si:
+            # --- STOCHASTIC-INTEGRAL FB objective over the horizon -----------
+            # Stratified-sample K horizons h_i in [h_lo, h_hi] (K even grids, one
+            # uniform draw per grid, per row), gamma_i = 1-exp(-h_i). Batch-forward
+            # F(s, pi, z, gamma_i), take the NORMALIZED per-step value
+            # N_i = (1-gamma_i)*<F,z>, softmax over horizons (max-subtracted) as
+            # integral weights w_i, and integrate:  Q_final = sum_i w_i * N_i.
+            K = int(getattr(self.cfg, "fb_integral_K", 8))
             gL = float(self.cfg.discount); gS = float(self.cfg.actor_gamma_short)
-            fb_short_scale = (1.0 - gS) / max(1.0 - gL, 1e-6) * float(self.cfg.actor_gamma_short_alpha)
-            Q_fb_combined = Q_fb + fb_short_scale * Q_fb_short          # [B]
-            fb_short_term = fb_short_scale * Q_fb_short.mean()
-            # gamma-NORMALIZED logs: (1-gamma)*Q ~ per-step value, so the two
-            # horizons are on a comparable scale (raw Q ~ 1/(1-gamma)).
-            self._q_fb_short_log = Q_fb_short.mean().detach()          # raw (back-compat)
-            self._q_fb_L_log = ((1.0 - gL) * Q_fb.mean()).detach()
-            self._q_fb_S_log = ((1.0 - gS) * Q_fb_short.mean()).detach()
+            h_lo = -math.log(max(1.0 - gS, 1e-6)); h_hi = -math.log(max(1.0 - gL, 1e-6))
+            edges = torch.linspace(h_lo, h_hi, K + 1, device=z.device)          # [K+1]
+            u = torch.rand(Bsz, K, device=z.device)
+            hs = edges[:-1].view(1, K) + u * (edges[1:] - edges[:-1]).view(1, K)  # [B,K]
+            gammas_k = 1.0 - torch.exp(-hs)                                       # [B,K]
+            # Vectorized: fold the K horizons into the batch dim -> one forward
+            # over B*K, then reshape back. obs is a dict; tile each key K-fold
+            # (repeat_interleave so row order is [b0g0..b0gK-1, b1g0..]).
+            def _tileK(t):
+                return t.repeat_interleave(K, dim=0)
+            obs_bk = {k: _tileK(v) for k, v in obs.items()} if isinstance(obs, dict) else _tileK(obs)
+            z_bk = _tileK(z)                                                     # [B*K, d]
+            a_bk = _tileK(sampled_action)                                        # [B*K, A]
+            g_bk = gammas_k.reshape(-1)                                          # [B*K]
+            F_bk = p._forward_map(obs_bk, z_bk, a_bk, g_bk)                      # [par, B*K, d]
+            _, _, Q_bk = self._pessimistic_value((F_bk * z_bk).sum(dim=-1),
+                                                 self.cfg.actor_pessimism_penalty)  # [B*K]
+            N = ((1.0 - g_bk) * Q_bk).reshape(Bsz, K)                            # normalized [B,K]
+            # softmax integral weights — DETACHED: they are fixed importance
+            # weights, so the gradient flows only through the N values, not
+            # through the weighting (Q_final is a weighted average of N).
+            w = torch.softmax(N - N.max(dim=1, keepdim=True).values, dim=1).detach()  # [B,K]
+            Q_final = (w * N).sum(dim=1)                                         # [B]
+            Q_fb = Q_final
+            Q_fb_combined = Q_final
+            # split-log needs an Fs; reuse the last grid's long-horizon slice
+            # (F_bk row for the K-th sub-sample of each row ~ near gamma_L).
+            Fs = F_bk[:, K - 1::K, :]                                            # [par, B, d]
+            self._q_fb_integral_log = Q_final.mean().detach()
+        else:
+            if fb_gc:
+                gL = torch.full((Bsz,), float(self.cfg.discount), device=z.device)
+                gS = torch.full((Bsz,), float(self.cfg.actor_gamma_short), device=z.device)
+                gL_args = (gL,)
+                Fs_S = p._forward_map(obs, z, sampled_action, gS)
+                _, _, Q_fb_short = self._pessimistic_value((Fs_S * z).sum(dim=-1),
+                                                           self.cfg.actor_pessimism_penalty)
+            Fs = p._forward_map(obs, z, sampled_action, *gL_args)
+            Qs_fb = (Fs * z).sum(dim=-1)
+            _, _, Q_fb = self._pessimistic_value(Qs_fb, self.cfg.actor_pessimism_penalty)
+            # Short-horizon FB term added to the actor objective (0 when off).
+            # ``Q_fb_combined`` [B] is the FULL FB objective the actor maximizes:
+            #   Q_fb_L + (1-gamma_S)/(1-gamma_L) * alpha * Q_fb_S
+            # It also drives the scale_reg ``weight`` (so the aux/disc reg terms
+            # track the magnitude of the SUM of both scaled FB Qs, not just Q_fb_L).
+            Q_fb_combined = Q_fb
+            if Q_fb_short is not None:
+                gL = float(self.cfg.discount); gS = float(self.cfg.actor_gamma_short)
+                fb_short_scale = (1.0 - gS) / max(1.0 - gL, 1e-6) * float(self.cfg.actor_gamma_short_alpha)
+                Q_fb_combined = Q_fb + fb_short_scale * Q_fb_short          # [B]
+                fb_short_term = fb_short_scale * Q_fb_short.mean()
+                # gamma-NORMALIZED logs: (1-gamma)*Q ~ per-step value, so the two
+                # horizons are on a comparable scale (raw Q ~ 1/(1-gamma)).
+                self._q_fb_short_log = Q_fb_short.mean().detach()          # raw (back-compat)
+                self._q_fb_L_log = ((1.0 - gL) * Q_fb.mean()).detach()
+                self._q_fb_S_log = ((1.0 - gS) * Q_fb_short.mean()).detach()
         # Optional per-block Q split (anchored variant: local vs spatial z).
         # No-op in the base. Stash for the metrics dict below.
         self._q_fb_split_logs = self._q_fb_split(Fs, z)
@@ -3203,6 +3251,8 @@ class FBCprAux:
                 out["MutableGamma/Q_fb_S_raw"] = self._q_fb_short_log
                 out["MutableGamma/Q_fb_L"] = self._q_fb_L_log   # (1-gamma_L)*Q_fb_L
                 out["MutableGamma/Q_fb_S"] = self._q_fb_S_log   # (1-gamma_S)*Q_fb_S
+            if getattr(self, "_q_fb_integral_log", None) is not None:
+                out["MutableGamma/Q_fb_integral"] = self._q_fb_integral_log
             out.update(act_stats)
             out.update(extra_logs)
             if getattr(self, "_q_fb_split_logs", None):
