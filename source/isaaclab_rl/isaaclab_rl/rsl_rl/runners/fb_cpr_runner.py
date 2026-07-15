@@ -119,6 +119,7 @@ class FBCprRunner:
         # or explicitly reinitialized parameters still require rank-0 sync.
         self._checkpoint_loaded = False
         self._checkpoint_requires_parameter_sync = False
+        self._is_resumed_run = False
 
         # Scrub class_name keys (consumed before network instantiation).
         self.policy_cfg.pop("class_name", None)
@@ -1952,7 +1953,11 @@ class FBCprRunner:
         except Exception as e:  # pragma: no cover - defensive
             print(f"[FBCprRunner] WARN: S3 mirror stage copy failed: {e}", flush=True)
             return
-        dest = f"{self.s3_ckpt_uri}/{self.s3_ckpt_name}"
+        upload_name = self.s3_ckpt_name
+        if self._is_resumed_run:
+            stem, ext = os.path.splitext(upload_name)
+            upload_name = f"{stem}_resume{ext}"
+        dest = f"{self.s3_ckpt_uri}/{upload_name}"
 
         def _worker():
             t0 = time.time()
@@ -2229,6 +2234,7 @@ class FBCprRunner:
 
         self._checkpoint_loaded = True
         self._checkpoint_requires_parameter_sync = bool(reinit_keys)
+        self._is_resumed_run = True
 
         return ckpt.get("infos", {})
 
