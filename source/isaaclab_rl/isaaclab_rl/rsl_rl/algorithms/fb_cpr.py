@@ -250,6 +250,10 @@ class FBCprAuxAlgorithmCfg:
     # integrate. See backward_actor.
     fb_stochastic_integral: bool = False
     fb_integral_K: int = 8
+    # Align scale on the integrated Q: 1/(1-fb_integral_align_gamma) (default
+    # gamma=0.98 -> 50) so the per-step integral sits at the standard-gamma
+    # Q magnitude.
+    fb_integral_align_gamma: float = 0.98
     relabel_ratio: float | None = 0.8
     train_goal_ratio: float = 0.2
     expert_asm_ratio: float = 0.6
@@ -3090,6 +3094,12 @@ class FBCprAux:
         self._q_fb_L_log = None
         self._q_fb_S_log = None
         self._q_fb_integral_log = None
+        self._q_fb_w_entropy_log = None
+        self._q_fb_w_entropy_frac_log = None
+        self._q_fb_w_top_log = None
+        self._q_fb_w_profile = None
+        self._q_fb_w_argmax_frac = None
+        self._q_fb_w_tau_log = None
 
         if fb_si:
             # --- STOCHASTIC-INTEGRAL FB objective over the horizon -----------
@@ -3128,14 +3138,37 @@ class FBCprAux:
                 _, _, Qt_bk = self._pessimistic_value((Ft_bk * z_bk).sum(dim=-1),
                                                       self.cfg.actor_pessimism_penalty)
                 Nt = ((1.0 - g_bk) * Qt_bk).reshape(Bsz, K)                      # target normalized
-                w = torch.softmax(Nt - Nt.max(dim=1, keepdim=True).values, dim=1)  # [B,K]
-            Q_final = (w * N).sum(dim=1)                                         # [B]
+                # Adaptive softmax temperature tau = sqrt(|mean normalized Q|)
+                # (per-row): sharper weighting when values are small, softer when
+                # large — keeps the weight sharpness scale-invariant. From the
+                # TARGET Nt (w stays fully target-derived).
+                tau = Nt.mean(dim=1, keepdim=True).abs().clamp_min(1e-6).sqrt()   # [B,1]
+                w = torch.softmax((Nt - Nt.max(dim=1, keepdim=True).values) / tau, dim=1)  # [B,K]
+            # Alignment scale: the integral is a per-step (normalized) value; the
+            # standard-gamma FB Q lives at ~1/(1-gamma) magnitude. Multiply by
+            # 1/(1-gamma_align) (default gamma_align=0.98 -> 50) so Q_final sits on
+            # the same scale as the rest of the actor objective.
+            g_align = float(getattr(self.cfg, "fb_integral_align_gamma", 0.98))
+            align = 1.0 / max(1.0 - g_align, 1e-6)
+            Q_final = align * (w * N).sum(dim=1)                                 # [B]
             Q_fb = Q_final
             Q_fb_combined = Q_final
             # split-log needs an Fs; reuse the last grid's long-horizon slice
             # (F_bk row for the K-th sub-sample of each row ~ near gamma_L).
             Fs = F_bk[:, K - 1::K, :]                                            # [par, B, d]
             self._q_fb_integral_log = Q_final.mean().detach()
+            # --- weight-distribution diagnostics (over the K horizon grids) ---
+            # entropy of w (0 = one grid dominates, log K = uniform); the mean
+            # weight of the top (highest-weight) grid; and the mean per-grid
+            # weight profile (grid 0 = shortest horizon .. K-1 = longest).
+            with torch.no_grad():
+                ent = -(w.clamp_min(1e-12) * w.clamp_min(1e-12).log()).sum(dim=1)  # [B]
+                self._q_fb_w_entropy_log = ent.mean().detach()
+                self._q_fb_w_entropy_frac_log = (ent.mean() / math.log(K)).detach()  # /max entropy
+                self._q_fb_w_top_log = w.max(dim=1).values.mean().detach()
+                self._q_fb_w_profile = w.mean(dim=0).detach()                    # [K] mean weight per grid
+                self._q_fb_w_argmax_frac = (w.argmax(dim=1).float() / max(K - 1, 1)).mean().detach()
+                self._q_fb_w_tau_log = tau.mean().detach()                       # mean softmax temperature
         else:
             if fb_gc:
                 gL = torch.full((Bsz,), float(self.cfg.discount), device=z.device)
@@ -3260,6 +3293,14 @@ class FBCprAux:
                 out["MutableGamma/Q_fb_S"] = self._q_fb_S_log   # (1-gamma_S)*Q_fb_S
             if getattr(self, "_q_fb_integral_log", None) is not None:
                 out["MutableGamma/Q_fb_integral"] = self._q_fb_integral_log
+                out["MutableGamma/w_entropy"] = self._q_fb_w_entropy_log
+                out["MutableGamma/w_entropy_frac"] = self._q_fb_w_entropy_frac_log  # /log K
+                out["MutableGamma/w_top"] = self._q_fb_w_top_log                    # mean max weight
+                out["MutableGamma/w_argmax_frac"] = self._q_fb_w_argmax_frac        # 0=short..1=long
+                out["MutableGamma/w_tau"] = self._q_fb_w_tau_log                    # softmax temperature
+                if self._q_fb_w_profile is not None:
+                    for gi in range(self._q_fb_w_profile.numel()):
+                        out[f"MutableGamma/w_grid{gi}"] = self._q_fb_w_profile[gi]
             out.update(act_stats)
             out.update(extra_logs)
             if getattr(self, "_q_fb_split_logs", None):
