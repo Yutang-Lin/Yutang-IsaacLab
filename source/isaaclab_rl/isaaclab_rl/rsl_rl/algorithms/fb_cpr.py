@@ -3096,8 +3096,9 @@ class FBCprAux:
             # Stratified-sample K horizons h_i in [h_lo, h_hi] (K even grids, one
             # uniform draw per grid, per row), gamma_i = 1-exp(-h_i). Batch-forward
             # F(s, pi, z, gamma_i), take the NORMALIZED per-step value
-            # N_i = (1-gamma_i)*<F,z>, softmax over horizons (max-subtracted) as
-            # integral weights w_i, and integrate:  Q_final = sum_i w_i * N_i.
+            # N_i = (1-gamma_i)*<F,z>. Integral weights w_i = softmax over horizons
+            # of the TARGET-F normalized values (max-subtracted, no-grad, EMA-
+            # stable); integrate the ONLINE N:  Q_final = sum_i w_i * N_i.
             K = int(getattr(self.cfg, "fb_integral_K", 8))
             gL = float(self.cfg.discount); gS = float(self.cfg.actor_gamma_short)
             h_lo = -math.log(max(1.0 - gS, 1e-6)); h_hi = -math.log(max(1.0 - gL, 1e-6))
@@ -3117,11 +3118,17 @@ class FBCprAux:
             F_bk = p._forward_map(obs_bk, z_bk, a_bk, g_bk)                      # [par, B*K, d]
             _, _, Q_bk = self._pessimistic_value((F_bk * z_bk).sum(dim=-1),
                                                  self.cfg.actor_pessimism_penalty)  # [B*K]
-            N = ((1.0 - g_bk) * Q_bk).reshape(Bsz, K)                            # normalized [B,K]
-            # softmax integral weights — DETACHED: they are fixed importance
-            # weights, so the gradient flows only through the N values, not
-            # through the weighting (Q_final is a weighted average of N).
-            w = torch.softmax(N - N.max(dim=1, keepdim=True).values, dim=1).detach()  # [B,K]
+            N = ((1.0 - g_bk) * Q_bk).reshape(Bsz, K)                            # online normalized [B,K]
+            # Integral weights from the TARGET forward map (EMA), not the online
+            # F — stabler weighting that doesn't chase the fast-moving online net.
+            # The integrated N still uses the ONLINE F (gradient flows through N);
+            # w is target-derived AND detached, so it's a fixed importance weight.
+            with torch.no_grad():
+                Ft_bk = p._target_forward_map(obs_bk, z_bk, a_bk, g_bk)          # [par, B*K, d]
+                _, _, Qt_bk = self._pessimistic_value((Ft_bk * z_bk).sum(dim=-1),
+                                                      self.cfg.actor_pessimism_penalty)
+                Nt = ((1.0 - g_bk) * Qt_bk).reshape(Bsz, K)                      # target normalized
+                w = torch.softmax(Nt - Nt.max(dim=1, keepdim=True).values, dim=1)  # [B,K]
             Q_final = (w * N).sum(dim=1)                                         # [B]
             Q_fb = Q_final
             Q_fb_combined = Q_final
