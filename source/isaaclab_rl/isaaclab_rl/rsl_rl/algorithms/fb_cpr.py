@@ -1870,9 +1870,11 @@ class FBCprAux:
             g_s = float(self.cfg.actor_gamma_short)
             h_l = -math.log(max(1.0 - g_l, 1e-6))
             h_s = -math.log(max(1.0 - g_s, 1e-6))
-            u = torch.rand(not_term.shape[0], device=self.device)
+            # rand_like(not_term) so _fb_gamma matches not_term's shape ([B] or
+            # [B,1]) — a [B] vs [B,1] mismatch would broadcast discount to [B,B].
+            u = torch.rand_like(not_term)
             h = h_s + u * (h_l - h_s)
-            self._fb_gamma = 1.0 - torch.exp(-h)          # [B] in [g_s, g_l]
+            self._fb_gamma = 1.0 - torch.exp(-h)          # same shape as not_term, in [g_s, g_l]
             discount = self._fb_gamma * not_term
         else:
             discount = self.cfg.discount * not_term
