@@ -1572,6 +1572,10 @@ class RslRlOnPolicyRunnerCfg:
     save_interval: int = MISSING
     """The number of iterations between saves."""
 
+    log_env_steps_world_size_cap: int = 0
+    """Maximum world-size contribution to the logged env-step x-axis. Values
+    <= 0 use the full world size."""
+
     upload_checkpoint: bool = False
     """Whether to upload the checkpoint to the cloud. Default is False."""
 

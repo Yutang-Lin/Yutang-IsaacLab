@@ -365,8 +365,17 @@ class FBCprRunner:
 
         # --- Logging ---------------------------------------------------
         self.num_steps_per_env = int(self.cfg.get("num_steps_per_env", 1))
+        log_ws_cap = int(self.cfg.get("log_env_steps_world_size_cap", 0))
+        self._log_world_size = (
+            min(self.gpu_world_size, log_ws_cap)
+            if log_ws_cap > 0
+            else self.gpu_world_size
+        )
         self.writer = None
         self.tot_timesteps = 0
+        # Kept separate from tot_timesteps so logging normalization cannot
+        # alter LR schedules or other training behavior.
+        self.log_timesteps = 0
         self.tot_time = 0.0
         self.current_learning_iteration = 0
 
@@ -797,7 +806,7 @@ class FBCprRunner:
                 print(f"[FBCprRunner] running initial tracking eval (no priority update) ...", flush=True)
             eval0 = self._run_tracking_eval(update_priorities=False)
             if self._is_head and eval0 is not None and self.log_dir is not None and self.writer is not None:
-                env_steps = int(self.tot_timesteps)
+                env_steps = int(self.log_timesteps)
                 # Log the initial eval on the SAME curve as subsequent
                 # evals (``Eval/*``) so wandb/TB show a continuous
                 # trajectory from untrained-policy baseline onwards.
@@ -841,9 +850,9 @@ class FBCprRunner:
         # cadence. Each rank has its own replay buffer, so
         # ``num_seed_steps``/``update_agent_every``/``eval_every_steps`` are
         # per-rank budgets. BFM has this too: every rank runs its own train
-        # loop and only the wall-clock metrics are world-scaled.
-        # ``self.tot_timesteps`` remains the GLOBAL (env_steps × world_size)
-        # counter used only for logging / reporting.
+        # loop. ``self.tot_timesteps`` remains the raw GLOBAL
+        # (env_steps x world_size) counter used by LR schedules and checkpoint
+        # metadata; ``self.log_timesteps`` is the separately normalized x-axis.
         local_timesteps = getattr(self, "_local_timesteps", 0)
 
         for it in range(start_iter, tot_iter):
@@ -1140,10 +1149,11 @@ class FBCprRunner:
 
                     obs_dict = new_obs
 
-                    # Local = per-rank steps (drives warmup + update cadence).
-                    # Global = world-scaled (for logging only).
+                    # Local drives warmup/update cadence. The raw global counter
+                    # drives schedules; the logging counter may cap world size.
                     local_timesteps += self.env.num_envs
                     self.tot_timesteps += self.env.num_envs * self.gpu_world_size
+                    self.log_timesteps += self.env.num_envs * self._log_world_size
                     steps_since_last_update += self.env.num_envs
 
             collection_time = time.time() - start
@@ -1800,7 +1810,7 @@ class FBCprRunner:
         rewbuffer: deque,
         lenbuffer: deque,
     ) -> None:
-        env_steps = int(self.tot_timesteps)
+        env_steps = int(self.log_timesteps)
         for tag, val in loss_dict.items():
             self.writer.add_scalar(tag, val, env_steps)
         if len(rewbuffer) > 0:
@@ -1874,6 +1884,8 @@ class FBCprRunner:
             "optimizers": self.alg.optimizer_dict,
             "iter": self.current_learning_iteration,
             "tot_timesteps": self.tot_timesteps,
+            "log_timesteps": self.log_timesteps,
+            "world_size": self.gpu_world_size,
             "local_timesteps": getattr(self, "_local_timesteps", 0),
             "last_eval_step": self._last_eval_step,
             "infos": infos or {},
@@ -2019,8 +2031,8 @@ class FBCprRunner:
             relearns its separator on a degenerate distribution, which
             manifests as disc_loss climbing visibly after resume.
 
-        ``tot_timesteps`` (global wall-clock counter for logging) is
-        preserved regardless — we only rewind the cadence gates.
+        The raw and logging step counters are preserved regardless; only the
+        cadence gates are rewound.
         """
         # Deserialize on CPU. Loading a resumed XL checkpoint directly onto CUDA
         # temporarily holds the checkpoint's model + Adam tensors alongside the
@@ -2179,6 +2191,38 @@ class FBCprRunner:
         self.current_learning_iteration = ckpt.get("iter", 0)
         self.tot_timesteps = ckpt.get("tot_timesteps", 0)
         self._local_timesteps = ckpt.get("local_timesteps", 0)
+        if "log_timesteps" in ckpt:
+            self.log_timesteps = int(ckpt["log_timesteps"])
+        else:
+            # Legacy checkpoints did not persist a logging-only counter or
+            # world size. Infer the old world size from global/local steps, or
+            # from completed iterations when periodic saves still have a stale
+            # local counter. Fall back to the current world size.
+            saved_world_size = ckpt.get("world_size")
+            completed_iterations = int(ckpt.get("iter", -1)) + 1
+            iter_local_timesteps = (
+                completed_iterations * self.env.num_envs * self.num_steps_per_env
+            )
+            for candidate_local_steps in (
+                self._local_timesteps,
+                iter_local_timesteps,
+            ):
+                if saved_world_size is not None or candidate_local_steps <= 0:
+                    continue
+                ratio = self.tot_timesteps / candidate_local_steps
+                rounded_ratio = round(ratio)
+                if 1 <= rounded_ratio <= 4096 and abs(ratio - rounded_ratio) < 1e-6:
+                    saved_world_size = rounded_ratio
+            saved_world_size = max(int(saved_world_size or self.gpu_world_size), 1)
+            log_ws_cap = int(self.cfg.get("log_env_steps_world_size_cap", 0))
+            saved_log_world_size = (
+                min(saved_world_size, log_ws_cap)
+                if log_ws_cap > 0
+                else saved_world_size
+            )
+            self.log_timesteps = round(
+                self.tot_timesteps * saved_log_world_size / saved_world_size
+            )
         self._last_eval_step = ckpt.get("last_eval_step", self._last_eval_step)
 
         replay_restored = False
@@ -2221,8 +2265,8 @@ class FBCprRunner:
                 )
             print(
                 f"[FBCprRunner] Replay not restored — rewinding "
-                f"local_timesteps=0 and _last_eval_step=0. tot_timesteps kept "
-                f"at {self.tot_timesteps} for logging continuity.",
+                f"local_timesteps=0 and _last_eval_step=0. Raw/logging step "
+                f"counters kept at {self.tot_timesteps}/{self.log_timesteps}.",
                 flush=True,
             )
         # Reset torch.compile cache after loading — prevents compiled graph
