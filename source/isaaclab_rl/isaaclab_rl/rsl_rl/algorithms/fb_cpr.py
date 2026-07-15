@@ -159,6 +159,10 @@ class FBCprAuxAlgorithmCfg:
     # sqrt(batch_size / 1024).
     lr_scale_with_batch_size: bool = True
 
+    # Optional world-size scaling for the FB/critic target-network Polyak rates.
+    target_tau_scale_with_world_size: bool = False
+    target_tau_world_size_cap: int = 0
+
     # LR anneling. When ``lr_anneal_enable=True`` and ``lr_anneal_steps>0``,
     # linearly decay each optimizer's LR from the DDP-scaled start value
     # (``base_lr * sqrt(world_size)``) down to the un-scaled base value
@@ -464,11 +468,7 @@ class FBCprAux:
         # ``lr_anneal_steps`` env-steps.
         #
         # Discriminator gets the same ``combined_mult`` as every other branch.
-        # The "disc saturates too fast on clean gradient" artifact is now
-        # addressed on the downstream side by scaling
-        # ``critic_target_tau`` / ``fb_target_tau`` with sqrt(W*B/B_ref) so
-        # the critic's target network keeps up with the online's new speed —
-        # rather than by slowing disc down.
+        # Target-network Polyak rates are scaled independently below.
         import math
         REF_BATCH_SIZE = 1024
         ws = (int(torch.distributed.get_world_size())
@@ -523,7 +523,6 @@ class FBCprAux:
         # disc-damp); these are downstream of the online network's motion,
         # not upstream like disc.
         if combined_mult != 1.0 and combined_mult > 0.0:
-            import math as _math
             # BatchNorm per-key momentum on _obs_normalizer._normalizers[<k>]._normalizer
             new_obs_moms: Dict[str, float] = {}
             if hasattr(self.policy, "_obs_normalizer") and hasattr(
@@ -559,6 +558,28 @@ class FBCprAux:
             print(
                 f"[FBCprAux] EMA normalizer scaling (×{combined_mult:.3f}): "
                 f"obs_momentum={{{obs_moms_str}}}  aux_tau={aux_tau_str}",
+                flush=True,
+            )
+
+        # Target-network Polyak rates track world-size scaling separately from
+        # LR and normalizer EMA scaling. They intentionally do not include the
+        # per-rank batch multiplier.
+        if bool(getattr(cfg, "target_tau_scale_with_world_size", False)):
+            target_tau_ws_cap = int(getattr(cfg, "target_tau_world_size_cap", 0))
+            target_tau_ws = (
+                min(ws, target_tau_ws_cap)
+                if target_tau_ws_cap > 0
+                else ws
+            )
+            target_tau_mult = math.sqrt(max(target_tau_ws, 1))
+            cfg.fb_target_tau = min(1.0, float(cfg.fb_target_tau) * target_tau_mult)
+            cfg.critic_target_tau = min(
+                1.0, float(cfg.critic_target_tau) * target_tau_mult
+            )
+            print(
+                f"[FBCprAux] target tau scaling: world_size={ws}"
+                f"->{target_tau_ws} (×{target_tau_mult:.3f})  "
+                f"fb={cfg.fb_target_tau:.4g} critic={cfg.critic_target_tau:.4g}",
                 flush=True,
             )
 

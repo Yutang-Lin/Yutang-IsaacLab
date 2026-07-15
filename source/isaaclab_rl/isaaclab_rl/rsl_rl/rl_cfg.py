@@ -1264,6 +1264,14 @@ class RslRlFBCprAlgorithmCfg:
     sqrt(world_size) ONLY — use when batch_size is set to num_envs (or otherwise
     off the 1024 reference) and you do NOT want the LR to chase batch_size."""
 
+    target_tau_scale_with_world_size: bool = False
+    """Whether FB and critic target-network Polyak rates scale with
+    sqrt(world_size)."""
+
+    target_tau_world_size_cap: int = 0
+    """Maximum world size used for target-network Polyak-rate scaling. Values
+    <= 0 leave the world-size contribution uncapped."""
+
     # LR anneling. When ``lr_anneal_enable=True`` and ``lr_anneal_steps>0``,
     # every optimizer's LR linearly decays from the DDP-scaled start
     # (``sqrt(world_size) * base_lr``) to the un-scaled ``base_lr`` over
