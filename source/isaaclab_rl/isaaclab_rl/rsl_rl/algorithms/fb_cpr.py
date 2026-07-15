@@ -3044,6 +3044,34 @@ class FBCprAux:
         action: torch.Tensor,
         z: torch.Tensor,
     ) -> Tuple[Dict[str, torch.Tensor], Any]:
+        # The actor loss backpropagates through F / critic / aux_critic to the
+        # sampled action, but their optimizers have already stepped and only the
+        # actor optimizer steps below. Suppress those three DDP reducers during
+        # this phase. Otherwise one autograd graph contains four independent DDP
+        # modules, whose bucket hooks can enqueue NCCL collectives in a different
+        # inter-module order on different ranks (an intermittent deadlock).
+        #
+        # The MLP actor remains DDP-synchronized by its own hooks. The transformer
+        # actor bypasses DDP.forward and is synchronized explicitly in
+        # _backward_actor_transformer, so both paths issue exactly one actor
+        # gradient synchronization in this phase.
+        if self.is_distributed and self._is_ddp_wrapped:
+            with contextlib.ExitStack() as actor_value_ctx:
+                for net in (
+                    self.policy._forward_map,
+                    self.policy._critic,
+                    self.policy._aux_critic,
+                ):
+                    actor_value_ctx.enter_context(net.no_sync())
+                return self._backward_actor_impl(obs, action, z)
+        return self._backward_actor_impl(obs, action, z)
+
+    def _backward_actor_impl(
+        self,
+        obs: torch.Tensor | dict[str, torch.Tensor],
+        action: torch.Tensor,
+        z: torch.Tensor,
+    ) -> Tuple[Dict[str, torch.Tensor], Any]:
         # Transformer actor: parallel FB -Q over all H+1 timestep positions.
         win = getattr(self, "_train_actor_window", None)
         if win is not None and isinstance(self._unwrap(self.policy._actor), TransformerActorWrapper):
