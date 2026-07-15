@@ -227,6 +227,9 @@ class FBCprAuxAlgorithmCfg:
     reg_coeff: float = 0.05       # weight on Q_discriminator inside actor loss
     reg_coeff_aux: float = 0.02   # weight on Q_aux_critic inside actor loss
     scale_reg: bool = True         # multiply regs by |Q_fb|.abs().mean().detach()
+    # Actor-only FB scale alignment. Applied before scale_reg so the direct FB
+    # and regularizer terms scale together; FB TD targets remain unchanged.
+    actor_fb_scale: float = 1.0
 
     # Mixed-z sampling (at training time and for the in-rollout ZBuffer)
     batch_size: int = 1024
@@ -3044,6 +3047,7 @@ class FBCprAux:
             _gL = float(self.cfg.discount); _gS = float(self.cfg.actor_gamma_short)
             _sc = (1.0 - _gS) / max(1.0 - _gL, 1e-6) * float(self.cfg.actor_gamma_short_alpha)
             Q_fb = Q_fb + _sc * _fbshort_flat  # fold short-horizon into the FB Q used below
+        Q_fb = float(getattr(self.cfg, "actor_fb_scale", 1.0)) * Q_fb
 
         # Per-position weight (scale_reg) over VALID positions only, then a
         # valid-masked MEAN over positions (not a sum).
@@ -3271,6 +3275,15 @@ class FBCprAux:
                 self._q_fb_short_log = Q_fb_short.mean().detach()          # raw (back-compat)
                 self._q_fb_L_log = ((1.0 - gL) * Q_fb.mean()).detach()
                 self._q_fb_S_log = ((1.0 - gS) * Q_fb_short.mean()).detach()
+        # Align the actor-side FB objective without changing F's TD targets.
+        # Q_fb_combined also drives scale_reg, so Q_disc/Q_aux retain their
+        # relative balance with the scaled direct FB term.
+        actor_fb_scale = float(getattr(self.cfg, "actor_fb_scale", 1.0))
+        Q_fb = actor_fb_scale * Q_fb
+        Q_fb_combined = actor_fb_scale * Q_fb_combined
+        fb_short_term = actor_fb_scale * fb_short_term
+        if self._q_fb_integral_log is not None:
+            self._q_fb_integral_log = actor_fb_scale * self._q_fb_integral_log
         # Optional per-block Q split (anchored variant: local vs spatial z).
         # No-op in the base. Stash for the metrics dict below.
         self._q_fb_split_logs = self._q_fb_split(Fs, z)

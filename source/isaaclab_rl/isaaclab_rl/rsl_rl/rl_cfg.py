@@ -1345,6 +1345,10 @@ class RslRlFBCprAlgorithmCfg:
     reg_coeff: float = 0.05
     reg_coeff_aux: float = 0.02
     scale_reg: bool = True
+    actor_fb_scale: float = 1.0
+    """Scale applied to the actor's FB objective only. The same scaled FB
+    magnitude drives ``scale_reg`` so discriminator/auxiliary terms retain
+    their relative weighting. FB training targets and losses are unchanged."""
 
     # Main batch for FB / actor / critic / aux_critic. Rounded down to
     # a multiple of seq_length at init.
