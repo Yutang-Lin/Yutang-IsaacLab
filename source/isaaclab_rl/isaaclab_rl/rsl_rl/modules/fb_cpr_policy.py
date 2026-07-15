@@ -559,7 +559,17 @@ class ObsNormalizer(nn.Module):
 
 
 class BackwardMap(nn.Module):
-    """BFM backward map ``B(s_+) -> z`` with optional sphere projection."""
+    """BFM backward map ``B(s_+) -> z`` with optional sphere projection.
+
+    ``model``:
+      * ``"simple"`` (default) — the original plain MLP: an input LayerNorm+Tanh
+        block, then ``hidden_layers-1`` Linear+ReLU layers, then the z head.
+      * ``"residual"`` — a lightweight residual MLP with LayerNorm: input
+        projection, then ``hidden_layers-1`` pre-LayerNorm residual blocks
+        (LayerNorm -> Linear -> Mish, with a skip), then the z head. Same
+        ``hidden_dim``/``hidden_layers`` budget as ``simple`` (still lightweight)
+        but with skip connections + per-block LayerNorm for stabler B gradients.
+    """
 
     def __init__(
         self,
@@ -569,6 +579,7 @@ class BackwardMap(nn.Module):
         hidden_layers: int = 1,
         norm: bool = True,
         input_keys: str | tp.Sequence[str] | None = None,
+        model: str = "simple",
     ) -> None:
         super().__init__()
         self.input_filter = build_input_filter(obs_space, input_keys)
@@ -577,10 +588,22 @@ class BackwardMap(nn.Module):
             f"filtered_space must be a Box space, got {type(filtered_space)}."
         )
         assert len(filtered_space.shape) == 1, "filtered_space must have a 1D shape"
-        seq: list[nn.Module] = [nn.Linear(filtered_space.shape[0], hidden_dim), nn.LayerNorm(hidden_dim), nn.Tanh()]
-        for _ in range(hidden_layers - 1):
-            seq += [nn.Linear(hidden_dim, hidden_dim), nn.ReLU()]
-        seq += [nn.Linear(hidden_dim, z_dim)]
+        in_dim = filtered_space.shape[0]
+        if model == "residual":
+            # Lightweight residual MLP with LayerNorm. Input projection into the
+            # hidden width, then (hidden_layers-1) pre-LN residual blocks, then
+            # the linear z head. ResidualBlock = LayerNorm -> Linear -> Mish + skip.
+            seq: list[nn.Module] = [nn.Linear(in_dim, hidden_dim), nn.LayerNorm(hidden_dim), nn.Mish()]
+            for _ in range(hidden_layers - 1):
+                seq += [ResidualBlock(hidden_dim)]
+            seq += [nn.Linear(hidden_dim, z_dim)]
+        elif model == "simple":
+            seq = [nn.Linear(in_dim, hidden_dim), nn.LayerNorm(hidden_dim), nn.Tanh()]
+            for _ in range(hidden_layers - 1):
+                seq += [nn.Linear(hidden_dim, hidden_dim), nn.ReLU()]
+            seq += [nn.Linear(hidden_dim, z_dim)]
+        else:
+            raise ValueError(f"BackwardMap: unknown model '{model}' (want 'simple' or 'residual').")
         if norm:
             seq += [Norm()]
         self.net = nn.Sequential(*seq)
@@ -604,6 +627,7 @@ class ReconstructionHead(nn.Module):
         linear: bool = False,
         square_augment: bool = False,
         target_scale: float = 1.0,
+        model: str = "simple",
     ) -> None:
         super().__init__()
         self.targets = [(str(k), int(s), int(e)) for (k, s, e) in targets]
@@ -627,12 +651,23 @@ class ReconstructionHead(nn.Module):
             # (a bias would let W fit the feature mean for free, defeating the
             # span constraint). BFM-0.5 feature-coverage map.
             self.net = nn.Linear(z_dim, self.output_dim, bias=False)
-        else:
-            seq: list[nn.Module] = [nn.Linear(z_dim, hidden_dim), nn.LayerNorm(hidden_dim), nn.Tanh()]
+        elif model == "residual":
+            # Lightweight residual MLP with LayerNorm — SAME block structure as
+            # the residual BackwardMap: input proj -> pre-LN residual blocks ->
+            # linear output head. Decodes the full target from z = B(s).
+            seq: list[nn.Module] = [nn.Linear(z_dim, hidden_dim), nn.LayerNorm(hidden_dim), nn.Mish()]
+            for _ in range(max(0, hidden_layers - 1)):
+                seq += [ResidualBlock(hidden_dim)]
+            seq += [nn.Linear(hidden_dim, self.output_dim)]
+            self.net = nn.Sequential(*seq)
+        elif model == "simple":
+            seq = [nn.Linear(z_dim, hidden_dim), nn.LayerNorm(hidden_dim), nn.Tanh()]
             for _ in range(max(0, hidden_layers - 1)):
                 seq += [nn.Linear(hidden_dim, hidden_dim), nn.ReLU()]
             seq += [nn.Linear(hidden_dim, self.output_dim)]
             self.net = nn.Sequential(*seq)
+        else:
+            raise ValueError(f"ReconstructionHead: unknown model '{model}' (want 'simple' or 'residual').")
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:
         return self.net(z)
@@ -1161,6 +1196,7 @@ class FBCprNetworkCfg:
     backward_hidden_dim: int = 256
     backward_hidden_layers: int = 1
     backward_norm: bool = True
+    backward_model: str = "simple"  # {"simple", "residual"} — residual = LN residual MLP
     backward_input_keys: tp.Sequence[str] = ("state", "privileged_state")
 
     # Forward map (F) / critics share this architecture
@@ -1290,6 +1326,7 @@ class FBCprNetworkCfg:
     recon_targets: tp.Sequence[tuple[str, int, int]] = ()
     recon_hidden_dim: int = 256
     recon_hidden_layers: int = 2
+    recon_model: str = "simple"  # {"simple", "residual"} — residual = same LN residual MLP as B (ignored if recon_linear)
     # BFM-0.5: make the recon head a single LINEAR projection W (no MLP) and
     # augment the target with elementwise squares ([feats, feats^2]). This is
     # the feature-coverage map ensuring the tracking-reward features (and their
@@ -1372,6 +1409,7 @@ class FBCprAuxPolicy(nn.Module):
             hidden_layers=cfg.backward_hidden_layers,
             norm=cfg.backward_norm,
             input_keys=cfg.backward_input_keys,
+            model=cfg.backward_model,
         )
 
         # Optional reconstruction head (end-effector decoder from z).
@@ -1387,6 +1425,7 @@ class FBCprAuxPolicy(nn.Module):
                 linear=bool(getattr(cfg, "recon_linear", False)),
                 square_augment=bool(getattr(cfg, "recon_square_augment", False)),
                 target_scale=float(getattr(cfg, "recon_target_scale", 1.0)),
+                model=str(getattr(cfg, "recon_model", "simple")),
             )
 
         # Forward map (z-output).

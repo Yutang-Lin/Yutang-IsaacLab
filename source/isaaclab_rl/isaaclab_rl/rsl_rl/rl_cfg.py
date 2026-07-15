@@ -1115,6 +1115,7 @@ class RslRlFBCprPolicyCfg:
     backward_hidden_dim: int = 256
     backward_hidden_layers: int = 1
     backward_norm: bool = True
+    backward_model: str = "simple"  # {"simple", "residual"} — residual = LN residual MLP
     backward_input_keys: tuple[str, ...] = ("state", "privileged_state")
 
     # Forward map (F)
@@ -1215,6 +1216,10 @@ class RslRlFBCprPolicyCfg:
     recon_targets: tuple[tuple[str, int, int], ...] = ()
     recon_hidden_dim: int = 256
     recon_hidden_layers: int = 2
+    recon_model: str = "simple"  # {"simple", "residual"} — residual = same LN residual MLP as B (ignored if recon_linear)
+    recon_linear: bool = False
+    recon_square_augment: bool = False
+    recon_target_scale: float = 1.0
 
     # Manifold attractor
     manifold_attractor: bool = False
