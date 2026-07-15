@@ -113,6 +113,12 @@ class FBCprRunner:
         self.env = env
         self.env_unwrapped = env.unwrapped  # type: ignore
         self.log_dir = log_dir
+        # Resume bookkeeping for the initial parameter synchronization in
+        # learn(). train.py calls load() on every rank, so an exact checkpoint
+        # restore makes the subsequent full-policy broadcast redundant. Missing
+        # or explicitly reinitialized parameters still require rank-0 sync.
+        self._checkpoint_loaded = False
+        self._checkpoint_requires_parameter_sync = False
 
         # Scrub class_name keys (consumed before network instantiation).
         self.policy_cfg.pop("class_name", None)
@@ -325,12 +331,10 @@ class FBCprRunner:
         # holds the latest checkpoint, not a growing pile. Configurable via
         #   cfg.s3_ckpt_uri  = "s3://bucket/prefix"   (None/"" disables)
         #   cfg.s3_ckpt_name = "model_latest.pt"      (the single rolling key)
-        #   cfg.s3_profile   = "default"              (aws --profile)
         # Env override: BFM_S3_CKPT_URI takes precedence over the cfg value.
         self.s3_ckpt_uri = str(
             os.environ.get("BFM_S3_CKPT_URI", self.cfg.get("s3_ckpt_uri", "")) or "").rstrip("/")
         self.s3_ckpt_name = str(self.cfg.get("s3_ckpt_name", "model_latest.pt"))
-        self.s3_profile = str(self.cfg.get("s3_profile", "default"))
         self._s3_thread: threading.Thread | None = None
         if self.s3_ckpt_uri and shutil.which("aws") is None:
             print("[FBCprRunner] WARN: s3_ckpt_uri set but 'aws' CLI not found — "
@@ -669,13 +673,40 @@ class FBCprRunner:
                 from torch.utils.tensorboard import SummaryWriter  # type: ignore
                 self.writer = SummaryWriter(log_dir=self.log_dir, flush_secs=10)
 
-        # DDP: broadcast the rank-0 parameters + running stats to every rank
-        # so every worker starts from the same weights. Must run BEFORE the
-        # first forward pass; the algorithm's ``broadcast_parameters`` is a
-        # no-op when ``is_distributed`` is False.
+        # DDP: broadcast rank-0 parameters + running stats on fresh starts or
+        # partial checkpoint restores. On a normal resume, train.py calls load()
+        # on every rank, including optimizer state. Re-broadcasting the full XL
+        # policy after that restore is both redundant and dangerous: populated
+        # Adam state already consumes its steady-state GPU memory, while
+        # broadcast_object_list adds a large serialized staging payload.
+        #
+        # Reduce a one-element eligibility flag first so every rank makes the
+        # same skip/broadcast decision. If even one rank did not load, or retained
+        # freshly initialized parameters, all ranks take the broadcast path.
         if self.is_distributed:
-            print(f"[FBCprRunner] Synchronizing parameters for rank {self.gpu_global_rank}...", flush=True)
-            self.alg.broadcast_parameters()
+            can_skip = (
+                self._checkpoint_loaded
+                and not self._checkpoint_requires_parameter_sync
+            )
+            skip_flag = torch.tensor(
+                int(can_skip), device=self.device, dtype=torch.int32
+            )
+            torch.distributed.all_reduce(
+                skip_flag, op=torch.distributed.ReduceOp.MIN
+            )
+            if bool(skip_flag.item()):
+                print(
+                    f"[FBCprRunner] rank {self.gpu_global_rank}: checkpoint "
+                    f"restored on every rank; skipping redundant parameter broadcast.",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"[FBCprRunner] Synchronizing parameters for rank "
+                    f"{self.gpu_global_rank}...",
+                    flush=True,
+                )
+                self.alg.broadcast_parameters()
 
         obs_flat, extras = self.env.get_observations()
         obs_dict = self._obs_to_device(obs_flat, extras)
@@ -1922,14 +1953,25 @@ class FBCprRunner:
             print(f"[FBCprRunner] WARN: S3 mirror stage copy failed: {e}", flush=True)
             return
         dest = f"{self.s3_ckpt_uri}/{self.s3_ckpt_name}"
-        profile = self.s3_profile
 
         def _worker():
             t0 = time.time()
             try:
+                # Do not inherit AWS_PROFILE or pass --profile: the cluster's
+                # confidential credential provider is resolved through the
+                # default AWS credential chain. Keep this change local to the
+                # subprocesses instead of mutating the training process.
+                aws_env = os.environ.copy()
+                aws_env.pop("AWS_PROFILE", None)
                 subprocess.run(
-                    ["aws", "s3", "cp", staged, dest, "--profile", profile],
+                    ["aws", "configure", "set", "region", "us-east-1"],
                     check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                    env=aws_env,
+                )
+                subprocess.run(
+                    ["aws", "s3", "cp", staged, dest],
+                    check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                    env=aws_env,
                 )
                 print(f"[FBCprRunner] S3 mirror: uploaded -> {dest} "
                       f"({time.time() - t0:.1f}s)", flush=True)
@@ -1975,7 +2017,12 @@ class FBCprRunner:
         ``tot_timesteps`` (global wall-clock counter for logging) is
         preserved regardless — we only rewind the cadence gates.
         """
-        ckpt = torch.load(path, map_location=self.device, weights_only=False)
+        # Deserialize on CPU. Loading a resumed XL checkpoint directly onto CUDA
+        # temporarily holds the checkpoint's model + Adam tensors alongside the
+        # already constructed model/optimizers, which can OOM one rank while the
+        # others later wait in a collective. load_state_dict copies/casts each
+        # model and optimizer tensor onto its owning parameter device.
+        ckpt = torch.load(path, map_location="cpu", weights_only=False)
         model_sd = ckpt["model"]
         # Align checkpoint keys to the current policy's prefix scheme.
         # DDP adds ``.module.``; torch.compile adds ``._orig_mod.``. The
@@ -2179,6 +2226,9 @@ class FBCprRunner:
             torch._dynamo.reset()
         except Exception:
             pass
+
+        self._checkpoint_loaded = True
+        self._checkpoint_requires_parameter_sync = bool(reinit_keys)
 
         return ckpt.get("infos", {})
 
