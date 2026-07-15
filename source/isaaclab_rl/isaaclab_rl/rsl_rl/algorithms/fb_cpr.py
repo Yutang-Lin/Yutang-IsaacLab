@@ -254,6 +254,10 @@ class FBCprAuxAlgorithmCfg:
     # gamma=0.98 -> 50) so the per-step integral sits at the standard-gamma
     # Q magnitude.
     fb_integral_align_gamma: float = 0.98
+    # Adaptive softmax temperature for stochastic-integral weights. The
+    # temperature is sqrt(abs(mean target N)) with a floor of 1.0, so enabling
+    # it can soften the plain softmax but can never make it sharper.
+    fb_integral_adaptive_tau: bool = False
     relabel_ratio: float | None = 0.8
     train_goal_ratio: float = 0.2
     expert_asm_ratio: float = 0.6
@@ -3094,6 +3098,12 @@ class FBCprAux:
         self._q_fb_L_log = None
         self._q_fb_S_log = None
         self._q_fb_integral_log = None
+        self._q_fb_w_entropy_log = None
+        self._q_fb_w_entropy_frac_log = None
+        self._q_fb_w_top_log = None
+        self._q_fb_w_profile = None
+        self._q_fb_w_argmax_frac = None
+        self._q_fb_w_tau_log = None
 
         if fb_si:
             # --- STOCHASTIC-INTEGRAL FB objective over the horizon -----------
@@ -3132,16 +3142,39 @@ class FBCprAux:
                 _, _, Qt_bk = self._pessimistic_value((Ft_bk * z_bk).sum(dim=-1),
                                                       self.cfg.actor_pessimism_penalty)
                 Nt = ((1.0 - g_bk) * Qt_bk).reshape(Bsz, K)                      # target normalized
-                w = torch.softmax(Nt - Nt.max(dim=1, keepdim=True).values, dim=1)  # [B,K]
+                logits = Nt - Nt.max(dim=1, keepdim=True).values                 # [B,K]
+                if bool(getattr(self.cfg, "fb_integral_adaptive_tau", False)):
+                    # Floor tau at 1: adaptive weighting may soften the plain
+                    # softmax, but cannot sharpen it when mean(Nt) is near zero.
+                    tau = Nt.mean(dim=1, keepdim=True).abs().sqrt().clamp_min(1.0)
+                    logits = logits / tau
+                    self._q_fb_w_tau_log = tau.mean()
+                w = torch.softmax(logits, dim=1)                                 # [B,K]
+                # Detached, scalar-only diagnostics. The per-grid profile is
+                # retained here as [K], then emitted below as K separate scalars.
+                wd = w.detach()
+                ent = -(wd.clamp_min(1e-12) * wd.clamp_min(1e-12).log()).sum(dim=1)
+                self._q_fb_w_entropy_log = ent.mean()
+                self._q_fb_w_entropy_frac_log = ent.mean() / max(math.log(K), 1e-12)
+                self._q_fb_w_top_log = wd.max(dim=1).values.mean()
+                self._q_fb_w_profile = wd.mean(dim=0)
+                self._q_fb_w_argmax_frac = (
+                    wd.argmax(dim=1).float().mean() / max(K - 1, 1)
+                )
             # Alignment scale: the integral is a per-step (normalized) value; the
             # standard-gamma FB Q lives at ~1/(1-gamma) magnitude. Multiply by
             # 1/(1-gamma_align) (default gamma_align=0.98 -> 50) so Q_final sits on
             # the same scale as the rest of the actor objective.
             g_align = float(getattr(self.cfg, "fb_integral_align_gamma", 0.98))
             align = 1.0 / max(1.0 - g_align, 1e-6)
-            Q_final = align * (w * N).sum(dim=1)                                 # [B]
+            Q_integral = (w * N).sum(dim=1)                                      # [B] per-step
+            Q_final = align * Q_integral                                        # aligned objective
             Q_fb = Q_final
-            Q_fb_combined = Q_final
+            # scale_reg weight comes from the UN-aligned per-step integral, so the
+            # Q_disc/Q_aux reg terms keep the same magnitude as the pre-align
+            # (514905ae) run — the x50 align only scales the -Q_fb objective term,
+            # NOT the reg weighting (which x50 would blow up -> unstable/NaN).
+            Q_fb_combined = Q_integral
             # split-log needs an Fs; reuse the last grid's long-horizon slice
             # (F_bk row for the K-th sub-sample of each row ~ near gamma_L).
             Fs = F_bk[:, K - 1::K, :]                                            # [par, B, d]
@@ -3270,6 +3303,15 @@ class FBCprAux:
                 out["MutableGamma/Q_fb_S"] = self._q_fb_S_log   # (1-gamma_S)*Q_fb_S
             if getattr(self, "_q_fb_integral_log", None) is not None:
                 out["MutableGamma/Q_fb_integral"] = self._q_fb_integral_log
+                out["MutableGamma/w_entropy"] = self._q_fb_w_entropy_log
+                out["MutableGamma/w_entropy_frac"] = self._q_fb_w_entropy_frac_log
+                out["MutableGamma/w_top"] = self._q_fb_w_top_log
+                out["MutableGamma/w_argmax_frac"] = self._q_fb_w_argmax_frac
+                if self._q_fb_w_tau_log is not None:
+                    out["MutableGamma/w_tau"] = self._q_fb_w_tau_log
+                if self._q_fb_w_profile is not None:
+                    for gi in range(self._q_fb_w_profile.numel()):
+                        out[f"MutableGamma/w_grid{gi}"] = self._q_fb_w_profile[gi]
             out.update(act_stats)
             out.update(extra_logs)
             if getattr(self, "_q_fb_split_logs", None):
