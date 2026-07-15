@@ -3161,14 +3161,17 @@ class FBCprAux:
             # entropy of w (0 = one grid dominates, log K = uniform); the mean
             # weight of the top (highest-weight) grid; and the mean per-grid
             # weight profile (grid 0 = shortest horizon .. K-1 = longest).
+            # SCALAR-ONLY diagnostics (every logged metric is a 0-dim tensor;
+            # the runner's metric accumulator sums + .item()s them, so a
+            # non-scalar [K] entry is the odd path out — keep them all scalar).
             with torch.no_grad():
-                ent = -(w.clamp_min(1e-12) * w.clamp_min(1e-12).log()).sum(dim=1)  # [B]
-                self._q_fb_w_entropy_log = ent.mean().detach()
-                self._q_fb_w_entropy_frac_log = (ent.mean() / math.log(K)).detach()  # /max entropy
-                self._q_fb_w_top_log = w.max(dim=1).values.mean().detach()
-                self._q_fb_w_profile = w.mean(dim=0).detach()                    # [K] mean weight per grid
-                self._q_fb_w_argmax_frac = (w.argmax(dim=1).float() / max(K - 1, 1)).mean().detach()
-                self._q_fb_w_tau_log = tau.mean().detach()                       # mean softmax temperature
+                wd = w.detach()                                                  # fully graph-inert
+                ent = -(wd.clamp_min(1e-12) * wd.clamp_min(1e-12).log()).sum(dim=1)  # [B]
+                self._q_fb_w_entropy_log = ent.mean()
+                self._q_fb_w_entropy_frac_log = ent.mean() / math.log(K)          # /max entropy
+                self._q_fb_w_top_log = wd.max(dim=1).values.mean()
+                self._q_fb_w_argmax_frac = wd.argmax(dim=1).float().mean() / max(K - 1, 1)
+                self._q_fb_w_tau_log = tau.detach().mean()                        # mean softmax temperature
         else:
             if fb_gc:
                 gL = torch.full((Bsz,), float(self.cfg.discount), device=z.device)
