@@ -1264,10 +1264,6 @@ class RslRlFBCprAlgorithmCfg:
     sqrt(world_size) ONLY — use when batch_size is set to num_envs (or otherwise
     off the 1024 reference) and you do NOT want the LR to chase batch_size."""
 
-    lr_scale_max: float = 0.0
-    """Maximum combined world-size and batch-size LR multiplier. Values <= 0
-    disable the cap."""
-
     # LR anneling. When ``lr_anneal_enable=True`` and ``lr_anneal_steps>0``,
     # every optimizer's LR linearly decays from the DDP-scaled start
     # (``sqrt(world_size) * base_lr``) to the un-scaled ``base_lr`` over
