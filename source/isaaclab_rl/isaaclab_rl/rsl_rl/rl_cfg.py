@@ -1312,6 +1312,7 @@ class RslRlFBCprAlgorithmCfg:
     fb_stochastic_integral: bool = False  # softmax-weighted horizon integral actor FB term
     fb_integral_K: int = 8
     fb_integral_align_gamma: float = 0.98  # integral Q *= 1/(1-this) for scale alignment
+    fb_integral_adaptive_tau: bool = False  # softmax temp tau=sqrt(|mean N|) for integral weights
 
     length_proportional_priors: bool = True
     """When True, ``FBCprExpertBuffer`` scales the initial uniform priors AND

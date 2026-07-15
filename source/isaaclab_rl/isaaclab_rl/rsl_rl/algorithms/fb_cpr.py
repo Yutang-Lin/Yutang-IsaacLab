@@ -254,6 +254,8 @@ class FBCprAuxAlgorithmCfg:
     # gamma=0.98 -> 50) so the per-step integral sits at the standard-gamma
     # Q magnitude.
     fb_integral_align_gamma: float = 0.98
+    # Adaptive softmax temperature tau=sqrt(|mean N|) for the integral weights.
+    fb_integral_adaptive_tau: bool = False
     relabel_ratio: float | None = 0.8
     train_goal_ratio: float = 0.2
     expert_asm_ratio: float = 0.6
@@ -3098,6 +3100,7 @@ class FBCprAux:
         self._q_fb_w_entropy_frac_log = None
         self._q_fb_w_top_log = None
         self._q_fb_w_argmax_frac = None
+        self._q_fb_w_tau_log = None
 
         if fb_si:
             # --- STOCHASTIC-INTEGRAL FB objective over the horizon -----------
@@ -3136,7 +3139,16 @@ class FBCprAux:
                 _, _, Qt_bk = self._pessimistic_value((Ft_bk * z_bk).sum(dim=-1),
                                                       self.cfg.actor_pessimism_penalty)
                 Nt = ((1.0 - g_bk) * Qt_bk).reshape(Bsz, K)                      # target normalized
-                w = torch.softmax(Nt - Nt.max(dim=1, keepdim=True).values, dim=1)  # [B,K]
+                logits = Nt - Nt.max(dim=1, keepdim=True).values                 # [B,K]
+                # Optional adaptive softmax temperature tau = sqrt(|mean N|)
+                # (per-row, target-derived): scale-invariant weighting sharpness.
+                # Flag-gated so it can be toggled off without a code change.
+                self._q_fb_w_tau_log = None
+                if bool(getattr(self.cfg, "fb_integral_adaptive_tau", False)):
+                    tau = Nt.mean(dim=1, keepdim=True).abs().clamp_min(1e-6).sqrt()  # [B,1]
+                    logits = logits / tau
+                    self._q_fb_w_tau_log = tau.mean()
+                w = torch.softmax(logits, dim=1)                                 # [B,K]
                 # Weight-distribution diagnostics — SCALARS ONLY, computed inside
                 # this no_grad target block so they are entirely graph-inert (w is
                 # target-derived and never on the actor-loss graph). entropy (0=one
@@ -3289,6 +3301,8 @@ class FBCprAux:
                 out["MutableGamma/w_entropy_frac"] = self._q_fb_w_entropy_frac_log  # /log K
                 out["MutableGamma/w_top"] = self._q_fb_w_top_log                    # mean max weight
                 out["MutableGamma/w_argmax_frac"] = self._q_fb_w_argmax_frac        # 0=short..1=long
+                if self._q_fb_w_tau_log is not None:
+                    out["MutableGamma/w_tau"] = self._q_fb_w_tau_log               # adaptive softmax temp
             out.update(act_stats)
             out.update(extra_logs)
             if getattr(self, "_q_fb_split_logs", None):
