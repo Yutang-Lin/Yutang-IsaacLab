@@ -3093,12 +3093,24 @@ class FBCprAux:
         Qs_fb = (Fs * z).sum(dim=-1)
         _, _, Q_fb = self._pessimistic_value(Qs_fb, self.cfg.actor_pessimism_penalty)
         # Short-horizon FB term added to the actor objective (0 when off).
+        # ``Q_fb_combined`` [B] is the FULL FB objective the actor maximizes:
+        #   Q_fb_L + (1-gamma_S)/(1-gamma_L) * alpha * Q_fb_S
+        # It also drives the scale_reg ``weight`` (so the aux/disc reg terms track
+        # the magnitude of the SUM of both scaled FB Qs, not just Q_fb_L).
         fb_short_term = torch.zeros((), device=z.device, dtype=z.dtype)
+        Q_fb_combined = Q_fb
+        self._q_fb_L_log = None
+        self._q_fb_S_log = None
         if Q_fb_short is not None:
             gL = float(self.cfg.discount); gS = float(self.cfg.actor_gamma_short)
             fb_short_scale = (1.0 - gS) / max(1.0 - gL, 1e-6) * float(self.cfg.actor_gamma_short_alpha)
+            Q_fb_combined = Q_fb + fb_short_scale * Q_fb_short          # [B]
             fb_short_term = fb_short_scale * Q_fb_short.mean()
-            self._q_fb_short_log = Q_fb_short.mean().detach()
+            # gamma-NORMALIZED logs: (1-gamma)*Q ~ per-step value, so the two
+            # horizons are on a comparable scale (raw Q ~ 1/(1-gamma)).
+            self._q_fb_short_log = Q_fb_short.mean().detach()          # raw (back-compat)
+            self._q_fb_L_log = ((1.0 - gL) * Q_fb.mean()).detach()
+            self._q_fb_S_log = ((1.0 - gS) * Q_fb_short.mean()).detach()
         # Optional per-block Q split (anchored variant: local vs spatial z).
         # No-op in the base. Stash for the metrics dict below.
         self._q_fb_split_logs = self._q_fb_split(Fs, z)
@@ -3107,12 +3119,15 @@ class FBCprAux:
             R = 1.0  # soft FB uses unit ball
             z_norms = z.norm(dim=-1)
 
+        # scale_reg weight tracks the magnitude of the FULL FB objective
+        # (Q_fb_combined = scaled sum of Q_fb_L and Q_fb_S). == Q_fb when
+        # gamma-conditioning is off, so non-conditioned behavior is unchanged.
         if self.cfg.soft_fb and self.cfg.scale_reg:
             z_norm_clamped = z_norms.clamp(min=0.1 * R)
-            Q_fb_normalized = Q_fb * (R / z_norm_clamped)
+            Q_fb_normalized = Q_fb_combined * (R / z_norm_clamped)
             weight = Q_fb_normalized.abs().mean().detach()
         elif self.cfg.scale_reg:
-            weight = Q_fb.abs().mean().detach()
+            weight = Q_fb_combined.abs().mean().detach()
         else:
             weight = 1.0
 
@@ -3182,11 +3197,15 @@ class FBCprAux:
                 "Q_aux": Q_aux.mean(),
                 "Q_fb": Q_fb.mean(),
             }
-            # gamma-conditioned: Q_fb above IS the long-horizon Q_fb_L (also what
-            # scale_reg 'weight' and the Q_aux/Q_disc terms use). Log both.
+            # gamma-conditioned F: log BOTH horizons under the MutableGamma/
+            # category. Raw Q ~ 1/(1-gamma), so also log gamma-NORMALIZED
+            # (per-step) values which are comparable across horizons. Q_fb
+            # (above) is the long-horizon Q_fb_L.
             if getattr(self, "_q_fb_short_log", None) is not None:
-                out["Q_fb_L"] = Q_fb.mean()
-                out["Q_fb_S"] = self._q_fb_short_log
+                out["MutableGamma/Q_fb_L_raw"] = Q_fb.mean()
+                out["MutableGamma/Q_fb_S_raw"] = self._q_fb_short_log
+                out["MutableGamma/Q_fb_L"] = self._q_fb_L_log   # (1-gamma_L)*Q_fb_L
+                out["MutableGamma/Q_fb_S"] = self._q_fb_S_log   # (1-gamma_S)*Q_fb_S
             out.update(act_stats)
             out.update(extra_logs)
             if getattr(self, "_q_fb_split_logs", None):
