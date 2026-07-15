@@ -3045,7 +3045,11 @@ class FBCprAux:
         actor_loss = (per_pos * vmask).sum() / nval
 
         self.actor_optimizer.zero_grad(set_to_none=True)
-        actor_loss.backward()
+        # Only actor parameters are optimized in this phase. Restricting the
+        # backward leaves still propagates through F/critic/aux-critic to the
+        # sampled action, but it cannot accumulate their parameter gradients or
+        # trigger their DDP reducer hooks.
+        actor_loss.backward(inputs=tuple(actor.parameters()))
         # DDP: the transformer actor runs through the UNWRAPPED module
         # (forward_window is a custom method, not DDP.forward), so DDP's bucket
         # hooks never fire and the grads are LOCAL. Manually all-reduce them so
@@ -3072,9 +3076,8 @@ class FBCprAux:
         # The actor loss backpropagates through F / critic / aux_critic to the
         # sampled action, but their optimizers have already stepped and only the
         # actor optimizer steps below. Suppress those three DDP reducers during
-        # this phase. Otherwise one autograd graph contains four independent DDP
-        # modules, whose bucket hooks can enqueue NCCL collectives in a different
-        # inter-module order on different ranks (an intermittent deadlock).
+        # their forwards; _backward_actor_impl also restricts backward leaves to
+        # actor parameters so their hooks cannot participate in this phase.
         #
         # The MLP actor remains DDP-synchronized by its own hooks. The transformer
         # actor bypasses DDP.forward and is synchronized explicitly in
@@ -3334,7 +3337,9 @@ class FBCprAux:
         actor_loss = actor_loss + extra_loss
 
         self.actor_optimizer.zero_grad(set_to_none=True)
-        actor_loss.backward()
+        # Preserve dQ/da through the value networks while excluding their
+        # parameter leaves. Only the actor DDP reducer may run in this phase.
+        actor_loss.backward(inputs=tuple(p._actor.parameters()))
         # DDP handled reduce inside backward.
         handle = None
 
