@@ -155,6 +155,12 @@ class FBCprAuxAlgorithmCfg:
     lr_aux_critic: float = 3e-4
     lr_discriminator: float = 1e-5
 
+    # Startup LR scaling controls. The batch contribution is
+    # sqrt(batch_size / 1024); lr_scale_max <= 0 leaves the combined
+    # world-size and batch-size multiplier uncapped.
+    lr_scale_with_batch_size: bool = True
+    lr_scale_max: float = 0.0
+
     # LR anneling. When ``lr_anneal_enable=True`` and ``lr_anneal_steps>0``,
     # linearly decay each optimizer's LR from the DDP-scaled start value
     # (``base_lr * sqrt(world_size)``) down to the un-scaled base value
@@ -479,7 +485,9 @@ class FBCprAux:
         else:
             bs_mult = 1.0
         ws_mult = math.sqrt(max(ws, 1))
-        combined_mult = ws_mult * bs_mult
+        uncapped_mult = ws_mult * bs_mult
+        max_mult = float(getattr(cfg, "lr_scale_max", 0.0))
+        combined_mult = min(uncapped_mult, max_mult) if max_mult > 0.0 else uncapped_mult
         if combined_mult != 1.0:
             cfg.lr_actor = float(cfg.lr_actor) * combined_mult
             cfg.lr_critic = float(cfg.lr_critic) * combined_mult
@@ -492,7 +500,12 @@ class FBCprAux:
             print(
                 f"[FBCprAux] LR scaling: world_size={ws} (×{ws_mult:.3f})  "
                 f"batch_size={cfg.batch_size}/{REF_BATCH_SIZE} (×{bs_mult:.3f})  "
-                f"combined ×{combined_mult:.3f}",
+                f"combined ×{combined_mult:.3f}"
+                + (
+                    f" (capped from ×{uncapped_mult:.3f}, max ×{max_mult:.3f})"
+                    if combined_mult < uncapped_mult
+                    else ""
+                ),
                 flush=True,
             )
             print(
