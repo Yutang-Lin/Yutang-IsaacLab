@@ -713,6 +713,34 @@ class ReconstructionHead(nn.Module):
         return feats
 
 
+class FourierMLP(nn.Module):
+    """Embed a scalar (here h = -log(1-gamma)) via fixed sinusoidal (Fourier)
+    features, then a small MLP -> ``out_dim``.
+
+    Fourier features: ``[sin(w_k * h), cos(w_k * h)]`` for a geometric spread of
+    frequencies ``w_k`` — a multi-scale, smooth positional-encoding-style basis
+    that lets the MLP resolve both coarse and fine variation in h far better than
+    a raw scalar input. Frequencies are fixed (registered buffer), not learned.
+    """
+
+    def __init__(self, out_dim: int, num_freqs: int = 16, max_freq: float = 64.0) -> None:
+        super().__init__()
+        self.num_freqs = int(num_freqs)
+        # Geometric frequencies from 1 .. max_freq (log-spaced).
+        freqs = torch.logspace(0.0, math.log10(max_freq), self.num_freqs)
+        self.register_buffer("freqs", freqs, persistent=False)
+        feat_dim = 2 * self.num_freqs  # sin + cos per frequency
+        self.mlp = nn.Sequential(
+            nn.Linear(feat_dim, out_dim), nn.Mish(), nn.Linear(out_dim, out_dim), nn.Mish(),
+        )
+
+    def forward(self, h: torch.Tensor) -> torch.Tensor:
+        # h: [B, 1]. Broadcast against frequencies -> [B, num_freqs].
+        hw = h * self.freqs.to(h.dtype).view(1, -1)
+        feats = torch.cat([torch.sin(hw), torch.cos(hw)], dim=-1)  # [B, 2*num_freqs]
+        return self.mlp(feats)
+
+
 class ForwardMap(nn.Module):
     """BFM forward map ``F(s, z, a) -> z`` (also reused as the critic / aux-critic).
 
@@ -762,14 +790,14 @@ class ForwardMap(nn.Module):
         else:
             raise ValueError(f"Unsupported forward_map model {model}")
 
-        # Discount-conditioning embedding: h = -log(1-gamma) -> gamma_embed_dim.
-        # A plain (num_parallel-agnostic) MLP; its output is expanded across the
-        # parallel ensemble in forward() and concatenated into both branches.
+        # Discount-conditioning embedding: h = -log(1-gamma) -> Fourier features
+        # -> MLP -> gamma_embed_dim. Sinusoidal (Fourier) features give the MLP a
+        # multi-scale, smooth basis over the log-horizon h (vs a raw scalar,
+        # which an MLP resolves poorly at fine frequencies). Output is expanded
+        # across the parallel ensemble in forward() and concat'd into both branches.
         gdim = self.gamma_embed_dim
         if gdim > 0:
-            self.embed_gamma = nn.Sequential(
-                nn.Linear(1, gdim), nn.Mish(), nn.Linear(gdim, gdim), nn.Mish(),
-            )
+            self.embed_gamma = FourierMLP(out_dim=gdim)
         else:
             self.embed_gamma = None
 
