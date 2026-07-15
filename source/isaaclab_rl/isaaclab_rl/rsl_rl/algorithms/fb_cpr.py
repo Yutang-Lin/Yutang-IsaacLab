@@ -3226,11 +3226,9 @@ class FBCprAux:
             Q_integral = (w * N).sum(dim=1)                                      # [B] per-step
             Q_final = align * Q_integral                                        # aligned objective
             Q_fb = Q_final
-            # scale_reg weight comes from the UN-aligned per-step integral, so the
-            # Q_disc/Q_aux reg terms keep the same magnitude as the pre-align
-            # (514905ae) run — the x50 align only scales the -Q_fb objective term,
-            # NOT the reg weighting (which x50 would blow up -> unstable/NaN).
-            Q_fb_combined = Q_integral
+            # Use the same aligned units for scale_reg so Q_disc/Q_aux preserve
+            # their relative balance with the 50x-aligned FB objective.
+            Q_fb_combined = Q_final
             # split-log needs an Fs; reuse the last grid's long-horizon slice
             # (F_bk row for the K-th sub-sample of each row ~ near gamma_L).
             Fs = F_bk[:, K - 1::K, :]                                            # [par, B, d]
