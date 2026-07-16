@@ -1257,6 +1257,10 @@ class RslRlFBCprAlgorithmCfg:
     lr_aux_critic: float = 3e-4
     lr_discriminator: float = 1e-5
 
+    lr_scale_with_world_size: bool = True
+    """Whether startup LRs and coupled normalizer EMA rates include the
+    sqrt(world_size) factor. Disable for exact base-LR DDP parity runs."""
+
     lr_scale_with_batch_size: bool = True
     """Whether the startup LR (and coupled momentum/EMA-tau) scaling includes the
     sqrt(batch_size / 1024) factor. When True (default) the multiplier is
@@ -1321,6 +1325,17 @@ class RslRlFBCprAlgorithmCfg:
     fb_integral_K: int = 8
     fb_integral_align_gamma: float = 0.98  # integral Q *= 1/(1-this) for scale alignment
     fb_integral_adaptive_tau: bool = False  # tau=sqrt(abs(mean target N)), clamped to >=1
+    fb_integral_prior_lambda: float = 0.0
+    """Exponential SI prior strength over ``h=-log(1-gamma)``. The actor adds
+    ``-lambda * (h-h_min)`` to its weight logits, so positive values prefer
+    shorter horizons. Zero preserves the original SI softmax."""
+
+    fb_gamma_innovation_align: bool = False
+    """Whether the FB update samples a second gamma and aligns the two Bellman
+    innovations for each transition."""
+
+    fb_gamma_innovation_align_coef: float = 1.0
+    """MSE coefficient for cross-gamma Bellman-innovation alignment."""
 
     length_proportional_priors: bool = True
     """When True, ``FBCprExpertBuffer`` scales the initial uniform priors AND

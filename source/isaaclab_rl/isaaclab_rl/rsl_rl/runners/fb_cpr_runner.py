@@ -1820,6 +1820,7 @@ class FBCprRunner:
         # Print the key FB-CPR-Aux losses inline when the update fired.
         loss_keys_to_print = (
             "fb_loss",
+            "fb_innovation_align_loss",
             "orth_loss",
             "critic_loss",
             "aux_critic_loss",

@@ -38,6 +38,11 @@ from torch import autograd
 
 from isaaclab.utils import configclass
 
+from ..fb_cpr_math import (
+    innovation_alignment_loss,
+    sample_log_horizon_gamma,
+    stochastic_integral_weights,
+)
 from ..modules.fb_cpr_policy import (
     FBCprAuxPolicy,
     FBCprNetworkCfg,
@@ -157,6 +162,7 @@ class FBCprAuxAlgorithmCfg:
 
     # Startup LR scaling control. The batch contribution is
     # sqrt(batch_size / 1024).
+    lr_scale_with_world_size: bool = True
     lr_scale_with_batch_size: bool = True
 
     # Optional world-size scaling for the FB/critic target-network Polyak rates.
@@ -269,6 +275,15 @@ class FBCprAuxAlgorithmCfg:
     # temperature is sqrt(abs(mean target N)) with a floor of 1.0, so enabling
     # it can soften the plain softmax but can never make it sharper.
     fb_integral_adaptive_tau: bool = False
+    # Exponential prior over the sampled log-horizon h=-log(1-gamma):
+    # p0(h) ∝ exp(-lambda * (h - h_min)). Zero preserves the old SI weights.
+    fb_integral_prior_lambda: float = 0.0
+    # Explicitly match Bellman innovations at two independently sampled gammas:
+    # [F_gamma B^T - gamma F'_gamma B_target^T]. This regularizes one
+    # gamma-conditioned F to represent the same immediate transition measure
+    # across horizons.
+    fb_gamma_innovation_align: bool = False
+    fb_gamma_innovation_align_coef: float = 1.0
     relabel_ratio: float | None = 0.8
     train_goal_ratio: float = 0.2
     expert_asm_ratio: float = 0.6
@@ -464,7 +479,7 @@ class FBCprAux:
             "discriminator": float(cfg.lr_discriminator),
         }
 
-        # LR scaling. Two independent sqrt terms stack multiplicatively:
+        # LR scaling. Two independently configurable sqrt terms stack:
         #   (1) DDP world_size: gradient averaging over ``world_size`` ranks
         #       reduces noise by sqrt(world_size); bumping the LR by the
         #       same factor keeps the per-example step size unchanged.
@@ -484,16 +499,20 @@ class FBCprAux:
         REF_BATCH_SIZE = 1024
         ws = (int(torch.distributed.get_world_size())
               if self.is_distributed else 1)
-        # LR (and the coupled momentum/EMA-tau) scaling. By default we scale by
-        # sqrt(world_size) * sqrt(batch_size / 1024). Set
-        # ``lr_scale_with_batch_size=False`` to scale by sqrt(world_size) ONLY
-        # (bs_mult forced to 1) — e.g. when batch_size is intentionally set to
-        # num_envs and you do NOT want the LR to chase it.
+        # LR (and coupled normalizer-EMA) scaling defaults to
+        # sqrt(world_size) * sqrt(batch_size / 1024).
+        # ``lr_scale_with_world_size`` and ``lr_scale_with_batch_size`` disable
+        # either factor independently. This lets parity experiments use an exact
+        # base LR even under DDP and with a non-reference local batch.
         if bool(getattr(cfg, "lr_scale_with_batch_size", True)):
             bs_mult = math.sqrt(max(int(cfg.batch_size), 1) / REF_BATCH_SIZE)
         else:
             bs_mult = 1.0
-        ws_mult = math.sqrt(max(ws, 1))
+        ws_mult = (
+            math.sqrt(max(ws, 1))
+            if bool(getattr(cfg, "lr_scale_with_world_size", True))
+            else 1.0
+        )
         combined_mult = ws_mult * bs_mult
         if combined_mult != 1.0:
             cfg.lr_actor = float(cfg.lr_actor) * combined_mult
@@ -1936,16 +1955,16 @@ class FBCprAux:
         # so F(.,gamma) fits the successor measure at that horizon. fb_gamma is
         # None when the feature is off (F stays plain, discount = scalar).
         self._fb_gamma = None
+        self._fb_gamma_alt = None
+        self._fb_not_term = not_term
         if bool(getattr(self.cfg, "fb_gamma_conditioned", False)):
             g_l = float(self.cfg.discount)
             g_s = float(self.cfg.actor_gamma_short)
-            h_l = -math.log(max(1.0 - g_l, 1e-6))
-            h_s = -math.log(max(1.0 - g_s, 1e-6))
             # rand_like(not_term) so _fb_gamma matches not_term's shape ([B] or
             # [B,1]) — a [B] vs [B,1] mismatch would broadcast discount to [B,B].
-            u = torch.rand_like(not_term)
-            h = h_s + u * (h_l - h_s)
-            self._fb_gamma = 1.0 - torch.exp(-h)          # same shape as not_term, in [g_s, g_l]
+            self._fb_gamma = sample_log_horizon_gamma(not_term, g_s, g_l)
+            if bool(getattr(self.cfg, "fb_gamma_innovation_align", False)):
+                self._fb_gamma_alt = sample_log_horizon_gamma(not_term, g_s, g_l)
             discount = self._fb_gamma * not_term
         else:
             discount = self.cfg.discount * not_term
@@ -2645,19 +2664,63 @@ class FBCprAux:
         p = self.policy
         # gamma-conditioned F: pass the per-row gamma sampled in update() to BOTH
         # the online and target F. Same gamma the TD target is discounted by
-        # (``discount`` was set from _fb_gamma in update()). None => plain F.
+        # (``discount`` was set from _fb_gamma in update()). When innovation
+        # alignment is enabled, batch the primary and independent alternate gamma
+        # into one online-F call and one target-F call.
         fb_gamma = getattr(self, "_fb_gamma", None)
-        f_args = (fb_gamma,) if fb_gamma is not None else ()
+        fb_gamma_alt = getattr(self, "_fb_gamma_alt", None)
+        align_innovations = (
+            fb_gamma is not None
+            and fb_gamma_alt is not None
+            and bool(getattr(self.cfg, "fb_gamma_innovation_align", False))
+        )
+
+        def _cat_batch(x):
+            if isinstance(x, dict):
+                return {key: torch.cat((value, value), dim=0) for key, value in x.items()}
+            return torch.cat((x, x), dim=0)
+
         with torch.no_grad():
             # next_action via actor (raw obs for the transformer actor — see
             # _target_next_action; avoids double-normalization in the TD target)
             next_action = self._target_next_action(next_obs, z)
-            target_Fs = p._target_forward_map(next_obs, z, next_action, *f_args)  # (num_par, B, d)
+            if align_innovations:
+                batch_size = z.shape[0]
+                gamma_pair = torch.cat((fb_gamma, fb_gamma_alt), dim=0)
+                target_Fs_pair = p._target_forward_map(
+                    _cat_batch(next_obs),
+                    torch.cat((z, z), dim=0),
+                    torch.cat((next_action, next_action), dim=0),
+                    gamma_pair,
+                )
+                target_Fs, target_Fs_alt = target_Fs_pair.split(batch_size, dim=1)
+            else:
+                f_args = (fb_gamma,) if fb_gamma is not None else ()
+                target_Fs = p._target_forward_map(next_obs, z, next_action, *f_args)
+                target_Fs_alt = None
             target_B = p._target_backward_map(goal)  # (B, d)
             target_Ms = torch.matmul(target_Fs, target_B.T)  # (num_par, B, B)
             _, _, target_M = self._pessimistic_value(target_Ms, self.cfg.fb_pessimism_penalty)
+            if target_Fs_alt is not None:
+                target_Ms_alt = torch.matmul(target_Fs_alt, target_B.T)
+                _, _, target_M_alt = self._pessimistic_value(
+                    target_Ms_alt, self.cfg.fb_pessimism_penalty
+                )
+            else:
+                target_M_alt = None
 
-        Fs = p._forward_map(obs, z, action, *f_args)
+        if align_innovations:
+            Fs_pair = p._forward_map(
+                _cat_batch(obs),
+                torch.cat((z, z), dim=0),
+                torch.cat((action, action), dim=0),
+                torch.cat((fb_gamma, fb_gamma_alt), dim=0),
+            )
+            Fs, Fs_alt = Fs_pair.split(z.shape[0], dim=1)
+        else:
+            f_args = (fb_gamma,) if fb_gamma is not None else ()
+            Fs = p._forward_map(obs, z, action, *f_args)
+            Fs_alt = None
         B = p._backward_map(goal)
         Ms = torch.matmul(Fs, B.T)
 
@@ -2665,6 +2728,18 @@ class FBCprAux:
         fb_offdiag = 0.5 * (diff * self._off_diag).pow(2).sum() / self._off_diag_sum
         fb_diag = -torch.diagonal(diff, dim1=1, dim2=2).mean() * Ms.shape[0]
         fb_loss = fb_offdiag + fb_diag
+
+        innovation_align_loss = torch.zeros((), device=z.device, dtype=z.dtype)
+        if Fs_alt is not None and target_M_alt is not None:
+            Ms_alt = torch.matmul(Fs_alt, B.T)
+            not_term = getattr(self, "_fb_not_term", torch.ones_like(fb_gamma_alt))
+            discount_alt = fb_gamma_alt * not_term
+            diff_alt = Ms_alt - discount_alt.view(-1, 1) * target_M_alt
+            innovation_align_loss = innovation_alignment_loss(diff, diff_alt)
+            fb_loss = fb_loss + (
+                float(getattr(self.cfg, "fb_gamma_innovation_align_coef", 1.0))
+                * innovation_align_loss
+            )
 
         # Orthonormality loss on B: ||E[B(s)B(s)^T] - I||^2
         if self.cfg.soft_fb:
@@ -2736,6 +2811,7 @@ class FBCprAux:
                 "fb_loss": fb_loss,
                 "fb_diag": fb_diag,
                 "fb_offdiag": fb_offdiag,
+                "fb_innovation_align_loss": innovation_align_loss,
                 "orth_loss": orth_loss,
                 "orth_loss_diag": orth_loss_diag,
                 "orth_loss_offdiag": orth_loss_offdiag,
@@ -3231,14 +3307,13 @@ class FBCprAux:
                 _, _, Qt_bk = self._pessimistic_value((Ft_bk * z_bk).sum(dim=-1),
                                                       self.cfg.actor_pessimism_penalty)
                 Nt = ((1.0 - g_bk) * Qt_bk).reshape(Bsz, K)                      # target normalized
-                logits = Nt - Nt.max(dim=1, keepdim=True).values                 # [B,K]
-                if bool(getattr(self.cfg, "fb_integral_adaptive_tau", False)):
-                    # Floor tau at 1: adaptive weighting may soften the plain
-                    # softmax, but cannot sharpen it when mean(Nt) is near zero.
-                    tau = Nt.mean(dim=1, keepdim=True).abs().sqrt().clamp_min(1.0)
-                    logits = logits / tau
+                adaptive_tau = bool(getattr(self.cfg, "fb_integral_adaptive_tau", False))
+                prior_lambda = float(getattr(self.cfg, "fb_integral_prior_lambda", 0.0))
+                w, tau = stochastic_integral_weights(
+                    Nt, hs, h_lo, prior_lambda, adaptive_tau
+                )
+                if adaptive_tau:
                     self._q_fb_w_tau_log = tau.mean()
-                w = torch.softmax(logits, dim=1)                                 # [B,K]
                 # Detached, scalar-only diagnostics. The per-grid profile is
                 # retained here as [K], then emitted below as K separate scalars.
                 wd = w.detach()
