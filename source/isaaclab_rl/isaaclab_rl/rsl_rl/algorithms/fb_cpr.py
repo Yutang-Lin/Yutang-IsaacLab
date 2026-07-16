@@ -309,12 +309,16 @@ class FBCprAuxAlgorithmCfg:
     tracking_T_min: int = 1
     tracking_T_max: int = 16
     # If non-empty, sample T from this discrete set instead of uniformly
-    # from [T_min, T_max]. Used for both expert disc encoding and per-env
-    # tracking z window.
+    # from [T_min, T_max]. This controls only the per-env rollout tracking-z
+    # mean window and is sampled once per tracking episode.
     tracking_T_choices: tuple[int, ...] = ()
     # Per-choice probabilities (must match len(tracking_T_choices) when set).
     # Empty tuple = uniform over choices.
     tracking_T_choice_probs: tuple[float, ...] = ()
+    # Fixed expert/discriminator z-mean horizon. Positive values decouple the
+    # discriminator from episodic rollout tracking-T randomization. Zero keeps
+    # the legacy behavior where the discriminator shares tracking_T_*.
+    disc_fixed_T: int = 0
     # If True, the discriminator's positive (expert) window is ALWAYS the full
     # seq_length regardless of the per-sequence z-window T — i.e. every frame
     # in the sub-sequence is a valid positive. The z is still computed from the
@@ -989,11 +993,11 @@ class FBCprAux:
     def encode_expert(
         self, next_obs: torch.Tensor | dict[str, torch.Tensor]
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """Encode expert sub-sequences through B with variable-T window.
+        """Encode expert sub-sequences through B for discriminator training.
 
-        For each sub-sequence, samples T ∈ [T_min, T_max], computes z as
-        mean of first T frames. Only frames within the T-window are "real"
-        for discriminator training; returns a mask marking valid frames.
+        ``disc_fixed_T > 0`` uses that fixed mean horizon independently of the
+        episodic rollout tracking-z horizon. Zero retains the legacy coupled
+        behavior and samples from ``tracking_T_*``.
 
         Returns:
             z_expert: [batch_size, z_dim] z replicated per frame
@@ -1007,14 +1011,25 @@ class FBCprAux:
         B_expert = B_expert.view(N, seq_length, B_expert.shape[-1])
         device = B_expert.device
 
-        # Variable T per sub-sequence
+        # Fixed discriminator T when configured; otherwise retain the legacy
+        # coupling to rollout tracking-T settings.
+        fixed_disc_T = int(getattr(self.cfg, "disc_fixed_T", 0))
         choices = tuple(getattr(self.cfg, "tracking_T_choices", ()) or ())
         choice_probs = tuple(getattr(self.cfg, "tracking_T_choice_probs", ()) or ())
         T_min = getattr(self.cfg, "tracking_T_min", 1)
         T_max = min(getattr(self.cfg, "tracking_T_max", 16), seq_length)
         disc_mask: torch.Tensor | None = None
         T_per_seq: torch.Tensor | None = None
-        if choices:
+        if fixed_disc_T > 0:
+            if fixed_disc_T > seq_length:
+                raise ValueError(
+                    f"disc_fixed_T={fixed_disc_T} exceeds policy "
+                    f"seq_length={seq_length}"
+                )
+            T_per_seq = torch.full(
+                (N,), fixed_disc_T, device=device, dtype=torch.long
+            )
+        elif choices:
             kept = [(c, choice_probs[i] if choice_probs else 1.0)
                     for i, c in enumerate(choices) if c <= seq_length]
             choices_kept = [c for c, _ in kept]
@@ -1146,7 +1161,8 @@ class FBCprAux:
         # Global FB: sample active mask once per tracking episode.
         global_fb_prob = getattr(self.cfg, "global_fb_zero_prob", 0.5)
         self._tracking_global_fb_active = torch.rand(n_elem, device=self.device) >= global_fb_prob
-        # Per-env variable T for z computation window.
+        # Per-env T for the rollout tracking-z mean. Sampled once here and held
+        # for the full tracking episode; it does not affect discriminator T.
         choices = tuple(getattr(self.cfg, "tracking_T_choices", ()) or ())
         choice_probs = tuple(getattr(self.cfg, "tracking_T_choice_probs", ()) or ())
         T_min = getattr(self.cfg, "tracking_T_min", 1)
@@ -1162,7 +1178,9 @@ class FBCprAux:
         elif T_min < T_max:
             self._tracking_T = torch.randint(T_min, T_max + 1, (n_elem,), device=self.device)
         else:
-            self._tracking_T = None
+            self._tracking_T = torch.full(
+                (n_elem,), T_min, device=self.device, dtype=torch.long
+            )
         # Store robot pose for reference viz.
         if robot_root_xy is not None:
             self._tracking_robot_xy = robot_root_xy[self._tracking_env_idx].to(self.device).clone()

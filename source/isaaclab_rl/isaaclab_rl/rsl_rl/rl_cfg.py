@@ -1376,6 +1376,15 @@ class RslRlFBCprAlgorithmCfg:
     terrain_variant_root_h_prob: float = 0.50
     global_fb_zero_prob: float = 0.5
     z_buffer_size: int = 8192
+    tracking_T_min: int = 1
+    tracking_T_max: int = 16
+    tracking_T_choices: tuple[int, ...] = ()
+    tracking_T_choice_probs: tuple[float, ...] = ()
+    disc_fixed_T: int = 0
+    """Fixed expert/discriminator z-mean horizon. Zero preserves the legacy
+    coupling to tracking_T_*; positive values keep discriminator T fixed while
+    rollout tracking environments randomize their mean-z horizon episodically."""
+    disc_positive_full_window: bool = False
 
     # AMP (bf16)
     amp: bool = False
