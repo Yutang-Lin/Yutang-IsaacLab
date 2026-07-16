@@ -1460,15 +1460,8 @@ class FBCprRunner:
                     ap[:, 2] = 1.0  # cos(theta=0)
                     next_obs_dict["anchored_pose"] = ap
                 z = self.policy.backward_map(next_obs_dict)   # [L-1, z_dim]
-                # Match BFM's eval z-encoding exactly
-                # (humanoidverse_isaac.py:424-427 and tracking_inference.py:72-73):
-                #   for step in range(z.shape[0]):
-                #       end_idx = min(step + 1, z.shape[0])  # window = 1 frame
-                #       z[step] = z[step:end_idx].mean(dim=0)
-                # which is mathematically an identity (mean over 1 frame).
-                # We keep the loop for bit-wise parity with BFM's code path
-                # even though it's a no-op. DO NOT substitute ``seq_length``
-                # for the 1 here — BFM's eval does NOT temporally average.
+                # Match UFO's eval z-encoding exactly: one next-reference frame,
+                # so this mean is an identity rather than temporal averaging.
                 for s in range(z.shape[0]):
                     end = min(s + 1, z.shape[0])
                     z[s] = z[s:end].mean(dim=0)
