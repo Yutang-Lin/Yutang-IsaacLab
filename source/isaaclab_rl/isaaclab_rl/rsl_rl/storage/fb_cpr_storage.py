@@ -490,6 +490,38 @@ class FBCprReplayBuffer:
     # -- sampling (BFM's get_idxs + _tensor_slices_from_startend) -----------
 
     @torch.no_grad()
+    def _sample_uniform_valid_starts(
+        self,
+        lengths: torch.Tensor,
+        num_samples: int,
+        seq_length: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Sample uniformly over all valid sequence starts.
+
+        A trajectory of length ``L`` has ``L - seq_length - 1`` valid starts:
+        the final stored row is the post-reset boundary and every sampled
+        sequence also needs one next-observation row. Sampling a trajectory
+        uniformly first would therefore overrepresent short trajectories.
+        """
+        valid_start_counts = lengths - seq_length - 1
+        if not bool((valid_start_counts > 0).all().item()):
+            raise ValueError("All trajectories must have at least one valid sequence start.")
+
+        cumulative_counts = valid_start_counts.cumsum(dim=0)
+        total_starts = int(cumulative_counts[-1].item())
+        flat_starts = torch.randint(
+            total_starts,
+            (num_samples,),
+            device=self.device,
+        )
+        traj_sel = torch.searchsorted(cumulative_counts, flat_starts, right=True)
+        previous_counts = torch.cat(
+            (cumulative_counts.new_zeros(1), cumulative_counts[:-1]),
+        )
+        relative_starts = flat_starts - previous_counts[traj_sel]
+        return traj_sel, relative_starts
+
+    @torch.no_grad()
     def sample(self, batch_size: int, seq_length: int | None = None) -> dict:
         seq_length = seq_length or self.seq_length
         if len(self) == 0:
@@ -511,14 +543,12 @@ class FBCprReplayBuffer:
         eligible_lengths = self._lengths[eligible_idx]
         eligible_starts = self._start_idx[eligible_idx]
 
-        traj_sel = torch.randint(eligible_idx.shape[0], (num_slices,), device=self.device)
-        sel_lengths = eligible_lengths[traj_sel]
+        traj_sel, relative_starts = self._sample_uniform_valid_starts(
+            eligible_lengths,
+            num_slices,
+            seq_length,
+        )
         sel_starts = eligible_starts[traj_sel]  # [num_slices, 2]
-
-        # max start = length - seq_length - 2 so that last next_obs
-        # at start + seq_length stays before the truncated row.
-        end_point = (sel_lengths - seq_length - 2).clamp_min(0).to(torch.float32)
-        relative_starts = (torch.rand(num_slices, device=self.device) * (end_point + 1.0)).floor().to(torch.long)
 
         time_starts = (sel_starts[:, 0] + relative_starts)  # [num_slices]
         env_ids = sel_starts[:, 1]  # [num_slices]
@@ -550,8 +580,11 @@ class FBCprReplayBuffer:
         eligible_idx = eligible.nonzero(as_tuple=False).squeeze(-1)
         eligible_lengths = self._lengths[eligible_idx]
         eligible_starts = self._start_idx[eligible_idx]
-        traj_sel = torch.randint(eligible_idx.shape[0], (batch_size,), device=self.device)
-        sel_lengths = eligible_lengths[traj_sel]
+        traj_sel, rel = self._sample_uniform_valid_starts(
+            eligible_lengths,
+            batch_size,
+            seq_length=1,
+        )
         sel_starts = eligible_starts[traj_sel]
         # Pick a random transition index ``rel`` in [0, length-3] so that the
         # next-obs ``start+rel+1`` is at most ``start+length-2`` — the LAST
@@ -563,8 +596,6 @@ class FBCprReplayBuffer:
         # ``terminated`` only) would NOT zero it -> B/F get trained on a garbage
         # one-step "reach 50 m" successor target. Excluding it here is the clean
         # fix (mirrors sample()'s seq-window bound). Needs length>=3 for any pair.
-        end_point = (sel_lengths - 3).clamp_min(0).to(torch.float32)
-        rel = (torch.rand(batch_size, device=self.device) * (end_point + 1.0)).floor().to(torch.long)
         time_idx = (sel_starts[:, 0] + rel) % self.time_capacity
         env_idx = sel_starts[:, 1]
         time_idx_next = (time_idx + 1) % self.time_capacity
