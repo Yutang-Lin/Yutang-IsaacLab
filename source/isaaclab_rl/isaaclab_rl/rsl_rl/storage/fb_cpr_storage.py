@@ -458,31 +458,46 @@ class FBCprReplayBuffer:
         E = done.shape[1]
         starts_list: list[torch.Tensor] = []
         lengths_list: list[int] = []
+        # ``truncated[t]`` marks row t as the FIRST observation after a reset.
+        # Traverse the ring in chronological order and split immediately before
+        # each such row. The newest written row is an ordinary open-trajectory
+        # endpoint, not a synthetic reset boundary.
         if self._is_full:
-            cursor = (self._idx - 1) % self.time_capacity
-            done_copy = done.clone()
-            done_copy[cursor] = True
+            time_order = (
+                torch.arange(T, device=self.device, dtype=torch.long) + self._idx
+            ) % self.time_capacity
         else:
-            done_copy = done.clone()
-            done_copy[T - 1] = True
+            time_order = torch.arange(T, device=self.device, dtype=torch.long)
         for e in range(E):
-            col = done_copy[:, e]
-            ends = col.nonzero(as_tuple=False).squeeze(-1)
-            if ends.numel() == 0:
-                starts_list.append(torch.tensor([0, e], device=self.device))
-                lengths_list.append(T)
-                continue
-            prev_end = -1
-            for end_t in ends.tolist():
-                start_t = (prev_end + 1) % T if prev_end >= 0 else 0
-                if self._is_full and prev_end == -1:
-                    start_t = (ends[-1].item() + 1) % T
-                length = end_t - start_t + 1
+            boundaries = done[time_order, e].nonzero(as_tuple=False).squeeze(-1)
+            # The oldest retained row starts a segment even if its true episode
+            # began before the ring cursor. Reset rows start the following
+            # segments and remain sampleable as their first observations.
+            segment_starts = torch.cat(
+                (
+                    torch.zeros(1, device=self.device, dtype=torch.long),
+                    boundaries[boundaries > 0],
+                )
+            )
+            segment_ends = torch.cat(
+                (
+                    segment_starts[1:],
+                    torch.tensor([T], device=self.device, dtype=torch.long),
+                )
+            )
+            for start_pos, end_pos in zip(segment_starts.tolist(), segment_ends.tolist()):
+                length = end_pos - start_pos
                 if length <= 0:
-                    length += T
-                starts_list.append(torch.tensor([start_t, e], device=self.device))
+                    continue
+                starts_list.append(
+                    torch.stack(
+                        (
+                            time_order[start_pos],
+                            torch.tensor(e, device=self.device, dtype=torch.long),
+                        )
+                    )
+                )
                 lengths_list.append(length)
-                prev_end = end_t
         self._start_idx = torch.stack(starts_list)  # [N_traj, 2]
         self._lengths = torch.tensor(lengths_list, device=self.device, dtype=torch.long)
         self._recompute_traj_info = False
@@ -498,12 +513,12 @@ class FBCprReplayBuffer:
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Sample uniformly over all valid sequence starts.
 
-        A trajectory of length ``L`` has ``L - seq_length - 1`` valid starts:
-        the final stored row is the post-reset boundary and every sampled
-        sequence also needs one next-observation row. Sampling a trajectory
-        uniformly first would therefore overrepresent short trajectories.
+        A trajectory containing ``L`` same-episode observation rows has
+        ``L - seq_length`` valid starts because every sampled sequence needs
+        one next-observation row. Sampling a trajectory uniformly first would
+        therefore overrepresent short trajectories.
         """
-        valid_start_counts = lengths - seq_length - 1
+        valid_start_counts = lengths - seq_length
         if not bool((valid_start_counts > 0).all().item()):
             raise ValueError("All trajectories must have at least one valid sequence start.")
 
@@ -529,11 +544,9 @@ class FBCprReplayBuffer:
         # Round batch down to a multiple of seq_length.
         self._ensure_traj_info()
         num_slices = max(1, batch_size // seq_length)
-        # Episode "length" includes the truncated row (post-reset obs).
-        # The last valid transition's next_obs is at position length-2 (0-indexed).
-        # A window of seq_length obs frames needs next_obs at start+seq_length,
-        # so we need start + seq_length <= length - 2, i.e. length >= seq_length + 2.
-        min_len = seq_length + 2
+        # A sequence of ``seq_length`` transitions needs ``seq_length + 1``
+        # observations from the same episode.
+        min_len = seq_length + 1
         eligible = self._lengths >= min_len
         if not bool(eligible.any().item()):
             raise RuntimeError(
@@ -572,11 +585,10 @@ class FBCprReplayBuffer:
         if len(self) == 0:
             raise RuntimeError("FBCprReplayBuffer.sample_flat() called on empty buffer")
         self._ensure_traj_info()
-        # Need length>=3: a valid NON-boundary pair (obs, next_obs) requires the
-        # next-obs to be a pre-reset row (<= start+length-2), so rel in [0,L-3].
-        eligible = self._lengths >= 3
+        # A flat transition needs two observations from the same episode.
+        eligible = self._lengths >= 2
         if not bool(eligible.any().item()):
-            raise RuntimeError("No trajectories with length >= 3.")
+            raise RuntimeError("No trajectories with length >= 2.")
         eligible_idx = eligible.nonzero(as_tuple=False).squeeze(-1)
         eligible_lengths = self._lengths[eligible_idx]
         eligible_starts = self._start_idx[eligible_idx]
@@ -586,16 +598,9 @@ class FBCprReplayBuffer:
             seq_length=1,
         )
         sel_starts = eligible_starts[traj_sel]
-        # Pick a random transition index ``rel`` in [0, length-3] so that the
-        # next-obs ``start+rel+1`` is at most ``start+length-2`` — the LAST
-        # PRE-RESET obs. The final row of a segment (``start+length-1``) is the
-        # truncated row = the POST-RESET spawn; sampling rel=length-2 would form
-        # the cross-boundary transition (last-pre-reset -> fresh-spawn), a ~tens-
-        # of-metres teleport in the (anchored) global pose. That timeout boundary
-        # is ``truncated`` not ``terminated``, so the FB/critic discount (masks
-        # ``terminated`` only) would NOT zero it -> B/F get trained on a garbage
-        # one-step "reach 50 m" successor target. Excluding it here is the clean
-        # fix (mirrors sample()'s seq-window bound). Needs length>=3 for any pair.
+        # ``rel`` is in [0, length-2], so current and next rows remain in the
+        # same segment. A reset row starts a new segment; the transition into it
+        # is never represented by a valid start.
         time_idx = (sel_starts[:, 0] + rel) % self.time_capacity
         env_idx = sel_starts[:, 1]
         time_idx_next = (time_idx + 1) % self.time_capacity
@@ -693,12 +698,12 @@ class FBCprReplayBuffer:
             # ahead of the current step (offsets are <=0 so tw<=time_idx unless wrapped).
             valid &= (tw <= cur_t)
         else:
-            cursor = (self._idx - 1) % Tcap
-            # "steps back from current" for each window pos (0..H), and steps from
-            # current back to the cursor; invalidate positions older than the cursor.
+            oldest = self._idx
+            # "steps back from current" for each window pos (0..H), and the
+            # maximum available history back to the oldest retained row.
             steps_back = (cur_t - tw) % Tcap                     # [B,H+1] in 0..Tcap-1
-            steps_to_cursor = (cur_t.squeeze(1) - cursor) % Tcap # [B]
-            valid &= (steps_back <= steps_to_cursor.unsqueeze(1))
+            available_history = (cur_t.squeeze(1) - oldest) % Tcap
+            valid &= (steps_back <= available_history.unsqueeze(1))
         valid[:, H] = True                                       # current always valid
         return {
             "obs": obs_w,            # dict key -> [B, H+1, dim]
@@ -1428,7 +1433,10 @@ class FBCprExpertBuffer:
             - "starts": [num_trajs] — start frame within each motion
             - "motion_lens": [num_trajs] — usable length of each motion
         """
-        MIN_FRAMES = 50
+        # Tracking z must come from a genuinely contiguous trajectory. Circular
+        # wrapping a short non-looping clip injects an artificial end->start
+        # transition into B(next_obs).
+        MIN_FRAMES = max(50, traj_length + 1)
         eligible_mask = self._lengths_t >= MIN_FRAMES
         if not bool(eligible_mask.any().item()):
             raise RuntimeError(f"No motion has at least {MIN_FRAMES} frames.")
@@ -1446,15 +1454,8 @@ class FBCprExpertBuffer:
 
         arange = torch.arange(traj_length, device=self.device).unsqueeze(0)
         raw_frame = starts.unsqueeze(1) + arange
-        usable_lens = (motion_lens - 1).clamp_min(1).unsqueeze(1)
-        # Terrain motions: clamp to last frame (pad). Others: circular wrap.
-        is_terrain = self.requires_terrain_t[motion_picks].unsqueeze(1)  # [N, 1]
-        frame_cur_wrap = raw_frame % usable_lens
-        frame_cur_clamp = raw_frame.clamp(max=usable_lens - 1)
-        frame_cur = torch.where(is_terrain, frame_cur_clamp, frame_cur_wrap).reshape(-1)
-        frame_nxt_wrap = (raw_frame + 1) % usable_lens
-        frame_nxt_clamp = (raw_frame + 1).clamp(max=usable_lens - 1)
-        frame_nxt = torch.where(is_terrain, frame_nxt_clamp, frame_nxt_wrap).reshape(-1)
+        frame_cur = raw_frame.reshape(-1)
+        frame_nxt = (raw_frame + 1).reshape(-1)
         motion_flat = motion_picks.unsqueeze(1).expand(-1, traj_length).reshape(-1)
 
         global_cur = self._motion_obs_starts[motion_flat] + frame_cur
@@ -1591,10 +1592,9 @@ class FBCprExpertBuffer:
         # Round batch down to a multiple of seq_length.
         num_slices = max(1, batch_size // seq_length)
 
-        # Eligibility: need at least 50 frames (~1s at 50Hz). Short motions
-        # are circular-padded so they can be sampled for tracking trajectories
-        # even if shorter than seq_length.
-        MIN_FRAMES = 50
+        # Need a genuinely contiguous current/next window. The historical
+        # modulo path wrapped the final next frame to frame zero.
+        MIN_FRAMES = max(50, seq_length + 1)
         eligible_mask = self._lengths_t >= MIN_FRAMES
         if not bool(eligible_mask.any().item()):
             raise RuntimeError(f"No motion has at least {MIN_FRAMES} frames.")
@@ -1607,8 +1607,7 @@ class FBCprExpertBuffer:
         sel = torch.multinomial(eligible_priors, num_slices, replacement=True)
         motion_picks = eligible_idx[sel]                    # [num_slices]
         motion_lens = eligible_lengths[sel]                 # [num_slices]
-        # For motions longer than seq_length: start in [0, T-seq_length-1].
-        # For shorter motions: start at 0, frames will wrap via modulo.
+        # Start in [0, T-seq_length-1].
         rand01 = torch.rand(num_slices, device=self.device)
         max_start = (motion_lens - seq_length - 1).clamp_min(0).to(torch.float32)
         starts = (rand01 * (max_start + 1.0)).floor().to(torch.long)
@@ -1616,11 +1615,8 @@ class FBCprExpertBuffer:
         # Build per-slice arange window and flatten.
         arange = torch.arange(seq_length, device=self.device).unsqueeze(0)     # [1, seq_length]
         raw_frame = starts.unsqueeze(1) + arange                                # [num_slices, seq_length]
-        # Circular wrap for short motions: frame % (T-1) keeps within
-        # valid obs range [0, T-2] (T-1 is next_obs of last transition).
-        usable_lens = (motion_lens - 1).clamp_min(1).unsqueeze(1)              # [num_slices, 1]
-        frame_cur = (raw_frame % usable_lens).reshape(-1)                       # [B]
-        frame_nxt = ((raw_frame + 1) % usable_lens).reshape(-1)                 # [B]
+        frame_cur = raw_frame.reshape(-1)                                       # [B]
+        frame_nxt = (raw_frame + 1).reshape(-1)                                 # [B]
         motion_flat = motion_picks.unsqueeze(1).expand(-1, seq_length).reshape(-1)  # [B]
 
         # Fully-vectorized gather using the flat obs buffers (one big

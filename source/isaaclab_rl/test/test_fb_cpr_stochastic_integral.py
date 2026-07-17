@@ -24,6 +24,19 @@ def test_independent_gamma_samples_stay_in_range():
     assert not torch.equal(gamma, gamma_alt)
 
 
+def test_gamma99_log_horizon_distribution():
+    torch.manual_seed(17)
+    reference = torch.empty(200_000)
+    gamma = sample_log_horizon_gamma(reference, 0.4, 0.99)
+
+    assert torch.all(gamma >= 0.4)
+    assert torch.all(gamma <= 0.99)
+    # Uniform log-horizon sampling intentionally puts a substantial, stable
+    # fraction of FB rows in the long-horizon tail.
+    tail = (gamma > 0.975).float().mean()
+    torch.testing.assert_close(tail, torch.tensor(0.2238), atol=0.004, rtol=0)
+
+
 def test_innovation_alignment_is_zero_for_matching_innovations():
     innovation = torch.randn(2, 8, 8)
     loss = innovation_alignment_loss(innovation, innovation.clone())

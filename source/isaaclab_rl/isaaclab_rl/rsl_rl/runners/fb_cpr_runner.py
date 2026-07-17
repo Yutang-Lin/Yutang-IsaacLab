@@ -224,7 +224,7 @@ class FBCprRunner:
             distributed_shard=distributed_expert and self.is_distributed,
             shard_rank=self.gpu_global_rank,
             shard_world_size=self.gpu_world_size,
-            shard_seed=int(self.cfg.get("seed", 42)),
+            shard_seed=int(self.alg_cfg.get("expert_shard_seed", 42)),
             # Optional keypoint-list override (BFM-One: 26-body priv). When
             # None the buffer falls back to the precompute script's
             # KEYPOINT_NAMES (31-body). Must match the env's
@@ -718,8 +718,6 @@ class FBCprRunner:
                 )
                 self.alg.broadcast_parameters()
 
-        obs_flat, extras = self.env.get_observations()
-        obs_dict = self._obs_to_device(obs_flat, extras)
         step_count = torch.zeros(self.env.num_envs, dtype=torch.long, device=self.device)
 
         # Per-env z context.
@@ -733,6 +731,8 @@ class FBCprRunner:
         )
         if terrain_reset is not None:
             env_ids = terrain_reset["env_ids"]
+            if hasattr(self.env_unwrapped, "_reset_idx"):
+                self.env_unwrapped._reset_idx(env_ids)
             self._terrain_rsi_from_tracking(
                 env_ids, terrain_reset["motion_ids"], terrain_reset["starts"],
             )
@@ -766,6 +766,13 @@ class FBCprRunner:
             # at spawn.
             self._apply_tracking_sim_anchor(_robot)
 
+        # Capture the first policy observation only after all RSI and anchor
+        # writes. Observation terms own history buffers, so reading before and
+        # after these writes would both return stale data and advance history
+        # twice without a simulator step.
+        obs_flat, extras = self.env.get_observations()
+        obs_dict = self._obs_to_device(obs_flat, extras)
+
         # Per-env exploration std: init all envs with a fresh draw in
         # [explore_std_min, explore_std_max]. Resampled per episode on done.
         if self._use_explore_std_grad:
@@ -780,7 +787,15 @@ class FBCprRunner:
         # to mark episode boundaries. ``terminated`` and ``truncated`` from
         # the PREVIOUS step are written alongside the current obs/action.
         prev_terminated = torch.zeros(self.env.num_envs, 1, dtype=torch.bool, device=self.device)
-        prev_truncated = torch.zeros(self.env.num_envs, 1, dtype=torch.bool, device=self.device)
+        # A restored replay ends in a different simulator process/state. Mark
+        # the first newly appended observations as episode starts so the ring
+        # never creates an old-checkpoint -> fresh-simulator transition.
+        prev_truncated = torch.full(
+            (self.env.num_envs, 1),
+            fill_value=len(self.replay_buffer) > 0,
+            dtype=torch.bool,
+            device=self.device,
+        )
 
         start_iter = self.current_learning_iteration
         tot_iter = start_iter + num_learning_iterations
@@ -788,6 +803,7 @@ class FBCprRunner:
 
         steps_since_last_update = 0
         total_metrics: Dict[str, torch.Tensor] | None = None
+        max_metrics: Dict[str, torch.Tensor] = {}
         num_metrics_updates = 0
 
         # --- Initial (pre-training) tracking eval ---
@@ -822,29 +838,10 @@ class FBCprRunner:
                     f"num_motions={int(eval0.get('Eval/num_motions', 0))}",
                     flush=True,
                 )
-            # After the initial eval we refresh obs_dict/z_context because
-            # the eval rolled + restored the env; the cached obs_dict we
-            # already took (line 369) is still from before the eval so it
-            # is still valid, but z_context may have been touched by the
-            # internal eval act() calls. Recompute to be safe.
-            z_context, terrain_reset = self.alg.maybe_update_rollout_context(
-                z=None, step_count=step_count, expert_buffer=self.expert_buffer,
-                robot_root_xy=_robot.data.root_pos_w[:, :2].to(self.device) if _robot else None,
-                robot_root_quat=_robot.data.root_quat_w.to(self.device) if _robot else None,
-                terrain_z_fn=_terrain_z_fn,
-            )
-            if terrain_reset is not None and hasattr(self.env_unwrapped, "_reset_idx"):
-                env_ids = terrain_reset["env_ids"]
-                self._terrain_rsi_from_tracking(
-                    env_ids, terrain_reset["motion_ids"], terrain_reset["starts"],
-                )
-                step_count[env_ids] = 0
-                if _robot is not None:
-                    self.alg.update_tracking_pose_after_reset(
-                        env_ids,
-                        _robot.data.root_pos_w[:, :2].to(self.device),
-                        _robot.data.root_quat_w.to(self.device),
-                    )
+            # Eval snapshots and restores the environment and does not mutate the
+            # rollout context. Keep the existing z and cached observation; a
+            # second z=None call here used to resample tracking assignments and
+            # advance observation history without a simulator step.
 
         # Track LOCAL env-steps (per-rank) for warmup / update cadence / eval
         # cadence. Each rank has its own replay buffer, so
@@ -857,6 +854,9 @@ class FBCprRunner:
 
         for it in range(start_iter, tot_iter):
             start = time.time()
+            tracking_resamples_before = int(
+                getattr(self.alg, "_tracking_resample_count", 0)
+            )
             # Per-iteration anchored-goal-following accumulators (tracking envs):
             # sum of |robot_xy - ref_xy| and |wrap(robot_yaw - ref_yaw)| each
             # step AFTER env.step, where ref_* is the reference motion's
@@ -866,6 +866,8 @@ class FBCprRunner:
             _trk_xy_sum = 0.0
             _trk_yaw_sum = 0.0
             _trk_count = 0
+            rollout_done_count = 0
+            rollout_transition_count = 0
             # ----- rollout -----
             with torch.inference_mode():
                 self.policy.eval()
@@ -983,6 +985,8 @@ class FBCprRunner:
                     new_obs = self._obs_to_device(new_obs, infos)
                     rewards = rewards.to(self.device)
                     dones = dones.to(self.device)
+                    rollout_done_count += int(dones.bool().sum().item())
+                    rollout_transition_count += int(dones.numel())
 
                     # Anchored-goal-following deviation (tracking envs): robot's
                     # post-step world pose vs the REFERENCE motion's intrinsic
@@ -1116,25 +1120,29 @@ class FBCprRunner:
 
                     if terrain_reset is not None and hasattr(self.env_unwrapped, "_reset_idx"):
                         env_ids = terrain_reset["env_ids"]
-                        already_done = dones[env_ids].bool()
-                        if not already_done.all():
-                            mask = ~already_done
-                            need_reset = env_ids[mask]
-                            self._terrain_rsi_from_tracking(
-                                need_reset,
-                                terrain_reset["motion_ids"][mask],
-                                terrain_reset["starts"][mask],
+                        # Run the full reset path first so action/observation
+                        # histories, episode counters and MDP-owned state cannot
+                        # leak across the tracking teleport. Apply the exact RSI
+                        # state afterward and mark the next replay row as a
+                        # boundary, including envs that also ended naturally.
+                        self.env_unwrapped._reset_idx(env_ids)
+                        self._terrain_rsi_from_tracking(
+                            env_ids,
+                            terrain_reset["motion_ids"],
+                            terrain_reset["starts"],
+                        )
+                        step_count[env_ids] = 0
+                        dones[env_ids] = 1
+                        prev_terminated[env_ids] = False
+                        prev_truncated[env_ids] = True
+                        fresh_obs, fresh_extras = self.env.get_observations()
+                        new_obs = self._obs_to_device(fresh_obs, fresh_extras)
+                        if _robot is not None:
+                            self.alg.update_tracking_pose_after_reset(
+                                env_ids,
+                                _robot.data.root_pos_w[:, :2].to(self.device),
+                                _robot.data.root_quat_w.to(self.device),
                             )
-                            step_count[need_reset] = 0
-                            dones[need_reset] = 1
-                            fresh_obs, fresh_extras = self.env.get_observations()
-                            new_obs = self._obs_to_device(fresh_obs, fresh_extras)
-                            if _robot is not None:
-                                self.alg.update_tracking_pose_after_reset(
-                                    need_reset,
-                                    _robot.data.root_pos_w[:, :2].to(self.device),
-                                    _robot.data.root_quat_w.to(self.device),
-                                )
 
                     # Two-frame anchor: a tracking resample sampled A_anchor (the
                     # init-local offset). Compute the DISPLACED sim-space env
@@ -1152,6 +1160,7 @@ class FBCprRunner:
                     # Local drives warmup/update cadence. The raw global counter
                     # drives schedules; the logging counter may cap world size.
                     local_timesteps += self.env.num_envs
+                    self._local_timesteps = local_timesteps
                     self.tot_timesteps += self.env.num_envs * self.gpu_world_size
                     self.log_timesteps += self.env.num_envs * self._log_world_size
                     steps_since_last_update += self.env.num_envs
@@ -1160,7 +1169,20 @@ class FBCprRunner:
             start = time.time()
 
             # ----- updates -----
-            loss_dict: Dict[str, float] = {}
+            loss_dict: Dict[str, float] = {
+                "Rollout/tracking_resamples": float(
+                    int(getattr(self.alg, "_tracking_resample_count", 0))
+                    - tracking_resamples_before
+                ),
+                "Rollout/tracking_phase": float(
+                    int(getattr(self.alg, "_tracking_phase", 0))
+                ),
+                "Rollout/reset_fraction": (
+                    rollout_done_count / max(rollout_transition_count, 1)
+                ),
+                "Event/tracking_eval": 0.0,
+                "Event/checkpoint": float(it % self.save_interval == 0),
+            }
             # Hold off updates until _delay_updates_until (== num_seed_steps on
             # a fresh run; larger on a no-replay resume so the resumed policy
             # refills the empty buffer on-policy first). Note the random-action
@@ -1194,14 +1216,51 @@ class FBCprRunner:
                         for k, v in metrics.items():
                             total_metrics[k] = total_metrics.get(k, torch.zeros_like(v.float())) + v.float().detach()
                         num_metrics_updates += 1
+                    for k in (
+                        "fb_offdiag",
+                        "fb_offdiag_row_max",
+                        "fb_offdiag_col_max",
+                        "fb_innovation_align_loss",
+                        "grad_norm/forward_map",
+                        "grad_norm/backward_map",
+                    ):
+                        if k in metrics:
+                            value = metrics[k].float().detach().mean()
+                            if k in max_metrics:
+                                max_metrics[k] = torch.maximum(max_metrics[k], value)
+                            else:
+                                max_metrics[k] = value.clone()
 
                 # Single running-stat sync per iter (was per-update = 16×).
                 if self.is_distributed:
                     self.alg._sync_running_stats()
 
-                for k, v in total_metrics.items():
-                    loss_dict[k] = float(v.mean().item()) / max(num_metrics_updates, 1)
+                metric_keys = sorted(total_metrics)
+                metric_values = torch.stack(
+                    [
+                        total_metrics[k].float().mean() / max(num_metrics_updates, 1)
+                        for k in metric_keys
+                    ]
+                ).to(self.device)
+                if self.is_distributed:
+                    torch.distributed.all_reduce(
+                        metric_values, op=torch.distributed.ReduceOp.SUM
+                    )
+                    metric_values.div_(self.gpu_world_size)
+                for k, v in zip(metric_keys, metric_values):
+                    loss_dict[k] = float(v.item())
+
+                if max_metrics:
+                    max_keys = sorted(max_metrics)
+                    max_values = torch.stack([max_metrics[k] for k in max_keys]).to(self.device)
+                    if self.is_distributed:
+                        torch.distributed.all_reduce(
+                            max_values, op=torch.distributed.ReduceOp.MAX
+                        )
+                    for k, v in zip(max_keys, max_values):
+                        loss_dict[f"Spike/{k}_update_rank_max"] = float(v.item())
                 total_metrics = None
+                max_metrics = {}
                 num_metrics_updates = 0
 
             # Per-iteration global-tracking deviation (tracking envs only).
@@ -1225,6 +1284,13 @@ class FBCprRunner:
                 self._last_eval_step = local_timesteps
                 eval_metrics = self._run_tracking_eval()
                 if eval_metrics is not None:
+                    loss_dict["Event/tracking_eval"] = 1.0
+                    # Treat eval as a rollout boundary even though the env
+                    # snapshot now restores hidden state. This guarantees that
+                    # an overlooked simulator/sensor cache can never create a
+                    # pre-eval -> post-eval replay transition.
+                    prev_terminated.zero_()
+                    prev_truncated.fill_(True)
                     for k, v in eval_metrics.items():
                         loss_dict[k] = v
 
@@ -1405,15 +1471,26 @@ class FBCprRunner:
         RSI fields.
         """
         do_update_priors = self.eval_update_priorities if update_priorities is None else bool(update_priorities)
-        if not getattr(self.expert_buffer, "supports_reset_states", False):
-            return None
         num_envs = self.env.num_envs
         num_motions = self.expert_buffer.num_unique_motions
-        if num_motions == 0:
-            return None
-
         env_u = self.env_unwrapped
-        if not (hasattr(env_u, "snapshot_state") and hasattr(env_u, "restore_state")):
+        local_ready = bool(
+            getattr(self.expert_buffer, "supports_reset_states", False)
+            and num_motions > 0
+            and hasattr(env_u, "snapshot_state")
+            and hasattr(env_u, "restore_state")
+        )
+        if (
+            self.is_distributed
+            and bool(self.alg_cfg.get("distributed_expert", False))
+            and torch.distributed.is_initialized()
+        ):
+            ready = torch.tensor(
+                int(local_ready), device=self.device, dtype=torch.int32
+            )
+            torch.distributed.all_reduce(ready, op=torch.distributed.ReduceOp.MIN)
+            local_ready = bool(ready.item())
+        if not local_ready:
             return None
 
         snap = env_u.snapshot_state()
@@ -1755,6 +1832,13 @@ class FBCprRunner:
         eu.robot.write_root_velocity_to_sim(
             torch.cat([rlv, rav], dim=-1), env_ids=env_ids)
         eu.scene.write_data_to_sim()
+        eu.sim.forward()
+        if hasattr(eu, "_refresh_sim_tensors"):
+            eu._refresh_sim_tensors(env_ids)
+        if hasattr(eu, "last_joint_pos"):
+            eu.last_joint_pos[env_ids] = eu.joint_pos[env_ids]
+        if hasattr(eu, "last_joint_vel"):
+            eu.last_joint_vel[env_ids] = eu.joint_vel[env_ids]
 
     def _obs_to_device(self, obs: Any, extras: dict | None = None) -> Dict[str, torch.Tensor]:
         """Convert the env's flat ``policy`` + ``critic`` tensors into a BFM-agent dict.

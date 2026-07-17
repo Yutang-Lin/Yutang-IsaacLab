@@ -1268,6 +1268,9 @@ class RslRlFBCprAlgorithmCfg:
     sqrt(world_size) ONLY — use when batch_size is set to num_envs (or otherwise
     off the 1024 reference) and you do NOT want the LR to chase batch_size."""
 
+    obs_normalizer_scale_momentum: bool = True
+    """Whether LR scaling also speeds up observation BatchNorm running moments."""
+
     target_tau_scale_with_world_size: bool = False
     """Whether FB and critic target-network Polyak rates scale with
     sqrt(world_size)."""
@@ -1352,6 +1355,10 @@ class RslRlFBCprAlgorithmCfg:
     linearly with world_size; required for datasets bigger than fits on
     one GPU. Tracking-eval metrics are all-reduced so global numbers
     are reported."""
+
+    expert_shard_seed: int = 42
+    """Rank-invariant seed for distributed expert sharding. This must remain
+    identical across ranks so ``perm[rank::world_size]`` forms disjoint shards."""
 
     # Discriminator
     grad_penalty_discriminator: float = 10.0
@@ -1649,8 +1656,9 @@ class RslRlOnPolicyRunnerCfg:
     If regex expression, the latest (alphabetical order) matching run will be loaded.
     """
 
-    load_checkpoint: str = "model_.*.pt"
-    """The checkpoint file to load. Default is ``"model_.*.pt"`` (all).
+    load_checkpoint: str = r"^model_[0-9]+\.pt$"
+    """The checkpoint file to load. Default matches numbered model checkpoints
+    while excluding their ``.replay.pt`` siblings.
 
     If regex expression, the latest (alphabetical order) matching file will be loaded.
     """

@@ -65,6 +65,21 @@ __all__ = [
 ]
 
 
+def _grad_norm_without_clipping(
+    parameters: list[torch.nn.Parameter],
+) -> torch.Tensor:
+    """Return the total L2 gradient norm without modifying any gradient."""
+    grad_norms = [
+        torch.linalg.vector_norm(param.grad.detach(), ord=2)
+        for param in parameters
+        if param.grad is not None
+    ]
+    if grad_norms:
+        return torch.linalg.vector_norm(torch.stack(grad_norms), ord=2)
+    device = parameters[0].device if parameters else torch.device("cpu")
+    return torch.zeros((), device=device)
+
+
 # --------------------------------------------------------------------------- #
 # Algorithm configuration
 # --------------------------------------------------------------------------- #
@@ -164,6 +179,7 @@ class FBCprAuxAlgorithmCfg:
     # sqrt(batch_size / 1024).
     lr_scale_with_world_size: bool = True
     lr_scale_with_batch_size: bool = True
+    obs_normalizer_scale_momentum: bool = True
 
     # Optional world-size scaling for the FB/critic target-network Polyak rates.
     target_tau_scale_with_world_size: bool = False
@@ -225,6 +241,7 @@ class FBCprAuxAlgorithmCfg:
     # reasonable coverage. Tracking-eval metrics are all-reduced across
     # ranks in the runner so global numbers are reported.
     distributed_expert: bool = False
+    expert_shard_seed: int = 42
 
     # Discriminator
     grad_penalty_discriminator: float = 10.0
@@ -537,7 +554,8 @@ class FBCprAux:
                 flush=True,
             )
 
-        # EMA normalizer time-constant scaling.
+        # EMA normalizer time-constant scaling. Observation scaling can be
+        # disabled independently once DDP uses globally pooled batch moments.
         #
         # The obs_normalizer (per-key BatchNorm1d) and aux_reward_normalizer
         # (EMA) are low-pass filters specified in per-iter units. When LR
@@ -555,8 +573,12 @@ class FBCprAux:
         if combined_mult != 1.0 and combined_mult > 0.0:
             # BatchNorm per-key momentum on _obs_normalizer._normalizers[<k>]._normalizer
             new_obs_moms: Dict[str, float] = {}
-            if hasattr(self.policy, "_obs_normalizer") and hasattr(
-                self.policy._obs_normalizer, "_normalizers"
+            if (
+                bool(getattr(cfg, "obs_normalizer_scale_momentum", True))
+                and hasattr(self.policy, "_obs_normalizer")
+                and hasattr(
+                    self.policy._obs_normalizer, "_normalizers"
+                )
             ):
                 for key, mod in self.policy._obs_normalizer._normalizers.items():
                     bn = getattr(mod, "_normalizer", None)
@@ -920,6 +942,14 @@ class FBCprAux:
         n = z.shape[0]
         buf = self._z_buffer
         cap = buf.shape[0]
+        if n >= cap:
+            # Sampling from this buffer is unordered, so retaining the newest
+            # ``cap`` rows contiguously is equivalent and avoids duplicate CUDA
+            # advanced-index writes when n > cap.
+            buf.copy_(z[-cap:].detach().to(buf.dtype))
+            self._z_buffer_cursor = 0
+            self._z_buffer_size = cap
+            return
         idxs = (torch.arange(n, device=buf.device) + self._z_buffer_cursor) % cap
         buf[idxs] = z.detach().to(buf.dtype)
         self._z_buffer_cursor = int((self._z_buffer_cursor + n) % cap)
@@ -1116,9 +1146,21 @@ class FBCprAux:
             assigned terrain-required motions and need an env reset to
             align with the terrain, or None.
         """
+        tracking_fraction = float(self.cfg.rollout_expert_trajectories_percentage)
+        if not 0.0 <= tracking_fraction <= 1.0:
+            raise ValueError(
+                "rollout_expert_trajectories_percentage must be in [0, 1], "
+                f"got {tracking_fraction}"
+            )
+        tracking_enabled = bool(
+            self.cfg.rollout_expert_trajectories
+            and expert_buffer is not None
+            and tracking_fraction > 0.0
+        )
+
         if z is None:
             z = self.policy.sample_z(step_count.shape[0], device=self.device)
-            if self.cfg.rollout_expert_trajectories and expert_buffer is not None:
+            if tracking_enabled:
                 terrain_envs = self._resample_tracking(
                     step_count, expert_buffer, robot_root_xy, robot_root_quat,
                     terrain_z_fn=terrain_z_fn,
@@ -1138,16 +1180,26 @@ class FBCprAux:
         z = torch.where(mask_reset_z, new_z, z.to(self.device))
 
         terrain_envs = None
-        if self.cfg.rollout_expert_trajectories and expert_buffer is not None:
-            idxs = step_count % self.cfg.rollout_expert_trajectories_length
-            if bool((idxs == 0).any()):
+        if tracking_enabled:
+            traj_len = int(self.cfg.rollout_expert_trajectories_length)
+            tracking_phase = int(getattr(self, "_tracking_phase", 0)) + 1
+            if tracking_phase >= traj_len:
+                old_tracking_env_idx = getattr(self, "_tracking_env_idx", None)
+                if old_tracking_env_idx is not None:
+                    old_tracking_env_idx = old_tracking_env_idx.clone()
                 terrain_envs = self._resample_tracking(
                     step_count, expert_buffer, robot_root_xy, robot_root_quat,
                     terrain_z_fn=terrain_z_fn,
                 )
+                # Envs leaving the tracking set must stop using their previous
+                # trajectory z immediately. Overlapping/new tracking envs are
+                # overwritten with their new tracking z below.
+                if old_tracking_env_idx is not None:
+                    z[old_tracking_env_idx] = new_z[old_tracking_env_idx]
+                tracking_phase = 0
+            self._tracking_phase = tracking_phase
             if getattr(self, "_tracking_env_idx", None) is not None:
-                mod_time = idxs[self._tracking_env_idx].view(-1)
-                mod_time = torch.clamp(mod_time, 0, self._tracking_z.shape[1] - 1)
+                mod_time = min(tracking_phase, self._tracking_z.shape[1] - 1)
                 n = len(self._tracking_env_idx)
                 z[self._tracking_env_idx] = self._tracking_z[
                     torch.arange(n, device=self.device), mod_time,
@@ -1168,8 +1220,18 @@ class FBCprAux:
         ``terrain_z_fn``: callable([M,2] -> [M]) for sim terrain height query.
         """
         n_envs = step_count.shape[0]
-        n_elem = max(1, int(self.cfg.rollout_expert_trajectories_percentage * n_envs))
-        self._tracking_env_idx = torch.randint(0, n_envs, (n_elem,), device=self.device)
+        tracking_fraction = float(self.cfg.rollout_expert_trajectories_percentage)
+        n_elem = min(n_envs, max(1, int(tracking_fraction * n_envs)))
+        self._tracking_env_idx = torch.randperm(
+            n_envs, device=self.device
+        )[:n_elem]
+        # This is a rollout-context clock, deliberately independent of per-env
+        # episode ages. Using ``any(step_count % traj_len == 0)`` made one random
+        # env reset resample the complete tracking population.
+        self._tracking_phase = 0
+        self._tracking_resample_count = (
+            int(getattr(self, "_tracking_resample_count", 0)) + 1
+        )
         traj_len = self.cfg.rollout_expert_trajectories_length
         # Decide global root_h flag BEFORE z encoding.
         grh_prob = getattr(self.cfg, "terrain_variant_root_h_prob", 0.0)
@@ -1318,9 +1380,14 @@ class FBCprAux:
 
     def _tracking_anchor_global_idx(self) -> torch.Tensor:
         """Global flat index for each tracking trajectory's anchor frame."""
-        usable = (self._tracking_motion_lens - 1).clamp_min(1)
-        frame0 = self._tracking_starts % usable
+        final_frame = (self._tracking_motion_lens - 1).clamp_min(0)
+        frame0 = torch.minimum(self._tracking_starts, final_frame)
         return (self._cached_obs_starts_dev[self._tracking_motion_ids] + frame0).long()
+
+    def _tracking_local_time(self) -> torch.Tensor:
+        """Current frame offset shared by the active tracking population."""
+        phase = int(getattr(self, "_tracking_phase", 0))
+        return torch.full_like(self._tracking_env_idx, phase)
 
     @torch.no_grad()
     def get_tracking_ref_root_pos(
@@ -1340,10 +1407,12 @@ class FBCprAux:
         self._ensure_buffer_cache(expert_buffer)
         N = step_count.shape[0]
         ref = torch.zeros(N, 3, device=self.device)
-        traj_len = self.cfg.rollout_expert_trajectories_length
-        local_t = step_count[self._tracking_env_idx] % traj_len
-        usable = (self._tracking_motion_lens - 1).clamp_min(1)
-        frame = (self._tracking_starts + local_t.view(-1) + 1) % usable
+        local_t = self._tracking_local_time()
+        final_frame = (self._tracking_motion_lens - 1).clamp_min(0)
+        frame = torch.minimum(
+            self._tracking_starts + local_t.view(-1) + 1,
+            final_frame,
+        )
         obs_starts = self._cached_obs_starts_dev[self._tracking_motion_ids]
         anchor_idx = self._tracking_anchor_global_idx()
         motion_anchor_xy = self._cached_root_pos_dev[anchor_idx, :2]
@@ -1413,10 +1482,12 @@ class FBCprAux:
                 d = (target_heading_delta - self._tracking_heading_delta + math.pi) % (2 * math.pi) - math.pi
                 self._tracking_heading_delta = self._tracking_heading_delta + ema * d
 
-        traj_len = self.cfg.rollout_expert_trajectories_length
-        local_t = step_count[self._tracking_env_idx] % traj_len
-        usable = (self._tracking_motion_lens - 1).clamp_min(1)
-        frame = (self._tracking_starts + local_t.view(-1) + 1) % usable
+        local_t = self._tracking_local_time()
+        final_frame = (self._tracking_motion_lens - 1).clamp_min(0)
+        frame = torch.minimum(
+            self._tracking_starts + local_t.view(-1) + 1,
+            final_frame,
+        )
         obs_starts = self._cached_obs_starts_dev[self._tracking_motion_ids]
         global_idx = (obs_starts + frame).long()
 
@@ -1474,10 +1545,12 @@ class FBCprAux:
         if expert_buffer.root_pos_buffer is None:
             return None
         self._ensure_buffer_cache(expert_buffer)
-        traj_len = self.cfg.rollout_expert_trajectories_length
-        local_t = step_count[self._tracking_env_idx] % traj_len
-        usable = (self._tracking_motion_lens - 1).clamp_min(1)
-        frame = (self._tracking_starts + local_t.view(-1) + 1) % usable
+        local_t = self._tracking_local_time()
+        final_frame = (self._tracking_motion_lens - 1).clamp_min(0)
+        frame = torch.minimum(
+            self._tracking_starts + local_t.view(-1) + 1,
+            final_frame,
+        )
         obs_starts = self._cached_obs_starts_dev[self._tracking_motion_ids]
         global_idx = (obs_starts + frame).long()
         body_pos = expert_buffer.compute_body_pos(global_idx)
@@ -1544,10 +1617,12 @@ class FBCprAux:
             return None
         self._ensure_buffer_cache(expert_buffer)
         N = step_count.shape[0]
-        traj_len = self.cfg.rollout_expert_trajectories_length
-        local_t = step_count[self._tracking_env_idx] % traj_len
-        usable = (self._tracking_motion_lens - 1).clamp_min(1)
-        frame = (self._tracking_starts + local_t.view(-1) + 1) % usable
+        local_t = self._tracking_local_time()
+        final_frame = (self._tracking_motion_lens - 1).clamp_min(0)
+        frame = torch.minimum(
+            self._tracking_starts + local_t.view(-1) + 1,
+            final_frame,
+        )
         obs_starts = self._cached_obs_starts_dev[self._tracking_motion_ids]
         global_idx = (obs_starts + frame).long()
 
@@ -1662,16 +1737,9 @@ class FBCprAux:
             # Reconstruct global indices (same as sample_tracking_trajectories).
             arange = torch.arange(traj_length, device=self.device).unsqueeze(0)
             raw_frame = self._tracking_starts.unsqueeze(1) + arange
-            usable = (self._tracking_motion_lens - 1).clamp_min(1).unsqueeze(1)
+            final_frame = (self._tracking_motion_lens - 1).clamp_min(0).unsqueeze(1)
+            frame_nxt = torch.minimum(raw_frame + 1, final_frame)
             is_t = self._tracking_requires_terrain
-            if is_t is not None:
-                frame_nxt = torch.where(
-                    is_t.unsqueeze(1),
-                    (raw_frame + 1).clamp(max=usable - 1),
-                    (raw_frame + 1) % usable,
-                )
-            else:
-                frame_nxt = (raw_frame + 1) % usable
             obs_starts = self._cached_obs_starts_dev[self._tracking_motion_ids]
             global_nxt = (obs_starts.unsqueeze(1) + frame_nxt).long().reshape(-1)
             root_pos_z = self._cached_root_pos_dev[global_nxt, 2]  # [B*T]
@@ -1894,6 +1962,75 @@ class FBCprAux:
                 b.view(-1).copy_(flat[offset: offset + n].to(b.dtype))
                 offset += n
 
+    @torch.no_grad()
+    def _update_obs_running_stats(
+        self,
+        train_obs: dict[str, torch.Tensor],
+        train_next_obs: dict[str, torch.Tensor],
+    ) -> None:
+        """Update observation moments from the same global batch on every rank."""
+        normalizer = self.policy._obs_normalizer
+        if not self.is_distributed:
+            normalizer(train_obs)
+            normalizer(train_next_obs)
+            return
+
+        entries: list[tuple[torch.nn.BatchNorm1d, torch.Tensor]] = []
+        packed_parts: list[torch.Tensor] = []
+        for obs in (train_obs, train_next_obs):
+            for key, module in normalizer._normalizers.items():
+                if key not in obs:
+                    continue
+                x = obs[key].detach()
+                if x.ndim != 2:
+                    raise ValueError(
+                        f"Observation normalizer key {key!r} expected a 2D tensor, "
+                        f"got shape {tuple(x.shape)}"
+                    )
+                bn = module._normalizer
+                x64 = x.to(torch.float64)
+                packed_parts.extend(
+                    (
+                        x64.sum(dim=0),
+                        x64.square().sum(dim=0),
+                        torch.tensor([x.shape[0]], device=x.device, dtype=torch.float64),
+                    )
+                )
+                entries.append((bn, x))
+
+        if not packed_parts:
+            return
+        packed = torch.cat(packed_parts)
+        torch.distributed.all_reduce(packed, op=torch.distributed.ReduceOp.SUM)
+
+        offset = 0
+        for bn, x in entries:
+            width = x.shape[1]
+            total = packed[offset: offset + width]
+            offset += width
+            total_sq = packed[offset: offset + width]
+            offset += width
+            count = packed[offset]
+            offset += 1
+
+            mean = total / count
+            # BatchNorm stores the unbiased batch variance in running_var.
+            var = (
+                (total_sq - total.square() / count) / (count - 1.0)
+            ).clamp_min_(0.0)
+            if bn.num_batches_tracked is not None:
+                bn.num_batches_tracked.add_(1)
+                batches = int(bn.num_batches_tracked.item())
+            else:
+                batches = 1
+            momentum = (
+                float(bn.momentum)
+                if bn.momentum is not None
+                else 1.0 / float(batches)
+            )
+            bn.running_mean.lerp_(mean.to(bn.running_mean.dtype), momentum)
+            bn.running_var.lerp_(var.to(bn.running_var.dtype), momentum)
+
     def _anneal_lrs(self, step: int) -> Dict[str, float]:
         """Linearly anneal every optimizer's LR from the DDP-scaled start
         down to the un-scaled base LR over ``cfg.lr_anneal_steps``
@@ -2003,9 +2140,11 @@ class FBCprAux:
         # target path normalizes itself). Shallow-copied dict of the raw tensors.
         self._raw_train_next_obs = dict(train_next_obs)
 
-        # Update obs-normalizer running stats on the train batch.
-        self.policy._obs_normalizer(train_obs)
-        self.policy._obs_normalizer(train_next_obs)
+        # Update from globally pooled sufficient statistics. Updating local
+        # BatchNorm EMAs for all agent steps and averaging only afterward loses
+        # between-rank variance and makes each rank normalize against stale,
+        # rank-local moments during the update burst.
+        self._update_obs_running_stats(train_obs, train_next_obs)
 
         # Freeze normalizer momentum for downstream passes.
         with torch.no_grad(), eval_mode(self.policy._obs_normalizer):
@@ -2724,9 +2863,10 @@ class FBCprAux:
         B = p._backward_map(goal)
         Ms = torch.matmul(Fs, B.T)
 
-        diff = Ms - discount.view(-1, 1) * target_M
-        fb_offdiag = 0.5 * (diff * self._off_diag).pow(2).sum() / self._off_diag_sum
-        fb_diag = -torch.diagonal(diff, dim1=1, dim2=2).mean() * Ms.shape[0]
+        fb_diff = Ms - discount.view(-1, 1) * target_M
+        fb_offdiag_sq = 0.5 * (fb_diff * self._off_diag).pow(2)
+        fb_offdiag = fb_offdiag_sq.sum() / self._off_diag_sum
+        fb_diag = -torch.diagonal(fb_diff, dim1=1, dim2=2).mean() * Ms.shape[0]
         fb_loss = fb_offdiag + fb_diag
 
         innovation_align_loss = torch.zeros((), device=z.device, dtype=z.dtype)
@@ -2735,7 +2875,7 @@ class FBCprAux:
             not_term = getattr(self, "_fb_not_term", torch.ones_like(fb_gamma_alt))
             discount_alt = fb_gamma_alt * not_term
             diff_alt = Ms_alt - discount_alt.view(-1, 1) * target_M_alt
-            innovation_align_loss = innovation_alignment_loss(diff, diff_alt)
+            innovation_align_loss = innovation_alignment_loss(fb_diff, diff_alt)
             fb_loss = fb_loss + (
                 float(getattr(self.cfg, "fb_gamma_innovation_align_coef", 1.0))
                 * innovation_align_loss
@@ -2801,6 +2941,13 @@ class FBCprAux:
         B_handle = None
 
         with torch.no_grad():
+            # One bad source row affects every goal column; one bad B(goal)
+            # column affects every source row. Keep tail diagnostics separate
+            # from the dense mean so random spike batches are attributable.
+            batch_size = fb_diff.shape[-1]
+            offdiag_count = max(batch_size - 1, 1)
+            row_energy = fb_offdiag_sq.sum(dim=(0, 2)) / offdiag_count
+            col_energy = fb_offdiag_sq.sum(dim=(0, 1)) / offdiag_count
             out = {
                 "target_M": target_M.mean(),
                 "M1": Ms[0].mean(),
@@ -2811,6 +2958,13 @@ class FBCprAux:
                 "fb_loss": fb_loss,
                 "fb_diag": fb_diag,
                 "fb_offdiag": fb_offdiag,
+                "fb_offdiag_row_p99": torch.quantile(row_energy, 0.99),
+                "fb_offdiag_row_max": row_energy.max(),
+                "fb_offdiag_col_p99": torch.quantile(col_energy, 0.99),
+                "fb_offdiag_col_max": col_energy.max(),
+                "fb_offdiag_top_row_share": (
+                    row_energy.max() / row_energy.sum().clamp_min(1e-12)
+                ),
                 "fb_innovation_align_loss": innovation_align_loss,
                 "orth_loss": orth_loss,
                 "orth_loss_diag": orth_loss_diag,
@@ -2818,6 +2972,36 @@ class FBCprAux:
                 "q_loss": q_loss,
                 "recon_loss": recon_loss,
             }
+            if fb_gamma is not None:
+                gamma_flat = fb_gamma.view(-1)
+                worst_row = row_energy.argmax()
+                out["MutableGamma/fb_gamma_mean"] = gamma_flat.mean()
+                out["MutableGamma/fb_gamma_max"] = gamma_flat.max()
+                out["MutableGamma/fb_gamma_at_row_max"] = gamma_flat[worst_row]
+                out["MutableGamma/fb_gamma_gt_0975"] = (
+                    gamma_flat > 0.975
+                ).float().mean()
+                high_gamma = gamma_flat > 0.975
+                low_gamma = gamma_flat < 0.9
+                out["MutableGamma/fb_offdiag_gt_0975"] = (
+                    row_energy * high_gamma
+                ).sum() / high_gamma.sum().clamp_min(1)
+                out["MutableGamma/fb_offdiag_lt_09"] = (
+                    row_energy * low_gamma
+                ).sum() / low_gamma.sum().clamp_min(1)
+                out["MutableGamma/fb_offdiag_gt_0975_max"] = torch.where(
+                    high_gamma.any(),
+                    row_energy.masked_fill(~high_gamma, -torch.inf).max(),
+                    torch.zeros((), device=row_energy.device),
+                )
+                if fb_gamma_alt is not None:
+                    gamma_alt_flat = fb_gamma_alt.view(-1)
+                    h = -torch.log1p(-gamma_flat)
+                    h_alt = -torch.log1p(-gamma_alt_flat)
+                    out["MutableGamma/fb_gamma_alt_mean"] = gamma_alt_flat.mean()
+                    out["MutableGamma/fb_gamma_h_gap_mean"] = (
+                        h - h_alt
+                    ).abs().mean()
             out.update(fb_extra_logs)
         return out, F_handle, B_handle
 
@@ -2833,13 +3017,6 @@ class FBCprAux:
         p = self.policy
         finish_async_reduce(F_handle)
         finish_async_reduce(B_handle)
-        # ``clip_grad_norm_`` returns the pre-clip total L2 norm. Use the
-        # configured max_norm if clipping is on; otherwise use inf as a
-        # no-op clip that still returns the norm (cheaper than a manual
-        # sum-of-squares second pass).
-        max_norm = float(clip_grad_norm) if clip_grad_norm is not None else float("inf")
-        gn_f = torch.nn.utils.clip_grad_norm_(p._forward_map.parameters(), max_norm)
-        gn_b = torch.nn.utils.clip_grad_norm_(p._backward_map.parameters(), max_norm)
         # DDP: the reconstruction head (linear W) is a sibling module, NOT inside
         # the DDP-wrapped _backward_map, so its grads (from the recon_loss folded
         # into fb_loss) are LOCAL. Reduce them so W (and the analytic z_bar=W^T c_g
@@ -2853,11 +3030,32 @@ class FBCprAux:
         if self.is_distributed and rh is not None and not getattr(self, "_merge_phase1_reduce", False):
             from ..utils import reduce_gradients
             reduce_gradients(rh)
+
+        f_params = list(p._forward_map.parameters())
+        b_params = list(p._backward_map.parameters())
+        gn_f = _grad_norm_without_clipping(f_params)
+        gn_b = _grad_norm_without_clipping(b_params)
+        nonfinite = (~torch.isfinite(gn_f) | ~torch.isfinite(gn_b)).to(torch.int32)
+        if self.is_distributed:
+            torch.distributed.all_reduce(nonfinite, op=torch.distributed.ReduceOp.MAX)
+        if bool(nonfinite.item()):
+            self.forward_optimizer.zero_grad(set_to_none=True)
+            self.backward_optimizer.zero_grad(set_to_none=True)
+            return {
+                "grad_norm/forward_map": gn_f.detach(),
+                "grad_norm/backward_map": gn_b.detach(),
+                "grad_nonfinite/fb_skipped": torch.ones((), device=gn_f.device),
+            }
+
+        if clip_grad_norm is not None:
+            torch.nn.utils.clip_grad_norm_(f_params, float(clip_grad_norm))
+            torch.nn.utils.clip_grad_norm_(b_params, float(clip_grad_norm))
         self.forward_optimizer.step()
         self.backward_optimizer.step()
         return {
             "grad_norm/forward_map": gn_f.detach(),
             "grad_norm/backward_map": gn_b.detach(),
+            "grad_nonfinite/fb_skipped": torch.zeros((), device=gn_f.device),
         }
 
     def backward_critic(
