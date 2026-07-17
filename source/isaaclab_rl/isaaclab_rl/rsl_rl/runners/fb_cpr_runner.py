@@ -1289,8 +1289,18 @@ class FBCprRunner:
                     # snapshot now restores hidden state. This guarantees that
                     # an overlooked simulator/sensor cache can never create a
                     # pre-eval -> post-eval replay transition.
-                    prev_terminated.zero_()
-                    prev_truncated.fill_(True)
+                    # The previous flags were produced inside inference_mode,
+                    # so they are inference tensors and cannot be mutated here.
+                    prev_terminated = torch.zeros(
+                        (self.env.num_envs, 1),
+                        dtype=torch.bool,
+                        device=self.device,
+                    )
+                    prev_truncated = torch.ones(
+                        (self.env.num_envs, 1),
+                        dtype=torch.bool,
+                        device=self.device,
+                    )
                     for k, v in eval_metrics.items():
                         loss_dict[k] = v
 
