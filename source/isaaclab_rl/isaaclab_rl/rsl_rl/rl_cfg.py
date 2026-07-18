@@ -1327,7 +1327,8 @@ class RslRlFBCprAlgorithmCfg:
     fb_stochastic_integral: bool = False  # softmax-weighted horizon integral actor FB term
     fb_integral_K: int = 8
     fb_integral_align_gamma: float = 0.98  # integral Q *= 1/(1-this) for scale alignment
-    fb_integral_adaptive_tau: bool = False  # tau=centered RMS spread of target N, clamped to >=1
+    # tau=sqrt(mean(abs(N - N_max))), clamped to >=1
+    fb_integral_adaptive_tau: bool = False
     fb_integral_prior_lambda: float = 0.0
     """Exponential SI prior strength over ``h=-log(1-gamma)``. The actor adds
     ``-lambda * (h-h_min)`` to its weight logits, so positive values prefer

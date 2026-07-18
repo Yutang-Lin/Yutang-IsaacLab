@@ -288,9 +288,9 @@ class FBCprAuxAlgorithmCfg:
     # gamma=0.98 -> 50) so the per-step integral sits at the standard-gamma
     # Q magnitude.
     fb_integral_align_gamma: float = 0.98
-    # Adaptive softmax temperature for stochastic-integral weights. The
-    # temperature is the centered RMS spread of target N with a floor of 1.0,
-    # so common value offsets do not alter the horizon preferences.
+    # Adaptive softmax temperature for stochastic-integral weights:
+    # sqrt(mean(abs(N - N_max))) with a floor of 1.0. Growing Q gaps therefore
+    # sharpen horizon selection gradually rather than linearly.
     fb_integral_adaptive_tau: bool = False
     # Exponential prior over the sampled log-horizon h=-log(1-gamma):
     # p0(h) ∝ exp(-lambda * (h - h_min)). Zero preserves the old SI weights.

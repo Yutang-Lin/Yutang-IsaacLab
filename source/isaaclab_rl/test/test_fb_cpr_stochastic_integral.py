@@ -80,7 +80,7 @@ def test_adaptive_temperature_is_translation_invariant():
     torch.testing.assert_close(shifted_weights, weights)
 
 
-def test_adaptive_temperature_uses_centered_rms_with_unit_floor():
+def test_adaptive_temperature_uses_sqrt_mean_max_gap_with_unit_floor():
     values = torch.tensor([[3.0, 3.0, 3.0], [-3.0, 0.0, 3.0]])
     horizons = torch.zeros_like(values)
 
@@ -89,4 +89,23 @@ def test_adaptive_temperature_uses_centered_rms_with_unit_floor():
     )
 
     torch.testing.assert_close(tau[0], torch.tensor([1.0]))
-    torch.testing.assert_close(tau[1], torch.tensor([6.0**0.5]))
+    torch.testing.assert_close(tau[1], torch.tensor([3.0**0.5]))
+
+
+def test_adaptive_temperature_allows_sqrt_scale_sharpening():
+    values = torch.tensor([[0.0, 2.0, 4.0]])
+    horizons = torch.zeros_like(values)
+
+    weights, tau = stochastic_integral_weights(
+        values, horizons, h_min=0.0, prior_lambda=0.0, adaptive_temperature=True
+    )
+    scaled_weights, scaled_tau = stochastic_integral_weights(
+        9.0 * values,
+        horizons,
+        h_min=0.0,
+        prior_lambda=0.0,
+        adaptive_temperature=True,
+    )
+
+    torch.testing.assert_close(scaled_tau, 3.0 * tau)
+    assert scaled_weights[0, -1] > weights[0, -1]
