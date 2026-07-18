@@ -62,3 +62,31 @@ def test_positive_prior_prefers_short_horizons_for_equal_values():
     )
 
     assert torch.all(weights[:, :-1] > weights[:, 1:])
+
+
+def test_adaptive_temperature_is_translation_invariant():
+    values = torch.tensor([[0.0, 1.0, 4.0], [-3.0, 2.0, 8.0]])
+    horizons = torch.tensor([[0.5, 1.0, 2.0], [0.5, 1.0, 2.0]])
+    shifted = values + torch.tensor([[100.0], [-57.0]])
+
+    weights, tau = stochastic_integral_weights(
+        values, horizons, h_min=0.5, prior_lambda=0.5, adaptive_temperature=True
+    )
+    shifted_weights, shifted_tau = stochastic_integral_weights(
+        shifted, horizons, h_min=0.5, prior_lambda=0.5, adaptive_temperature=True
+    )
+
+    torch.testing.assert_close(shifted_tau, tau)
+    torch.testing.assert_close(shifted_weights, weights)
+
+
+def test_adaptive_temperature_uses_centered_rms_with_unit_floor():
+    values = torch.tensor([[3.0, 3.0, 3.0], [-3.0, 0.0, 3.0]])
+    horizons = torch.zeros_like(values)
+
+    _, tau = stochastic_integral_weights(
+        values, horizons, h_min=0.0, prior_lambda=0.0, adaptive_temperature=True
+    )
+
+    torch.testing.assert_close(tau[0], torch.tensor([1.0]))
+    torch.testing.assert_close(tau[1], torch.tensor([6.0**0.5]))

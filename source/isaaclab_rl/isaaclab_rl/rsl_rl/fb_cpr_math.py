@@ -44,7 +44,8 @@ def stochastic_integral_weights(
         raise ValueError("fb_integral_prior_lambda must be non-negative")
     logits = target_values - target_values.max(dim=1, keepdim=True).values
     if adaptive_temperature:
-        tau = target_values.mean(dim=1, keepdim=True).abs().sqrt().clamp_min(1.0)
+        centered = target_values - target_values.mean(dim=1, keepdim=True)
+        tau = centered.square().mean(dim=1, keepdim=True).sqrt().clamp_min(1.0)
         logits = logits / tau
     else:
         tau = torch.ones_like(target_values[:, :1])

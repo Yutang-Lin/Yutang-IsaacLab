@@ -289,8 +289,8 @@ class FBCprAuxAlgorithmCfg:
     # Q magnitude.
     fb_integral_align_gamma: float = 0.98
     # Adaptive softmax temperature for stochastic-integral weights. The
-    # temperature is sqrt(abs(mean target N)) with a floor of 1.0, so enabling
-    # it can soften the plain softmax but can never make it sharper.
+    # temperature is the centered RMS spread of target N with a floor of 1.0,
+    # so common value offsets do not alter the horizon preferences.
     fb_integral_adaptive_tau: bool = False
     # Exponential prior over the sampled log-horizon h=-log(1-gamma):
     # p0(h) ∝ exp(-lambda * (h - h_min)). Zero preserves the old SI weights.
@@ -2871,11 +2871,17 @@ class FBCprAux:
 
         innovation_align_loss = torch.zeros((), device=z.device, dtype=z.dtype)
         if Fs_alt is not None and target_M_alt is not None:
-            Ms_alt = torch.matmul(Fs_alt, B.T)
+            # Cross-gamma alignment regularizes F. Keep B under the original FB
+            # and orthogonality objectives instead of letting it rotate to hide
+            # disagreement between the two gamma-conditioned innovations.
+            B_align_t = B.detach().T
+            Ms_align = torch.matmul(Fs, B_align_t)
+            Ms_alt = torch.matmul(Fs_alt, B_align_t)
             not_term = getattr(self, "_fb_not_term", torch.ones_like(fb_gamma_alt))
             discount_alt = fb_gamma_alt * not_term
+            diff_align = Ms_align - discount.view(-1, 1) * target_M
             diff_alt = Ms_alt - discount_alt.view(-1, 1) * target_M_alt
-            innovation_align_loss = innovation_alignment_loss(fb_diff, diff_alt)
+            innovation_align_loss = innovation_alignment_loss(diff_align, diff_alt)
             fb_loss = fb_loss + (
                 float(getattr(self.cfg, "fb_gamma_innovation_align_coef", 1.0))
                 * innovation_align_loss
