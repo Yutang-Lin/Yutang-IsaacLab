@@ -71,13 +71,15 @@ def _grad_norm_without_clipping(
     parameters: list[torch.nn.Parameter],
 ) -> torch.Tensor:
     """Return the total L2 gradient norm without modifying any gradient."""
-    grad_norms = [
-        torch.linalg.vector_norm(param.grad.detach(), ord=2)
+    grads = [
+        param.grad.detach()
         for param in parameters
         if param.grad is not None
     ]
-    if grad_norms:
-        return torch.linalg.vector_norm(torch.stack(grad_norms), ord=2)
+    if grads:
+        return torch.nn.utils.get_total_norm(
+            grads, norm_type=2.0, foreach=None
+        )
     device = parameters[0].device if parameters else torch.device("cpu")
     return torch.zeros((), device=device)
 
@@ -210,6 +212,9 @@ class FBCprAuxAlgorithmCfg:
     fb_grad_spike_ema_decay: float = 0.99
     fb_grad_spike_multiplier: float = 5.0
     fb_grad_spike_warmup_steps: int = 128
+    # Expensive tail percentiles are diagnostics only. Maxima and gamma-at-worst
+    # are still computed every update.
+    fb_tail_quantile_every: int = 1
 
     # Target-network Polyak rates
     fb_target_tau: float = 0.01
@@ -489,6 +494,7 @@ class FBCprAux:
         self._fb_grad_norm_ema_f = 0.0
         self._fb_grad_norm_ema_b = 0.0
         self._fb_grad_norm_ema_steps = 0
+        self._fb_tail_diagnostic_step = 0
         if bool(getattr(cfg, "fb_grad_spike_clip", False)):
             decay = float(getattr(cfg, "fb_grad_spike_ema_decay", 0.99))
             multiplier = float(getattr(cfg, "fb_grad_spike_multiplier", 5.0))
@@ -505,6 +511,8 @@ class FBCprAux:
                 raise ValueError(
                     f"fb_grad_spike_warmup_steps must be non-negative, got {warmup}"
                 )
+        if int(getattr(cfg, "fb_tail_quantile_every", 1)) <= 0:
+            raise ValueError("fb_tail_quantile_every must be positive")
 
         # Disc batch is sized as disc_num_slices * seq_length (must be a
         # multiple of seq_length for [num_slices, seq_length] reshape).
@@ -3031,6 +3039,13 @@ class FBCprAux:
             offdiag_count = max(batch_size - 1, 1)
             row_energy = fb_offdiag_sq.sum(dim=(0, 2)) / offdiag_count
             col_energy = fb_offdiag_sq.sum(dim=(0, 1)) / offdiag_count
+            tail_quantile_every = int(
+                getattr(self.cfg, "fb_tail_quantile_every", 1)
+            )
+            log_tail_quantiles = (
+                self._fb_tail_diagnostic_step % tail_quantile_every == 0
+            )
+            self._fb_tail_diagnostic_step += 1
             out = {
                 "target_M": target_M.mean(),
                 "M1": Ms[0].mean(),
@@ -3041,9 +3056,7 @@ class FBCprAux:
                 "fb_loss": fb_loss,
                 "fb_diag": fb_diag,
                 "fb_offdiag": fb_offdiag,
-                "fb_offdiag_row_p99": torch.quantile(row_energy, 0.99),
                 "fb_offdiag_row_max": row_energy.max(),
-                "fb_offdiag_col_p99": torch.quantile(col_energy, 0.99),
                 "fb_offdiag_col_max": col_energy.max(),
                 "fb_offdiag_top_row_share": (
                     row_energy.max() / row_energy.sum().clamp_min(1e-12)
@@ -3055,6 +3068,9 @@ class FBCprAux:
                 "q_loss": q_loss,
                 "recon_loss": recon_loss,
             }
+            if log_tail_quantiles:
+                out["fb_offdiag_row_p99"] = torch.quantile(row_energy, 0.99)
+                out["fb_offdiag_col_p99"] = torch.quantile(col_energy, 0.99)
             if fb_gamma is not None:
                 gamma_flat = fb_gamma.view(-1)
                 worst_row = row_energy.argmax()
@@ -3171,36 +3187,29 @@ class FBCprAux:
             self._fb_grad_norm_ema_b = next_ema_b
             self._fb_grad_norm_ema_steps = steps + 1
 
-            spike_metrics = {
-                "grad_spike/forward_map": torch.tensor(
-                    float(spike_f), device=gn_f.device
-                ),
-                "grad_spike/backward_map": torch.tensor(
-                    float(spike_b), device=gn_b.device
-                ),
-                "grad_spike/forward_map_ema": torch.tensor(
-                    ema_f, device=gn_f.device
-                ),
-                "grad_spike/backward_map_ema": torch.tensor(
-                    ema_b, device=gn_b.device
-                ),
-                "grad_spike/forward_map_threshold": torch.tensor(
-                    threshold_f, device=gn_f.device
-                ),
-                "grad_spike/backward_map_threshold": torch.tensor(
-                    threshold_b, device=gn_b.device
-                ),
-                "grad_spike/forward_map_clip_scale": torch.tensor(
-                    min(1.0, threshold_f / max(norm_f, 1e-12))
-                    if spike_f else 1.0,
-                    device=gn_f.device,
-                ),
-                "grad_spike/backward_map_clip_scale": torch.tensor(
-                    min(1.0, threshold_b / max(norm_b, 1e-12))
-                    if spike_b else 1.0,
-                    device=gn_b.device,
-                ),
-            }
+            spike_keys = (
+                "grad_spike/forward_map",
+                "grad_spike/backward_map",
+                "grad_spike/forward_map_ema",
+                "grad_spike/backward_map_ema",
+                "grad_spike/forward_map_threshold",
+                "grad_spike/backward_map_threshold",
+                "grad_spike/forward_map_clip_scale",
+                "grad_spike/backward_map_clip_scale",
+            )
+            spike_values = gn_f.new_tensor((
+                float(spike_f),
+                float(spike_b),
+                ema_f,
+                ema_b,
+                threshold_f,
+                threshold_b,
+                min(1.0, threshold_f / max(norm_f, 1e-12))
+                if spike_f else 1.0,
+                min(1.0, threshold_b / max(norm_b, 1e-12))
+                if spike_b else 1.0,
+            ))
+            spike_metrics = dict(zip(spike_keys, spike_values.unbind()))
 
         static_limit = (
             float(clip_grad_norm) if clip_grad_norm is not None else float("inf")

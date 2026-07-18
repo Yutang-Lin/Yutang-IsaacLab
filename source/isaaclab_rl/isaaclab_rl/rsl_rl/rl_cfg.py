@@ -1300,6 +1300,8 @@ class RslRlFBCprAlgorithmCfg:
     """A finite gradient is a spike above this multiple of its branch EMA."""
     fb_grad_spike_warmup_steps: int = 128
     """Number of FB optimizer steps used to establish the EMA before clipping."""
+    fb_tail_quantile_every: int = 1
+    """Compute FB row/column p99 diagnostics every N optimizer updates."""
 
     # Target Polyak rates
     fb_target_tau: float = 0.01

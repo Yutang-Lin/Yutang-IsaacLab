@@ -802,9 +802,8 @@ class FBCprRunner:
         best_reward = -float("inf")
 
         steps_since_last_update = 0
-        total_metrics: Dict[str, torch.Tensor] | None = None
-        max_metrics: Dict[str, torch.Tensor] = {}
-        num_metrics_updates = 0
+        total_metrics: Dict[str, list[torch.Tensor]] = {}
+        max_metrics: Dict[str, list[torch.Tensor]] = {}
 
         # --- Initial (pre-training) tracking eval ---
         # Runs once BEFORE any gradient step so the user sees a baseline
@@ -1209,13 +1208,12 @@ class FBCprRunner:
                 }
                 for _ in range(self.num_agent_updates):
                     metrics = self.alg.update(replay_dict, step=int(self.tot_timesteps))
-                    if total_metrics is None:
-                        total_metrics = {k: v.float().detach().clone() for k, v in metrics.items()}
-                        num_metrics_updates = 1
-                    else:
-                        for k, v in metrics.items():
-                            total_metrics[k] = total_metrics.get(k, torch.zeros_like(v.float())) + v.float().detach()
-                        num_metrics_updates += 1
+                    # Keep detached scalar views and reduce them in one packed
+                    # operation after all updates. The old path allocated a
+                    # zeros_like default and launched an out-of-place GPU add
+                    # for every metric on every update.
+                    for k, v in metrics.items():
+                        total_metrics.setdefault(k, []).append(v.detach())
                     for k in (
                         "fb_offdiag",
                         "fb_offdiag_row_max",
@@ -1225,11 +1223,9 @@ class FBCprRunner:
                         "grad_norm/backward_map",
                     ):
                         if k in metrics:
-                            value = metrics[k].float().detach().mean()
-                            if k in max_metrics:
-                                max_metrics[k] = torch.maximum(max_metrics[k], value)
-                            else:
-                                max_metrics[k] = value.clone()
+                            max_metrics.setdefault(k, []).append(
+                                metrics[k].detach()
+                            )
 
                 # Single running-stat sync per iter (was per-update = 16×).
                 if self.is_distributed:
@@ -1238,7 +1234,10 @@ class FBCprRunner:
                 metric_keys = sorted(total_metrics)
                 metric_values = torch.stack(
                     [
-                        total_metrics[k].float().mean() / max(num_metrics_updates, 1)
+                        torch.stack([
+                            value.float().mean()
+                            for value in total_metrics[k]
+                        ]).mean()
                         for k in metric_keys
                     ]
                 ).to(self.device)
@@ -1247,21 +1246,28 @@ class FBCprRunner:
                         metric_values, op=torch.distributed.ReduceOp.SUM
                     )
                     metric_values.div_(self.gpu_world_size)
-                for k, v in zip(metric_keys, metric_values):
-                    loss_dict[k] = float(v.item())
+                metric_values_host = metric_values.detach().cpu().tolist()
+                for k, value in zip(metric_keys, metric_values_host):
+                    loss_dict[k] = float(value)
 
                 if max_metrics:
                     max_keys = sorted(max_metrics)
-                    max_values = torch.stack([max_metrics[k] for k in max_keys]).to(self.device)
+                    max_values = torch.stack([
+                        torch.stack([
+                            value.float().mean()
+                            for value in max_metrics[k]
+                        ]).max()
+                        for k in max_keys
+                    ]).to(self.device)
                     if self.is_distributed:
                         torch.distributed.all_reduce(
                             max_values, op=torch.distributed.ReduceOp.MAX
                         )
-                    for k, v in zip(max_keys, max_values):
-                        loss_dict[f"Spike/{k}_update_rank_max"] = float(v.item())
-                total_metrics = None
+                    max_values_host = max_values.detach().cpu().tolist()
+                    for k, value in zip(max_keys, max_values_host):
+                        loss_dict[f"Spike/{k}_update_rank_max"] = float(value)
+                total_metrics = {}
                 max_metrics = {}
-                num_metrics_updates = 0
 
             # Per-iteration global-tracking deviation (tracking envs only).
             if _trk_count > 0:
