@@ -1324,6 +1324,10 @@ class RslRlFBCprAlgorithmCfg:
     fb_gamma_conditioned: bool = False
     actor_gamma_short: float = 0.8
     actor_gamma_short_alpha: float = 0.5
+    fb_gamma_loss_weighting: bool = False
+    """Weight gamma-conditioned Bellman FB rows by ``(1-gamma)^2``, normalized
+    to unit expectation under the configured uniform log-horizon distribution."""
+
     fb_stochastic_integral: bool = False  # softmax-weighted horizon integral actor FB term
     fb_integral_K: int = 8
     fb_integral_align_gamma: float = 0.98  # integral Q *= 1/(1-this) for scale alignment

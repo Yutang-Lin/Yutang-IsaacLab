@@ -40,6 +40,7 @@ from isaaclab.utils import configclass
 
 from ..fb_cpr_math import (
     innovation_alignment_loss,
+    normalized_gamma_loss_weights,
     sample_log_horizon_gamma,
     stochastic_integral_weights,
 )
@@ -278,6 +279,9 @@ class FBCprAuxAlgorithmCfg:
     actor_gamma_short: float = 0.8
     # Weight alpha on the short-horizon FB term in the actor loss.
     actor_gamma_short_alpha: float = 0.5
+    # Weight each gamma-conditioned Bellman FB row by (1-gamma)^2, normalized
+    # to unit expectation under the uniform log-horizon sampling distribution.
+    fb_gamma_loss_weighting: bool = False
     # Stochastic-integral FB actor objective (overrides the two-gamma term when on;
     # requires fb_gamma_conditioned). Stratified-sample fb_integral_K horizons in
     # [gamma_short, discount], softmax-weight the normalized per-step values, and
@@ -2865,8 +2869,30 @@ class FBCprAux:
 
         fb_diff = Ms - discount.view(-1, 1) * target_M
         fb_offdiag_sq = 0.5 * (fb_diff * self._off_diag).pow(2)
-        fb_offdiag = fb_offdiag_sq.sum() / self._off_diag_sum
-        fb_diag = -torch.diagonal(fb_diff, dim1=1, dim2=2).mean() * Ms.shape[0]
+        gamma_loss_weights = None
+        if bool(getattr(self.cfg, "fb_gamma_loss_weighting", False)):
+            if fb_gamma is None:
+                raise ValueError(
+                    "fb_gamma_loss_weighting requires fb_gamma_conditioned=True"
+                )
+            gamma_loss_weights = normalized_gamma_loss_weights(
+                fb_gamma.view(-1),
+                float(self.cfg.actor_gamma_short),
+                float(self.cfg.discount),
+            )
+            row_weights = gamma_loss_weights.view(1, -1, 1)
+            fb_offdiag = (
+                fb_offdiag_sq * row_weights
+            ).sum() / self._off_diag_sum
+            fb_diag_values = torch.diagonal(fb_diff, dim1=1, dim2=2)
+            fb_diag = -(
+                fb_diag_values * gamma_loss_weights.view(1, -1)
+            ).mean() * Ms.shape[0]
+        else:
+            fb_offdiag = fb_offdiag_sq.sum() / self._off_diag_sum
+            fb_diag = -torch.diagonal(
+                fb_diff, dim1=1, dim2=2
+            ).mean() * Ms.shape[0]
         fb_loss = fb_offdiag + fb_diag
 
         innovation_align_loss = torch.zeros((), device=z.device, dtype=z.dtype)
@@ -2987,6 +3013,16 @@ class FBCprAux:
                 out["MutableGamma/fb_gamma_gt_0975"] = (
                     gamma_flat > 0.975
                 ).float().mean()
+                if gamma_loss_weights is not None:
+                    out["MutableGamma/fb_loss_weight_mean"] = (
+                        gamma_loss_weights.mean()
+                    )
+                    out["MutableGamma/fb_loss_weight_min"] = (
+                        gamma_loss_weights.min()
+                    )
+                    out["MutableGamma/fb_loss_weight_max"] = (
+                        gamma_loss_weights.max()
+                    )
                 high_gamma = gamma_flat > 0.975
                 low_gamma = gamma_flat < 0.9
                 out["MutableGamma/fb_offdiag_gt_0975"] = (

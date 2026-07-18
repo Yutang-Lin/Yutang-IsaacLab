@@ -24,6 +24,24 @@ def sample_log_horizon_gamma(
     return 1.0 - torch.exp(-h)
 
 
+def normalized_gamma_loss_weights(
+    gamma: torch.Tensor,
+    gamma_min: float,
+    gamma_max: float,
+) -> torch.Tensor:
+    """Return ``(1-gamma)^2`` weights with unit expectation under log-h sampling."""
+    if not 0.0 <= gamma_min < gamma_max < 1.0:
+        raise ValueError(
+            f"Expected 0 <= gamma_min < gamma_max < 1, got {gamma_min}, {gamma_max}"
+        )
+    h_min = -math.log1p(-gamma_min)
+    h_max = -math.log1p(-gamma_max)
+    expected_square = (
+        (1.0 - gamma_min) ** 2 - (1.0 - gamma_max) ** 2
+    ) / (2.0 * (h_max - h_min))
+    return (1.0 - gamma).square() / expected_square
+
+
 def innovation_alignment_loss(
     innovation: torch.Tensor,
     innovation_alt: torch.Tensor,
