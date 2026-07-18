@@ -8,6 +8,27 @@ import torch
 import torch.nn.functional as F
 
 
+def ema_grad_spike_state(
+    grad_norm: float,
+    ema: float,
+    steps: int,
+    decay: float,
+    multiplier: float,
+    warmup_steps: int,
+) -> tuple[float, float, bool]:
+    """Advance a winsorized grad-norm EMA and return its pre-update spike test."""
+    baseline = grad_norm if steps == 0 or ema <= 1e-12 else ema
+    threshold = max(multiplier * baseline, 1e-12)
+    spike = steps >= warmup_steps and grad_norm > threshold
+    if steps == 0:
+        next_ema = grad_norm
+    else:
+        next_ema = decay * baseline + (1.0 - decay) * min(
+            grad_norm, threshold
+        )
+    return next_ema, threshold, spike
+
+
 def sample_log_horizon_gamma(
     reference: torch.Tensor,
     gamma_min: float,

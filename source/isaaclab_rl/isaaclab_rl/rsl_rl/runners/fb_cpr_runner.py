@@ -1970,6 +1970,7 @@ class FBCprRunner:
         base = {
             "model": self.policy.state_dict(),
             "optimizers": self.alg.optimizer_dict,
+            "algorithm_state": self.alg.training_state_dict,
             "iter": self.current_learning_iteration,
             "tot_timesteps": self.tot_timesteps,
             "log_timesteps": self.log_timesteps,
@@ -2276,6 +2277,14 @@ class FBCprRunner:
                         f"(Adam momentums preserved): {pretty}",
                         flush=True,
                     )
+            fb_reinitialised = any(
+                "_forward_map" in key or "_backward_map" in key
+                for key in reinit_keys
+            )
+            if not fb_reinitialised:
+                self.alg.load_training_state_dict(
+                    ckpt.get("algorithm_state", {})
+                )
         self.current_learning_iteration = ckpt.get("iter", 0)
         self.tot_timesteps = ckpt.get("tot_timesteps", 0)
         self._local_timesteps = ckpt.get("local_timesteps", 0)

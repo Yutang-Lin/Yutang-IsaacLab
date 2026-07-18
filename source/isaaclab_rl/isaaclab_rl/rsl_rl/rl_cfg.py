@@ -1292,6 +1292,14 @@ class RslRlFBCprAlgorithmCfg:
     weight_decay: float = 0.0
     weight_decay_discriminator: float = 0.0
     clip_grad_norm: float = 0.0
+    fb_grad_spike_clip: bool = False
+    """Whether finite F/B gradient-norm spikes are EMA-detected and clipped."""
+    fb_grad_spike_ema_decay: float = 0.99
+    """Decay for the separate forward/backward gradient-norm EMAs."""
+    fb_grad_spike_multiplier: float = 5.0
+    """A finite gradient is a spike above this multiple of its branch EMA."""
+    fb_grad_spike_warmup_steps: int = 128
+    """Number of FB optimizer steps used to establish the EMA before clipping."""
 
     # Target Polyak rates
     fb_target_tau: float = 0.01

@@ -39,6 +39,7 @@ from torch import autograd
 from isaaclab.utils import configclass
 
 from ..fb_cpr_math import (
+    ema_grad_spike_state,
     innovation_alignment_loss,
     normalized_gamma_loss_weights,
     sample_log_horizon_gamma,
@@ -201,6 +202,14 @@ class FBCprAuxAlgorithmCfg:
     weight_decay: float = 0.0
     weight_decay_discriminator: float = 0.0
     clip_grad_norm: float = 0.0  # 0 = disabled
+    # Optional finite-spike guard for the coupled F/B update. Each branch keeps
+    # its own pre-clip gradient-norm EMA. Once warm, a norm above
+    # ``multiplier * EMA`` is clipped to that threshold instead of skipping the
+    # optimizer step. Non-finite gradients are still skipped.
+    fb_grad_spike_clip: bool = False
+    fb_grad_spike_ema_decay: float = 0.99
+    fb_grad_spike_multiplier: float = 5.0
+    fb_grad_spike_warmup_steps: int = 128
 
     # Target-network Polyak rates
     fb_target_tau: float = 0.01
@@ -477,6 +486,25 @@ class FBCprAux:
         self.is_distributed = (
             torch.distributed.is_available() and torch.distributed.is_initialized()
         )
+        self._fb_grad_norm_ema_f = 0.0
+        self._fb_grad_norm_ema_b = 0.0
+        self._fb_grad_norm_ema_steps = 0
+        if bool(getattr(cfg, "fb_grad_spike_clip", False)):
+            decay = float(getattr(cfg, "fb_grad_spike_ema_decay", 0.99))
+            multiplier = float(getattr(cfg, "fb_grad_spike_multiplier", 5.0))
+            warmup = int(getattr(cfg, "fb_grad_spike_warmup_steps", 128))
+            if not 0.0 <= decay < 1.0:
+                raise ValueError(
+                    f"fb_grad_spike_ema_decay must be in [0, 1), got {decay}"
+                )
+            if multiplier <= 1.0:
+                raise ValueError(
+                    f"fb_grad_spike_multiplier must be > 1, got {multiplier}"
+                )
+            if warmup < 0:
+                raise ValueError(
+                    f"fb_grad_spike_warmup_steps must be non-negative, got {warmup}"
+                )
 
         # Disc batch is sized as disc_num_slices * seq_length (must be a
         # multiple of seq_length for [num_slices, seq_length] reshape).
@@ -921,6 +949,29 @@ class FBCprAux:
             **({"manifold_attractor_optimizer": self.manifold_attractor_optimizer.state_dict()}
                if self.manifold_attractor_optimizer is not None else {}),
         }
+
+    @property
+    def training_state_dict(self) -> Dict[str, Any]:
+        """Small non-model state needed for an exact training resume."""
+        return {
+            "fb_grad_norm_ema_f": self._fb_grad_norm_ema_f,
+            "fb_grad_norm_ema_b": self._fb_grad_norm_ema_b,
+            "fb_grad_norm_ema_steps": self._fb_grad_norm_ema_steps,
+        }
+
+    def load_training_state_dict(self, state: Dict[str, Any]) -> None:
+        """Restore optional training-only state from a checkpoint."""
+        if not state:
+            return
+        self._fb_grad_norm_ema_f = max(
+            float(state.get("fb_grad_norm_ema_f", 0.0)), 0.0
+        )
+        self._fb_grad_norm_ema_b = max(
+            float(state.get("fb_grad_norm_ema_b", 0.0)), 0.0
+        )
+        self._fb_grad_norm_ema_steps = max(
+            int(state.get("fb_grad_norm_ema_steps", 0)), 0
+        )
 
     # --- inference surface ------------------------------------------------- #
 
@@ -3089,16 +3140,92 @@ class FBCprAux:
                 "grad_nonfinite/fb_skipped": torch.ones((), device=gn_f.device),
             }
 
-        if clip_grad_norm is not None:
-            torch.nn.utils.clip_grad_norm_(f_params, float(clip_grad_norm))
-            torch.nn.utils.clip_grad_norm_(b_params, float(clip_grad_norm))
+        spike_metrics: Dict[str, torch.Tensor] = {}
+        dynamic_f_limit = None
+        dynamic_b_limit = None
+        if bool(getattr(self.cfg, "fb_grad_spike_clip", False)):
+            decay = float(getattr(self.cfg, "fb_grad_spike_ema_decay", 0.99))
+            multiplier = float(getattr(self.cfg, "fb_grad_spike_multiplier", 5.0))
+            warmup = int(getattr(self.cfg, "fb_grad_spike_warmup_steps", 128))
+            norm_f = float(gn_f.detach().item())
+            norm_b = float(gn_b.detach().item())
+            steps = self._fb_grad_norm_ema_steps
+
+            ema_f = norm_f if steps == 0 else self._fb_grad_norm_ema_f
+            ema_b = norm_b if steps == 0 else self._fb_grad_norm_ema_b
+            next_ema_f, threshold_f, spike_f = ema_grad_spike_state(
+                norm_f, ema_f, steps, decay, multiplier, warmup
+            )
+            next_ema_b, threshold_b, spike_b = ema_grad_spike_state(
+                norm_b, ema_b, steps, decay, multiplier, warmup
+            )
+            if spike_f:
+                dynamic_f_limit = threshold_f
+            if spike_b:
+                dynamic_b_limit = threshold_b
+
+            # Winsorize the EMA observation at the pre-update threshold. A
+            # single spike therefore cannot raise the baseline to its own size,
+            # while a sustained scale change can still be followed gradually.
+            self._fb_grad_norm_ema_f = next_ema_f
+            self._fb_grad_norm_ema_b = next_ema_b
+            self._fb_grad_norm_ema_steps = steps + 1
+
+            spike_metrics = {
+                "grad_spike/forward_map": torch.tensor(
+                    float(spike_f), device=gn_f.device
+                ),
+                "grad_spike/backward_map": torch.tensor(
+                    float(spike_b), device=gn_b.device
+                ),
+                "grad_spike/forward_map_ema": torch.tensor(
+                    ema_f, device=gn_f.device
+                ),
+                "grad_spike/backward_map_ema": torch.tensor(
+                    ema_b, device=gn_b.device
+                ),
+                "grad_spike/forward_map_threshold": torch.tensor(
+                    threshold_f, device=gn_f.device
+                ),
+                "grad_spike/backward_map_threshold": torch.tensor(
+                    threshold_b, device=gn_b.device
+                ),
+                "grad_spike/forward_map_clip_scale": torch.tensor(
+                    min(1.0, threshold_f / max(norm_f, 1e-12))
+                    if spike_f else 1.0,
+                    device=gn_f.device,
+                ),
+                "grad_spike/backward_map_clip_scale": torch.tensor(
+                    min(1.0, threshold_b / max(norm_b, 1e-12))
+                    if spike_b else 1.0,
+                    device=gn_b.device,
+                ),
+            }
+
+        static_limit = (
+            float(clip_grad_norm) if clip_grad_norm is not None else float("inf")
+        )
+        f_limit = min(
+            static_limit,
+            dynamic_f_limit if dynamic_f_limit is not None else float("inf"),
+        )
+        b_limit = min(
+            static_limit,
+            dynamic_b_limit if dynamic_b_limit is not None else float("inf"),
+        )
+        if math.isfinite(f_limit):
+            torch.nn.utils.clip_grad_norm_(f_params, f_limit)
+        if math.isfinite(b_limit):
+            torch.nn.utils.clip_grad_norm_(b_params, b_limit)
         self.forward_optimizer.step()
         self.backward_optimizer.step()
-        return {
+        metrics = {
             "grad_norm/forward_map": gn_f.detach(),
             "grad_norm/backward_map": gn_b.detach(),
             "grad_nonfinite/fb_skipped": torch.zeros((), device=gn_f.device),
         }
+        metrics.update(spike_metrics)
+        return metrics
 
     def backward_critic(
         self,
@@ -3835,6 +3962,7 @@ class FBCprAux:
         return {
             "policy": self.policy.state_dict(),
             "optimizers": self.optimizer_dict,
+            "training_state": self.training_state_dict,
         }
 
     def load_state_dict(self, state: Dict[str, Any]) -> None:
@@ -3871,6 +3999,7 @@ class FBCprAux:
                     opt.load_state_dict(sd)
                 except (ValueError, RuntimeError) as e:
                     print(f"[FBCprAux] skipping optimizer '{name}' load: {e}")
+        self.load_training_state_dict(state.get("training_state", {}))
 
 
 ##########################
