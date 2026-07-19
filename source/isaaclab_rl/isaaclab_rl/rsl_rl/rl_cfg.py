@@ -1424,6 +1424,9 @@ class RslRlFBCprAlgorithmCfg:
     coupling to tracking_T_*; positive values keep discriminator T fixed while
     rollout tracking environments randomize their mean-z horizon episodically."""
     disc_positive_full_window: bool = False
+    disc_positive_window: int = 0
+    """Centered discriminator-positive width around the expert z-mean
+    midpoint. Zero preserves the legacy T-matched/full-window behavior."""
 
     # AMP (bf16)
     amp: bool = False

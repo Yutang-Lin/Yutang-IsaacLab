@@ -8,6 +8,26 @@ import torch
 import torch.nn.functional as F
 
 
+def centered_context_offsets(
+    mean_widths: torch.Tensor,
+    context_width: int,
+) -> torch.Tensor:
+    """Return context starts relative to first-T means with aligned midpoints."""
+    return torch.div(
+        mean_widths - context_width,
+        2,
+        rounding_mode="floor",
+    )
+
+
+def centered_subwindow_start(
+    container_length: int,
+    subwindow_length: int,
+) -> int:
+    """Return the left-biased centered start for a fixed-width subwindow."""
+    return (container_length - subwindow_length + 1) // 2
+
+
 def ema_grad_spike_state(
     grad_norm: float,
     ema: float,

@@ -6,11 +6,29 @@ os.environ["ENABLE_ISAACLAB"] = "False"
 import torch
 
 from isaaclab_rl.rsl_rl.fb_cpr_math import (
+    centered_context_offsets,
+    centered_subwindow_start,
     innovation_alignment_loss,
     normalized_gamma_loss_weights,
     sample_log_horizon_gamma,
     stochastic_integral_weights,
 )
+
+
+def test_centered_positive_context_preserves_first_t_mean():
+    widths = torch.tensor([1, 2, 4, 8, 16])
+    offsets = centered_context_offsets(widths, context_width=16)
+
+    assert offsets.tolist() == [-8, -7, -6, -4, 0]
+    mean_center_twice = widths - 1
+    context_center_twice = 2 * offsets + 16 - 1
+    assert (mean_center_twice - context_center_twice).tolist() == [1, 0, 0, 0, 0]
+
+
+def test_configurable_positive_window_is_centered_in_context():
+    assert centered_subwindow_start(16, 16) == 0
+    assert centered_subwindow_start(16, 8) == 4
+    assert centered_subwindow_start(16, 1) == 8
 
 
 def test_independent_gamma_samples_stay_in_range():

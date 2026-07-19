@@ -1587,10 +1587,37 @@ class FBCprExpertBuffer:
     # -- sampling ----------------------------------------------------------
 
     @torch.no_grad()
-    def sample(self, batch_size: int, seq_length: int | None = None) -> dict:
+    def sample(
+        self,
+        batch_size: int,
+        seq_length: int | None = None,
+        mean_widths: torch.Tensor | None = None,
+    ) -> dict:
         seq_length = int(seq_length) if seq_length is not None else self.seq_length
         # Round batch down to a multiple of seq_length.
         num_slices = max(1, batch_size // seq_length)
+        if mean_widths is not None:
+            mean_widths = mean_widths.to(
+                device=self.device, dtype=torch.long
+            ).view(-1)
+            if mean_widths.numel() != num_slices:
+                raise ValueError(
+                    f"mean_widths has {mean_widths.numel()} rows, expected "
+                    f"{num_slices}"
+                )
+            # The mean remains next_obs[0:T]. Shift only the observation
+            # context so its midpoint aligns with that first-T mean.
+            context_offsets = torch.div(
+                mean_widths - seq_length,
+                2,
+                rounding_mode="floor",
+            )
+            min_starts = (-context_offsets).clamp_min(0)
+        else:
+            context_offsets = torch.zeros(
+                num_slices, dtype=torch.long, device=self.device
+            )
+            min_starts = torch.zeros_like(context_offsets)
 
         # Need a genuinely contiguous current/next window. The historical
         # modulo path wrapped the final next frame to frame zero.
@@ -1607,15 +1634,23 @@ class FBCprExpertBuffer:
         sel = torch.multinomial(eligible_priors, num_slices, replacement=True)
         motion_picks = eligible_idx[sel]                    # [num_slices]
         motion_lens = eligible_lengths[sel]                 # [num_slices]
-        # Start in [0, T-seq_length-1].
+        # ``starts`` is the first transition used by the unchanged first-T
+        # expert z mean. Leave enough prefix for the centered positive context.
         rand01 = torch.rand(num_slices, device=self.device)
         max_start = (motion_lens - seq_length - 1).clamp_min(0).to(torch.float32)
-        starts = (rand01 * (max_start + 1.0)).floor().to(torch.long)
+        start_span = (max_start - min_starts).clamp_min(0).to(torch.float32)
+        starts = min_starts + (
+            rand01 * (start_span + 1.0)
+        ).floor().to(torch.long)
 
-        # Build per-slice arange window and flatten.
+        # The discriminator observation context may begin before ``starts``.
+        # next_obs deliberately does not move: its first T rows remain the
+        # expert relabel z source.
         arange = torch.arange(seq_length, device=self.device).unsqueeze(0)     # [1, seq_length]
         raw_frame = starts.unsqueeze(1) + arange                                # [num_slices, seq_length]
-        frame_cur = raw_frame.reshape(-1)                                       # [B]
+        frame_cur = (
+            raw_frame + context_offsets.unsqueeze(1)
+        ).reshape(-1)                                                           # [B]
         frame_nxt = (raw_frame + 1).reshape(-1)                                 # [B]
         motion_flat = motion_picks.unsqueeze(1).expand(-1, seq_length).reshape(-1)  # [B]
 

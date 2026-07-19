@@ -39,6 +39,7 @@ from torch import autograd
 from isaaclab.utils import configclass
 
 from ..fb_cpr_math import (
+    centered_subwindow_start,
     ema_grad_spike_state,
     innovation_alignment_loss,
     normalized_gamma_loss_weights,
@@ -376,6 +377,11 @@ class FBCprAuxAlgorithmCfg:
     # per-T window; only the disc_mask is forced to all-True. If False (default),
     # the positive window matches T (frames 0..T-1 only).
     disc_positive_full_window: bool = False
+    # Centered discriminator-positive window around the midpoint of the
+    # expert z-mean horizon. Zero preserves the legacy first-T/full-window
+    # behavior above. Positive values decouple the style-positive width from T;
+    # the sampled expert sequence must be at least this long.
+    disc_positive_window: int = 0
     # EMA alignment of the Global-FB reference frame: if > 0, each step
     # the stored ``_tracking_robot_xy`` and ``_tracking_heading_delta``
     # are pulled toward the robot's current root xy/yaw with rate
@@ -519,11 +525,19 @@ class FBCprAux:
         # multiple of seq_length for [num_slices, seq_length] reshape).
         # Main cfg.batch_size is independent and stays exact (e.g. 1024).
         seq_length = int(self.policy.seq_length)
+        positive_window = int(getattr(cfg, "disc_positive_window", 0))
+        if positive_window < 0 or positive_window > seq_length:
+            raise ValueError(
+                f"disc_positive_window={positive_window} must be in "
+                f"[0, seq_length={seq_length}]"
+            )
+        self._disc_positive_window = positive_window
         disc_num_slices = getattr(cfg, "disc_num_slices", None)
         if disc_num_slices is not None:
             self._disc_batch_size = int(disc_num_slices) * seq_length
         else:
             self._disc_batch_size = max(seq_length, (cfg.batch_size // seq_length) * seq_length)
+        self._disc_num_sequences = self._disc_batch_size // seq_length
 
         # Remember the un-scaled base LRs BEFORE DDP sqrt-scaling. Used as
         # the target ("bottom") of the linear anneal schedule when
@@ -1094,6 +1108,79 @@ class FBCprAux:
         ``expert_encodings[idx]`` (vanilla expert-encoded z)."""
         return expert_encodings[idx]
 
+    def _sample_expert_T(
+        self,
+        num_sequences: int,
+        seq_length: int,
+    ) -> torch.Tensor | None:
+        """Sample one expert z-mean horizon per sequence."""
+        fixed_disc_T = int(getattr(self.cfg, "disc_fixed_T", 0))
+        choices = tuple(getattr(self.cfg, "tracking_T_choices", ()) or ())
+        choice_probs = tuple(
+            getattr(self.cfg, "tracking_T_choice_probs", ()) or ()
+        )
+        T_min = int(getattr(self.cfg, "tracking_T_min", 1))
+        T_max = min(
+            int(getattr(self.cfg, "tracking_T_max", 16)), seq_length
+        )
+        if fixed_disc_T > 0:
+            if fixed_disc_T > seq_length:
+                raise ValueError(
+                    f"disc_fixed_T={fixed_disc_T} exceeds policy "
+                    f"seq_length={seq_length}"
+                )
+            return torch.full(
+                (num_sequences,),
+                fixed_disc_T,
+                device=self.device,
+                dtype=torch.long,
+            )
+        if choices:
+            kept = [
+                (choice, choice_probs[i] if choice_probs else 1.0)
+                for i, choice in enumerate(choices)
+                if choice <= seq_length
+            ]
+            if not kept:
+                raise ValueError(
+                    f"No tracking_T_choices fit seq_length={seq_length}: "
+                    f"{choices}"
+                )
+            choices_t = torch.tensor(
+                [choice for choice, _ in kept],
+                device=self.device,
+                dtype=torch.long,
+            )
+            if choice_probs:
+                weights = torch.tensor(
+                    [prob for _, prob in kept],
+                    device=self.device,
+                    dtype=torch.float32,
+                )
+                selection = torch.multinomial(
+                    weights, num_sequences, replacement=True
+                )
+            else:
+                selection = torch.randint(
+                    0,
+                    len(kept),
+                    (num_sequences,),
+                    device=self.device,
+                )
+            return choices_t[selection]
+        if T_min < T_max:
+            return torch.randint(
+                T_min,
+                T_max + 1,
+                (num_sequences,),
+                device=self.device,
+            )
+        if self._disc_positive_window > 0:
+            return torch.full(
+                (num_sequences,), T_min, device=self.device, dtype=torch.long
+            )
+        return None
+
     @staticmethod
     def _permute_obs(
         obs: torch.Tensor | dict[str, torch.Tensor], perm: torch.Tensor
@@ -1104,7 +1191,9 @@ class FBCprAux:
 
     @torch.no_grad()
     def encode_expert(
-        self, next_obs: torch.Tensor | dict[str, torch.Tensor]
+        self,
+        next_obs: torch.Tensor | dict[str, torch.Tensor],
+        T_per_seq: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Encode expert sub-sequences through B for discriminator training.
 
@@ -1114,8 +1203,8 @@ class FBCprAux:
 
         Returns:
             z_expert: [batch_size, z_dim] z replicated per frame
-            disc_mask: [batch_size] bool, True for frames within T-window.
-                None if no variable-T (all frames valid).
+            disc_mask: [batch_size] bool, True for frames within the configured
+                positive window. None when all sequence frames are positive.
         """
         B_expert = self.policy._backward_map(next_obs).detach()
         seq_length = self.policy.seq_length
@@ -1124,55 +1213,54 @@ class FBCprAux:
         B_expert = B_expert.view(N, seq_length, B_expert.shape[-1])
         device = B_expert.device
 
-        # Fixed discriminator T when configured; otherwise retain the legacy
-        # coupling to rollout tracking-T settings.
-        fixed_disc_T = int(getattr(self.cfg, "disc_fixed_T", 0))
-        choices = tuple(getattr(self.cfg, "tracking_T_choices", ()) or ())
-        choice_probs = tuple(getattr(self.cfg, "tracking_T_choice_probs", ()) or ())
-        T_min = getattr(self.cfg, "tracking_T_min", 1)
-        T_max = min(getattr(self.cfg, "tracking_T_max", 16), seq_length)
+        positive_window = self._disc_positive_window
         disc_mask: torch.Tensor | None = None
-        T_per_seq: torch.Tensor | None = None
-        if fixed_disc_T > 0:
-            if fixed_disc_T > seq_length:
-                raise ValueError(
-                    f"disc_fixed_T={fixed_disc_T} exceeds policy "
-                    f"seq_length={seq_length}"
-                )
-            T_per_seq = torch.full(
-                (N,), fixed_disc_T, device=device, dtype=torch.long
-            )
-        elif choices:
-            kept = [(c, choice_probs[i] if choice_probs else 1.0)
-                    for i, c in enumerate(choices) if c <= seq_length]
-            choices_kept = [c for c, _ in kept]
-            probs_kept = [p for _, p in kept]
-            choices_t = torch.tensor(choices_kept, device=device, dtype=torch.long)
-            if choice_probs and len(probs_kept) == len(choices_kept):
-                w = torch.tensor(probs_kept, device=device, dtype=torch.float32)
-                sel = torch.multinomial(w, N, replacement=True)
-            else:
-                sel = torch.randint(0, len(choices_kept), (N,), device=device)
-            T_per_seq = choices_t[sel]
-        elif T_min < T_max:
-            T_per_seq = torch.randint(T_min, T_max + 1, (N,), device=device)
+        if T_per_seq is None:
+            T_per_seq = self._sample_expert_T(N, seq_length)
         if T_per_seq is not None:
             d = B_expert.shape[-1]
             cumz = torch.cat([torch.zeros(N, 1, d, device=device),
                               torch.cumsum(B_expert, dim=1)], dim=1)  # [N, seq+1, d]
             arange_N = torch.arange(N, device=device)
+            # Expert relabel z remains byte-for-byte the first T encoded frames.
             z_sum = cumz[arange_N, T_per_seq]  # [N, d]
             z_expert = z_sum / T_per_seq.float().unsqueeze(-1)
-            # Frames 0..T-1 are within window; T..seq_length-1 are not.
-            arange_T = torch.arange(seq_length, device=device).unsqueeze(0)
-            disc_mask = (arange_T < T_per_seq.unsqueeze(1)).reshape(-1)  # [N*seq_length]
-            # Optionally use the FULL seq_length as the discriminator positive
-            # window for every sub-sequence, regardless of its z-window T (z is
-            # still the per-T mean above; only the positive mask is widened).
-            if bool(getattr(self.cfg, "disc_positive_full_window", False)):
-                disc_mask = None
+            if positive_window > 0:
+                if positive_window == seq_length:
+                    disc_mask = None
+                else:
+                    positive_start = centered_subwindow_start(
+                        seq_length, positive_window
+                    )
+                    positive_end = positive_start + positive_window
+                    arange_T = torch.arange(
+                        seq_length, device=device
+                    )
+                    disc_mask = (
+                        (arange_T >= positive_start)
+                        & (arange_T < positive_end)
+                    ).repeat(N)
+            else:
+                # Legacy: frames 0..T-1 are within the positive window.
+                arange_T = torch.arange(
+                    seq_length, device=device
+                ).unsqueeze(0)
+                disc_mask = (
+                    arange_T < T_per_seq.unsqueeze(1)
+                ).reshape(-1)
+                # Optionally use the FULL seq_length as the discriminator
+                # positive window while retaining the first-T z mean.
+                if bool(getattr(self.cfg, "disc_positive_full_window", False)):
+                    disc_mask = None
         else:
             z_expert = B_expert.mean(dim=1)
+            if 0 < positive_window < seq_length:
+                positive_start = (seq_length - positive_window + 1) // 2
+                arange_T = torch.arange(seq_length, device=device)
+                disc_mask = (
+                    (arange_T >= positive_start)
+                    & (arange_T < positive_start + positive_window)
+                ).repeat(N)
 
         if self.cfg.soft_fb:
             norm = z_expert.norm(dim=-1, keepdim=True).clamp(min=1e-8)
@@ -2139,7 +2227,21 @@ class FBCprAux:
         """
         current_lrs = self._anneal_lrs(step)
 
-        expert_batch = replay_buffer[self._EXPERT_KEY].sample(self._disc_batch_size)
+        expert_T_per_seq = None
+        expert_sample_kwargs = {}
+        if self._disc_positive_window > 0:
+            expert_T_per_seq = self._sample_expert_T(
+                self._disc_num_sequences,
+                int(self.policy.seq_length),
+            )
+            expert_sample_kwargs = {
+                "seq_length": int(self.policy.seq_length),
+                "mean_widths": expert_T_per_seq,
+            }
+        expert_batch = replay_buffer[self._EXPERT_KEY].sample(
+            self._disc_batch_size,
+            **expert_sample_kwargs,
+        )
         train_batch = replay_buffer[self._REPLAY_KEY].sample(self.cfg.batch_size)
 
         train_obs = self._to_device(train_batch["observation"])
@@ -2235,7 +2337,10 @@ class FBCprAux:
         )
 
         # Encode expert → z_expert (+ disc validity mask for variable T)
-        expert_z, expert_disc_mask = self.encode_expert(next_obs=expert_next_obs)
+        expert_z, expert_disc_mask = self.encode_expert(
+            next_obs=expert_next_obs,
+            T_per_seq=expert_T_per_seq,
+        )
         train_z = train_batch["z"].to(self.device, non_blocking=True)
 
         # BFM order: disc sees ORIGINAL train_z (from rollout), THEN relabel.

@@ -24,6 +24,7 @@ _spec = importlib.util.spec_from_file_location("fb_cpr_storage", _STORAGE_PATH)
 _mod = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_mod)
 FBCprReplayBuffer = _mod.FBCprReplayBuffer
+FBCprExpertBuffer = _mod.FBCprExpertBuffer
 
 
 def _make_buffer() -> FBCprReplayBuffer:
@@ -57,6 +58,42 @@ def test_flat_sampling_is_uniform_over_transitions():
     expected = torch.full((7,), 10_000.0)
     assert torch.all((counts[expected_rows].float() - expected).abs() < 500)
     assert counts.sum() == 70_000
+
+
+def test_expert_positive_context_moves_but_first_t_next_window_does_not():
+    buffer = FBCprExpertBuffer.__new__(FBCprExpertBuffer)
+    buffer.seq_length = 16
+    buffer.device = torch.device("cpu")
+    buffer._lengths_t = torch.tensor([80])
+    buffer._priorities = torch.ones(1)
+    buffer._motion_obs_starts = torch.tensor([0])
+    frames = torch.arange(80, dtype=torch.float32).unsqueeze(-1)
+    buffer._flat_state = frames
+    buffer._flat_priv = frames.clone()
+    buffer._flat_last_action = frames.clone()
+    buffer._flat_history_actor = frames.clone()
+    buffer.requires_terrain_t = torch.zeros(1, dtype=torch.bool)
+    buffer._emit_anchored_pose = False
+
+    widths = torch.tensor([1, 2, 4, 8, 16])
+    batch = buffer.sample(
+        batch_size=80,
+        seq_length=16,
+        mean_widths=widths,
+    )
+    obs = batch["observation"]["state"].view(5, 16)
+    next_obs = batch["next"]["observation"]["state"].view(5, 16)
+
+    expected_offsets = torch.tensor([-8, -7, -6, -4, 0])
+    torch.testing.assert_close(
+        obs[:, 0] - next_obs[:, 0],
+        expected_offsets.float() - 1.0,
+    )
+    # The B input remains a contiguous window starting at current_time + 1.
+    torch.testing.assert_close(
+        next_obs[:, 1:] - next_obs[:, :-1],
+        torch.ones(5, 15),
+    )
 
 
 def test_sequence_sampling_is_uniform_over_valid_starts():
