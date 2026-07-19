@@ -206,7 +206,7 @@ class FBCprAuxAlgorithmCfg:
     clip_grad_norm: float = 0.0  # 0 = disabled
     # Optional finite-spike guard for the coupled F/B update. Each branch keeps
     # its own pre-clip gradient-norm EMA. Once warm, a norm above
-    # ``multiplier * EMA`` is clipped to that threshold instead of skipping the
+    # ``multiplier * EMA`` is clipped back to the EMA instead of skipping the
     # optimizer step. Non-finite gradients are still skipped.
     fb_grad_spike_clip: bool = False
     fb_grad_spike_ema_decay: float = 0.99
@@ -3176,9 +3176,9 @@ class FBCprAux:
                 norm_b, ema_b, steps, decay, multiplier, warmup
             )
             if spike_f:
-                dynamic_f_limit = threshold_f
+                dynamic_f_limit = max(ema_f, 1e-12)
             if spike_b:
-                dynamic_b_limit = threshold_b
+                dynamic_b_limit = max(ema_b, 1e-12)
 
             # Winsorize the EMA observation at the pre-update threshold. A
             # single spike therefore cannot raise the baseline to its own size,
@@ -3204,9 +3204,9 @@ class FBCprAux:
                 ema_b,
                 threshold_f,
                 threshold_b,
-                min(1.0, threshold_f / max(norm_f, 1e-12))
+                min(1.0, max(ema_f, 1e-12) / max(norm_f, 1e-12))
                 if spike_f else 1.0,
-                min(1.0, threshold_b / max(norm_b, 1e-12))
+                min(1.0, max(ema_b, 1e-12) / max(norm_b, 1e-12))
                 if spike_b else 1.0,
             ))
             spike_metrics = dict(zip(spike_keys, spike_values.unbind()))
