@@ -358,9 +358,10 @@ class FBCprAuxAlgorithmCfg:
     log_global_track_dev: bool = True
     tracking_T_min: int = 1
     tracking_T_max: int = 16
-    # If non-empty, sample T from this discrete set instead of uniformly
-    # from [T_min, T_max]. This controls only the per-env rollout tracking-z
-    # mean window and is sampled once per tracking episode.
+    # If non-empty, sample T from this discrete set instead of uniformly from
+    # [T_min, T_max]. This controls per-env rollout tracking z and, when
+    # disc_fixed_T=0, the expert z shared by relabeling and the discriminator.
+    # Rollout T is sampled once per tracking episode; expert T once per sequence.
     tracking_T_choices: tuple[int, ...] = ()
     # Per-choice probabilities (must match len(tracking_T_choices) when set).
     # Empty tuple = uniform over choices.
@@ -2956,10 +2957,9 @@ class FBCprAux:
 
         innovation_align_loss = torch.zeros((), device=z.device, dtype=z.dtype)
         if Fs_alt is not None and target_M_alt is not None:
-            # Cross-gamma alignment regularizes F. Keep B under the original FB
-            # and orthogonality objectives instead of letting it rotate to hide
-            # disagreement between the two gamma-conditioned innovations.
-            B_align_t = B.detach().T
+            # Let the shared successor space adapt with both F and B so the
+            # gamma-conditioned innovations agree in one representation.
+            B_align_t = B.T
             Ms_align = torch.matmul(Fs, B_align_t)
             Ms_alt = torch.matmul(Fs_alt, B_align_t)
             not_term = getattr(self, "_fb_not_term", torch.ones_like(fb_gamma_alt))

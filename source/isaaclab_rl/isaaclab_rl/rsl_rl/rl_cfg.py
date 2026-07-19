@@ -1416,6 +1416,8 @@ class RslRlFBCprAlgorithmCfg:
     tracking_T_min: int = 1
     tracking_T_max: int = 16
     tracking_T_choices: tuple[int, ...] = ()
+    """Optional discrete mean-z horizons. These control episodic tracking z and,
+    when disc_fixed_T=0, expert z used by relabeling and the discriminator."""
     tracking_T_choice_probs: tuple[float, ...] = ()
     disc_fixed_T: int = 0
     """Fixed expert/discriminator z-mean horizon. Zero preserves the legacy

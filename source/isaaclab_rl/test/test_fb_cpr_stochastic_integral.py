@@ -59,6 +59,23 @@ def test_innovation_alignment_is_zero_for_matching_innovations():
     torch.testing.assert_close(loss, torch.zeros_like(loss))
 
 
+def test_innovation_alignment_propagates_to_shared_backward_projection():
+    forward = torch.randn(2, 8, 4, requires_grad=True)
+    forward_alt = torch.randn(2, 8, 4, requires_grad=True)
+    backward = torch.randn(8, 4, requires_grad=True)
+    target = torch.randn(2, 8, 8)
+    target_alt = torch.randn(2, 8, 8)
+
+    innovation = forward @ backward.T - target
+    innovation_alt = forward_alt @ backward.T - target_alt
+    innovation_alignment_loss(innovation, innovation_alt).backward()
+
+    assert forward.grad is not None
+    assert forward_alt.grad is not None
+    assert backward.grad is not None
+    assert backward.grad.abs().sum() > 0
+
+
 def test_zero_prior_preserves_original_softmax():
     values = torch.tensor([[0.1, -0.2, 0.7]])
     horizons = torch.tensor([[0.5, 1.0, 2.0]])
