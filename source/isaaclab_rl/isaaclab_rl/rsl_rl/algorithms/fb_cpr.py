@@ -294,9 +294,10 @@ class FBCprAuxAlgorithmCfg:
     actor_gamma_short: float = 0.8
     # Weight alpha on the short-horizon FB term in the actor loss.
     actor_gamma_short_alpha: float = 0.5
-    # Weight each gamma-conditioned Bellman FB row by (1-gamma)^2, normalized
-    # to unit expectation under the uniform log-horizon sampling distribution.
+    # Weight each gamma-conditioned Bellman FB row by (1-gamma)^power,
+    # normalized under the uniform log-horizon sampling distribution.
     fb_gamma_loss_weighting: bool = False
+    fb_gamma_loss_weight_power: float = 2.0
     # Stochastic-integral FB actor objective (overrides the two-gamma term when on;
     # requires fb_gamma_conditioned). Stratified-sample fb_integral_K horizons in
     # [gamma_short, discount], softmax-weight the normalized per-step values, and
@@ -3044,6 +3045,7 @@ class FBCprAux:
                 fb_gamma.view(-1),
                 float(self.cfg.actor_gamma_short),
                 float(self.cfg.discount),
+                float(getattr(self.cfg, "fb_gamma_loss_weight_power", 2.0)),
             )
             row_weights = gamma_loss_weights.view(1, -1, 1)
             fb_offdiag = (

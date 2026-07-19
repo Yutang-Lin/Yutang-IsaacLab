@@ -71,6 +71,20 @@ def test_gamma_loss_weights_have_unit_log_horizon_expectation():
     assert weights[gamma.argmin()] > weights[gamma.argmax()]
 
 
+def test_soft_gamma_loss_weights_have_unit_log_horizon_expectation():
+    h_min = -math.log1p(-0.4)
+    h_max = -math.log1p(-0.99)
+    edges = torch.linspace(h_min, h_max, 100_001, dtype=torch.float64)
+    h = 0.5 * (edges[:-1] + edges[1:])
+    gamma = 1.0 - torch.exp(-h)
+    weights = normalized_gamma_loss_weights(gamma, 0.4, 0.99, power=1.0)
+
+    torch.testing.assert_close(
+        weights.mean(), torch.tensor(1.0, dtype=weights.dtype), atol=1e-9, rtol=0
+    )
+    assert weights[gamma.argmin()] > weights[gamma.argmax()]
+
+
 def test_innovation_alignment_is_zero_for_matching_innovations():
     innovation = torch.randn(2, 8, 8)
     loss = innovation_alignment_loss(innovation, innovation.clone())

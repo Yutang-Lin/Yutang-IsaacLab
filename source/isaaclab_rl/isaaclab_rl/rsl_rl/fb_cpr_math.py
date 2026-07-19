@@ -69,18 +69,23 @@ def normalized_gamma_loss_weights(
     gamma: torch.Tensor,
     gamma_min: float,
     gamma_max: float,
+    power: float = 2.0,
 ) -> torch.Tensor:
-    """Return ``(1-gamma)^2`` weights with unit expectation under log-h sampling."""
+    """Return ``(1-gamma)^power`` with unit expectation under log-h sampling."""
     if not 0.0 <= gamma_min < gamma_max < 1.0:
         raise ValueError(
             f"Expected 0 <= gamma_min < gamma_max < 1, got {gamma_min}, {gamma_max}"
         )
+    if power < 0.0:
+        raise ValueError(f"Expected power >= 0, got {power}")
+    if power == 0.0:
+        return torch.ones_like(gamma)
     h_min = -math.log1p(-gamma_min)
     h_max = -math.log1p(-gamma_max)
-    expected_square = (
-        (1.0 - gamma_min) ** 2 - (1.0 - gamma_max) ** 2
-    ) / (2.0 * (h_max - h_min))
-    return (1.0 - gamma).square() / expected_square
+    expected_weight = (
+        (1.0 - gamma_min) ** power - (1.0 - gamma_max) ** power
+    ) / (power * (h_max - h_min))
+    return (1.0 - gamma).pow(power) / expected_weight
 
 
 def innovation_alignment_loss(
