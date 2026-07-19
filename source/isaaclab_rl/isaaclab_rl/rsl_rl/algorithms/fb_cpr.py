@@ -2957,9 +2957,9 @@ class FBCprAux:
 
         innovation_align_loss = torch.zeros((), device=z.device, dtype=z.dtype)
         if Fs_alt is not None and target_M_alt is not None:
-            # Let the shared successor space adapt with both F and B so the
-            # gamma-conditioned innovations agree in one representation.
-            B_align_t = B.T
+            # Keep alignment from moving the shared B space; B remains trained
+            # by the main FB and orthogonality objectives.
+            B_align_t = B.detach().T
             Ms_align = torch.matmul(Fs, B_align_t)
             Ms_alt = torch.matmul(Fs_alt, B_align_t)
             not_term = getattr(self, "_fb_not_term", torch.ones_like(fb_gamma_alt))
