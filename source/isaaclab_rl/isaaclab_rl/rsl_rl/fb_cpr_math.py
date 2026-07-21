@@ -96,16 +96,36 @@ def innovation_alignment_loss(
     return 0.5 * F.mse_loss(innovation, innovation_alt)
 
 
+def aux_reward_for_critic(
+    raw_reward: torch.Tensor,
+    ema_normalized_reward: torch.Tensor,
+    fixed_scale: float,
+) -> torch.Tensor:
+    """Use fixed numerical reward units when requested, else adaptive units."""
+    if fixed_scale < 0.0:
+        raise ValueError("fixed_scale must be non-negative")
+    if fixed_scale > 0.0:
+        return raw_reward / fixed_scale
+    return ema_normalized_reward
+
+
 def aux_q_for_actor(
     q_aux: torch.Tensor,
     reward_variance: torch.Tensor,
     denormalize: bool,
+    fixed_scale: float = 0.0,
 ) -> torch.Tensor:
     """Optionally restore normalized Q_aux to detached reward-scale units."""
     if not denormalize:
         return q_aux
-    sigma = reward_variance.clamp_min(0.0).sqrt().detach()
-    return q_aux * sigma.to(device=q_aux.device, dtype=q_aux.dtype)
+    if fixed_scale < 0.0:
+        raise ValueError("fixed_scale must be non-negative")
+    if fixed_scale > 0.0:
+        scale = q_aux.new_tensor(fixed_scale)
+    else:
+        scale = reward_variance.clamp_min(0.0).sqrt().detach()
+        scale = scale.to(device=q_aux.device, dtype=q_aux.dtype)
+    return q_aux * scale
 
 
 def stochastic_integral_weights(

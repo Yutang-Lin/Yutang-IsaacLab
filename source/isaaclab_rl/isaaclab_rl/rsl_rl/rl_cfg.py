@@ -1385,8 +1385,11 @@ class RslRlFBCprAlgorithmCfg:
     reg_coeff: float = 0.05
     reg_coeff_aux: float = 0.02
     aux_actor_denormalize_q: bool = False
-    """Whether the actor multiplies normalized Q_aux by the detached current
-    auxiliary-reward EMA sigma. Auxiliary critic targets remain normalized."""
+    """Whether the actor restores Q_aux using the configured fixed reward
+    scale, or the detached EMA sigma when no fixed scale is configured."""
+    aux_reward_fixed_scale: float = 0.0
+    """Positive fixed divisor for aux-critic rewards. When actor Q_aux
+    denormalization is enabled, the same constant restores its reward units."""
     scale_reg: bool = True
     actor_fb_scale: float = 1.0
     """Scale applied to the actor's FB objective only. The same scaled FB

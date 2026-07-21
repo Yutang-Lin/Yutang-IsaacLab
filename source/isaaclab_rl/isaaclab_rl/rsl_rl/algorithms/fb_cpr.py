@@ -40,6 +40,7 @@ from isaaclab.utils import configclass
 
 from ..fb_cpr_math import (
     aux_q_for_actor,
+    aux_reward_for_critic,
     centered_subwindow_start,
     ema_grad_spike_state,
     innovation_alignment_loss,
@@ -267,8 +268,11 @@ class FBCprAuxAlgorithmCfg:
     reg_coeff: float = 0.05       # weight on Q_discriminator inside actor loss
     reg_coeff_aux: float = 0.02   # weight on Q_aux_critic inside actor loss
     aux_actor_denormalize_q: bool = False
-    """Multiply normalized Q_aux by the detached auxiliary-reward EMA sigma
-    in the actor objective. The aux critic still trains on normalized rewards."""
+    """Restore actor Q_aux using the fixed reward scale when configured,
+    otherwise using the detached auxiliary-reward EMA sigma."""
+    aux_reward_fixed_scale: float = 0.0
+    """If positive, train the aux critic on raw reward divided by this fixed
+    scale. With aux_actor_denormalize_q, the actor multiplies Q_aux by it."""
     scale_reg: bool = True         # multiply regs by |Q_fb|.abs().mean().detach()
     # Actor-only FB scale alignment. Applied before scale_reg so the direct FB
     # and regularizer terms scale together; FB TD targets remain unchanged.
@@ -507,6 +511,8 @@ class FBCprAux:
         self._fb_grad_norm_ema_b = 0.0
         self._fb_grad_norm_ema_steps = 0
         self._fb_tail_diagnostic_step = 0
+        if float(getattr(cfg, "aux_reward_fixed_scale", 0.0)) < 0.0:
+            raise ValueError("aux_reward_fixed_scale must be non-negative")
         if bool(getattr(cfg, "fb_grad_spike_clip", False)):
             decay = float(getattr(cfg, "fb_grad_spike_ema_decay", 0.99))
             multiplier = float(getattr(cfg, "fb_grad_spike_multiplier", 5.0))
@@ -2406,8 +2412,14 @@ class FBCprAux:
                 vals = aux_batch[name].to(self.device, non_blocking=True).view(-1, 1)
                 aux_rew_logs[f"aux_rew/{name}"] = vals.mean().detach()
                 aux_reward = aux_reward + scale * vals
-        # Pass through EMA reward normalizer (BFM's `RewardNormalizer(scale=True)`).
-        aux_reward = self.policy._aux_reward_normalizer(aux_reward)
+        # Always update EMA moments for diagnostics. A positive fixed scale
+        # replaces adaptive normalization while retaining those diagnostics.
+        aux_reward_ema = self.policy._aux_reward_normalizer(aux_reward)
+        aux_reward = aux_reward_for_critic(
+            aux_reward,
+            aux_reward_ema,
+            self.cfg.aux_reward_fixed_scale,
+        )
 
         # =============================================================
         # PHASE 1: disc + F/B + aux_critic all have NO data dependency
@@ -3550,6 +3562,7 @@ class FBCprAux:
             q_aux,
             self.policy._aux_reward_normalizer.S,
             self.cfg.aux_actor_denormalize_q,
+            self.cfg.aux_reward_fixed_scale,
         )
 
     def _backward_actor_transformer(self, win: dict, z: torch.Tensor):

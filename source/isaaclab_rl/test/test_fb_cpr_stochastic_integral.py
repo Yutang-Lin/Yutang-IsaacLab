@@ -7,6 +7,7 @@ import torch
 
 from isaaclab_rl.rsl_rl.fb_cpr_math import (
     aux_q_for_actor,
+    aux_reward_for_critic,
     centered_context_offsets,
     centered_subwindow_start,
     innovation_alignment_loss,
@@ -14,6 +15,19 @@ from isaaclab_rl.rsl_rl.fb_cpr_math import (
     sample_log_horizon_gamma,
     stochastic_integral_weights,
 )
+
+
+def test_aux_critic_uses_fixed_reward_scale_instead_of_ema():
+    raw = torch.tensor([[-128.0], [64.0]])
+    adaptive = torch.tensor([[-1.0], [0.5]])
+
+    output = aux_reward_for_critic(raw, adaptive, fixed_scale=64.0)
+
+    torch.testing.assert_close(output, torch.tensor([[-2.0], [1.0]]))
+    torch.testing.assert_close(
+        aux_reward_for_critic(raw, adaptive, fixed_scale=0.0),
+        adaptive,
+    )
 
 
 def test_aux_actor_q_is_unchanged_by_default():
@@ -32,6 +46,20 @@ def test_aux_actor_q_restores_detached_reward_sigma():
     output.sum().backward()
     torch.testing.assert_close(q_aux.grad, torch.full_like(q_aux, 2.0))
     assert variance.grad is None
+
+
+def test_aux_actor_q_uses_fixed_scale_instead_of_ema_sigma():
+    q_aux = torch.tensor([1.0, 3.0], requires_grad=True)
+    output = aux_q_for_actor(
+        q_aux,
+        reward_variance=torch.tensor(4.0),
+        denormalize=True,
+        fixed_scale=64.0,
+    )
+
+    torch.testing.assert_close(output, 64.0 * q_aux)
+    output.sum().backward()
+    torch.testing.assert_close(q_aux.grad, torch.full_like(q_aux, 64.0))
 
 
 def test_centered_positive_context_preserves_first_t_mean():
