@@ -96,6 +96,18 @@ def innovation_alignment_loss(
     return 0.5 * F.mse_loss(innovation, innovation_alt)
 
 
+def aux_q_for_actor(
+    q_aux: torch.Tensor,
+    reward_variance: torch.Tensor,
+    denormalize: bool,
+) -> torch.Tensor:
+    """Optionally restore normalized Q_aux to detached reward-scale units."""
+    if not denormalize:
+        return q_aux
+    sigma = reward_variance.clamp_min(0.0).sqrt().detach()
+    return q_aux * sigma.to(device=q_aux.device, dtype=q_aux.dtype)
+
+
 def stochastic_integral_weights(
     target_values: torch.Tensor,
     horizons: torch.Tensor,

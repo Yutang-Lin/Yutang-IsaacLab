@@ -1931,6 +1931,7 @@ class FBCprRunner:
             "Q_aux",
             "mean_disc_reward",
             "mean_aux_reward",
+            "aux_reward_sigma_ema",
             # Manifold attractor
             "ma_loss",
             # Soft FB

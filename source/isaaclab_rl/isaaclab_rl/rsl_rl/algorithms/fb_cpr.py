@@ -39,6 +39,7 @@ from torch import autograd
 from isaaclab.utils import configclass
 
 from ..fb_cpr_math import (
+    aux_q_for_actor,
     centered_subwindow_start,
     ema_grad_spike_state,
     innovation_alignment_loss,
@@ -265,6 +266,9 @@ class FBCprAuxAlgorithmCfg:
     # Reg-coeffs in the actor objective
     reg_coeff: float = 0.05       # weight on Q_discriminator inside actor loss
     reg_coeff_aux: float = 0.02   # weight on Q_aux_critic inside actor loss
+    aux_actor_denormalize_q: bool = False
+    """Multiply normalized Q_aux by the detached auxiliary-reward EMA sigma
+    in the actor objective. The aux critic still trains on normalized rewards."""
     scale_reg: bool = True         # multiply regs by |Q_fb|.abs().mean().detach()
     # Actor-only FB scale alignment. Applied before scale_reg so the direct FB
     # and regularizer terms scale together; FB TD targets remain unchanged.
@@ -3477,6 +3481,7 @@ class FBCprAux:
                 "unc_auxQ": Q_unc.mean(),
                 "aux_critic_loss": aux_critic_loss.mean(),
                 "mean_aux_reward": aux_reward.mean(),
+                "aux_reward_sigma_ema": p._aux_reward_normalizer.S.sqrt(),
             }
             if distributional:
                 out["aux_critic_q_spread"] = Qs.std(dim=-1).mean()
@@ -3538,6 +3543,14 @@ class FBCprAux:
         }
 
     # --- actor --------------------------------------------------------------- #
+
+    def _aux_q_for_actor(self, q_aux: torch.Tensor) -> torch.Tensor:
+        """Optionally restore normalized Q_aux to current reward-scale units."""
+        return aux_q_for_actor(
+            q_aux,
+            self.policy._aux_reward_normalizer.S,
+            self.cfg.aux_actor_denormalize_q,
+        )
 
     def _backward_actor_transformer(self, win: dict, z: torch.Tensor):
         """Actor loss for the RoPE transformer actor — ALL H+1 TOKENS (temporal-parallel).
@@ -3602,7 +3615,7 @@ class FBCprAux:
         if bool(getattr(pol_cfg, "aux_critic_distributional", False)):
             Qs_aux = Qs_aux.mean(dim=-1, keepdim=True)
         _, _, Q_aux = self._pessimistic_value(Qs_aux, self.cfg.actor_pessimism_penalty)
-        Q_aux = Q_aux.reshape(BL)
+        Q_aux = self._aux_q_for_actor(Q_aux.reshape(BL))
         # gamma-conditioned F: main term at gamma_L, plus a gamma_S short-horizon
         # term (mirrors the MLP actor path). f_gc guards non-conditioned F.
         _f_gc = bool(getattr(self.cfg, "fb_gamma_conditioned", False)) and \
@@ -3729,6 +3742,7 @@ class FBCprAux:
         if bool(getattr(pol_cfg, "aux_critic_distributional", False)):
             Qs_aux = Qs_aux.mean(dim=-1, keepdim=True)
         _, _, Q_aux = self._pessimistic_value(Qs_aux, self.cfg.actor_pessimism_penalty)
+        Q_aux = self._aux_q_for_actor(Q_aux)
         # Q from FB (implicit Q = F·z). With gamma-conditioning, query F at the
         # LONG horizon gamma_L (= cfg.discount) for the main term, and add a
         # short-horizon term at gamma_S:

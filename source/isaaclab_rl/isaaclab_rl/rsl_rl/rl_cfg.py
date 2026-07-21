@@ -1384,6 +1384,9 @@ class RslRlFBCprAlgorithmCfg:
     # Actor-objective coefficients
     reg_coeff: float = 0.05
     reg_coeff_aux: float = 0.02
+    aux_actor_denormalize_q: bool = False
+    """Whether the actor multiplies normalized Q_aux by the detached current
+    auxiliary-reward EMA sigma. Auxiliary critic targets remain normalized."""
     scale_reg: bool = True
     actor_fb_scale: float = 1.0
     """Scale applied to the actor's FB objective only. The same scaled FB

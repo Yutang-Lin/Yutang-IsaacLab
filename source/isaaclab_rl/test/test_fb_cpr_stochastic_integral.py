@@ -6,6 +6,7 @@ os.environ["ENABLE_ISAACLAB"] = "False"
 import torch
 
 from isaaclab_rl.rsl_rl.fb_cpr_math import (
+    aux_q_for_actor,
     centered_context_offsets,
     centered_subwindow_start,
     innovation_alignment_loss,
@@ -13,6 +14,24 @@ from isaaclab_rl.rsl_rl.fb_cpr_math import (
     sample_log_horizon_gamma,
     stochastic_integral_weights,
 )
+
+
+def test_aux_actor_q_is_unchanged_by_default():
+    q_aux = torch.tensor([1.0, 3.0], requires_grad=True)
+    output = aux_q_for_actor(q_aux, torch.tensor(4.0), denormalize=False)
+
+    torch.testing.assert_close(output, q_aux)
+
+
+def test_aux_actor_q_restores_detached_reward_sigma():
+    q_aux = torch.tensor([1.0, 3.0], requires_grad=True)
+    variance = torch.tensor(4.0, requires_grad=True)
+    output = aux_q_for_actor(q_aux, variance, denormalize=True)
+
+    torch.testing.assert_close(output, 2.0 * q_aux)
+    output.sum().backward()
+    torch.testing.assert_close(q_aux.grad, torch.full_like(q_aux, 2.0))
+    assert variance.grad is None
 
 
 def test_centered_positive_context_preserves_first_t_mean():
