@@ -1137,7 +1137,7 @@ class RslRlFBCprPolicyCfg:
     actor_model: Literal["residual", "simple"] = "residual"
     actor_hidden_layers: int = 6
     actor_embedding_layers: int = 2
-    actor_std: float = 0.05
+    actor_std: float | tuple[float, ...] = 0.05
     actor_input_keys: tuple[str, ...] = (
         "state",
         "last_action",

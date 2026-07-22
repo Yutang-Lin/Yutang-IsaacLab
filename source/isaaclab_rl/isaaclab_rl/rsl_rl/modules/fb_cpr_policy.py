@@ -850,6 +850,36 @@ class ForwardMap(nn.Module):
         return self.Fs(torch.cat([sa_embedding, z_embedding], dim=-1))
 
 
+ActorStd = float | tp.Sequence[float] | torch.Tensor
+
+
+def _broadcast_actor_std(mu: torch.Tensor, std: ActorStd) -> torch.Tensor:
+    """Broadcast scalar, per-env, or fixed per-action exploration std."""
+    if torch.is_tensor(std):
+        s = std.to(mu.device, mu.dtype)
+        if s.dim() == 1 and s.numel() == mu.shape[-1]:
+            shape = (1,) * (mu.dim() - 1) + (mu.shape[-1],)
+            return torch.ones_like(mu) * s.view(shape)
+        # Behavior-policy overrides are per-env: [N] or [N, 1].
+        if s.dim() == 1:
+            s = s.unsqueeze(-1)
+        while s.dim() < mu.dim():
+            s = s.unsqueeze(-1)
+        return torch.ones_like(mu) * s
+    if isinstance(std, numbers.Real):
+        return torch.ones_like(mu) * float(std)
+
+    # Config sequences are fixed per-action values and broadcast over every
+    # leading batch/time dimension.
+    s = torch.as_tensor(tuple(std), device=mu.device, dtype=mu.dtype)
+    if s.ndim != 1 or s.numel() != mu.shape[-1]:
+        raise ValueError(
+            f"Per-action actor_std must have {mu.shape[-1]} values, got {tuple(s.shape)}"
+        )
+    shape = (1,) * (mu.dim() - 1) + (mu.shape[-1],)
+    return torch.ones_like(mu) * s.view(shape)
+
+
 class Actor(nn.Module):
     """BFM actor ``pi(a | s, z)`` returning a :class:`TruncatedNormal`."""
 
@@ -926,7 +956,7 @@ class Actor(nn.Module):
         self,
         obs: torch.Tensor | dict[str, torch.Tensor],
         z: torch.Tensor,
-        std: float | torch.Tensor,
+        std: ActorStd,
     ) -> TruncatedNormal:
         obs = self.input_filter(obs)
         z_embedding = self.embed_z(torch.cat([obs, z], dim=-1))
@@ -941,14 +971,7 @@ class Actor(nn.Module):
             return SquashedNormal(mu_raw, std_tensor)
         else:
             mu = torch.tanh(out)
-            if torch.is_tensor(std):
-                # Per-env std: accept [N] or [N,1], broadcast over action dims.
-                s = std.to(mu.device, mu.dtype)
-                if s.dim() == 1:
-                    s = s.unsqueeze(-1)
-                std_tensor = torch.ones_like(mu) * s
-            else:
-                std_tensor = torch.ones_like(mu) * std
+            std_tensor = _broadcast_actor_std(mu, std)
             return TruncatedNormal(mu, std_tensor)
 
 
@@ -1109,13 +1132,7 @@ class TransformerActorWrapper(nn.Module):
 
     @staticmethod
     def _dist(mu, std):
-        if torch.is_tensor(std):
-            s = std.to(mu.device, mu.dtype)
-            while s.dim() < mu.dim():
-                s = s.unsqueeze(-1)
-            std_tensor = torch.ones_like(mu) * s
-        else:
-            std_tensor = torch.ones_like(mu) * std
+        std_tensor = _broadcast_actor_std(mu, std)
         return TruncatedNormal(mu, std_tensor)
 
 
@@ -1286,7 +1303,7 @@ class FBCprNetworkCfg:
     actor_model: str = "residual"
     actor_hidden_layers: int = 6
     actor_embedding_layers: int = 2
-    actor_std: float = 0.05
+    actor_std: float | tuple[float, ...] = 0.05
     actor_input_keys: tp.Sequence[str] = ("state", "last_action", "history_actor")
     # Actor architecture: "mlp" (default residual MLP, Actor) or "transformer"
     # (RoPE causal transformer over per-timestep tokens, RoPETransformerActor).
@@ -1461,7 +1478,24 @@ class FBCprAuxPolicy(nn.Module):
         self.z_dim: int = cfg.z_dim
         self.norm_z: bool = cfg.norm_z
         self.seq_length: int = cfg.seq_length
-        self.actor_std: float = cfg.actor_std
+        if isinstance(cfg.actor_std, numbers.Real):
+            self._actor_std_scalar: float | None = float(cfg.actor_std)
+            self.register_buffer("_actor_std_vector", None, persistent=False)
+        else:
+            actor_std = tuple(float(value) for value in cfg.actor_std)
+            if len(actor_std) != action_dim:
+                raise ValueError(
+                    f"actor_std must have {action_dim} per-action values, "
+                    f"got {len(actor_std)}"
+                )
+            if any(not math.isfinite(value) or value <= 0.0 for value in actor_std):
+                raise ValueError("Every per-action actor_std must be finite and positive")
+            self._actor_std_scalar = None
+            self.register_buffer(
+                "_actor_std_vector",
+                torch.tensor(actor_std, dtype=torch.float32),
+                persistent=False,
+            )
 
         # Obs normalizer.
         self._obs_normalizer = ObsNormalizer(
@@ -1634,6 +1668,13 @@ class FBCprAuxPolicy(nn.Module):
         self.train(False)
         self.requires_grad_(False)
 
+    @property
+    def actor_std(self) -> float | torch.Tensor:
+        if self._actor_std_scalar is not None:
+            return self._actor_std_scalar
+        assert self._actor_std_vector is not None
+        return self._actor_std_vector
+
     # ---- training setup ----
 
     def _prepare_for_train(self) -> None:
@@ -1800,9 +1841,9 @@ class FBCprAuxPolicy(nn.Module):
         obs: torch.Tensor | dict[str, torch.Tensor],
         z: torch.Tensor,
         mean: bool = True,
-        std: "float | torch.Tensor | None" = None,
+        std: "ActorStd | None" = None,
     ) -> torch.Tensor:
-        # ``std`` overrides the scalar ``self.actor_std`` for exploration. A
+        # ``std`` overrides the configured fixed ``self.actor_std``. A
         # per-env tensor (shape [N] or [N,1]) broadcasts against the action mean
         # so each env can roll out with its own exploration scale. mean=True
         # (deterministic) ignores std.

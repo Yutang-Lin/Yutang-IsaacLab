@@ -624,7 +624,7 @@ class FBCprRunner:
         """``n`` per-env exploration stds, uniform in [explore_std_min,
         explore_std_max]. Behavior-policy only; the TD target uses actor_std."""
         lo, hi = self.explore_std_min, self.explore_std_max
-        return torch.rand(n, device=self.device) * (hi - lo) + lo
+        return torch.rand(n, 1, device=self.device) * (hi - lo) + lo
 
     def _apply_tracking_sim_anchor(self, robot) -> None:
         """Two-frame anchor: set the env ``anchored_pose`` anchor for the freshly
