@@ -1570,6 +1570,9 @@ class RslRlFBCprAlgorithmCfg:
     eval_rollout_length: int = 250
     """Per-motion tracking rollout length (steps). BFM's default 250."""
 
+    eval_emd_workers: int = 4
+    """Parallel exact POT EMD solves per rank. Each solve uses one CPU thread."""
+
     eval_update_priorities: bool = True
     """If True, feed tracking MPJPE back into the expert buffer's
     sampling weights (prioritized RSI sampling). BFM production: True."""

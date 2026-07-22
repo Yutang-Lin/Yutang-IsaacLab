@@ -21,6 +21,7 @@ import subprocess
 import threading
 import time
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict
 
 import torch
@@ -356,6 +357,7 @@ class FBCprRunner:
         # eval only fires once ``tot_timesteps - 0 >= eval_every_steps``.
         self.eval_every_steps = int(self.alg_cfg.get("eval_every_steps", 9_600_000))
         self.eval_rollout_length = int(self.alg_cfg.get("eval_rollout_length", 250))
+        self.eval_emd_workers = max(1, int(self.alg_cfg.get("eval_emd_workers", 4)))
         self.eval_update_priorities = bool(self.alg_cfg.get("eval_update_priorities", True))
         self.eval_priority_min = float(self.alg_cfg.get("eval_priority_min", 0.5))
         self.eval_priority_max = float(self.alg_cfg.get("eval_priority_max", 2.0))
@@ -1534,9 +1536,21 @@ class FBCprRunner:
             action_dim = int(self.action_dim)
             num_joints = int(self.expert_buffer.num_joints)
 
-            # Pre-encode z per motion via B + rolling seq_length mean.
-            z_per_motion: list[torch.Tensor] = []
-            for m in range(num_motions):
+            # Pre-encode a time-major CPU schedule for the motions that are
+            # actually assigned to an environment. Keeping motion (rather than
+            # environment) rows avoids duplicating z for the multiple DR
+            # replicas of each motion. At rollout, one contiguous transfer plus
+            # one GPU index_select replaces the old per-motion mask/transfer
+            # loop at every timestep.
+            num_assigned_motions = min(num_motions, num_envs)
+            z_motion_schedule = torch.empty(
+                L - 1,
+                num_assigned_motions,
+                self.policy.z_dim,
+                dtype=torch.float32,
+                device="cpu",
+            )
+            for m in range(num_assigned_motions):
                 win = self.expert_buffer.get_motion_window(m, num_frames=L)
                 next_obs_dict = {
                     "state": win["state"][1:].to(self.device, non_blocking=True),
@@ -1554,16 +1568,18 @@ class FBCprRunner:
                     next_obs_dict["anchored_pose"] = ap
                 z = self.policy.backward_map(next_obs_dict)   # [L-1, z_dim]
                 # Match UFO's eval z-encoding exactly: one next-reference frame,
-                # so this mean is an identity rather than temporal averaging.
-                for s in range(z.shape[0]):
-                    end = min(s + 1, z.shape[0])
-                    z[s] = z[s:end].mean(dim=0)
+                # i.e. no temporal averaging is needed here.
                 z = self.policy.project_z(z)
-                # Stash on CPU: the full z_per_motion list is [num_motions x
-                # (L-1) x z_dim] and with the mirrored dataset that's ~5 GB/rank
-                # held on GPU for the whole rollout. Keep it in host RAM and move
-                # each motion's slice to the GPU on demand in the rollout loop.
-                z_per_motion.append(z.to("cpu"))
+                if z.shape[0] == 0:
+                    z_motion_schedule[:, m].zero_()
+                    continue
+                z_cpu = z.to(device="cpu", dtype=torch.float32)
+                n = min(int(z_cpu.shape[0]), L - 1)
+                z_motion_schedule[:n, m].copy_(z_cpu[:n])
+                # Match the old min(t, motion_length - 1) behavior for motions
+                # shorter than the fixed evaluation rollout.
+                if n < L - 1:
+                    z_motion_schedule[n:, m].copy_(z_cpu[n - 1])
 
             # --- reset envs to each motion's frame-0 state ---
             # Build aligned per-env buffers.
@@ -1646,18 +1662,12 @@ class FBCprRunner:
             jp_log[:, 0] = env_u.joint_pos
             dpd_log[:, 0] = obs_dict["state"][:, :num_joints]
             for t in range(1, L):
-                # Pack z for each env at time t (cap at motion length).
-                z_batch = torch.zeros(num_envs, self.policy.z_dim, device=self.device)
-                for m in range(num_motions):
-                    zm = z_per_motion[m]
-                    if zm.shape[0] == 0:
-                        continue
-                    idx = min(t - 1, zm.shape[0] - 1)
-                    mask = motion_of_env == m
-                    if mask.any():
-                        # zm is on CPU (see z_per_motion stash); move the single
-                        # indexed frame to the GPU for the assignment.
-                        z_batch[mask] = zm[idx].to(self.device)
+                # One H2D transfer for all assigned motions, then replicate
+                # motion z across their DR environments entirely on the GPU.
+                z_motion_t = z_motion_schedule[t - 1].to(
+                    self.device, non_blocking=True
+                )
+                z_batch = z_motion_t.index_select(0, motion_of_env)
                 action = self.policy.act(obs_dict, z_batch, mean=True)
                 new_obs, _, _, infos = self.env.step(action.to(self.env.device))
                 obs_dict = self._obs_to_device(new_obs, infos)
@@ -1673,39 +1683,64 @@ class FBCprRunner:
             mpjpe_per_motion = torch.zeros(num_motions, device=self.device)
             emd_per_motion = torch.zeros(num_motions, device=self.device)
             count_per_motion = torch.zeros(num_motions, device=self.device)
-            for m in range(num_motions):
-                win = self.expert_buffer.get_motion_window(m, num_frames=L)
-                T_m = int(win["num_frames"])
-                if T_m < 2:
-                    continue
-                target_jp = win["joint_pos"][:T_m].to(self.device)     # [T_m, J]
-                target_state = win["state"][:T_m, :num_joints].to(self.device)  # [T_m, J]
-                mask = motion_of_env == m
-                if not mask.any():
-                    continue
-                # MPJPE: per-env L2 error in mm (averaged over joints then over time).
-                env_jp = jp_log[mask, :T_m]                            # [N_env, T_m, J]
-                err = torch.norm(env_jp - target_jp.unsqueeze(0), dim=-1).mean(dim=-1) * 1000.0
-                mpjpe_per_motion[m] = err.mean()
-                # EMD: optimal transport on the rollout's dof_pos_dev sequence vs the
-                # motion's dof_pos_dev sequence. BFM uses `state[:, :QVEL_IDX]`, i.e.
-                # the dof_pos block only. Take the first env assigned to this motion
-                # (BFM averages across per-motion envs; for a single-rep eval picking
-                # the first is equivalent).
-                env_idxs = mask.nonzero(as_tuple=False).view(-1)
-                first_env = int(env_idxs[0].item())
-                agent_seq = dpd_log[first_env, :T_m].detach()          # [T_m, J]
-                ref_seq = target_state                                 # [T_m, J]
-                # pairwise L2 distance matrix, then uniform-mass OT.
-                cost = torch.cdist(agent_seq, ref_seq, p=2).detach().cpu().numpy()
-                a = _np.ones(cost.shape[0]) / cost.shape[0]
-                b = _np.ones(cost.shape[1]) / cost.shape[1]
+            emd_jobs = []
+
+            def _solve_uniform_emd(cost):
+                a = _np.ones(cost.shape[0], dtype=_np.float64) / cost.shape[0]
+                b = _np.ones(cost.shape[1], dtype=_np.float64) / cost.shape[1]
                 try:
-                    emd_val = float(_ot.emd2(a, b, cost, numItermax=100_000))
+                    return float(
+                        _ot.emd2(
+                            a,
+                            b,
+                            cost,
+                            numItermax=100_000,
+                            numThreads=1,
+                        )
+                    )
                 except Exception:
-                    emd_val = float("nan")
-                emd_per_motion[m] = emd_val
-                count_per_motion[m] = 1.0
+                    return float("nan")
+
+            # POT's exact network-simplex solver is CPU-only. Pipeline GPU
+            # cdist preparation with a bounded pool of independent EMD solves;
+            # each solve stays single-threaded to avoid nested oversubscription
+            # when many DDP ranks share one host.
+            num_emd_workers = min(self.eval_emd_workers, num_assigned_motions)
+            with ThreadPoolExecutor(
+                max_workers=num_emd_workers,
+                thread_name_prefix="bfm-eval-emd",
+            ) as emd_pool:
+                for m in range(num_motions):
+                    win = self.expert_buffer.get_motion_window(m, num_frames=L)
+                    T_m = int(win["num_frames"])
+                    if T_m < 2:
+                        continue
+                    target_jp = win["joint_pos"][:T_m].to(self.device)     # [T_m, J]
+                    target_state = win["state"][:T_m, :num_joints].to(self.device)  # [T_m, J]
+                    mask = motion_of_env == m
+                    if not mask.any():
+                        continue
+                    # MPJPE: per-env L2 error in mm (averaged over joints then over time).
+                    env_jp = jp_log[mask, :T_m]                            # [N_env, T_m, J]
+                    err = torch.norm(env_jp - target_jp.unsqueeze(0), dim=-1).mean(dim=-1) * 1000.0
+                    mpjpe_per_motion[m] = err.mean()
+                    # EMD: optimal transport on the rollout's dof_pos_dev sequence vs the
+                    # motion's dof_pos_dev sequence. BFM uses `state[:, :QVEL_IDX]`, i.e.
+                    # the dof_pos block only. Take the first env assigned to this motion
+                    # (BFM averages across per-motion envs; for a single-rep eval picking
+                    # the first is equivalent).
+                    env_idxs = mask.nonzero(as_tuple=False).view(-1)
+                    first_env = int(env_idxs[0].item())
+                    agent_seq = dpd_log[first_env, :T_m].detach()          # [T_m, J]
+                    ref_seq = target_state                                 # [T_m, J]
+                    # Prepare pairwise L2 cost on GPU, then submit the exact
+                    # uniform-mass OT solve immediately so CPU and GPU work overlap.
+                    cost = torch.cdist(agent_seq, ref_seq, p=2).detach().cpu().numpy()
+                    emd_jobs.append((m, emd_pool.submit(_solve_uniform_emd, cost)))
+                    count_per_motion[m] = 1.0
+
+                for m, future in emd_jobs:
+                    emd_per_motion[m] = future.result()
 
             valid = count_per_motion > 0
             if not bool(valid.any().item()):
