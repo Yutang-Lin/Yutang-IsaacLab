@@ -1271,6 +1271,24 @@ class RslRlFBCprAlgorithmCfg:
     obs_normalizer_scale_momentum: bool = True
     """Whether LR scaling also speeds up observation BatchNorm running moments."""
 
+    obs_normalizer_global_moments: bool = True
+    """Pool observation moments across DDP ranks before every optimizer update."""
+
+    rollout_tracking_legacy_schedule: bool = False
+    """Use episode-phase-triggered rollout tracking resampling."""
+
+    rollout_tracking_with_replacement: bool = False
+    """Select tracking environments with replacement, matching UFO FB-CPR."""
+
+    expert_tracking_circular_wrap: bool = False
+    """Allow short expert tracking motions using legacy circular/clamped indexing."""
+
+    replay_sampling_mode: str = "uniform_transition"
+    """Replay law: ``uniform_transition`` or legacy ``uniform_trajectory``."""
+
+    replay_mark_eval_boundary: bool = True
+    """Mark restored post-eval observations as a new replay segment."""
+
     target_tau_scale_with_world_size: bool = False
     """Whether FB and critic target-network Polyak rates scale with
     sqrt(world_size)."""

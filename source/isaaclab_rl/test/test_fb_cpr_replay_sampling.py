@@ -27,7 +27,9 @@ FBCprReplayBuffer = _mod.FBCprReplayBuffer
 FBCprExpertBuffer = _mod.FBCprExpertBuffer
 
 
-def _make_buffer() -> FBCprReplayBuffer:
+def _make_buffer(
+    sampling_mode: str = "uniform_transition",
+) -> FBCprReplayBuffer:
     return FBCprReplayBuffer(
         capacity=16,
         num_envs=1,
@@ -37,6 +39,7 @@ def _make_buffer() -> FBCprReplayBuffer:
         aux_reward_names=[],
         device="cpu",
         pin_memory=False,
+        replay_sampling_mode=sampling_mode,
     )
 
 
@@ -114,6 +117,122 @@ def test_sequence_sampling_is_uniform_over_valid_starts():
     expected = torch.full((6,), 5_000.0)
     assert torch.all((counts[expected_rows].float() - expected).abs() < 350)
     assert counts.sum() == 30_000
+
+
+def test_flat_legacy_sampling_is_uniform_over_trajectories():
+    buffer = _make_buffer(sampling_mode="uniform_trajectory")
+    # The trajectories have one and six valid transitions. Legacy sampling
+    # assigns half the draws to each trajectory, then samples within it.
+    buffer._start_idx = torch.tensor([[0, 0], [4, 0]])
+    buffer._lengths = torch.tensor([2, 7])
+    buffer._recompute_traj_info = False
+    buffer._idx = 12
+    buffer._obs["state"][:, 0, 0] = torch.arange(16)
+
+    torch.manual_seed(19)
+    sampled = buffer.sample_flat(70_000)["observation"]["state"][:, 0]
+    short_count = (sampled == 0).sum()
+    long_count = (sampled >= 4).sum()
+
+    assert abs(int(short_count) - 35_000) < 600
+    assert abs(int(long_count) - 35_000) < 600
+
+
+def test_sequence_legacy_sampling_is_uniform_over_trajectories():
+    buffer = _make_buffer(sampling_mode="uniform_trajectory")
+    # At seq_length=2 these trajectories have one and five valid starts.
+    buffer._start_idx = torch.tensor([[0, 0], [4, 0]])
+    buffer._lengths = torch.tensor([3, 7])
+    buffer._recompute_traj_info = False
+    buffer._idx = 12
+    buffer._obs["state"][:, 0, 0] = torch.arange(16)
+
+    torch.manual_seed(23)
+    sampled = buffer.sample(60_000, seq_length=2)["observation"]["state"]
+    starts = sampled[::2, 0]
+    short_count = (starts == 0).sum()
+    long_count = (starts >= 4).sum()
+
+    assert abs(int(short_count) - 15_000) < 450
+    assert abs(int(long_count) - 15_000) < 450
+
+
+def test_replay_sampling_mode_is_validated():
+    try:
+        _make_buffer(sampling_mode="not-a-mode")
+    except ValueError as exc:
+        assert "uniform_transition" in str(exc)
+        assert "uniform_trajectory" in str(exc)
+    else:
+        raise AssertionError("invalid replay sampling mode was accepted")
+
+
+def _make_tracking_expert_buffer(
+    circular_wrap: bool,
+    requires_terrain: bool,
+) -> FBCprExpertBuffer:
+    buffer = FBCprExpertBuffer.__new__(FBCprExpertBuffer)
+    buffer.seq_length = 8
+    buffer.device = torch.device("cpu")
+    buffer._expert_tracking_circular_wrap = circular_wrap
+    buffer._lengths_t = torch.tensor([60])
+    buffer._priorities = torch.ones(1)
+    buffer._motion_obs_starts = torch.tensor([0])
+    frames = torch.arange(60, dtype=torch.float32).unsqueeze(-1)
+    buffer._flat_state = frames
+    buffer._flat_priv = frames.clone()
+    buffer._flat_last_action = frames.clone()
+    buffer._flat_history_actor = frames.clone()
+    buffer.requires_terrain_t = torch.tensor([requires_terrain])
+    buffer._emit_anchored_pose = False
+    return buffer
+
+
+def test_tracking_short_motion_requires_legacy_wrap():
+    buffer = _make_tracking_expert_buffer(
+        circular_wrap=False,
+        requires_terrain=False,
+    )
+    try:
+        buffer.sample_tracking_trajectories(num_trajs=1, traj_length=70)
+    except RuntimeError as exc:
+        assert "at least 71 frames" in str(exc)
+    else:
+        raise AssertionError("short tracking motion was accepted without legacy wrap")
+
+
+def test_tracking_short_nonterrain_motion_wraps_circularly():
+    buffer = _make_tracking_expert_buffer(
+        circular_wrap=True,
+        requires_terrain=False,
+    )
+    batch = buffer.sample_tracking_trajectories(num_trajs=1, traj_length=70)
+
+    expected_obs = torch.arange(70) % 59
+    expected_next = (torch.arange(70) + 1) % 59
+    torch.testing.assert_close(
+        batch["observation"]["state"][:, 0], expected_obs.float()
+    )
+    torch.testing.assert_close(
+        batch["next_observation"]["state"][:, 0], expected_next.float()
+    )
+
+
+def test_tracking_short_terrain_motion_clamps_to_last_usable_frame():
+    buffer = _make_tracking_expert_buffer(
+        circular_wrap=True,
+        requires_terrain=True,
+    )
+    batch = buffer.sample_tracking_trajectories(num_trajs=1, traj_length=70)
+
+    expected_obs = torch.arange(70).clamp(max=58)
+    expected_next = (torch.arange(70) + 1).clamp(max=58)
+    torch.testing.assert_close(
+        batch["observation"]["state"][:, 0], expected_obs.float()
+    )
+    torch.testing.assert_close(
+        batch["next_observation"]["state"][:, 0], expected_next.float()
+    )
 
 
 def test_reset_markers_start_new_segments():

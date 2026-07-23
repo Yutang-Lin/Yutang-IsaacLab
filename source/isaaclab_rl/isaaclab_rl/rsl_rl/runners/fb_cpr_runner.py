@@ -257,6 +257,9 @@ class FBCprRunner:
             history_len_override=self._expert_history_len_override(),
             # FK compose on GPU even when stored on CPU (see above).
             compose_device=expert_compose_device,
+            expert_tracking_circular_wrap=bool(
+                self.alg_cfg.get("expert_tracking_circular_wrap", False)
+            ),
         )
         # Forward to the env so RSI can pull from it.
         if hasattr(self.env_unwrapped, "set_expert_buffer"):
@@ -292,6 +295,9 @@ class FBCprRunner:
             # from the policy's actor_history_len when actor_arch=="transformer".
             actor_window_len=self._actor_window_len(),
             history_recompose=history_recompose,
+            replay_sampling_mode=str(
+                self.alg_cfg.get("replay_sampling_mode", "uniform_transition")
+            ),
         )
 
         # --- Seed / rhythm controls ------------------------------------
@@ -839,10 +845,45 @@ class FBCprRunner:
                     f"num_motions={int(eval0.get('Eval/num_motions', 0))}",
                     flush=True,
                 )
-            # Eval snapshots and restores the environment and does not mutate the
-            # rollout context. Keep the existing z and cached observation; a
-            # second z=None call here used to resample tracking assignments and
-            # advance observation history without a simulator step.
+            if bool(
+                self.alg_cfg.get("rollout_tracking_legacy_schedule", False)
+            ):
+                # Legacy Gamma0.8 refreshed the complete rollout context after
+                # the initial evaluation, including a second tracking assignment
+                # draw and any terrain RSI reset it requested.
+                z_context, terrain_reset = self.alg.maybe_update_rollout_context(
+                    z=None,
+                    step_count=step_count,
+                    expert_buffer=self.expert_buffer,
+                    robot_root_xy=(
+                        _robot.data.root_pos_w[:, :2].to(self.device)
+                        if _robot else None
+                    ),
+                    robot_root_quat=(
+                        _robot.data.root_quat_w.to(self.device)
+                        if _robot else None
+                    ),
+                    terrain_z_fn=_terrain_z_fn,
+                )
+                if terrain_reset is not None:
+                    env_ids = terrain_reset["env_ids"]
+                    if hasattr(self.env_unwrapped, "_reset_idx"):
+                        self.env_unwrapped._reset_idx(env_ids)
+                    self._terrain_rsi_from_tracking(
+                        env_ids,
+                        terrain_reset["motion_ids"],
+                        terrain_reset["starts"],
+                    )
+                    step_count[env_ids] = 0
+                    if _robot is not None:
+                        self.alg.update_tracking_pose_after_reset(
+                            env_ids,
+                            _robot.data.root_pos_w[:, :2].to(self.device),
+                            _robot.data.root_quat_w.to(self.device),
+                        )
+            # Current scheduling keeps the existing z and cached observation:
+            # eval snapshots/restores the environment and does not mutate the
+            # rollout context.
 
         # Track LOCAL env-steps (per-rank) for warmup / update cadence / eval
         # cadence. Each rank has its own replay buffer, so
@@ -1299,16 +1340,17 @@ class FBCprRunner:
                     # pre-eval -> post-eval replay transition.
                     # The previous flags were produced inside inference_mode,
                     # so they are inference tensors and cannot be mutated here.
-                    prev_terminated = torch.zeros(
-                        (self.env.num_envs, 1),
-                        dtype=torch.bool,
-                        device=self.device,
-                    )
-                    prev_truncated = torch.ones(
-                        (self.env.num_envs, 1),
-                        dtype=torch.bool,
-                        device=self.device,
-                    )
+                    if bool(self.alg_cfg.get("replay_mark_eval_boundary", True)):
+                        prev_terminated = torch.zeros(
+                            (self.env.num_envs, 1),
+                            dtype=torch.bool,
+                            device=self.device,
+                        )
+                        prev_truncated = torch.ones(
+                            (self.env.num_envs, 1),
+                            dtype=torch.bool,
+                            device=self.device,
+                        )
                     for k, v in eval_metrics.items():
                         loss_dict[k] = v
 

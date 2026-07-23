@@ -93,6 +93,7 @@ class FBCprReplayBuffer:
         extra_field_shapes: dict[str, tuple[int, ...]] | None = None,
         actor_window_len: int = 0,
         history_recompose: dict | None = None,
+        replay_sampling_mode: str = "uniform_transition",
     ) -> None:
         # >0 -> sample() also returns an ``actor_window`` (the transformer actor's
         # per-timestep H+1 frame window + per-position obs + a valid mask), gathered
@@ -114,6 +115,15 @@ class FBCprReplayBuffer:
         self.device = torch.device(device)
         self.action_dim = int(action_dim)
         self.z_dim = int(z_dim)
+        self.replay_sampling_mode = str(replay_sampling_mode)
+        if self.replay_sampling_mode not in (
+            "uniform_transition",
+            "uniform_trajectory",
+        ):
+            raise ValueError(
+                "replay_sampling_mode must be 'uniform_transition' or "
+                f"'uniform_trajectory', got {self.replay_sampling_mode!r}"
+            )
         # BFM's train replay uses seq_length=1 (individual transitions).
         # seq_length=8 is only for the expert slicer. The train buffer's
         # trajectory awareness is for episode-boundary safety, not for
@@ -537,6 +547,34 @@ class FBCprReplayBuffer:
         return traj_sel, relative_starts
 
     @torch.no_grad()
+    def _sample_valid_starts(
+        self,
+        lengths: torch.Tensor,
+        num_samples: int,
+        seq_length: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Sample corrected-segmentation starts using the configured law."""
+        if (
+            getattr(self, "replay_sampling_mode", "uniform_transition")
+            == "uniform_transition"
+        ):
+            return self._sample_uniform_valid_starts(
+                lengths, num_samples, seq_length
+            )
+
+        valid_start_counts = lengths - seq_length
+        if not bool((valid_start_counts > 0).all().item()):
+            raise ValueError("All trajectories must have at least one valid sequence start.")
+        traj_sel = torch.randint(
+            lengths.shape[0], (num_samples,), device=self.device
+        )
+        selected_counts = valid_start_counts[traj_sel].to(torch.float32)
+        relative_starts = (
+            torch.rand(num_samples, device=self.device) * selected_counts
+        ).floor().to(torch.long)
+        return traj_sel, relative_starts
+
+    @torch.no_grad()
     def sample(self, batch_size: int, seq_length: int | None = None) -> dict:
         seq_length = seq_length or self.seq_length
         if len(self) == 0:
@@ -556,7 +594,7 @@ class FBCprReplayBuffer:
         eligible_lengths = self._lengths[eligible_idx]
         eligible_starts = self._start_idx[eligible_idx]
 
-        traj_sel, relative_starts = self._sample_uniform_valid_starts(
+        traj_sel, relative_starts = self._sample_valid_starts(
             eligible_lengths,
             num_slices,
             seq_length,
@@ -592,7 +630,7 @@ class FBCprReplayBuffer:
         eligible_idx = eligible.nonzero(as_tuple=False).squeeze(-1)
         eligible_lengths = self._lengths[eligible_idx]
         eligible_starts = self._start_idx[eligible_idx]
-        traj_sel, rel = self._sample_uniform_valid_starts(
+        traj_sel, rel = self._sample_valid_starts(
             eligible_lengths,
             batch_size,
             seq_length=1,
@@ -807,6 +845,7 @@ class FBCprExpertBuffer:
         priv_include_heading_body: bool = False,
         history_len_override: int | None = None,
         compose_device: str | torch.device | None = None,
+        expert_tracking_circular_wrap: bool = False,
     ) -> None:
         """Expert motion buffer.
 
@@ -831,6 +870,7 @@ class FBCprExpertBuffer:
         self.seq_length = int(seq_length)
         self._length_proportional_priors = bool(length_proportional_priors)
         self.device = torch.device(device)
+        self._expert_tracking_circular_wrap = bool(expert_tracking_circular_wrap)
         # Device for the ONE-TIME load-time FK compose (chain build + batched
         # FK). Defaults to the storage device. Set to a GPU when the buffer
         # itself is stored on CPU (device="cpu") so the compose stays fast
@@ -1433,10 +1473,12 @@ class FBCprExpertBuffer:
             - "starts": [num_trajs] — start frame within each motion
             - "motion_lens": [num_trajs] — usable length of each motion
         """
-        # Tracking z must come from a genuinely contiguous trajectory. Circular
-        # wrapping a short non-looping clip injects an artificial end->start
-        # transition into B(next_obs).
-        MIN_FRAMES = max(50, traj_length + 1)
+        # The default requires a genuinely contiguous trajectory. The opt-in
+        # legacy path accepts short clips and wraps non-terrain motions.
+        circular_wrap = bool(
+            getattr(self, "_expert_tracking_circular_wrap", False)
+        )
+        MIN_FRAMES = 50 if circular_wrap else max(50, traj_length + 1)
         eligible_mask = self._lengths_t >= MIN_FRAMES
         if not bool(eligible_mask.any().item()):
             raise RuntimeError(f"No motion has at least {MIN_FRAMES} frames.")
@@ -1454,8 +1496,24 @@ class FBCprExpertBuffer:
 
         arange = torch.arange(traj_length, device=self.device).unsqueeze(0)
         raw_frame = starts.unsqueeze(1) + arange
-        frame_cur = raw_frame.reshape(-1)
-        frame_nxt = (raw_frame + 1).reshape(-1)
+        if circular_wrap:
+            usable_lens = (motion_lens - 1).clamp_min(1).unsqueeze(1)
+            # Legacy terrain trajectories pad at the final usable frame;
+            # non-terrain trajectories wrap circularly.
+            is_terrain = self.requires_terrain_t[motion_picks].unsqueeze(1)
+            frame_cur_wrap = raw_frame % usable_lens
+            frame_cur_clamp = raw_frame.clamp(max=usable_lens - 1)
+            frame_cur = torch.where(
+                is_terrain, frame_cur_clamp, frame_cur_wrap
+            ).reshape(-1)
+            frame_nxt_wrap = (raw_frame + 1) % usable_lens
+            frame_nxt_clamp = (raw_frame + 1).clamp(max=usable_lens - 1)
+            frame_nxt = torch.where(
+                is_terrain, frame_nxt_clamp, frame_nxt_wrap
+            ).reshape(-1)
+        else:
+            frame_cur = raw_frame.reshape(-1)
+            frame_nxt = (raw_frame + 1).reshape(-1)
         motion_flat = motion_picks.unsqueeze(1).expand(-1, traj_length).reshape(-1)
 
         global_cur = self._motion_obs_starts[motion_flat] + frame_cur

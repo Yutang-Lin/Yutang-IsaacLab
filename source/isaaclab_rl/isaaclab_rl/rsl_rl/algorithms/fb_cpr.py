@@ -187,6 +187,16 @@ class FBCprAuxAlgorithmCfg:
     lr_scale_with_world_size: bool = True
     lr_scale_with_batch_size: bool = True
     obs_normalizer_scale_momentum: bool = True
+    obs_normalizer_global_moments: bool = True
+
+    # Rollout/replay sampling controls. The replacement flag is independent of
+    # the legacy episode-phase clock so standard coherent 250-step tracking can
+    # use UFO's cohort-selection law without restoring other legacy semantics.
+    rollout_tracking_legacy_schedule: bool = False
+    rollout_tracking_with_replacement: bool = False
+    expert_tracking_circular_wrap: bool = False
+    replay_sampling_mode: str = "uniform_transition"
+    replay_mark_eval_boundary: bool = True
 
     # Optional world-size scaling for the FB/critic target-network Polyak rates.
     target_tau_scale_with_world_size: bool = False
@@ -511,6 +521,14 @@ class FBCprAux:
         self._fb_grad_norm_ema_b = 0.0
         self._fb_grad_norm_ema_steps = 0
         self._fb_tail_diagnostic_step = 0
+        replay_sampling_mode = str(
+            getattr(cfg, "replay_sampling_mode", "uniform_transition")
+        )
+        if replay_sampling_mode not in ("uniform_transition", "uniform_trajectory"):
+            raise ValueError(
+                "replay_sampling_mode must be 'uniform_transition' or "
+                f"'uniform_trajectory', got {replay_sampling_mode!r}"
+            )
         if float(getattr(cfg, "aux_reward_fixed_scale", 0.0)) < 0.0:
             raise ValueError("aux_reward_fixed_scale must be non-negative")
         if bool(getattr(cfg, "fb_grad_spike_clip", False)):
@@ -1345,6 +1363,24 @@ class FBCprAux:
         terrain_envs = None
         if tracking_enabled:
             traj_len = int(self.cfg.rollout_expert_trajectories_length)
+            if bool(getattr(self.cfg, "rollout_tracking_legacy_schedule", False)):
+                idxs = step_count % traj_len
+                if bool((idxs == 0).any()):
+                    terrain_envs = self._resample_tracking(
+                        step_count, expert_buffer, robot_root_xy, robot_root_quat,
+                        terrain_z_fn=terrain_z_fn,
+                    )
+                if getattr(self, "_tracking_env_idx", None) is not None:
+                    mod_time = idxs[self._tracking_env_idx].view(-1)
+                    mod_time = torch.clamp(
+                        mod_time, 0, self._tracking_z.shape[1] - 1
+                    )
+                    n = len(self._tracking_env_idx)
+                    z[self._tracking_env_idx] = self._tracking_z[
+                        torch.arange(n, device=self.device), mod_time,
+                    ]
+                return z, terrain_envs
+
             tracking_phase = int(getattr(self, "_tracking_phase", 0)) + 1
             if tracking_phase >= traj_len:
                 old_tracking_env_idx = getattr(self, "_tracking_env_idx", None)
@@ -1385,9 +1421,18 @@ class FBCprAux:
         n_envs = step_count.shape[0]
         tracking_fraction = float(self.cfg.rollout_expert_trajectories_percentage)
         n_elem = min(n_envs, max(1, int(tracking_fraction * n_envs)))
-        self._tracking_env_idx = torch.randperm(
-            n_envs, device=self.device
-        )[:n_elem]
+        with_replacement = bool(
+            getattr(self.cfg, "rollout_tracking_with_replacement", False)
+            or getattr(self.cfg, "rollout_tracking_legacy_schedule", False)
+        )
+        if with_replacement:
+            self._tracking_env_idx = torch.randint(
+                0, n_envs, (n_elem,), device=self.device
+            )
+        else:
+            self._tracking_env_idx = torch.randperm(
+                n_envs, device=self.device
+            )[:n_elem]
         # This is a rollout-context clock, deliberately independent of per-env
         # episode ages. Using ``any(step_count % traj_len == 0)`` made one random
         # env reset resample the complete tracking population.
@@ -2131,9 +2176,12 @@ class FBCprAux:
         train_obs: dict[str, torch.Tensor],
         train_next_obs: dict[str, torch.Tensor],
     ) -> None:
-        """Update observation moments from the same global batch on every rank."""
+        """Update observation moments from the training observations."""
         normalizer = self.policy._obs_normalizer
-        if not self.is_distributed:
+        if (
+            not self.is_distributed
+            or not bool(getattr(self.cfg, "obs_normalizer_global_moments", True))
+        ):
             normalizer(train_obs)
             normalizer(train_next_obs)
             return
