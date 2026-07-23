@@ -2231,14 +2231,15 @@ class FBCprAux:
             ).clamp_min_(0.0)
             if bn.num_batches_tracked is not None:
                 bn.num_batches_tracked.add_(1)
-                batches = int(bn.num_batches_tracked.item())
+            if bn.momentum is not None:
+                momentum = float(bn.momentum)
             else:
-                batches = 1
-            momentum = (
-                float(bn.momentum)
-                if bn.momentum is not None
-                else 1.0 / float(batches)
-            )
+                batches = (
+                    int(bn.num_batches_tracked.item())
+                    if bn.num_batches_tracked is not None
+                    else 1
+                )
+                momentum = 1.0 / float(batches)
             bn.running_mean.lerp_(mean.to(bn.running_mean.dtype), momentum)
             bn.running_var.lerp_(var.to(bn.running_var.dtype), momentum)
 
@@ -2285,14 +2286,22 @@ class FBCprAux:
             returning at least `observation` and `next.observation`.
         """
         current_lrs = self._anneal_lrs(step)
+        self._cached_target_action_dist = None
 
         expert_T_per_seq = None
         expert_sample_kwargs = {}
         if self._disc_positive_window > 0:
-            expert_T_per_seq = self._sample_expert_T(
-                self._disc_num_sequences,
-                int(self.policy.seq_length),
+            expert_sampler = replay_buffer[self._EXPERT_KEY]
+            expert_T_per_seq = (
+                expert_sampler.peek("_mean_widths")
+                if hasattr(expert_sampler, "peek")
+                else None
             )
+            if expert_T_per_seq is None:
+                expert_T_per_seq = self._sample_expert_T(
+                    self._disc_num_sequences,
+                    int(self.policy.seq_length),
+                )
             expert_sample_kwargs = {
                 "seq_length": int(self.policy.seq_length),
                 "mean_widths": expert_T_per_seq,
@@ -3011,13 +3020,19 @@ class FBCprAux:
         every FB/critic/aux/entropy TD target.
         """
         p = self.policy
-        if isinstance(self._unwrap(p._actor), TransformerActorWrapper):
-            raw = getattr(self, "_raw_train_next_obs", None)
-            src = raw if raw is not None else next_obs
-            with eval_mode(p._actor):
-                dist = p.actor(src, z, p.actor_std)
-            return dist.sample(clip=self.cfg.stddev_clip)
-        dist = p._actor(next_obs, z, p.actor_std)
+        dist = getattr(self, "_cached_target_action_dist", None)
+        if dist is None:
+            if isinstance(self._unwrap(p._actor), TransformerActorWrapper):
+                raw = getattr(self, "_raw_train_next_obs", None)
+                src = raw if raw is not None else next_obs
+                with eval_mode(p._actor):
+                    dist = p.actor(src, z, p.actor_std)
+            else:
+                dist = p._actor(next_obs, z, p.actor_std)
+            # FB, critic and aux-critic use the same actor distribution but
+            # independently sample from it. Caching removes two identical actor
+            # forwards without correlating their target-smoothing noise.
+            self._cached_target_action_dist = dist
         return dist.sample(clip=self.cfg.stddev_clip)
 
     def backward_fb(
@@ -3316,8 +3331,10 @@ class FBCprAux:
         gn_f = _grad_norm_without_clipping(f_params)
         gn_b = _grad_norm_without_clipping(b_params)
         nonfinite = (~torch.isfinite(gn_f) | ~torch.isfinite(gn_b)).to(torch.int32)
-        if self.is_distributed:
-            torch.distributed.all_reduce(nonfinite, op=torch.distributed.ReduceOp.MAX)
+        # F/B gradients have already been globally reduced by DDP hooks or the
+        # merged phase-1 reducer, so this predicate is identical on every rank.
+        # A second scalar collective here only adds one synchronization per
+        # optimizer update.
         if bool(nonfinite.item()):
             self.forward_optimizer.zero_grad(set_to_none=True)
             self.backward_optimizer.zero_grad(set_to_none=True)

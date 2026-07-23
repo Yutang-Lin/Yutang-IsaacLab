@@ -465,9 +465,6 @@ class FBCprReplayBuffer:
             return
         done = self._truncated[:len(self)].squeeze(-1)  # [T, E] bool
         T = done.shape[0]
-        E = done.shape[1]
-        starts_list: list[torch.Tensor] = []
-        lengths_list: list[int] = []
         # ``truncated[t]`` marks row t as the FIRST observation after a reset.
         # Traverse the ring in chronological order and split immediately before
         # each such row. The newest written row is an ordinary open-trajectory
@@ -478,38 +475,24 @@ class FBCprReplayBuffer:
             ) % self.time_capacity
         else:
             time_order = torch.arange(T, device=self.device, dtype=torch.long)
-        for e in range(E):
-            boundaries = done[time_order, e].nonzero(as_tuple=False).squeeze(-1)
-            # The oldest retained row starts a segment even if its true episode
-            # began before the ring cursor. Reset rows start the following
-            # segments and remain sampleable as their first observations.
-            segment_starts = torch.cat(
-                (
-                    torch.zeros(1, device=self.device, dtype=torch.long),
-                    boundaries[boundaries > 0],
-                )
-            )
-            segment_ends = torch.cat(
-                (
-                    segment_starts[1:],
-                    torch.tensor([T], device=self.device, dtype=torch.long),
-                )
-            )
-            for start_pos, end_pos in zip(segment_starts.tolist(), segment_ends.tolist()):
-                length = end_pos - start_pos
-                if length <= 0:
-                    continue
-                starts_list.append(
-                    torch.stack(
-                        (
-                            time_order[start_pos],
-                            torch.tensor(e, device=self.device, dtype=torch.long),
-                        )
-                    )
-                )
-                lengths_list.append(length)
-        self._start_idx = torch.stack(starts_list)  # [N_traj, 2]
-        self._lengths = torch.tensor(lengths_list, device=self.device, dtype=torch.long)
+
+        # Build every segment on-device. The previous per-environment loop used
+        # ``Tensor.tolist()`` twice for each environment, forcing thousands of
+        # GPU-to-host synchronizations before every learner burst.
+        segment_start_mask = done[time_order].clone()
+        segment_start_mask[0] = True
+        env_ids, start_pos = segment_start_mask.transpose(0, 1).nonzero(
+            as_tuple=True
+        )
+        end_pos = torch.full_like(start_pos, T)
+        same_env = env_ids[:-1] == env_ids[1:]
+        end_pos[:-1] = torch.where(same_env, start_pos[1:], end_pos[:-1])
+
+        self._start_idx = torch.stack(
+            (time_order[start_pos], env_ids),
+            dim=1,
+        )
+        self._lengths = end_pos - start_pos
         self._recompute_traj_info = False
 
     # -- sampling (BFM's get_idxs + _tensor_slices_from_startend) -----------
@@ -529,9 +512,6 @@ class FBCprReplayBuffer:
         therefore overrepresent short trajectories.
         """
         valid_start_counts = lengths - seq_length
-        if not bool((valid_start_counts > 0).all().item()):
-            raise ValueError("All trajectories must have at least one valid sequence start.")
-
         cumulative_counts = valid_start_counts.cumsum(dim=0)
         total_starts = int(cumulative_counts[-1].item())
         flat_starts = torch.randint(
@@ -563,8 +543,6 @@ class FBCprReplayBuffer:
             )
 
         valid_start_counts = lengths - seq_length
-        if not bool((valid_start_counts > 0).all().item()):
-            raise ValueError("All trajectories must have at least one valid sequence start.")
         traj_sel = torch.randint(
             lengths.shape[0], (num_samples,), device=self.device
         )
@@ -586,11 +564,11 @@ class FBCprReplayBuffer:
         # observations from the same episode.
         min_len = seq_length + 1
         eligible = self._lengths >= min_len
-        if not bool(eligible.any().item()):
+        eligible_idx = eligible.nonzero(as_tuple=False).squeeze(-1)
+        if eligible_idx.numel() == 0:
             raise RuntimeError(
                 f"No trajectories with length >= {min_len}; buffer too small or all episodes shorter."
             )
-        eligible_idx = eligible.nonzero(as_tuple=False).squeeze(-1)
         eligible_lengths = self._lengths[eligible_idx]
         eligible_starts = self._start_idx[eligible_idx]
 
@@ -625,9 +603,9 @@ class FBCprReplayBuffer:
         self._ensure_traj_info()
         # A flat transition needs two observations from the same episode.
         eligible = self._lengths >= 2
-        if not bool(eligible.any().item()):
-            raise RuntimeError("No trajectories with length >= 2.")
         eligible_idx = eligible.nonzero(as_tuple=False).squeeze(-1)
+        if eligible_idx.numel() == 0:
+            raise RuntimeError("No trajectories with length >= 2.")
         eligible_lengths = self._lengths[eligible_idx]
         eligible_starts = self._start_idx[eligible_idx]
         traj_sel, rel = self._sample_valid_starts(
@@ -1945,7 +1923,8 @@ class FBCprExpertBuffer:
     @torch.no_grad()
     def sample_chunks(self, batch_size: int, num_chunks: int,
                       target_device: str | torch.device,
-                      seq_length: int | None = None) -> list[dict]:
+                      seq_length: int | None = None,
+                      mean_widths: torch.Tensor | None = None) -> list[dict]:
         """Sample ``num_chunks`` batches of size ``batch_size`` in ONE call.
 
         Each chunk preserves the ``[N x seq_length]`` ordering ``sample()``
@@ -1964,7 +1943,16 @@ class FBCprExpertBuffer:
         # Python loop of sample() calls (the hot path when the dataset
         # is clip-diced — ~862 motions, with hundreds of unique picks
         # per batch). Keeps the N × seq_length contiguous layout.
-        big = self.sample(batch_size * num_chunks, seq_length=seq_length)
+        mean_widths_flat = (
+            mean_widths.to(target_device).view(-1)
+            if mean_widths is not None
+            else None
+        )
+        big = self.sample(
+            batch_size * num_chunks,
+            seq_length=seq_length,
+            mean_widths=mean_widths_flat,
+        )
 
         # Propagate EVERY obs key sample() produced — not a hardcoded subset.
         # In particular ``anchored_pose`` (emitted when emit_anchored_pose=True)
@@ -2000,6 +1988,13 @@ class FBCprExpertBuffer:
             }
             if canon_cur_flat is not None:
                 chunk["canon_pose"] = canon_cur_flat[s]
+            if mean_widths_flat is not None:
+                seqs_per_chunk = batch_size // seq_length
+                ws = slice(
+                    i * seqs_per_chunk,
+                    (i + 1) * seqs_per_chunk,
+                )
+                chunk["_mean_widths"] = mean_widths_flat[ws]
             chunks.append(chunk)
         return chunks
 

@@ -99,6 +99,44 @@ def test_expert_positive_context_moves_but_first_t_next_window_does_not():
     )
 
 
+def test_expert_chunk_prefetch_preserves_mean_width_schedule():
+    buffer = FBCprExpertBuffer.__new__(FBCprExpertBuffer)
+    buffer.seq_length = 16
+    buffer.device = torch.device("cpu")
+    buffer._lengths_t = torch.tensor([80])
+    buffer._priorities = torch.ones(1)
+    buffer._motion_obs_starts = torch.tensor([0])
+    frames = torch.arange(80, dtype=torch.float32).unsqueeze(-1)
+    buffer._flat_state = frames
+    buffer._flat_priv = frames.clone()
+    buffer._flat_last_action = frames.clone()
+    buffer._flat_history_actor = frames.clone()
+    buffer._emit_anchored_pose = False
+
+    widths = torch.tensor([1, 2, 4, 8])
+    chunks = buffer.sample_chunks(
+        batch_size=32,
+        num_chunks=2,
+        target_device="cpu",
+        mean_widths=widths,
+    )
+
+    assert len(chunks) == 2
+    torch.testing.assert_close(chunks[0]["_mean_widths"], widths[:2])
+    torch.testing.assert_close(chunks[1]["_mean_widths"], widths[2:])
+    obs = torch.cat(
+        [chunk["observation"]["state"] for chunk in chunks]
+    ).view(4, 16)
+    next_obs = torch.cat(
+        [chunk["next"]["observation"]["state"] for chunk in chunks]
+    ).view(4, 16)
+    expected_offsets = torch.tensor([-8, -7, -6, -4])
+    torch.testing.assert_close(
+        obs[:, 0] - next_obs[:, 0],
+        expected_offsets.float() - 1.0,
+    )
+
+
 def test_sequence_sampling_is_uniform_over_valid_starts():
     buffer = _make_buffer()
     # At seq_length=2 these trajectories contribute one and five starts.
@@ -250,6 +288,32 @@ def test_reset_markers_start_new_segments():
     sampled = buffer.sample_flat(20_000)["observation"]["state"][:, 0].long()
     assert not bool((sampled == 2).any())  # 2 -> 3 crosses into the reset row
     assert bool((sampled == 3).any())      # 3 -> 4 is the first valid new-episode pair
+
+
+def test_multi_env_segments_are_grouped_and_length_correct():
+    buffer = FBCprReplayBuffer(
+        capacity=24,
+        num_envs=3,
+        obs_space={"state": (1,)},
+        action_dim=1,
+        z_dim=1,
+        aux_reward_names=[],
+        device="cpu",
+        pin_memory=False,
+    )
+    buffer._idx = 8
+    buffer._truncated[2, 1] = True
+    buffer._truncated[5, 0] = True
+    buffer._truncated[6, 1] = True
+    buffer._recompute_traj_info = True
+    buffer._ensure_traj_info()
+
+    assert buffer._start_idx.tolist() == [
+        [0, 0], [5, 0],
+        [0, 1], [2, 1], [6, 1],
+        [0, 2],
+    ]
+    assert buffer._lengths.tolist() == [5, 3, 2, 4, 2, 8]
 
 
 def test_full_buffer_actor_window_never_wraps_into_future():

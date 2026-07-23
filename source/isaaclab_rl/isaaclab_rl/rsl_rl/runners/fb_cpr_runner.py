@@ -74,6 +74,11 @@ class _PrefetchedSampler:
         self._chunks = chunks
         self._cursor = 0
 
+    def peek(self, key: str, default=None):
+        if self._cursor >= len(self._chunks):
+            return default
+        return self._chunks[self._cursor].get(key, default)
+
     def sample(self, batch_size: int, *args, **kwargs) -> dict:
         if self._cursor >= len(self._chunks):
             raise RuntimeError(
@@ -1242,8 +1247,20 @@ class FBCprRunner:
                 train_chunks = self.replay_buffer.sample_chunks(
                     batch_size, self.num_agent_updates, target_device=self.device,
                 )
+                expert_mean_widths = None
+                if self.alg._disc_positive_window > 0:
+                    expert_mean_widths = torch.cat([
+                        self.alg._sample_expert_T(
+                            self.alg._disc_num_sequences,
+                            int(self.policy.seq_length),
+                        )
+                        for _ in range(self.num_agent_updates)
+                    ])
                 expert_chunks = self.expert_buffer.sample_chunks(
-                    batch_size, self.num_agent_updates, target_device=self.device,
+                    self.alg._disc_batch_size,
+                    self.num_agent_updates,
+                    target_device=self.device,
+                    mean_widths=expert_mean_widths,
                 )
                 replay_dict = {
                     "train": _PrefetchedSampler(train_chunks),
