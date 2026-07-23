@@ -128,6 +128,67 @@ def aux_q_for_actor(
     return q_aux * scale
 
 
+def tracking_failure_metrics(
+    live_priv: torch.Tensor,
+    ref_priv: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return heading-local keypoint MPJPE and absolute root-height error.
+
+    Supports the standard ``max_local_self`` layout ``15*K-2`` and its
+    optional heading-body-tail layout ``24*K-5``.
+    """
+    if live_priv.shape != ref_priv.shape or live_priv.ndim != 2:
+        raise ValueError(
+            "live_priv and ref_priv must have the same [batch, features] shape"
+        )
+    priv_dim = int(ref_priv.shape[-1])
+    if (priv_dim + 2) % 15 == 0:
+        num_bodies = (priv_dim + 2) // 15
+    elif (priv_dim + 5) % 24 == 0:
+        num_bodies = (priv_dim + 5) // 24
+    else:
+        raise ValueError(
+            f"Cannot infer max_local_self body count from dim={priv_dim}"
+        )
+    pos_dim = 3 * (num_bodies - 1)
+    live_pos = live_priv[:, 1 : 1 + pos_dim].view(
+        -1, num_bodies - 1, 3
+    )
+    ref_pos = ref_priv[:, 1 : 1 + pos_dim].view_as(live_pos)
+    local_mpjpe = torch.linalg.vector_norm(
+        live_pos - ref_pos, dim=-1
+    ).mean(dim=-1)
+    root_height_error = (live_priv[:, 0] - ref_priv[:, 0]).abs()
+    return local_mpjpe, root_height_error
+
+
+def tracking_rollback_offsets(
+    local_time: torch.Tensor,
+    rollback_steps: int,
+) -> torch.Tensor:
+    """Return non-negative reference offsets after a failure rollback."""
+    if rollback_steps < 0:
+        raise ValueError("rollback_steps must be non-negative")
+    # local_time indexes the z used for the action that just completed; its
+    # synchronized post-step reference is local_time + 1.
+    return (local_time + 1 - rollback_steps).clamp_min(0)
+
+
+def advance_tracking_phases(
+    local_phases: torch.Tensor,
+    hold_once: torch.Tensor,
+    max_phase: int,
+) -> torch.Tensor:
+    """Advance normal tracking slots while holding freshly reset slots once."""
+    if local_phases.shape != hold_once.shape:
+        raise ValueError("local_phases and hold_once must have matching shapes")
+    if max_phase < 0:
+        raise ValueError("max_phase must be non-negative")
+    return torch.where(
+        hold_once, local_phases, local_phases + 1
+    ).clamp(max=max_phase)
+
+
 def stochastic_integral_weights(
     target_values: torch.Tensor,
     horizons: torch.Tensor,

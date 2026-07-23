@@ -6,6 +6,7 @@ os.environ["ENABLE_ISAACLAB"] = "False"
 import torch
 
 from isaaclab_rl.rsl_rl.fb_cpr_math import (
+    advance_tracking_phases,
     aux_q_for_actor,
     aux_reward_for_critic,
     centered_context_offsets,
@@ -14,6 +15,8 @@ from isaaclab_rl.rsl_rl.fb_cpr_math import (
     normalized_gamma_loss_weights,
     sample_log_horizon_gamma,
     stochastic_integral_weights,
+    tracking_failure_metrics,
+    tracking_rollback_offsets,
 )
 
 
@@ -60,6 +63,62 @@ def test_aux_actor_q_uses_fixed_scale_instead_of_ema_sigma():
     torch.testing.assert_close(output, 64.0 * q_aux)
     output.sum().backward()
     torch.testing.assert_close(q_aux.grad, torch.full_like(q_aux, 64.0))
+
+
+def test_tracking_failure_metric_uses_heading_local_cartesian_positions():
+    ref = torch.zeros(2, 463)
+    live = ref.clone()
+    # Every non-pelvis keypoint is displaced by 0.3 m along x.
+    live[0, 1:91:3] = 0.3
+    live[1, 0] = 0.25
+
+    local_mpjpe, root_h_error = tracking_failure_metrics(live, ref)
+
+    torch.testing.assert_close(local_mpjpe, torch.tensor([0.3, 0.0]))
+    torch.testing.assert_close(root_h_error, torch.tensor([0.0, 0.25]))
+
+
+def test_tracking_failure_metric_supports_heading_body_tail_layout():
+    # K=26 -> 24*K-5 = 619.
+    ref = torch.zeros(1, 619)
+    live = ref.clone()
+    live[:, 1 : 1 + 25 * 3] = 0.1
+
+    local_mpjpe, _ = tracking_failure_metrics(live, ref)
+
+    torch.testing.assert_close(
+        local_mpjpe, torch.tensor([3.0**0.5 * 0.1])
+    )
+
+
+def test_tracking_failure_rollback_restarts_before_failure_frame():
+    local_time = torch.tensor([3, 20, 249])
+
+    reset_offsets = tracking_rollback_offsets(
+        local_time, rollback_steps=10
+    )
+
+    # Post-step references were [4, 21, 250], then rewound by ten frames.
+    assert reset_offsets.tolist() == [0, 11, 240]
+
+
+def test_tracking_failure_zero_rollback_uses_poststep_reference():
+    local_time = torch.tensor([0, 7])
+
+    reset_offsets = tracking_rollback_offsets(
+        local_time, rollback_steps=0
+    )
+
+    assert reset_offsets.tolist() == [1, 8]
+
+
+def test_tracking_phase_holds_reset_slot_while_other_slots_advance():
+    phases = torch.tensor([11, 20, 249])
+    hold = torch.tensor([True, False, False])
+
+    advanced = advance_tracking_phases(phases, hold, max_phase=249)
+
+    assert advanced.tolist() == [11, 21, 249]
 
 
 def test_centered_positive_context_preserves_first_t_mean():

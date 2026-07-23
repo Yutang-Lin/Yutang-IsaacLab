@@ -27,6 +27,21 @@ FBCprReplayBuffer = _mod.FBCprReplayBuffer
 FBCprExpertBuffer = _mod.FBCprExpertBuffer
 
 
+def _make_priority_expert_buffer() -> FBCprExpertBuffer:
+    buffer = FBCprExpertBuffer.__new__(FBCprExpertBuffer)
+    buffer.device = torch.device("cpu")
+    buffer._motion_names = ["short", "medium", "long"]
+    buffer._lengths = [10, 20, 40]
+    buffer._length_proportional_priors = True
+    buffer._eval_priority_scores = torch.ones(3)
+    buffer._tracking_failure_ema = torch.zeros(3)
+    buffer._failure_priority_scale = 0.0
+    buffer._failure_priority_max_multiplier = 1.0
+    buffer._priority_length_weights = torch.tensor([10.0, 20.0, 40.0])
+    buffer._recompute_priorities()
+    return buffer
+
+
 def _make_buffer(
     sampling_mode: str = "uniform_transition",
 ) -> FBCprReplayBuffer:
@@ -61,6 +76,37 @@ def test_flat_sampling_is_uniform_over_transitions():
     expected = torch.full((7,), 10_000.0)
     assert torch.all((counts[expected_rows].float() - expected).abs() < 500)
     assert counts.sum() == 70_000
+
+
+def test_reset_boundary_transition_is_never_sampled():
+    buffer = _make_buffer(sampling_mode="uniform_transition")
+
+    for value, terminated, boundary in (
+        (0.0, False, False),
+        (1.0, False, False),   # failure-causing row
+        (100.0, True, True),   # first observation after synthetic reset
+        (101.0, False, False),
+        (102.0, False, False),
+    ):
+        buffer.extend(
+            {
+                "observation": {"state": torch.tensor([[value]])},
+                "action": torch.zeros(1, 1),
+                "z": torch.zeros(1, 1),
+                "terminated": torch.tensor([[terminated]]),
+                "truncated": torch.tensor([[boundary]]),
+                "aux_rewards": {},
+            }
+        )
+
+    torch.manual_seed(29)
+    batch = buffer.sample_flat(30_000)
+    current = batch["observation"]["state"][:, 0]
+    following = batch["next"]["observation"]["state"][:, 0]
+    pairs = set(zip(current.tolist(), following.tolist()))
+
+    assert pairs == {(0.0, 1.0), (100.0, 101.0), (101.0, 102.0)}
+    assert not torch.any((current == 1.0) & (following == 100.0))
 
 
 def test_expert_positive_context_moves_but_first_t_next_window_does_not():
@@ -203,6 +249,81 @@ def test_replay_sampling_mode_is_validated():
         assert "uniform_trajectory" in str(exc)
     else:
         raise AssertionError("invalid replay sampling mode was accepted")
+
+
+def test_tracking_failure_priority_does_not_change_expert_sampling():
+    buffer = _make_priority_expert_buffer()
+    expert_before = buffer._priorities.clone()
+
+    buffer.update_tracking_failure_statistics(
+        motion_ids=torch.tensor([0, 0, 1]),
+        failed=torch.tensor([True, False, True]),
+        ema_decay=0.0,
+        priority_scale=3.0,
+        max_multiplier=4.0,
+    )
+
+    torch.testing.assert_close(buffer._priorities, expert_before)
+    # Duplicate motion 0 aggregates to a 50% failure rate; motion 1 is 100%.
+    torch.testing.assert_close(
+        buffer._tracking_failure_ema, torch.tensor([0.5, 1.0, 0.0])
+    )
+    assert buffer._tracking_priorities[1] > buffer._priorities[1]
+    assert buffer._tracking_priorities[2] < buffer._priorities[2]
+
+
+def test_eval_priority_update_preserves_tracking_failure_ema():
+    buffer = _make_priority_expert_buffer()
+    buffer.update_tracking_failure_statistics(
+        motion_ids=torch.tensor([1]),
+        failed=torch.tensor([True]),
+        ema_decay=0.0,
+        priority_scale=3.0,
+        max_multiplier=4.0,
+    )
+
+    buffer.update_priorities(torch.tensor([4.0, 2.0, 1.0]))
+
+    torch.testing.assert_close(
+        buffer._tracking_failure_ema, torch.tensor([0.0, 1.0, 0.0])
+    )
+    # Length weighting is composed exactly once with the new eval scores.
+    expected_expert = torch.tensor([40.0, 40.0, 40.0])
+    expected_expert /= expected_expert.sum()
+    torch.testing.assert_close(buffer._priorities, expected_expert)
+    assert buffer._tracking_priorities[1] > buffer._priorities[1]
+
+
+def test_expert_priority_state_round_trip():
+    source = _make_priority_expert_buffer()
+    source.update_priorities(torch.tensor([1.0, 2.0, 3.0]))
+    source.update_tracking_failure_statistics(
+        motion_ids=torch.tensor([2]),
+        failed=torch.tensor([True]),
+        ema_decay=0.5,
+        priority_scale=2.0,
+        max_multiplier=3.0,
+    )
+    restored = _make_priority_expert_buffer()
+
+    assert restored.load_priority_state_dict(source.priority_state_dict())
+    torch.testing.assert_close(restored._priorities, source._priorities)
+    torch.testing.assert_close(
+        restored._tracking_priorities, source._tracking_priorities
+    )
+    torch.testing.assert_close(
+        restored._tracking_failure_ema, source._tracking_failure_ema
+    )
+
+
+def test_expert_priority_state_rejects_different_equal_sized_shard():
+    source = _make_priority_expert_buffer()
+    restored = _make_priority_expert_buffer()
+    restored._motion_names = ["other-a", "other-b", "other-c"]
+
+    assert not restored.load_priority_state_dict(
+        source.priority_state_dict()
+    )
 
 
 def _make_tracking_expert_buffer(

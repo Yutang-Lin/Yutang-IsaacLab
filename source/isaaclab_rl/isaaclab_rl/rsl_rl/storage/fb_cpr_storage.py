@@ -842,8 +842,8 @@ class FBCprExpertBuffer:
                 motion alongside 8000-frame LAFAN clips) this matters a
                 lot: under uniform motion-priors the transitions from a
                 short clip are sampled ~clip-length-ratio more often per
-                update. ``update_priorities()`` (from the tracking eval)
-                overwrites this init.
+                update. Periodic eval scores and online tracking-failure
+                multipliers are composed with this length weight.
         """
         self.seq_length = int(seq_length)
         self._length_proportional_priors = bool(length_proportional_priors)
@@ -1222,27 +1222,34 @@ class FBCprExpertBuffer:
             self.total_frames = 0
             self.num_joints = 0
 
-        # Initial priors: length-proportional (default) so the per-
-        # transition draw probability is equal across motions — otherwise
-        # a short clip's transitions are seen (clip_length_ratio)x more
-        # often per update than a long clip's. With a mix of 8k-frame
-        # LAFAN clips and a 7468-frame continuous motion that matters.
-        # ``update_priorities()`` (from the tracking eval) overwrites this.
+        # Eval difficulty and online tracking-failure difficulty are separate.
+        # Eval scores continue to govern expert/relabel/RSI sampling. The
+        # failure multiplier only affects tracking rollout assignment, which
+        # increases near-reference policy data for hard motions without also
+        # changing the FB expert-data distribution.
+        num_motions = len(self._motion_names)
+        self._eval_priority_scores = torch.ones(
+            num_motions, dtype=torch.float32, device=self.device,
+        )
+        self._tracking_failure_ema = torch.zeros_like(
+            self._eval_priority_scores
+        )
+        self._failure_priority_scale = 0.0
+        self._failure_priority_max_multiplier = 1.0
         if (
             self._length_proportional_priors
             and len(self._lengths) > 0
             and sum(int(x) for x in self._lengths) > 0
         ):
-            self._priorities = torch.tensor(
+            self._priority_length_weights = torch.tensor(
                 [float(x) for x in self._lengths],
                 dtype=torch.float32, device=self.device,
             )
-            self._priorities = self._priorities / self._priorities.sum().clamp_min(1e-12)
         else:
-            self._priorities = torch.ones(
-                len(self._motion_names), dtype=torch.float32, device=self.device,
+            self._priority_length_weights = torch.ones_like(
+                self._eval_priority_scores
             )
-            self._priorities = self._priorities / self._priorities.sum().clamp_min(1e-12)
+        self._recompute_priorities()
 
         # --- Flat concatenated obs buffers for O(1) sample() --------------
         # Same trick as the RSI flat buffer: cat all motions along time,
@@ -1461,7 +1468,10 @@ class FBCprExpertBuffer:
         if not bool(eligible_mask.any().item()):
             raise RuntimeError(f"No motion has at least {MIN_FRAMES} frames.")
         eligible_idx = torch.nonzero(eligible_mask, as_tuple=False).squeeze(-1)
-        eligible_priors = self._priorities[eligible_idx]
+        tracking_priorities = getattr(
+            self, "_tracking_priorities", self._priorities
+        )
+        eligible_priors = tracking_priorities[eligible_idx]
         eligible_priors = eligible_priors / eligible_priors.sum().clamp_min(1e-12)
         eligible_lengths = self._lengths_t[eligible_idx]
 
@@ -1577,20 +1587,41 @@ class FBCprExpertBuffer:
             "requires_terrain": self.requires_terrain_t[motion_picks],
         }
 
-    # -- priority updates (stub-ish; accepted by agent) --------------------
+    # -- priority updates --------------------------------------------------
+
+    def _recompute_priorities(self) -> None:
+        """Compose normalized eval and tracking-rollout sampling weights."""
+        base = self._eval_priority_scores.clamp_min(0.0)
+        base = base * self._priority_length_weights
+        base_sum = base.sum()
+        if bool(base_sum > 0):
+            self._priorities = base / base_sum
+        else:
+            self._priorities = torch.full_like(
+                base, 1.0 / max(base.numel(), 1)
+            )
+
+        multiplier = 1.0 + (
+            self._failure_priority_scale * self._tracking_failure_ema
+        )
+        multiplier = multiplier.clamp(
+            min=1.0,
+            max=max(self._failure_priority_max_multiplier, 1.0),
+        )
+        tracking = base * multiplier
+        tracking_sum = tracking.sum()
+        if bool(tracking_sum > 0):
+            self._tracking_priorities = tracking / tracking_sum
+        else:
+            self._tracking_priorities = self._priorities.clone()
 
     def update_priorities(self, priorities: torch.Tensor, idxs: torch.Tensor | None = None) -> None:
-        """Update per-motion sampling weights.
+        """Update periodic-eval difficulty scores.
 
         If ``idxs`` is None, expects ``priorities`` to have length equal to
-        the number of motions. Otherwise scatters the new values into the
-        given indices. Non-negative values are required; values are then
-        renormalised to sum to 1.
-
-        When ``length_proportional_priors`` is set, the incoming weights
-        (e.g. MPJPE-derived) are multiplied by per-motion length BEFORE
-        normalisation so the expected per-transition draw probability
-        stays uniform across motions regardless of clip-length skew.
+        the number of motions. Otherwise updates those local motion IDs.
+        Length weighting and online failure adaptation are composed afterward,
+        so neither component is accidentally applied twice or erased.
         """
         priorities = priorities.to(self.device).float().clamp_min(0.0)
         if idxs is None:
@@ -1598,27 +1629,104 @@ class FBCprExpertBuffer:
                 raise ValueError(
                     f"Expected priorities of length {len(self._motion_names)}, got {priorities.numel()}"
                 )
-            if self._length_proportional_priors:
-                lens = torch.tensor(
-                    [float(x) for x in self._lengths],
-                    dtype=priorities.dtype, device=self.device,
-                )
-                priorities = priorities * lens
-            self._priorities = priorities
+            self._eval_priority_scores.copy_(priorities)
         else:
             idxs = idxs.to(self.device).long()
-            if self._length_proportional_priors:
-                lens = torch.tensor(
-                    [float(self._lengths[int(i)]) for i in idxs.tolist()],
-                    dtype=priorities.dtype, device=self.device,
+            if priorities.numel() != idxs.numel():
+                raise ValueError(
+                    f"Expected one priority per index, got "
+                    f"{priorities.numel()} values for {idxs.numel()} indices"
                 )
-                priorities = priorities * lens
-            self._priorities[idxs] = priorities
-        s = self._priorities.sum()
-        if s > 0:
-            self._priorities = self._priorities / s
-        else:
-            self._priorities = torch.ones_like(self._priorities) / self._priorities.numel()
+            self._eval_priority_scores[idxs] = priorities
+        self._recompute_priorities()
+
+    def update_tracking_failure_statistics(
+        self,
+        motion_ids: torch.Tensor,
+        failed: torch.Tensor,
+        *,
+        ema_decay: float,
+        priority_scale: float,
+        max_multiplier: float,
+    ) -> None:
+        """Update per-motion failure EMA from completed tracking attempts.
+
+        Duplicate motion IDs are aggregated into one failure rate before the
+        EMA update. Both successes and failures must be supplied; otherwise
+        the adaptive sampler could only increase a motion's weight.
+        """
+        motion_ids = motion_ids.to(self.device).long().view(-1)
+        failed = failed.to(self.device).float().view(-1)
+        if motion_ids.numel() != failed.numel():
+            raise ValueError(
+                "motion_ids and failed must contain the same number of attempts"
+            )
+        if motion_ids.numel() == 0:
+            return
+        if not 0.0 <= ema_decay < 1.0:
+            raise ValueError(f"ema_decay must be in [0, 1), got {ema_decay}")
+
+        counts = torch.zeros_like(self._tracking_failure_ema)
+        failures = torch.zeros_like(self._tracking_failure_ema)
+        ones = torch.ones_like(failed)
+        counts.index_add_(0, motion_ids, ones)
+        failures.index_add_(0, motion_ids, failed)
+        observed = counts > 0
+        rates = failures[observed] / counts[observed]
+        self._tracking_failure_ema[observed] = (
+            ema_decay * self._tracking_failure_ema[observed]
+            + (1.0 - ema_decay) * rates
+        )
+        self._failure_priority_scale = max(float(priority_scale), 0.0)
+        self._failure_priority_max_multiplier = max(
+            float(max_multiplier), 1.0
+        )
+        self._recompute_priorities()
+
+    def priority_state_dict(self) -> dict[str, Any]:
+        """Small checkpoint state for adaptive expert/tracking sampling."""
+        return {
+            "motion_names": tuple(self._motion_names),
+            "eval_priority_scores": self._eval_priority_scores.detach().cpu(),
+            "tracking_failure_ema": self._tracking_failure_ema.detach().cpu(),
+            "failure_priority_scale": self._failure_priority_scale,
+            "failure_priority_max_multiplier": (
+                self._failure_priority_max_multiplier
+            ),
+        }
+
+    def load_priority_state_dict(self, state: dict) -> bool:
+        """Restore priority components; return False on incompatible shards."""
+        eval_scores = state.get("eval_priority_scores")
+        failure_ema = state.get("tracking_failure_ema")
+        motion_names = state.get("motion_names")
+        if (
+            motion_names is not None
+            and tuple(motion_names) != tuple(self._motion_names)
+        ):
+            return False
+        if not isinstance(eval_scores, torch.Tensor):
+            return False
+        if eval_scores.numel() != self._eval_priority_scores.numel():
+            return False
+        self._eval_priority_scores.copy_(
+            eval_scores.to(self.device, dtype=torch.float32)
+        )
+        if (
+            isinstance(failure_ema, torch.Tensor)
+            and failure_ema.numel() == self._tracking_failure_ema.numel()
+        ):
+            self._tracking_failure_ema.copy_(
+                failure_ema.to(self.device, dtype=torch.float32)
+            )
+        self._failure_priority_scale = max(
+            float(state.get("failure_priority_scale", 0.0)), 0.0
+        )
+        self._failure_priority_max_multiplier = max(
+            float(state.get("failure_priority_max_multiplier", 1.0)), 1.0
+        )
+        self._recompute_priorities()
+        return True
 
     # -- sampling ----------------------------------------------------------
 

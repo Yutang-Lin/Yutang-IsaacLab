@@ -915,6 +915,9 @@ class FBCprRunner:
             _trk_count = 0
             rollout_done_count = 0
             rollout_transition_count = 0
+            tracking_failure_count = 0
+            tracking_failure_eligible_steps = 0
+            tracking_failure_stat_chunks: list[torch.Tensor] = []
             # ----- rollout -----
             with torch.inference_mode():
                 self.policy.eval()
@@ -1018,12 +1021,14 @@ class FBCprRunner:
 
                     # Push whole-body reference (heading-frame priv + joint
                     # pos/vel) for the explicit imitation aux reward.
+                    _tracking_ref_priv = None
                     if hasattr(env_u, "set_tracking_ref_whole_body"):
                         wb = self.alg.get_tracking_ref_whole_body(
                             step_count, self.expert_buffer,
                         )
                         if wb is not None:
                             ref_priv, ref_jp, ref_jv, wb_mask = wb
+                            _tracking_ref_priv = ref_priv
                             env_u.set_tracking_ref_whole_body(
                                 ref_priv, ref_jp, ref_jv, wb_mask,
                             )
@@ -1032,6 +1037,99 @@ class FBCprRunner:
                     new_obs = self._obs_to_device(new_obs, infos)
                     rewards = rewards.to(self.device)
                     dones = dones.to(self.device)
+
+                    # A configurable subset of tracking envs treats sustained
+                    # heading-local pose error as an episode boundary.
+                    # Reset those envs shortly before the failed frame and
+                    # restart that slot's z schedule from the same offset;
+                    # a generic random reset would mismatch the still-active
+                    # mid-trajectory z context and immediately fail again. The
+                    # replay's row-boundary convention excludes the transition
+                    # into this reset, so this remains a continuing-task FB
+                    # curriculum rather than an absorbing failure target.
+                    failure_info = None
+                    if (
+                        _tracking_ref_priv is not None
+                        and "privileged_state" in new_obs
+                    ):
+                        failure_info = self.alg.get_tracking_failures(
+                            new_obs["privileged_state"],
+                            _tracking_ref_priv,
+                            dones.bool(),
+                        )
+                    if failure_info is not None:
+                        enabled = failure_info["enabled"]
+                        local_err = failure_info["local_mpjpe"]
+                        root_h_err = failure_info["root_height_error"]
+                        tracking_failure_eligible_steps += int(
+                            failure_info["eligible_count"]
+                        )
+                        tracking_failure_stat_chunks.append(
+                            torch.stack(
+                                (
+                                    local_err[enabled].sum(),
+                                    root_h_err[enabled].sum(),
+                                )
+                            )
+                        )
+                        failed_env_ids = failure_info.get("env_ids")
+                        if (
+                            failed_env_ids is not None
+                            and failed_env_ids.numel() > 0
+                        ):
+                            tracking_failure_count += int(
+                                failed_env_ids.numel()
+                            )
+                            dones = dones.clone()
+                            dones[failed_env_ids] = 1
+                            history_snapshot = (
+                                self._snapshot_observation_histories()
+                            )
+                            self.env_unwrapped._reset_idx(failed_env_ids)
+                            self._terrain_rsi_from_tracking(
+                                failed_env_ids,
+                                failure_info["motion_ids"],
+                                failure_info["reset_frames"],
+                                align_to_env_origins=True,
+                            )
+                            if _robot is not None:
+                                self.alg.update_tracking_pose_after_reset(
+                                    failed_env_ids,
+                                    _robot.data.root_pos_w[:, :2].to(
+                                        self.device
+                                    ),
+                                    _robot.data.root_quat_w.to(self.device),
+                                    reset_frames=failure_info[
+                                        "reset_frames"
+                                    ],
+                                    tracking_slots=failure_info["slots"],
+                                )
+                            fresh_raw = (
+                                self.env_unwrapped._get_observations()
+                            )
+                            self._restore_observation_histories(
+                                history_snapshot, failed_env_ids
+                            )
+                            fresh_obs = self._obs_to_device(fresh_raw)
+                            for key in new_obs:
+                                if key not in fresh_obs:
+                                    continue
+                                patched = new_obs[key].clone()
+                                patched[failed_env_ids] = fresh_obs[key][
+                                    failed_env_ids
+                                ]
+                                new_obs[key] = patched
+                            env_obs = getattr(
+                                self.env_unwrapped, "obs_buf", None
+                            )
+                            if isinstance(env_obs, dict):
+                                for key, value in fresh_raw.items():
+                                    if key not in env_obs:
+                                        continue
+                                    env_obs[key][failed_env_ids] = value[
+                                        failed_env_ids
+                                    ]
+
                     rollout_done_count += int(dones.bool().sum().item())
                     rollout_transition_count += int(dones.numel())
 
@@ -1227,9 +1325,41 @@ class FBCprRunner:
                 "Rollout/reset_fraction": (
                     rollout_done_count / max(rollout_transition_count, 1)
                 ),
+                "Track/early_termination_count": float(
+                    tracking_failure_count
+                ),
+                "Track/early_termination_rate": (
+                    tracking_failure_count
+                    / max(tracking_failure_eligible_steps, 1)
+                ),
                 "Event/tracking_eval": 0.0,
                 "Event/checkpoint": float(it % self.save_interval == 0),
             }
+            if tracking_failure_eligible_steps > 0:
+                tracking_failure_stats = torch.stack(
+                    tracking_failure_stat_chunks
+                ).sum(dim=0).detach().cpu().tolist()
+                loss_dict["Track/eligible_local_mpjpe_m"] = (
+                    tracking_failure_stats[0]
+                    / tracking_failure_eligible_steps
+                )
+                loss_dict["Track/eligible_root_height_error_m"] = (
+                    tracking_failure_stats[1]
+                    / tracking_failure_eligible_steps
+                )
+                failure_ema = getattr(
+                    self.expert_buffer, "_tracking_failure_ema", None
+                )
+                if failure_ema is not None:
+                    failure_ema_stats = torch.stack(
+                        (failure_ema.mean(), failure_ema.max())
+                    ).detach().cpu().tolist()
+                    loss_dict["Track/failure_priority_ema_mean"] = (
+                        failure_ema_stats[0]
+                    )
+                    loss_dict["Track/failure_priority_ema_max"] = (
+                        failure_ema_stats[1]
+                    )
             # Hold off updates until _delay_updates_until (== num_seed_steps on
             # a fresh run; larger on a no-replay resume so the resumed policy
             # refills the empty buffer on-policy first). Note the random-action
@@ -1902,6 +2032,8 @@ class FBCprRunner:
         env_ids: torch.Tensor,
         motion_ids: torch.Tensor,
         starts: torch.Tensor,
+        *,
+        align_to_env_origins: bool = False,
     ) -> None:
         """Reset specific envs to the tracking context's motion/frame.
 
@@ -1926,6 +2058,15 @@ class FBCprRunner:
         jv_usd = torch.zeros_like(jp_usd)
         jp_usd[:, joint_order_t] = jp_canon
         jv_usd[:, joint_order_t] = jv_canon
+        # Normal flat vector envs live in separate world tiles. Dataset root XY
+        # is motion-local, so a synthetic tracking reset must retain the exact
+        # reference pose/velocity while placing its root in that env's tile.
+        if align_to_env_origins and hasattr(eu.scene, "env_origins"):
+            rp = rp.clone()
+            rp[:, :2] = eu.scene.env_origins[env_ids, :2].to(dev)
+            rp[:, 2] = rp[:, 2] + float(
+                getattr(eu.cfg, "rsi_z_margin", 0.0)
+            )
         # No-anchor / origin-spawn: force the RSI root to world origin (XY=0)
         # facing +x, keeping the motion's joint pose + z. This matches the env's
         # spawn_at_origin reset so a mid-episode tracking resample restarts the
@@ -1949,6 +2090,64 @@ class FBCprRunner:
             eu.last_joint_pos[env_ids] = eu.joint_pos[env_ids]
         if hasattr(eu, "last_joint_vel"):
             eu.last_joint_vel[env_ids] = eu.joint_vel[env_ids]
+
+    @staticmethod
+    def _clone_observation_history(history):
+        if isinstance(history, torch.Tensor):
+            return history.clone()
+        if isinstance(history, dict):
+            return {
+                key: value.clone() for key, value in history.items()
+            }
+        if isinstance(history, (tuple, list)):
+            return type(history)(value.clone() for value in history)
+        return None
+
+    def _snapshot_observation_histories(self) -> list[tuple[Any, Any]]:
+        """Snapshot observation rings before an out-of-band subset reset."""
+        obs_cfg = getattr(
+            self.env_unwrapped, "main_observation_cfg", None
+        )
+        if obs_cfg is None:
+            return []
+        snapshots = []
+        for term in obs_cfg.observation_terms.values():
+            try:
+                history = term._get_from_private_buffer("history", None)
+            except (AttributeError, KeyError):
+                continue
+            cloned = self._clone_observation_history(history)
+            if cloned is not None:
+                snapshots.append((term, cloned))
+        return snapshots
+
+    def _restore_observation_histories(
+        self,
+        snapshots: list[tuple[Any, Any]],
+        reset_env_ids: torch.Tensor,
+    ) -> None:
+        """Undo the extra observation push for non-reset environments."""
+        keep = torch.ones(
+            self.env.num_envs, dtype=torch.bool, device=self.device
+        )
+        keep[reset_env_ids] = False
+
+        def _restore(current, saved) -> None:
+            if isinstance(current, torch.Tensor):
+                current[keep] = saved[keep]
+            elif isinstance(current, dict):
+                for key in current:
+                    current[key][keep] = saved[key][keep]
+            elif isinstance(current, (tuple, list)):
+                for value, saved_value in zip(current, saved):
+                    value[keep] = saved_value[keep]
+
+        for term, saved in snapshots:
+            current = term._get_from_private_buffer("history", None)
+            if current is None:
+                continue
+            _restore(current, saved)
+            term._set_to_private_buffer("history", current)
 
     def _obs_to_device(self, obs: Any, extras: dict | None = None) -> Dict[str, torch.Tensor]:
         """Convert the env's flat ``policy`` + ``critic`` tensors into a BFM-agent dict.
@@ -2078,6 +2277,19 @@ class FBCprRunner:
             "world_size": self.gpu_world_size,
             "local_timesteps": getattr(self, "_local_timesteps", 0),
             "last_eval_step": self._last_eval_step,
+            "expert_priority_state": (
+                self.expert_buffer.priority_state_dict()
+                if (
+                    hasattr(self.expert_buffer, "priority_state_dict")
+                    and not (
+                        self.is_distributed
+                        and bool(
+                            self.alg_cfg.get("distributed_expert", False)
+                        )
+                    )
+                )
+                else None
+            ),
             "infos": infos or {},
         }
         torch.save(base, path)
@@ -2422,6 +2634,20 @@ class FBCprRunner:
                 self.tot_timesteps * saved_log_world_size / saved_world_size
             )
         self._last_eval_step = ckpt.get("last_eval_step", self._last_eval_step)
+        priority_state = ckpt.get("expert_priority_state")
+        if (
+            priority_state is not None
+            and hasattr(self.expert_buffer, "load_priority_state_dict")
+        ):
+            restored = self.expert_buffer.load_priority_state_dict(
+                priority_state
+            )
+            if not restored:
+                print(
+                    "[FBCprRunner] expert priority state does not match this "
+                    "dataset shard; using fresh priorities.",
+                    flush=True,
+                )
 
         replay_restored = False
         if load_replay:
