@@ -32,9 +32,12 @@ def _make_priority_expert_buffer() -> FBCprExpertBuffer:
     buffer.device = torch.device("cpu")
     buffer._motion_names = ["short", "medium", "long"]
     buffer._lengths = [10, 20, 40]
+    buffer._lengths_t = torch.tensor(buffer._lengths)
     buffer._length_proportional_priors = True
     buffer._eval_priority_scores = torch.ones(3)
     buffer._tracking_failure_ema = torch.zeros(3)
+    buffer._tracking_failure_bin_frames = 0
+    buffer._init_tracking_failure_bins()
     buffer._failure_priority_scale = 0.0
     buffer._failure_priority_max_multiplier = 1.0
     buffer._priority_length_weights = torch.tensor([10.0, 20.0, 40.0])
@@ -253,18 +256,21 @@ def test_replay_sampling_mode_is_validated():
 
 def test_tracking_failure_priority_does_not_change_expert_sampling():
     buffer = _make_priority_expert_buffer()
+    buffer._tracking_failure_bin_frames = 10
+    buffer._init_tracking_failure_bins()
+    buffer._tracking_bin_success_ema.fill_(1.0)
     expert_before = buffer._priorities.clone()
 
-    buffer.update_tracking_failure_statistics(
-        motion_ids=torch.tensor([0, 0, 1]),
-        failed=torch.tensor([True, False, True]),
+    buffer.update_tracking_bin_success_statistics(
+        bin_ids=torch.tensor([0, 0, 1, 2]),
+        succeeded=torch.tensor([True, False, False, False]),
         ema_decay=0.0,
         priority_scale=3.0,
         max_multiplier=4.0,
     )
 
     torch.testing.assert_close(buffer._priorities, expert_before)
-    # Duplicate motion 0 aggregates to a 50% failure rate; motion 1 is 100%.
+    # Duplicate bin 0 aggregates to 50% success; both motion-1 bins fail.
     torch.testing.assert_close(
         buffer._tracking_failure_ema, torch.tensor([0.5, 1.0, 0.0])
     )
@@ -272,11 +278,76 @@ def test_tracking_failure_priority_does_not_change_expert_sampling():
     assert buffer._tracking_priorities[2] < buffer._priorities[2]
 
 
+def test_tracking_failure_bins_cover_motion_segments_and_map_frames():
+    buffer = _make_priority_expert_buffer()
+    buffer._lengths = [120, 55]
+    buffer._lengths_t = torch.tensor(buffer._lengths)
+    buffer._motion_names = ["long", "short"]
+    buffer._eval_priority_scores = torch.ones(2)
+    buffer._tracking_failure_ema = torch.zeros(2)
+    buffer._tracking_failure_bin_frames = 50
+    buffer._init_tracking_failure_bins()
+
+    assert buffer._tracking_bin_motion_ids.tolist() == [0, 0, 0, 1, 1]
+    assert buffer._tracking_bin_starts.tolist() == [0, 50, 100, 0, 50]
+    assert buffer._tracking_bin_ends.tolist() == [50, 100, 120, 50, 55]
+    bin_ids = buffer.tracking_bin_ids(
+        torch.tensor([0, 0, 0, 1, 1]),
+        torch.tensor([0, 99, 119, 49, 54]),
+    )
+    assert bin_ids.tolist() == [0, 1, 2, 3, 4]
+
+
+def test_tracking_bin_success_ema_aggregates_duplicate_attempts():
+    buffer = _make_priority_expert_buffer()
+    buffer._tracking_failure_bin_frames = 10
+    buffer._init_tracking_failure_bins()
+
+    buffer.update_tracking_bin_success_statistics(
+        bin_ids=torch.tensor([0, 0, 1]),
+        succeeded=torch.tensor([True, False, True]),
+        ema_decay=0.0,
+        priority_scale=3.0,
+        max_multiplier=4.0,
+    )
+
+    torch.testing.assert_close(
+        buffer._tracking_bin_success_ema[:2],
+        torch.tensor([0.5, 1.0]),
+    )
+    # Motion-level diagnostics are the duration-weighted mean bin failure.
+    assert 0.0 < float(buffer._tracking_failure_ema[0]) < 1.0
+
+
+def test_tracking_failure_bin_sampling_prefers_low_success_bins():
+    buffer = _make_priority_expert_buffer()
+    buffer._lengths = [20]
+    buffer._lengths_t = torch.tensor(buffer._lengths)
+    buffer._motion_names = ["motion"]
+    buffer._eval_priority_scores = torch.ones(1)
+    buffer._tracking_failure_ema = torch.zeros(1)
+    buffer._priority_length_weights = torch.ones(1)
+    buffer._tracking_failure_bin_frames = 10
+    buffer._init_tracking_failure_bins()
+    buffer._tracking_bin_success_ema[:] = torch.tensor([1.0, 0.0])
+    buffer._failure_priority_scale = 3.0
+    buffer._failure_priority_max_multiplier = 4.0
+
+    torch.manual_seed(19)
+    sampled = buffer.sample_tracking_failure_bins(50_000)["bin_ids"]
+    counts = torch.bincount(sampled, minlength=2).float()
+    ratio = counts[1] / counts[0]
+    assert 3.7 < float(ratio) < 4.3
+
+
 def test_eval_priority_update_preserves_tracking_failure_ema():
     buffer = _make_priority_expert_buffer()
-    buffer.update_tracking_failure_statistics(
-        motion_ids=torch.tensor([1]),
-        failed=torch.tensor([True]),
+    buffer._tracking_failure_bin_frames = 10
+    buffer._init_tracking_failure_bins()
+    buffer._tracking_bin_success_ema.fill_(1.0)
+    buffer.update_tracking_bin_success_statistics(
+        bin_ids=torch.tensor([1, 2]),
+        succeeded=torch.tensor([False, False]),
         ema_decay=0.0,
         priority_scale=3.0,
         max_multiplier=4.0,
@@ -296,15 +367,20 @@ def test_eval_priority_update_preserves_tracking_failure_ema():
 
 def test_expert_priority_state_round_trip():
     source = _make_priority_expert_buffer()
+    source._tracking_failure_bin_frames = 10
+    source._init_tracking_failure_bins()
+    source._tracking_bin_success_ema.fill_(1.0)
     source.update_priorities(torch.tensor([1.0, 2.0, 3.0]))
-    source.update_tracking_failure_statistics(
-        motion_ids=torch.tensor([2]),
-        failed=torch.tensor([True]),
+    source.update_tracking_bin_success_statistics(
+        bin_ids=torch.tensor([3]),
+        succeeded=torch.tensor([False]),
         ema_decay=0.5,
         priority_scale=2.0,
         max_multiplier=3.0,
     )
     restored = _make_priority_expert_buffer()
+    restored._tracking_failure_bin_frames = 10
+    restored._init_tracking_failure_bins()
 
     assert restored.load_priority_state_dict(source.priority_state_dict())
     torch.testing.assert_close(restored._priorities, source._priorities)
@@ -313,6 +389,28 @@ def test_expert_priority_state_round_trip():
     )
     torch.testing.assert_close(
         restored._tracking_failure_ema, source._tracking_failure_ema
+    )
+
+
+def test_tracking_bin_success_state_round_trip():
+    source = _make_priority_expert_buffer()
+    source._tracking_failure_bin_frames = 10
+    source._init_tracking_failure_bins()
+    source.update_tracking_bin_success_statistics(
+        bin_ids=torch.tensor([0, 1]),
+        succeeded=torch.tensor([True, False]),
+        ema_decay=0.5,
+        priority_scale=3.0,
+        max_multiplier=4.0,
+    )
+    restored = _make_priority_expert_buffer()
+    restored._tracking_failure_bin_frames = 10
+    restored._init_tracking_failure_bins()
+
+    assert restored.load_priority_state_dict(source.priority_state_dict())
+    torch.testing.assert_close(
+        restored._tracking_bin_success_ema,
+        source._tracking_bin_success_ema,
     )
 
 
@@ -334,6 +432,7 @@ def _make_tracking_expert_buffer(
     buffer.seq_length = 8
     buffer.device = torch.device("cpu")
     buffer._expert_tracking_circular_wrap = circular_wrap
+    buffer._lengths = [60]
     buffer._lengths_t = torch.tensor([60])
     buffer._priorities = torch.ones(1)
     buffer._motion_obs_starts = torch.tensor([0])
@@ -391,6 +490,29 @@ def test_tracking_short_terrain_motion_clamps_to_last_usable_frame():
     )
     torch.testing.assert_close(
         batch["next_observation"]["state"][:, 0], expected_next.float()
+    )
+
+
+def test_forced_tracking_bin_start_pads_without_crossing_motion_end():
+    buffer = _make_tracking_expert_buffer(
+        circular_wrap=False,
+        requires_terrain=False,
+    )
+    batch = buffer.sample_tracking_trajectories(
+        num_trajs=1,
+        traj_length=10,
+        motion_ids=torch.tensor([0]),
+        starts=torch.tensor([55]),
+        pad_to_motion_end=True,
+    )
+
+    torch.testing.assert_close(
+        batch["observation"]["state"][:, 0],
+        torch.tensor([55, 56, 57, 58, 59, 59, 59, 59, 59, 59]).float(),
+    )
+    torch.testing.assert_close(
+        batch["next_observation"]["state"][:, 0],
+        torch.tensor([56, 57, 58, 59, 59, 59, 59, 59, 59, 59]).float(),
     )
 
 

@@ -129,49 +129,45 @@ def aux_q_for_actor(
 
 
 def tracking_failure_metrics(
+    live_joint_pos: torch.Tensor,
+    ref_joint_pos: torch.Tensor,
     live_priv: torch.Tensor,
     ref_priv: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return heading-local keypoint MPJPE and absolute root-height error.
-
-    Supports the standard ``max_local_self`` layout ``15*K-2`` and its
-    optional heading-body-tail layout ``24*K-5``.
-    """
+    """Return canonical-joint MAE and absolute pelvis-height error."""
+    if (
+        live_joint_pos.shape != ref_joint_pos.shape
+        or live_joint_pos.ndim != 2
+    ):
+        raise ValueError(
+            "live_joint_pos and ref_joint_pos must have the same "
+            "[batch, joints] shape"
+        )
     if live_priv.shape != ref_priv.shape or live_priv.ndim != 2:
         raise ValueError(
             "live_priv and ref_priv must have the same [batch, features] shape"
         )
-    priv_dim = int(ref_priv.shape[-1])
-    if (priv_dim + 2) % 15 == 0:
-        num_bodies = (priv_dim + 2) // 15
-    elif (priv_dim + 5) % 24 == 0:
-        num_bodies = (priv_dim + 5) // 24
-    else:
+    if live_joint_pos.shape[0] != live_priv.shape[0]:
         raise ValueError(
-            f"Cannot infer max_local_self body count from dim={priv_dim}"
+            "joint-position and privileged-state batches must match"
         )
-    pos_dim = 3 * (num_bodies - 1)
-    live_pos = live_priv[:, 1 : 1 + pos_dim].view(
-        -1, num_bodies - 1, 3
-    )
-    ref_pos = ref_priv[:, 1 : 1 + pos_dim].view_as(live_pos)
-    local_mpjpe = torch.linalg.vector_norm(
-        live_pos - ref_pos, dim=-1
-    ).mean(dim=-1)
+    joint_mae = (live_joint_pos - ref_joint_pos).abs().mean(dim=-1)
     root_height_error = (live_priv[:, 0] - ref_priv[:, 0]).abs()
-    return local_mpjpe, root_height_error
+    return joint_mae, root_height_error
 
 
-def tracking_rollback_offsets(
-    local_time: torch.Tensor,
-    rollback_steps: int,
+def completed_tracking_bins(
+    poststep_frames: torch.Tensor,
+    bin_ends: torch.Tensor,
+    final_frames: torch.Tensor,
 ) -> torch.Tensor:
-    """Return non-negative reference offsets after a failure rollback."""
-    if rollback_steps < 0:
-        raise ValueError("rollback_steps must be non-negative")
-    # local_time indexes the z used for the action that just completed; its
-    # synchronized post-step reference is local_time + 1.
-    return (local_time + 1 - rollback_steps).clamp_min(0)
+    """Return bins whose final transition/frame has been reached."""
+    if (
+        poststep_frames.shape != bin_ends.shape
+        or poststep_frames.shape != final_frames.shape
+    ):
+        raise ValueError("tracking bin tensors must have matching shapes")
+    return poststep_frames >= torch.minimum(bin_ends, final_frames)
 
 
 def advance_tracking_phases(

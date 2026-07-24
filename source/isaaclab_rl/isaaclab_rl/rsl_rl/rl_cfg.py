@@ -1292,19 +1292,20 @@ class RslRlFBCprAlgorithmCfg:
     tracking_early_termination_fraction: float = 0.0
     """Fraction of unique tracking envs eligible for sustained-error resets."""
 
-    tracking_failure_threshold_m: float = 0.20
-    """Heading-local mean Cartesian keypoint distance threshold in metres."""
+    tracking_failure_joint_mae_threshold_rad: float = 0.20
+    """Mean absolute canonical-joint position error threshold in radians."""
 
     tracking_failure_root_height_threshold_m: float = 0.25
     """Absolute pelvis-height error threshold in metres."""
 
     tracking_failure_grace_steps: int = 10
     tracking_failure_consecutive_steps: int = 5
-    tracking_failure_rollback_steps: int = 10
-    """Reference frames rewound when a selected tracking env fails."""
     tracking_failure_priority_ema_decay: float = 0.90
     tracking_failure_priority_scale: float = 3.0
     tracking_failure_priority_max_multiplier: float = 4.0
+    tracking_failure_bin_size_s: float = 0.0
+    """Segment duration for per-bin success EMA and adaptive failure resets.
+    Values <= 0 disable segment bins."""
 
     target_tau_scale_with_world_size: bool = False
     """Whether FB and critic target-network Polyak rates scale with

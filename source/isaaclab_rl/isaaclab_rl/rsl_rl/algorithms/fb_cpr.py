@@ -43,13 +43,13 @@ from ..fb_cpr_math import (
     aux_q_for_actor,
     aux_reward_for_critic,
     centered_subwindow_start,
+    completed_tracking_bins,
     ema_grad_spike_state,
     innovation_alignment_loss,
     normalized_gamma_loss_weights,
     sample_log_horizon_gamma,
     stochastic_integral_weights,
     tracking_failure_metrics,
-    tracking_rollback_offsets,
 )
 from ..modules.fb_cpr_policy import (
     FBCprAuxPolicy,
@@ -201,18 +201,18 @@ class FBCprAuxAlgorithmCfg:
     replay_sampling_mode: str = "uniform_transition"
     replay_mark_eval_boundary: bool = True
     # Opt-in tracking curriculum. A fixed fraction of the unique physical
-    # tracking envs terminates after sustained heading-local keypoint error,
+    # tracking envs terminates after sustained mean joint-position error,
     # resets onto the failed reference frame, and contributes a binary outcome
     # to a per-motion failure EMA used only for future tracking assignments.
     tracking_early_termination_fraction: float = 0.0
-    tracking_failure_threshold_m: float = 0.20
+    tracking_failure_joint_mae_threshold_rad: float = 0.20
     tracking_failure_root_height_threshold_m: float = 0.25
     tracking_failure_grace_steps: int = 10
     tracking_failure_consecutive_steps: int = 5
-    tracking_failure_rollback_steps: int = 10
     tracking_failure_priority_ema_decay: float = 0.90
     tracking_failure_priority_scale: float = 3.0
     tracking_failure_priority_max_multiplier: float = 4.0
+    tracking_failure_bin_size_s: float = 0.0
 
     # Optional world-size scaling for the FB/critic target-network Polyak rates.
     target_tau_scale_with_world_size: bool = False
@@ -1445,7 +1445,6 @@ class FBCprAux:
         Returns dict with terrain env info for caller to reset, or None.
         ``terrain_z_fn``: callable([M,2] -> [M]) for sim terrain height query.
         """
-        self._flush_tracking_failure_statistics(expert_buffer)
         n_envs = step_count.shape[0]
         tracking_fraction = float(self.cfg.rollout_expert_trajectories_percentage)
         n_elem = min(n_envs, max(1, int(tracking_fraction * n_envs)))
@@ -1553,6 +1552,16 @@ class FBCprAux:
         )
         early_fraction = min(max(early_fraction, 0.0), 1.0)
         n_early = min(n_elem, int(round(early_fraction * n_elem)))
+        if (
+            n_early > 0
+            and getattr(
+                expert_buffer, "_tracking_failure_bin_frames", 0
+            ) <= 0
+        ):
+            raise ValueError(
+                "tracking_early_termination_fraction requires "
+                "tracking_failure_bin_size_s > 0"
+            )
         self._tracking_early_termination_count = n_early
         self._tracking_early_termination_mask = torch.zeros(
             n_elem, dtype=torch.bool, device=self.device
@@ -1572,8 +1581,8 @@ class FBCprAux:
         self._tracking_failure_streak = torch.zeros(
             n_elem, dtype=torch.long, device=self.device
         )
-        self._tracking_failed_once = torch.zeros(
-            n_elem, dtype=torch.bool, device=self.device
+        self._tracking_failure_attempt_age = torch.zeros(
+            n_elem, dtype=torch.long, device=self.device
         )
         self._tracking_local_phases = torch.zeros(
             n_elem, dtype=torch.long, device=self.device
@@ -1583,6 +1592,27 @@ class FBCprAux:
         )
         rt = batch.get("requires_terrain")
         self._tracking_requires_terrain = rt.to(self.device) if rt is not None else None
+        if (
+            n_early > 0
+            and getattr(
+                expert_buffer, "_tracking_failure_bin_frames", 0
+            ) > 0
+        ):
+            self._tracking_attempt_bin_ids = expert_buffer.tracking_bin_ids(
+                self._tracking_motion_ids,
+                self._tracking_starts,
+            ).to(self.device)
+            self._tracking_attempt_bin_ends = (
+                expert_buffer._tracking_bin_ends[
+                    self._tracking_attempt_bin_ids.to(
+                        expert_buffer.device
+                    )
+                ]
+                .to(self.device)
+            )
+        else:
+            self._tracking_attempt_bin_ids = None
+            self._tracking_attempt_bin_ends = None
         # Now compute heading delta (needs motion_ids/starts).
         self._tracking_heading_delta = self._compute_heading_delta(
             expert_buffer, robot_root_quat,
@@ -1617,26 +1647,23 @@ class FBCprAux:
             "starts": self._tracking_starts[mask],
         }
 
-    def _flush_tracking_failure_statistics(self, expert_buffer: Any) -> None:
-        """Commit the completed window's binary outcomes to motion priorities."""
-        enabled = getattr(self, "_tracking_early_termination_mask", None)
-        valid = getattr(self, "_tracking_early_termination_valid", None)
-        motion_ids = getattr(self, "_tracking_motion_ids", None)
-        failed = getattr(self, "_tracking_failed_once", None)
+    def _update_tracking_bin_statistics(
+        self,
+        expert_buffer: Any,
+        bin_ids: torch.Tensor,
+        succeeded: torch.Tensor,
+    ) -> None:
+        """Apply completed segment outcomes to the expert-buffer EMA."""
         if (
-            enabled is None
-            or valid is None
-            or motion_ids is None
-            or failed is None
-            or not hasattr(expert_buffer, "update_tracking_failure_statistics")
+            bin_ids.numel() == 0
+            or not hasattr(
+                expert_buffer, "update_tracking_bin_success_statistics"
+            )
         ):
             return
-        attempts = enabled & valid
-        if not bool(attempts.any()):
-            return
-        expert_buffer.update_tracking_failure_statistics(
-            motion_ids[attempts],
-            failed[attempts],
+        expert_buffer.update_tracking_bin_success_statistics(
+            bin_ids,
+            succeeded,
             ema_decay=float(
                 getattr(
                     self.cfg,
@@ -1656,21 +1683,86 @@ class FBCprAux:
             ),
         )
 
+    def _resample_failed_tracking_slots(
+        self,
+        failed_slots: torch.Tensor,
+        expert_buffer: Any,
+        terrain_z_fn=None,
+    ) -> dict[str, torch.Tensor]:
+        """Assign failed slots new failure-weighted bins and rebuild their z."""
+        num_failed = int(failed_slots.numel())
+        sampled = expert_buffer.sample_tracking_failure_bins(num_failed)
+        motion_ids = sampled["motion_ids"]
+        starts = sampled["starts"]
+        anchor_xy = self._tracking_anchor_canon_xy[failed_slots]
+        anchor_yaw = self._tracking_anchor_canon_yaw[failed_slots]
+        traj_len = int(self.cfg.rollout_expert_trajectories_length)
+        batch = expert_buffer.sample_tracking_trajectories(
+            num_failed,
+            traj_len,
+            anchor_canon_xy=anchor_xy.to(expert_buffer.device),
+            anchor_canon_yaw=anchor_yaw.to(expert_buffer.device),
+            motion_ids=motion_ids,
+            starts=starts,
+            pad_to_motion_end=True,
+        )
+        new_z = self._sample_tracking_z(
+            expert_buffer,
+            num_failed,
+            traj_len,
+            terrain_variant_root_h=(
+                self._tracking_terrain_variant_root_h[
+                    self._tracking_env_idx[failed_slots]
+                ]
+            ),
+            terrain_z_fn=terrain_z_fn,
+            batch=batch,
+            tracking_slots=failed_slots,
+        )
+
+        motion_ids_dev = motion_ids.to(self.device)
+        starts_dev = starts.to(self.device)
+        motion_lens_dev = batch["motion_lens"].to(self.device)
+        self._tracking_motion_ids[failed_slots] = motion_ids_dev
+        self._tracking_starts[failed_slots] = starts_dev
+        self._tracking_motion_lens[failed_slots] = motion_lens_dev
+        requires_terrain = batch.get("requires_terrain")
+        if requires_terrain is not None:
+            self._tracking_requires_terrain[failed_slots] = (
+                requires_terrain.to(self.device)
+            )
+        self._tracking_z[failed_slots] = new_z
+        self._tracking_local_phases[failed_slots] = 0
+        self._tracking_phase_hold_once[failed_slots] = True
+        self._tracking_failure_attempt_age[failed_slots] = 0
+        self._tracking_attempt_bin_ids[failed_slots] = sampled[
+            "bin_ids"
+        ].to(self.device)
+        self._tracking_attempt_bin_ends[failed_slots] = sampled[
+            "ends"
+        ].to(self.device)
+        return {
+            "motion_ids": motion_ids_dev,
+            "reset_frames": starts_dev,
+            "reset_offsets": torch.zeros_like(starts_dev),
+        }
+
     @torch.no_grad()
     def get_tracking_failures(
         self,
+        live_joint_pos: torch.Tensor,
+        ref_joint_pos: torch.Tensor,
         live_priv: torch.Tensor,
         ref_priv: torch.Tensor,
         natural_dones: torch.Tensor,
+        expert_buffer: Any,
+        terrain_z_fn=None,
     ) -> dict[str, Any] | None:
         """Detect sustained local tracking failures for the enabled cohort.
 
-        ``live_priv`` and ``ref_priv`` are synchronized post-step
-        ``max_local_self`` features. The position block is heading-aligned and
-        pelvis-relative, so its Cartesian error measures pose tracking without
-        penalizing intentionally unconstrained global XY/yaw motion. Root height
-        is checked separately because pelvis-centering cannot detect a coherent
-        whole-body vertical displacement.
+        Joint positions are synchronized post-step canonical-order tensors.
+        Root height is checked separately from ``max_local_self`` because joint
+        error cannot detect a coherent whole-body vertical displacement.
         """
         enabled = getattr(self, "_tracking_early_termination_active", None)
         valid = getattr(self, "_tracking_early_termination_valid", None)
@@ -1705,13 +1797,21 @@ class FBCprAux:
         if eligible_count == 0:
             return None
 
-        local_mpjpe, root_height_error = tracking_failure_metrics(
+        joint_mae, root_height_error = tracking_failure_metrics(
+            live_joint_pos[env_ids],
+            ref_joint_pos[env_ids],
             live_priv[env_ids], ref_priv[env_ids]
         )
 
         failed_frame = (
-            local_mpjpe
-            > float(getattr(self.cfg, "tracking_failure_threshold_m", 0.20))
+            joint_mae
+            > float(
+                getattr(
+                    self.cfg,
+                    "tracking_failure_joint_mae_threshold_rad",
+                    0.20,
+                )
+            )
         ) | (
             root_height_error
             > float(
@@ -1725,7 +1825,8 @@ class FBCprAux:
         grace = max(
             int(getattr(self.cfg, "tracking_failure_grace_steps", 10)), 0
         )
-        failed_frame &= int(getattr(self, "_tracking_phase", 0)) >= grace
+        attempt_age = self._tracking_failure_attempt_age
+        failed_frame &= attempt_age >= grace
         failed_frame &= enabled
 
         self._tracking_failure_streak = torch.where(
@@ -1745,53 +1846,114 @@ class FBCprAux:
             self._tracking_failure_streak >= consecutive,
             as_tuple=False,
         ).squeeze(-1)
+        failed_mask = torch.zeros_like(enabled)
+        failed_mask[failed_slots] = True
+
+        # A bin succeeds only after an enabled slot reaches its exclusive end
+        # without triggering the sustained-error criterion on this step.
+        local_t = self._tracking_local_time()
+        final_frame = (self._tracking_motion_lens - 1).clamp_min(0)
+        post_frames = torch.minimum(
+            self._tracking_starts + local_t + 1,
+            final_frame,
+        )
+        completed = (
+            enabled
+            & ~failed_mask
+            & completed_tracking_bins(
+                post_frames,
+                self._tracking_attempt_bin_ends,
+                final_frame,
+            )
+        )
+        completed_slots = torch.nonzero(
+            completed, as_tuple=False
+        ).squeeze(-1)
+        outcome_bins = []
+        outcome_success = []
+        if completed_slots.numel() > 0:
+            outcome_bins.append(
+                self._tracking_attempt_bin_ids[completed_slots]
+            )
+            outcome_success.append(
+                torch.ones(
+                    completed_slots.numel(),
+                    dtype=torch.bool,
+                    device=self.device,
+                )
+            )
+            next_frames = torch.minimum(
+                post_frames[completed_slots],
+                final_frame[completed_slots],
+            )
+            next_bins = expert_buffer.tracking_bin_ids(
+                self._tracking_motion_ids[completed_slots],
+                next_frames,
+            ).to(self.device)
+            self._tracking_attempt_bin_ids[completed_slots] = next_bins
+            self._tracking_attempt_bin_ends[completed_slots] = (
+                expert_buffer._tracking_bin_ends[
+                    next_bins.to(expert_buffer.device)
+                ].to(self.device)
+            )
+
+            at_motion_end = (
+                post_frames[completed_slots]
+                >= final_frame[completed_slots]
+            )
+            ended_slots = completed_slots[at_motion_end]
+            if ended_slots.numel() > 0:
+                enabled[ended_slots] = False
+                valid[ended_slots] = False
+                self._tracking_early_termination_active_count -= int(
+                    ended_slots.numel()
+                )
+
+        if failed_slots.numel() > 0:
+            outcome_bins.append(
+                self._tracking_attempt_bin_ids[failed_slots]
+            )
+            outcome_success.append(
+                torch.zeros(
+                    failed_slots.numel(),
+                    dtype=torch.bool,
+                    device=self.device,
+                )
+            )
+        if outcome_bins:
+            self._update_tracking_bin_statistics(
+                expert_buffer,
+                torch.cat(outcome_bins),
+                torch.cat(outcome_success),
+            )
+
+        attempt_age[enabled] += 1
         if failed_slots.numel() == 0:
             return {
-                "local_mpjpe": local_mpjpe,
+                "joint_mae": joint_mae,
                 "root_height_error": root_height_error,
                 "enabled": enabled_for_metrics,
                 "eligible_count": eligible_count,
+                "bin_success_count": int(completed_slots.numel()),
             }
 
         self._tracking_failure_streak[failed_slots] = 0
-        self._tracking_failed_once[failed_slots] = True
-        enabled[failed_slots] = False
-        self._tracking_early_termination_active_count -= int(
-            failed_slots.numel()
-        )
-        local_t = self._tracking_local_time()[failed_slots]
-        rollback_steps = int(
-            getattr(self.cfg, "tracking_failure_rollback_steps", 10)
-        )
-        reset_offsets = tracking_rollback_offsets(
-            local_t, rollback_steps
-        )
-        final_frame = (
-            self._tracking_motion_lens[failed_slots] - 1
-        ).clamp_min(0)
-        max_offsets = (
-            final_frame - self._tracking_starts[failed_slots]
-        ).clamp_min(0)
-        reset_offsets = torch.minimum(reset_offsets, max_offsets)
-        self._tracking_local_phases[failed_slots] = reset_offsets
-        # maybe_update_rollout_context runs after this reset. Hold these slots
-        # once so the next action consumes z[reset_offset], matching the reset
-        # observation instead of immediately advancing to reset_offset + 1.
-        self._tracking_phase_hold_once[failed_slots] = True
-        reset_frames = torch.minimum(
-            self._tracking_starts[failed_slots] + reset_offsets,
-            final_frame,
+        reset = self._resample_failed_tracking_slots(
+            failed_slots,
+            expert_buffer,
+            terrain_z_fn=terrain_z_fn,
         )
         return {
             "env_ids": env_ids[failed_slots],
             "slots": failed_slots,
-            "motion_ids": self._tracking_motion_ids[failed_slots],
-            "reset_frames": reset_frames,
-            "reset_offsets": reset_offsets,
-            "local_mpjpe": local_mpjpe,
+            "motion_ids": reset["motion_ids"],
+            "reset_frames": reset["reset_frames"],
+            "reset_offsets": reset["reset_offsets"],
+            "joint_mae": joint_mae,
             "root_height_error": root_height_error,
             "enabled": enabled_for_metrics,
             "eligible_count": eligible_count,
+            "bin_success_count": int(completed_slots.numel()),
         }
 
     def update_tracking_pose_after_reset(
@@ -2210,6 +2372,7 @@ class FBCprAux:
         terrain_variant_root_h: torch.Tensor | None = None,
         terrain_z_fn=None,
         batch: dict | None = None,
+        tracking_slots: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Encode z from expert sub-trajectories.
 
@@ -2224,6 +2387,42 @@ class FBCprAux:
             self._tracking_motion_lens = batch["motion_lens"].to(self.device)
             rt = batch.get("requires_terrain")
             self._tracking_requires_terrain = rt.to(self.device) if rt is not None else None
+        motion_ids = batch["motion_ids"].to(self.device)
+        starts = batch["starts"].to(self.device)
+        motion_lens = batch["motion_lens"].to(self.device)
+        requires_terrain = batch.get("requires_terrain")
+        if requires_terrain is not None:
+            requires_terrain = requires_terrain.to(self.device)
+        if tracking_slots is None:
+            tracking_T = getattr(self, "_tracking_T", None)
+            tracking_robot_xy = getattr(self, "_tracking_robot_xy", None)
+            tracking_heading_delta = getattr(
+                self, "_tracking_heading_delta", None
+            )
+        else:
+            tracking_slots = tracking_slots.to(self.device).long()
+            tracking_T_all = getattr(self, "_tracking_T", None)
+            tracking_T = (
+                tracking_T_all[tracking_slots]
+                if tracking_T_all is not None
+                else None
+            )
+            tracking_robot_xy_all = getattr(
+                self, "_tracking_robot_xy", None
+            )
+            tracking_robot_xy = (
+                tracking_robot_xy_all[tracking_slots]
+                if tracking_robot_xy_all is not None
+                else None
+            )
+            tracking_heading_delta_all = getattr(
+                self, "_tracking_heading_delta", None
+            )
+            tracking_heading_delta = (
+                tracking_heading_delta_all[tracking_slots]
+                if tracking_heading_delta_all is not None
+                else None
+            )
         next_obs = batch["next_observation"]
         next_obs = self._to_device(next_obs)
         # Patch expert root_h for global-root_h envs.
@@ -2234,11 +2433,11 @@ class FBCprAux:
             # Get root_pos_z for each frame from the flat buffer.
             # Reconstruct global indices (same as sample_tracking_trajectories).
             arange = torch.arange(traj_length, device=self.device).unsqueeze(0)
-            raw_frame = self._tracking_starts.unsqueeze(1) + arange
-            final_frame = (self._tracking_motion_lens - 1).clamp_min(0).unsqueeze(1)
+            raw_frame = starts.unsqueeze(1) + arange
+            final_frame = (motion_lens - 1).clamp_min(0).unsqueeze(1)
             frame_nxt = torch.minimum(raw_frame + 1, final_frame)
-            is_t = self._tracking_requires_terrain
-            obs_starts = self._cached_obs_starts_dev[self._tracking_motion_ids]
+            is_t = requires_terrain
+            obs_starts = self._cached_obs_starts_dev[motion_ids]
             global_nxt = (obs_starts.unsqueeze(1) + frame_nxt).long().reshape(-1)
             root_pos_z = self._cached_root_pos_dev[global_nxt, 2]  # [B*T]
             # Expand terrain_variant_root_h to [B*T]
@@ -2252,18 +2451,24 @@ class FBCprAux:
                     # Get motion root XY after offset for non-terrain motions.
                     root_pos_xy = self._cached_root_pos_dev[global_nxt, :2]
                     # Apply the same heading rotation + XY offset as ref viz.
-                    anchor_idx = self._tracking_anchor_global_idx()
+                    anchor_frame = torch.minimum(
+                        starts, (motion_lens - 1).clamp_min(0)
+                    )
+                    anchor_idx = (
+                        self._cached_obs_starts_dev[motion_ids]
+                        + anchor_frame
+                    ).long()
                     anchor_xy = self._cached_root_pos_dev[anchor_idx, :2]  # [B, 2]
                     anchor_xy_flat = anchor_xy.unsqueeze(1).expand(-1, traj_length, -1).reshape(-1, 2)
                     delta_xy = root_pos_xy - anchor_xy_flat
-                    if self._tracking_robot_xy is not None and self._tracking_heading_delta is not None:
-                        hd = self._tracking_heading_delta.unsqueeze(1).expand(-1, traj_length).reshape(-1)
+                    if tracking_robot_xy is not None and tracking_heading_delta is not None:
+                        hd = tracking_heading_delta.unsqueeze(1).expand(-1, traj_length).reshape(-1)
                         cos_d = torch.cos(hd)
                         sin_d = torch.sin(hd)
                         dx, dy = delta_xy[:, 0], delta_xy[:, 1]
                         rot_xy = torch.stack([cos_d * dx - sin_d * dy,
                                               sin_d * dx + cos_d * dy], dim=-1)
-                        rxy_flat = self._tracking_robot_xy.unsqueeze(1).expand(-1, traj_length, -1).reshape(-1, 2)
+                        rxy_flat = tracking_robot_xy.unsqueeze(1).expand(-1, traj_length, -1).reshape(-1, 2)
                         world_xy = rxy_flat + rot_xy
                     else:
                         world_xy = root_pos_xy
@@ -2284,7 +2489,7 @@ class FBCprAux:
         z = z.view(batch_dim, traj_length, z.shape[-1])
 
         # Variable-T rolling mean: per-env window from self._tracking_T
-        T_per_env = getattr(self, "_tracking_T", None)
+        T_per_env = tracking_T
         if T_per_env is not None and T_per_env.shape[0] == batch_dim:
             # Vectorized cumsum approach — no loops
             d = z.shape[-1]

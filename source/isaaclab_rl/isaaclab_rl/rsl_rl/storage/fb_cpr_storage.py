@@ -824,6 +824,7 @@ class FBCprExpertBuffer:
         history_len_override: int | None = None,
         compose_device: str | torch.device | None = None,
         expert_tracking_circular_wrap: bool = False,
+        tracking_failure_bin_frames: int = 0,
     ) -> None:
         """Expert motion buffer.
 
@@ -849,6 +850,9 @@ class FBCprExpertBuffer:
         self._length_proportional_priors = bool(length_proportional_priors)
         self.device = torch.device(device)
         self._expert_tracking_circular_wrap = bool(expert_tracking_circular_wrap)
+        self._tracking_failure_bin_frames = max(
+            int(tracking_failure_bin_frames), 0
+        )
         # Device for the ONE-TIME load-time FK compose (chain build + batched
         # FK). Defaults to the storage device. Set to a GPU when the buffer
         # itself is stored on CPU (device="cpu") so the compose stays fast
@@ -1234,6 +1238,7 @@ class FBCprExpertBuffer:
         self._tracking_failure_ema = torch.zeros_like(
             self._eval_priority_scores
         )
+        self._init_tracking_failure_bins()
         self._failure_priority_scale = 0.0
         self._failure_priority_max_multiplier = 1.0
         if (
@@ -1448,6 +1453,9 @@ class FBCprExpertBuffer:
         self, num_trajs: int, traj_length: int,
         anchor_canon_xy: torch.Tensor | None = None,
         anchor_canon_yaw: torch.Tensor | None = None,
+        motion_ids: torch.Tensor | None = None,
+        starts: torch.Tensor | None = None,
+        pad_to_motion_end: bool = False,
     ) -> dict:
         """Sample contiguous expert sub-trajectories for tracking.
 
@@ -1460,31 +1468,67 @@ class FBCprExpertBuffer:
         """
         # The default requires a genuinely contiguous trajectory. The opt-in
         # legacy path accepts short clips and wraps non-terrain motions.
+        # Explicit starts are used by the failure curriculum and may be close
+        # to a motion's end; those rows pad at the final frame rather than
+        # crossing into the next motion's flat storage.
         circular_wrap = bool(
             getattr(self, "_expert_tracking_circular_wrap", False)
         )
-        MIN_FRAMES = 50 if circular_wrap else max(50, traj_length + 1)
-        eligible_mask = self._lengths_t >= MIN_FRAMES
-        if not bool(eligible_mask.any().item()):
-            raise RuntimeError(f"No motion has at least {MIN_FRAMES} frames.")
-        eligible_idx = torch.nonzero(eligible_mask, as_tuple=False).squeeze(-1)
-        tracking_priorities = getattr(
-            self, "_tracking_priorities", self._priorities
-        )
-        eligible_priors = tracking_priorities[eligible_idx]
-        eligible_priors = eligible_priors / eligible_priors.sum().clamp_min(1e-12)
-        eligible_lengths = self._lengths_t[eligible_idx]
+        explicit_starts = motion_ids is not None or starts is not None
+        if explicit_starts:
+            if motion_ids is None or starts is None:
+                raise ValueError(
+                    "motion_ids and starts must both be supplied for forced "
+                    "tracking trajectories"
+                )
+            motion_picks = motion_ids.to(self.device).long().view(-1)
+            starts = starts.to(self.device).long().view(-1)
+            if motion_picks.numel() != num_trajs or starts.numel() != num_trajs:
+                raise ValueError(
+                    "forced motion_ids/starts must contain num_trajs entries"
+                )
+            if bool(
+                ((motion_picks < 0) | (motion_picks >= len(self._lengths))).any()
+            ):
+                raise IndexError("forced tracking motion ID is out of range")
+            motion_lens = self._lengths_t[motion_picks]
+            if bool(((starts < 0) | (starts >= motion_lens)).any()):
+                raise IndexError("forced tracking start is outside its motion")
+        else:
+            MIN_FRAMES = 50 if circular_wrap else max(50, traj_length + 1)
+            eligible_mask = self._lengths_t >= MIN_FRAMES
+            if not bool(eligible_mask.any().item()):
+                raise RuntimeError(f"No motion has at least {MIN_FRAMES} frames.")
+            eligible_idx = torch.nonzero(
+                eligible_mask, as_tuple=False
+            ).squeeze(-1)
+            tracking_priorities = getattr(
+                self, "_tracking_priorities", self._priorities
+            )
+            eligible_priors = tracking_priorities[eligible_idx]
+            eligible_priors = (
+                eligible_priors / eligible_priors.sum().clamp_min(1e-12)
+            )
+            eligible_lengths = self._lengths_t[eligible_idx]
 
-        sel = torch.multinomial(eligible_priors, num_trajs, replacement=True)
-        motion_picks = eligible_idx[sel]
-        motion_lens = eligible_lengths[sel]
-        rand01 = torch.rand(num_trajs, device=self.device)
-        max_start = (motion_lens - traj_length - 1).clamp_min(0).to(torch.float32)
-        starts = (rand01 * (max_start + 1.0)).floor().to(torch.long)
+            sel = torch.multinomial(
+                eligible_priors, num_trajs, replacement=True
+            )
+            motion_picks = eligible_idx[sel]
+            motion_lens = eligible_lengths[sel]
+            rand01 = torch.rand(num_trajs, device=self.device)
+            max_start = (
+                motion_lens - traj_length - 1
+            ).clamp_min(0).to(torch.float32)
+            starts = (rand01 * (max_start + 1.0)).floor().to(torch.long)
 
         arange = torch.arange(traj_length, device=self.device).unsqueeze(0)
         raw_frame = starts.unsqueeze(1) + arange
-        if circular_wrap:
+        if explicit_starts and pad_to_motion_end:
+            final_frame = (motion_lens - 1).clamp_min(0).unsqueeze(1)
+            frame_cur = torch.minimum(raw_frame, final_frame).reshape(-1)
+            frame_nxt = torch.minimum(raw_frame + 1, final_frame).reshape(-1)
+        elif circular_wrap:
             usable_lens = (motion_lens - 1).clamp_min(1).unsqueeze(1)
             # Legacy terrain trajectories pad at the final usable frame;
             # non-terrain trajectories wrap circularly.
@@ -1589,6 +1633,183 @@ class FBCprExpertBuffer:
 
     # -- priority updates --------------------------------------------------
 
+    def _init_tracking_failure_bins(self) -> None:
+        """Build fixed-width segment metadata for adaptive tracking resets."""
+        bin_frames = self._tracking_failure_bin_frames
+        if bin_frames <= 0:
+            self._tracking_bin_motion_ids = torch.empty(
+                0, dtype=torch.long, device=self.device
+            )
+            self._tracking_bin_starts = torch.empty_like(
+                self._tracking_bin_motion_ids
+            )
+            self._tracking_bin_ends = torch.empty_like(
+                self._tracking_bin_motion_ids
+            )
+            self._tracking_motion_bin_offsets = torch.zeros(
+                len(self._lengths) + 1,
+                dtype=torch.long,
+                device=self.device,
+            )
+            self._tracking_bin_success_ema = torch.empty(
+                0, dtype=torch.float32, device=self.device
+            )
+            return
+
+        motion_ids: list[torch.Tensor] = []
+        starts: list[torch.Tensor] = []
+        ends: list[torch.Tensor] = []
+        offsets = [0]
+        for motion_id, length in enumerate(self._lengths):
+            # A one-frame tail has no transition to learn or evaluate.
+            bin_starts = torch.arange(
+                0,
+                max(int(length) - 1, 1),
+                bin_frames,
+                dtype=torch.long,
+                device=self.device,
+            )
+            bin_ends = torch.minimum(
+                bin_starts + bin_frames,
+                torch.full_like(bin_starts, int(length)),
+            )
+            motion_ids.append(torch.full_like(bin_starts, motion_id))
+            starts.append(bin_starts)
+            ends.append(bin_ends)
+            offsets.append(offsets[-1] + int(bin_starts.numel()))
+
+        self._tracking_bin_motion_ids = torch.cat(motion_ids)
+        self._tracking_bin_starts = torch.cat(starts)
+        self._tracking_bin_ends = torch.cat(ends)
+        self._tracking_motion_bin_offsets = torch.tensor(
+            offsets, dtype=torch.long, device=self.device
+        )
+        # Unseen bins start at zero success, hence maximal failure priority.
+        self._tracking_bin_success_ema = torch.zeros(
+            len(self._tracking_bin_starts),
+            dtype=torch.float32,
+            device=self.device,
+        )
+
+    def tracking_bin_ids(
+        self,
+        motion_ids: torch.Tensor,
+        frames: torch.Tensor,
+    ) -> torch.Tensor:
+        """Map local motion frames to global one-second bin IDs."""
+        if self._tracking_failure_bin_frames <= 0:
+            raise RuntimeError("tracking failure bins are disabled")
+        motion_ids = motion_ids.to(self.device).long()
+        frames = frames.to(self.device).long()
+        lengths = self._lengths_t[motion_ids]
+        frames = torch.minimum(
+            frames.clamp_min(0), (lengths - 1).clamp_min(0)
+        )
+        local_bins = torch.div(
+            frames,
+            self._tracking_failure_bin_frames,
+            rounding_mode="floor",
+        )
+        max_local_bins = (
+            self._tracking_motion_bin_offsets[motion_ids + 1]
+            - self._tracking_motion_bin_offsets[motion_ids]
+            - 1
+        ).clamp_min(0)
+        local_bins = torch.minimum(local_bins, max_local_bins)
+        return self._tracking_motion_bin_offsets[motion_ids] + local_bins
+
+    def sample_tracking_failure_bins(
+        self,
+        num_samples: int,
+    ) -> dict[str, torch.Tensor]:
+        """Draw segment starts from capped failure-rate priorities."""
+        if self._tracking_bin_success_ema.numel() == 0:
+            raise RuntimeError("tracking failure bins are disabled")
+        failure_rate = 1.0 - self._tracking_bin_success_ema
+        multiplier = 1.0 + self._failure_priority_scale * failure_rate
+        multiplier = multiplier.clamp(
+            min=1.0,
+            max=max(self._failure_priority_max_multiplier, 1.0),
+        )
+        bin_lengths = (
+            self._tracking_bin_ends - self._tracking_bin_starts
+        ).float()
+        weights = bin_lengths * multiplier
+        if not bool(weights.sum() > 0):
+            weights = bin_lengths
+        picks = torch.multinomial(
+            weights, num_samples=num_samples, replacement=True
+        )
+        return {
+            "bin_ids": picks,
+            "motion_ids": self._tracking_bin_motion_ids[picks],
+            "starts": self._tracking_bin_starts[picks],
+            "ends": self._tracking_bin_ends[picks],
+        }
+
+    def update_tracking_bin_success_statistics(
+        self,
+        bin_ids: torch.Tensor,
+        succeeded: torch.Tensor,
+        *,
+        ema_decay: float,
+        priority_scale: float,
+        max_multiplier: float,
+    ) -> None:
+        """Update per-bin success EMA from completed segment attempts."""
+        bin_ids = bin_ids.to(self.device).long().view(-1)
+        succeeded = succeeded.to(self.device).float().view(-1)
+        if bin_ids.numel() != succeeded.numel():
+            raise ValueError(
+                "bin_ids and succeeded must contain the same number of attempts"
+            )
+        if bin_ids.numel() == 0:
+            return
+        if not 0.0 <= ema_decay < 1.0:
+            raise ValueError(f"ema_decay must be in [0, 1), got {ema_decay}")
+        if bool(
+            ((bin_ids < 0) | (
+                bin_ids >= self._tracking_bin_success_ema.numel()
+            )).any()
+        ):
+            raise IndexError("tracking bin ID is out of range")
+
+        counts = torch.zeros_like(self._tracking_bin_success_ema)
+        successes = torch.zeros_like(self._tracking_bin_success_ema)
+        counts.index_add_(0, bin_ids, torch.ones_like(succeeded))
+        successes.index_add_(0, bin_ids, succeeded)
+        observed = counts > 0
+        rates = successes[observed] / counts[observed]
+        self._tracking_bin_success_ema[observed] = (
+            ema_decay * self._tracking_bin_success_ema[observed]
+            + (1.0 - ema_decay) * rates
+        )
+        self._failure_priority_scale = max(float(priority_scale), 0.0)
+        self._failure_priority_max_multiplier = max(
+            float(max_multiplier), 1.0
+        )
+
+        # Keep the legacy per-motion diagnostic and initial-window sampler in
+        # sync with the finer segment statistics.
+        bin_failure = 1.0 - self._tracking_bin_success_ema
+        bin_lengths = (
+            self._tracking_bin_ends - self._tracking_bin_starts
+        ).float()
+        failure_sum = torch.zeros_like(self._tracking_failure_ema)
+        length_sum = torch.zeros_like(self._tracking_failure_ema)
+        failure_sum.index_add_(
+            0,
+            self._tracking_bin_motion_ids,
+            bin_failure * bin_lengths,
+        )
+        length_sum.index_add_(
+            0, self._tracking_bin_motion_ids, bin_lengths
+        )
+        self._tracking_failure_ema.copy_(
+            failure_sum / length_sum.clamp_min(1.0)
+        )
+        self._recompute_priorities()
+
     def _recompute_priorities(self) -> None:
         """Compose normalized eval and tracking-rollout sampling weights."""
         base = self._eval_priority_scores.clamp_min(0.0)
@@ -1640,55 +1861,16 @@ class FBCprExpertBuffer:
             self._eval_priority_scores[idxs] = priorities
         self._recompute_priorities()
 
-    def update_tracking_failure_statistics(
-        self,
-        motion_ids: torch.Tensor,
-        failed: torch.Tensor,
-        *,
-        ema_decay: float,
-        priority_scale: float,
-        max_multiplier: float,
-    ) -> None:
-        """Update per-motion failure EMA from completed tracking attempts.
-
-        Duplicate motion IDs are aggregated into one failure rate before the
-        EMA update. Both successes and failures must be supplied; otherwise
-        the adaptive sampler could only increase a motion's weight.
-        """
-        motion_ids = motion_ids.to(self.device).long().view(-1)
-        failed = failed.to(self.device).float().view(-1)
-        if motion_ids.numel() != failed.numel():
-            raise ValueError(
-                "motion_ids and failed must contain the same number of attempts"
-            )
-        if motion_ids.numel() == 0:
-            return
-        if not 0.0 <= ema_decay < 1.0:
-            raise ValueError(f"ema_decay must be in [0, 1), got {ema_decay}")
-
-        counts = torch.zeros_like(self._tracking_failure_ema)
-        failures = torch.zeros_like(self._tracking_failure_ema)
-        ones = torch.ones_like(failed)
-        counts.index_add_(0, motion_ids, ones)
-        failures.index_add_(0, motion_ids, failed)
-        observed = counts > 0
-        rates = failures[observed] / counts[observed]
-        self._tracking_failure_ema[observed] = (
-            ema_decay * self._tracking_failure_ema[observed]
-            + (1.0 - ema_decay) * rates
-        )
-        self._failure_priority_scale = max(float(priority_scale), 0.0)
-        self._failure_priority_max_multiplier = max(
-            float(max_multiplier), 1.0
-        )
-        self._recompute_priorities()
-
     def priority_state_dict(self) -> dict[str, Any]:
         """Small checkpoint state for adaptive expert/tracking sampling."""
         return {
             "motion_names": tuple(self._motion_names),
             "eval_priority_scores": self._eval_priority_scores.detach().cpu(),
             "tracking_failure_ema": self._tracking_failure_ema.detach().cpu(),
+            "tracking_failure_bin_frames": self._tracking_failure_bin_frames,
+            "tracking_bin_success_ema": (
+                self._tracking_bin_success_ema.detach().cpu()
+            ),
             "failure_priority_scale": self._failure_priority_scale,
             "failure_priority_max_multiplier": (
                 self._failure_priority_max_multiplier
@@ -1699,6 +1881,7 @@ class FBCprExpertBuffer:
         """Restore priority components; return False on incompatible shards."""
         eval_scores = state.get("eval_priority_scores")
         failure_ema = state.get("tracking_failure_ema")
+        bin_success_ema = state.get("tracking_bin_success_ema")
         motion_names = state.get("motion_names")
         if (
             motion_names is not None
@@ -1718,6 +1901,16 @@ class FBCprExpertBuffer:
         ):
             self._tracking_failure_ema.copy_(
                 failure_ema.to(self.device, dtype=torch.float32)
+            )
+        if (
+            int(state.get("tracking_failure_bin_frames", 0))
+            == self._tracking_failure_bin_frames
+            and isinstance(bin_success_ema, torch.Tensor)
+            and bin_success_ema.numel()
+            == self._tracking_bin_success_ema.numel()
+        ):
+            self._tracking_bin_success_ema.copy_(
+                bin_success_ema.to(self.device, dtype=torch.float32)
             )
         self._failure_priority_scale = max(
             float(state.get("failure_priority_scale", 0.0)), 0.0

@@ -220,6 +220,17 @@ class FBCprRunner:
         else:
             expert_compose_device = expert_device
         distributed_expert = bool(self.alg_cfg.get("distributed_expert", False))
+        tracking_bin_seconds = float(
+            self.alg_cfg.get("tracking_failure_bin_size_s", 0.0)
+        )
+        tracking_step_dt = float(
+            getattr(self.env.unwrapped, "step_dt", 1.0 / 50.0)
+        )
+        tracking_bin_frames = (
+            max(1, int(round(tracking_bin_seconds / tracking_step_dt)))
+            if tracking_bin_seconds > 0.0
+            else 0
+        )
         self.expert_buffer = FBCprExpertBuffer(
             pt_path=expert_path,
             seq_length=net_cfg.seq_length,
@@ -265,6 +276,7 @@ class FBCprRunner:
             expert_tracking_circular_wrap=bool(
                 self.alg_cfg.get("expert_tracking_circular_wrap", False)
             ),
+            tracking_failure_bin_frames=tracking_bin_frames,
         )
         # Forward to the env so RSI can pull from it.
         if hasattr(self.env_unwrapped, "set_expert_buffer"):
@@ -916,6 +928,7 @@ class FBCprRunner:
             rollout_done_count = 0
             rollout_transition_count = 0
             tracking_failure_count = 0
+            tracking_bin_success_count = 0
             tracking_failure_eligible_steps = 0
             tracking_failure_stat_chunks: list[torch.Tensor] = []
             # ----- rollout -----
@@ -1022,6 +1035,7 @@ class FBCprRunner:
                     # Push whole-body reference (heading-frame priv + joint
                     # pos/vel) for the explicit imitation aux reward.
                     _tracking_ref_priv = None
+                    _tracking_ref_joint_pos = None
                     if hasattr(env_u, "set_tracking_ref_whole_body"):
                         wb = self.alg.get_tracking_ref_whole_body(
                             step_count, self.expert_buffer,
@@ -1029,6 +1043,7 @@ class FBCprRunner:
                         if wb is not None:
                             ref_priv, ref_jp, ref_jv, wb_mask = wb
                             _tracking_ref_priv = ref_priv
+                            _tracking_ref_joint_pos = ref_jp
                             env_u.set_tracking_ref_whole_body(
                                 ref_priv, ref_jp, ref_jv, wb_mask,
                             )
@@ -1039,27 +1054,33 @@ class FBCprRunner:
                     dones = dones.to(self.device)
 
                     # A configurable subset of tracking envs treats sustained
-                    # heading-local pose error as an episode boundary.
-                    # Reset those envs shortly before the failed frame and
-                    # restart that slot's z schedule from the same offset;
-                    # a generic random reset would mismatch the still-active
-                    # mid-trajectory z context and immediately fail again. The
-                    # replay's row-boundary convention excludes the transition
-                    # into this reset, so this remains a continuing-task FB
-                    # curriculum rather than an absorbing failure target.
+                    # joint-position or pelvis-height error as an episode
+                    # boundary. Failed slots draw a failure-prioritized motion
+                    # bin, reset to its first frame, and restart a matching z
+                    # schedule. The replay row boundary excludes the teleport,
+                    # so this remains a continuing-task FB curriculum rather
+                    # than an absorbing failure target.
                     failure_info = None
                     if (
                         _tracking_ref_priv is not None
+                        and _tracking_ref_joint_pos is not None
                         and "privileged_state" in new_obs
                     ):
                         failure_info = self.alg.get_tracking_failures(
+                            env_u.joint_pos,
+                            _tracking_ref_joint_pos,
                             new_obs["privileged_state"],
                             _tracking_ref_priv,
                             dones.bool(),
+                            self.expert_buffer,
+                            terrain_z_fn=_terrain_z_fn,
                         )
                     if failure_info is not None:
+                        tracking_bin_success_count += int(
+                            failure_info.get("bin_success_count", 0)
+                        )
                         enabled = failure_info["enabled"]
-                        local_err = failure_info["local_mpjpe"]
+                        joint_err = failure_info["joint_mae"]
                         root_h_err = failure_info["root_height_error"]
                         tracking_failure_eligible_steps += int(
                             failure_info["eligible_count"]
@@ -1067,7 +1088,7 @@ class FBCprRunner:
                         tracking_failure_stat_chunks.append(
                             torch.stack(
                                 (
-                                    local_err[enabled].sum(),
+                                    joint_err[enabled].sum(),
                                     root_h_err[enabled].sum(),
                                 )
                             )
@@ -1328,6 +1349,9 @@ class FBCprRunner:
                 "Track/early_termination_count": float(
                     tracking_failure_count
                 ),
+                "Track/bin_success_count": float(
+                    tracking_bin_success_count
+                ),
                 "Track/early_termination_rate": (
                     tracking_failure_count
                     / max(tracking_failure_eligible_steps, 1)
@@ -1339,7 +1363,7 @@ class FBCprRunner:
                 tracking_failure_stats = torch.stack(
                     tracking_failure_stat_chunks
                 ).sum(dim=0).detach().cpu().tolist()
-                loss_dict["Track/eligible_local_mpjpe_m"] = (
+                loss_dict["Track/eligible_joint_mae_rad"] = (
                     tracking_failure_stats[0]
                     / tracking_failure_eligible_steps
                 )
@@ -1360,6 +1384,25 @@ class FBCprRunner:
                     loss_dict["Track/failure_priority_ema_max"] = (
                         failure_ema_stats[1]
                     )
+                bin_success_ema = getattr(
+                    self.expert_buffer,
+                    "_tracking_bin_success_ema",
+                    None,
+                )
+                if (
+                    bin_success_ema is not None
+                    and bin_success_ema.numel() > 0
+                ):
+                    bin_stats = torch.stack(
+                        (
+                            bin_success_ema.mean(),
+                            bin_success_ema.min(),
+                            bin_success_ema.max(),
+                        )
+                    ).detach().cpu().tolist()
+                    loss_dict["Track/bin_success_ema_mean"] = bin_stats[0]
+                    loss_dict["Track/bin_success_ema_min"] = bin_stats[1]
+                    loss_dict["Track/bin_success_ema_max"] = bin_stats[2]
             # Hold off updates until _delay_updates_until (== num_seed_steps on
             # a fresh run; larger on a no-replay resume so the resumed policy
             # refills the empty buffer on-policy first). Note the random-action
