@@ -1426,6 +1426,14 @@ class RslRlFBCprAlgorithmCfg:
     aux_reward_fixed_scale: float = 0.0
     """Positive fixed divisor for aux-critic rewards. When actor Q_aux
     denormalization is enabled, the same constant restores its reward units."""
+    aux_reward_sigma_min: float = 3.0
+    """Minimum adaptive reward sigma for denormalized actor-Q configurations.
+
+    Below this value, the critic reward divisor uses the floor; at or above it,
+    the critic uses the live EMA sigma. Actor Q_aux remains in normalized units
+    with multiplier one. Ignored unless actor-Q denormalization is enabled and
+    no fixed scale is configured.
+    """
     scale_reg: bool = True
     actor_fb_scale: float = 1.0
     """Scale applied to the actor's FB objective only. The same scaled FB

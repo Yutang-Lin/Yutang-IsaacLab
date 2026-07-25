@@ -65,6 +65,65 @@ def test_aux_actor_q_uses_fixed_scale_instead_of_ema_sigma():
     torch.testing.assert_close(q_aux.grad, torch.full_like(q_aux, 64.0))
 
 
+def test_aux_sigma_floor_scales_only_critic_below_floor():
+    sigma_floor = 5.0
+    raw = torch.tensor([[-6.0], [3.0]])
+    adaptive = torch.tensor([[-3.0], [1.5]])
+    variance = torch.tensor(4.0, requires_grad=True)
+
+    critic_reward = aux_reward_for_critic(
+        raw,
+        adaptive,
+        fixed_scale=0.0,
+        reward_variance=variance,
+        sigma_min=sigma_floor,
+    )
+    torch.testing.assert_close(
+        critic_reward,
+        torch.tensor([[-1.2], [0.6]]),
+    )
+
+    q_aux = torch.tensor([1.0, 3.0], requires_grad=True)
+    actor_q = aux_q_for_actor(
+        q_aux,
+        reward_variance=variance,
+        denormalize=True,
+        sigma_min=sigma_floor,
+    )
+    torch.testing.assert_close(actor_q, q_aux)
+    actor_q.sum().backward()
+    torch.testing.assert_close(q_aux.grad, torch.ones_like(q_aux))
+    assert variance.grad is None
+
+
+def test_aux_sigma_floor_uses_standard_normalization_above_floor():
+    sigma_floor = 5.0
+    raw = torch.tensor([[-8.0], [4.0]])
+    adaptive = torch.tensor([[-2.0], [1.0]])
+    variance = torch.tensor(36.0, requires_grad=True)
+
+    critic_reward = aux_reward_for_critic(
+        raw,
+        adaptive,
+        fixed_scale=0.0,
+        reward_variance=variance,
+        sigma_min=sigma_floor,
+    )
+    torch.testing.assert_close(critic_reward, adaptive)
+
+    q_aux = torch.tensor([1.0, 3.0], requires_grad=True)
+    actor_q = aux_q_for_actor(
+        q_aux,
+        reward_variance=variance,
+        denormalize=True,
+        sigma_min=sigma_floor,
+    )
+    torch.testing.assert_close(actor_q, q_aux)
+    actor_q.sum().backward()
+    torch.testing.assert_close(q_aux.grad, torch.ones_like(q_aux))
+    assert variance.grad is None
+
+
 def test_tracking_failure_metric_uses_canonical_joint_mae():
     ref_joint_pos = torch.zeros(2, 29)
     live_joint_pos = ref_joint_pos.clone()

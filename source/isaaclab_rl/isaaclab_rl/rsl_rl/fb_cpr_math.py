@@ -100,12 +100,25 @@ def aux_reward_for_critic(
     raw_reward: torch.Tensor,
     ema_normalized_reward: torch.Tensor,
     fixed_scale: float,
+    reward_variance: torch.Tensor | None = None,
+    sigma_min: float = 0.0,
 ) -> torch.Tensor:
-    """Use fixed numerical reward units when requested, else adaptive units."""
+    """Normalize aux rewards with a fixed scale or a floored EMA sigma."""
     if fixed_scale < 0.0:
         raise ValueError("fixed_scale must be non-negative")
+    if sigma_min < 0.0:
+        raise ValueError("sigma_min must be non-negative")
     if fixed_scale > 0.0:
         return raw_reward / fixed_scale
+    if sigma_min > 0.0:
+        if reward_variance is None:
+            raise ValueError(
+                "reward_variance is required when sigma_min is positive"
+            )
+        sigma = reward_variance.clamp_min(0.0).sqrt().detach()
+        sigma = sigma.to(device=raw_reward.device, dtype=raw_reward.dtype)
+        divisor = sigma.clamp_min(sigma_min)
+        return ema_normalized_reward * (sigma / divisor)
     return ema_normalized_reward
 
 
@@ -114,14 +127,19 @@ def aux_q_for_actor(
     reward_variance: torch.Tensor,
     denormalize: bool,
     fixed_scale: float = 0.0,
+    sigma_min: float = 0.0,
 ) -> torch.Tensor:
-    """Optionally restore normalized Q_aux to detached reward-scale units."""
+    """Apply the configured detached aux-Q reward-scale correction."""
     if not denormalize:
         return q_aux
     if fixed_scale < 0.0:
         raise ValueError("fixed_scale must be non-negative")
+    if sigma_min < 0.0:
+        raise ValueError("sigma_min must be non-negative")
     if fixed_scale > 0.0:
         scale = q_aux.new_tensor(fixed_scale)
+    elif sigma_min > 0.0:
+        return q_aux
     else:
         scale = reward_variance.clamp_min(0.0).sqrt().detach()
         scale = scale.to(device=q_aux.device, dtype=q_aux.dtype)

@@ -299,6 +299,14 @@ class FBCprAuxAlgorithmCfg:
     aux_reward_fixed_scale: float = 0.0
     """If positive, train the aux critic on raw reward divided by this fixed
     scale. With aux_actor_denormalize_q, the actor multiplies Q_aux by it."""
+    aux_reward_sigma_min: float = 3.0
+    """Minimum adaptive aux-reward sigma for denormalized-Q configurations.
+
+    This is active when ``aux_actor_denormalize_q`` is true and no fixed scale
+    is configured. Below the floor, critic rewards are divided by this value
+    instead of the live EMA sigma. Actor Q_aux remains normalized with
+    multiplier one both below and above the floor.
+    """
     scale_reg: bool = True         # multiply regs by |Q_fb|.abs().mean().detach()
     # Actor-only FB scale alignment. Applied before scale_reg so the direct FB
     # and regularizer terms scale together; FB TD targets remain unchanged.
@@ -547,6 +555,8 @@ class FBCprAux:
             )
         if float(getattr(cfg, "aux_reward_fixed_scale", 0.0)) < 0.0:
             raise ValueError("aux_reward_fixed_scale must be non-negative")
+        if float(cfg.aux_reward_sigma_min) < 0.0:
+            raise ValueError("aux_reward_sigma_min must be non-negative")
         if bool(getattr(cfg, "fb_grad_spike_clip", False)):
             decay = float(getattr(cfg, "fb_grad_spike_ema_decay", 0.99))
             multiplier = float(getattr(cfg, "fb_grad_spike_multiplier", 5.0))
@@ -2967,10 +2977,17 @@ class FBCprAux:
         # Always update EMA moments for diagnostics. A positive fixed scale
         # replaces adaptive normalization while retaining those diagnostics.
         aux_reward_ema = self.policy._aux_reward_normalizer(aux_reward)
+        aux_reward_sigma_min = (
+            self.cfg.aux_reward_sigma_min
+            if self.cfg.aux_actor_denormalize_q
+            else 0.0
+        )
         aux_reward = aux_reward_for_critic(
             aux_reward,
             aux_reward_ema,
             self.cfg.aux_reward_fixed_scale,
+            self.policy._aux_reward_normalizer.S,
+            aux_reward_sigma_min,
         )
 
         # =============================================================
@@ -4123,6 +4140,7 @@ class FBCprAux:
             self.policy._aux_reward_normalizer.S,
             self.cfg.aux_actor_denormalize_q,
             self.cfg.aux_reward_fixed_scale,
+            self.cfg.aux_reward_sigma_min,
         )
 
     def _backward_actor_transformer(self, win: dict, z: torch.Tensor):
