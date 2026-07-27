@@ -65,6 +65,29 @@ def sample_log_horizon_gamma(
     return 1.0 - torch.exp(-h)
 
 
+def sample_relabel_z(
+    stored_z: torch.Tensor,
+    mixed_z: torch.Tensor,
+    ratio: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Independently relabel rows and return the sampled column mask."""
+    if not 0.0 <= ratio <= 1.0:
+        raise ValueError(f"Expected relabel ratio in [0, 1], got {ratio}")
+    if stored_z.shape != mixed_z.shape:
+        raise ValueError(
+            "Stored and mixed z must have matching shapes, got "
+            f"{tuple(stored_z.shape)} and {tuple(mixed_z.shape)}"
+        )
+    mask_shape = (stored_z.shape[0],) + (1,) * (stored_z.ndim - 1)
+    if ratio == 0.0:
+        mask = torch.zeros(mask_shape, device=stored_z.device, dtype=torch.bool)
+    elif ratio == 1.0:
+        mask = torch.ones(mask_shape, device=stored_z.device, dtype=torch.bool)
+    else:
+        mask = torch.rand(mask_shape, device=stored_z.device) < ratio
+    return torch.where(mask, mixed_z, stored_z), mask
+
+
 def normalized_gamma_loss_weights(
     gamma: torch.Tensor,
     gamma_min: float,

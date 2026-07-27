@@ -15,6 +15,7 @@ from isaaclab_rl.rsl_rl.fb_cpr_math import (
     innovation_alignment_loss,
     normalized_gamma_loss_weights,
     sample_log_horizon_gamma,
+    sample_relabel_z,
     stochastic_integral_weights,
     tracking_failure_metrics,
 )
@@ -186,6 +187,50 @@ def test_independent_gamma_samples_stay_in_range():
     assert torch.all(gamma_alt >= 0.4)
     assert torch.all(gamma_alt <= 0.975)
     assert not torch.equal(gamma, gamma_alt)
+
+
+def test_relabel_z_ratio_endpoints_are_exact():
+    stored = torch.zeros(32, 4)
+    mixed = torch.ones_like(stored)
+
+    original, original_mask = sample_relabel_z(stored, mixed, 0.0)
+    relabeled, relabeled_mask = sample_relabel_z(stored, mixed, 1.0)
+
+    torch.testing.assert_close(original, stored)
+    assert not original_mask.any()
+    torch.testing.assert_close(relabeled, mixed)
+    assert relabeled_mask.all()
+
+
+def test_actor_and_value_relabel_masks_can_be_sampled_independently():
+    torch.manual_seed(23)
+    stored = torch.zeros(8192, 4)
+    mixed = torch.ones_like(stored)
+
+    value_z, value_mask = sample_relabel_z(stored, mixed, 0.8)
+    actor_z, actor_mask = sample_relabel_z(stored, mixed, 0.5)
+
+    torch.testing.assert_close(value_z[:, :1].bool(), value_mask)
+    torch.testing.assert_close(actor_z[:, :1].bool(), actor_mask)
+    assert not torch.equal(value_mask, actor_mask)
+    torch.testing.assert_close(
+        value_mask.float().mean(), torch.tensor(0.8), atol=0.02, rtol=0
+    )
+    torch.testing.assert_close(
+        actor_mask.float().mean(), torch.tensor(0.5), atol=0.02, rtol=0
+    )
+
+
+def test_relabel_z_rejects_invalid_ratio():
+    stored = torch.zeros(2, 4)
+    mixed = torch.ones_like(stored)
+
+    for ratio in (-0.1, 1.1):
+        try:
+            sample_relabel_z(stored, mixed, ratio)
+        except ValueError:
+            continue
+        raise AssertionError(f"Expected invalid relabel ratio {ratio} to fail")
 
 
 def test_gamma99_log_horizon_distribution():

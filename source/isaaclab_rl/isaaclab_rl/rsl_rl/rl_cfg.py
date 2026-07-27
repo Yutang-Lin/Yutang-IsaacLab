@@ -1454,6 +1454,9 @@ class RslRlFBCprAlgorithmCfg:
     ma_max_batch: int = 1024
     discount: float = 0.98
     relabel_ratio: float | None = 0.8
+    actor_relabel_ratio: float | None = None
+    """Optional actor-only relabel probability. ``None`` shares the FB/critic
+    relabeled z exactly; a float samples an independent actor relabel mask."""
     train_goal_ratio: float = 0.2
     expert_asm_ratio: float = 0.6
 
@@ -1469,13 +1472,22 @@ class RslRlFBCprAlgorithmCfg:
     tracking_T_min: int = 1
     tracking_T_max: int = 16
     tracking_T_choices: tuple[int, ...] = ()
-    """Optional discrete mean-z horizons. These control episodic tracking z and,
-    when disc_fixed_T=0, expert z used by relabeling and the discriminator."""
+    """Optional discrete rollout mean-z horizons. Expert/relabel z inherits
+    these only when expert_T_* and disc_fixed_T do not override them."""
     tracking_T_choice_probs: tuple[float, ...] = ()
+    expert_T_min: int = 0
+    expert_T_max: int = 0
+    """Optional expert/relabel mean-z horizon range. Positive values decouple
+    expert/relabel T sampling from ``tracking_T_*``; zeros inherit the rollout
+    tracking range. Sampling is uniform over inclusive integer frame counts."""
+    expert_T_choices: tuple[int, ...] = ()
+    expert_T_choice_probs: tuple[float, ...] = ()
+    """Optional discrete expert/relabel mean-z horizons and probabilities.
+    Empty choices use ``expert_T_min/max`` or fall back to ``tracking_T_*``."""
     disc_fixed_T: int = 0
-    """Fixed expert/discriminator z-mean horizon. Zero preserves the legacy
-    coupling to tracking_T_*; positive values keep discriminator T fixed while
-    rollout tracking environments randomize their mean-z horizon episodically."""
+    """Fixed expert/discriminator z-mean horizon. Positive values override all
+    sampled ranges. Zero uses expert_T_* when configured, otherwise preserving
+    the legacy coupling to tracking_T_*."""
     disc_positive_full_window: bool = False
     disc_positive_window: int = 0
     """Centered discriminator-positive width around the expert z-mean

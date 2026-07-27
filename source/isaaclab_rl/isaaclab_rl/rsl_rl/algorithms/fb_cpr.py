@@ -48,6 +48,7 @@ from ..fb_cpr_math import (
     innovation_alignment_loss,
     normalized_gamma_loss_weights,
     sample_log_horizon_gamma,
+    sample_relabel_z,
     stochastic_integral_weights,
     tracking_failure_metrics,
 )
@@ -364,6 +365,9 @@ class FBCprAuxAlgorithmCfg:
     fb_gamma_innovation_align: bool = False
     fb_gamma_innovation_align_coef: float = 1.0
     relabel_ratio: float | None = 0.8
+    # Optional actor-specific relabel probability. None preserves the original
+    # behavior where actor and value updates consume the same relabeled z.
+    actor_relabel_ratio: float | None = None
     train_goal_ratio: float = 0.2
     expert_asm_ratio: float = 0.6
 
@@ -403,16 +407,24 @@ class FBCprAuxAlgorithmCfg:
     tracking_T_min: int = 1
     tracking_T_max: int = 16
     # If non-empty, sample T from this discrete set instead of uniformly from
-    # [T_min, T_max]. This controls per-env rollout tracking z and, when
-    # disc_fixed_T=0, the expert z shared by relabeling and the discriminator.
+    # [T_min, T_max]. This controls per-env rollout tracking z and is inherited
+    # by expert/relabel z unless expert_T_* or disc_fixed_T overrides it.
     # Rollout T is sampled once per tracking episode; expert T once per sequence.
     tracking_T_choices: tuple[int, ...] = ()
     # Per-choice probabilities (must match len(tracking_T_choices) when set).
     # Empty tuple = uniform over choices.
     tracking_T_choice_probs: tuple[float, ...] = ()
+    # Optional expert/relabel mean-z horizon sampling. Zeros/empty choices
+    # inherit tracking_T_* for backward compatibility. These settings affect
+    # the expert z shared by relabeling and discriminator conditioning, not the
+    # independently configurable discriminator-positive observation window.
+    expert_T_min: int = 0
+    expert_T_max: int = 0
+    expert_T_choices: tuple[int, ...] = ()
+    expert_T_choice_probs: tuple[float, ...] = ()
     # Fixed expert/discriminator z-mean horizon. Positive values decouple the
-    # discriminator from episodic rollout tracking-T randomization. Zero keeps
-    # the legacy behavior where the discriminator shares tracking_T_*.
+    # expert z from all sampled ranges. Zero uses expert_T_* when configured,
+    # otherwise retaining the legacy tracking_T_* coupling.
     disc_fixed_T: int = 0
     # If True, the discriminator's positive (expert) window is ALWAYS the full
     # seq_length regardless of the per-sequence z-window T — i.e. every frame
@@ -557,6 +569,10 @@ class FBCprAux:
             raise ValueError("aux_reward_fixed_scale must be non-negative")
         if float(cfg.aux_reward_sigma_min) < 0.0:
             raise ValueError("aux_reward_sigma_min must be non-negative")
+        for name in ("relabel_ratio", "actor_relabel_ratio"):
+            ratio = getattr(cfg, name, None)
+            if ratio is not None and not 0.0 <= float(ratio) <= 1.0:
+                raise ValueError(f"{name} must be in [0, 1] or None, got {ratio}")
         if bool(getattr(cfg, "fb_grad_spike_clip", False)):
             decay = float(getattr(cfg, "fb_grad_spike_ema_decay", 0.99))
             multiplier = float(getattr(cfg, "fb_grad_spike_multiplier", 5.0))
@@ -1170,14 +1186,6 @@ class FBCprAux:
     ) -> torch.Tensor | None:
         """Sample one expert z-mean horizon per sequence."""
         fixed_disc_T = int(getattr(self.cfg, "disc_fixed_T", 0))
-        choices = tuple(getattr(self.cfg, "tracking_T_choices", ()) or ())
-        choice_probs = tuple(
-            getattr(self.cfg, "tracking_T_choice_probs", ()) or ()
-        )
-        T_min = int(getattr(self.cfg, "tracking_T_min", 1))
-        T_max = min(
-            int(getattr(self.cfg, "tracking_T_max", 16)), seq_length
-        )
         if fixed_disc_T > 0:
             if fixed_disc_T > seq_length:
                 raise ValueError(
@@ -1190,15 +1198,59 @@ class FBCprAux:
                 device=self.device,
                 dtype=torch.long,
             )
+
+        expert_choices = tuple(
+            getattr(self.cfg, "expert_T_choices", ()) or ()
+        )
+        expert_choice_probs = tuple(
+            getattr(self.cfg, "expert_T_choice_probs", ()) or ()
+        )
+        expert_T_min = int(getattr(self.cfg, "expert_T_min", 0))
+        expert_T_max = int(getattr(self.cfg, "expert_T_max", 0))
+        if expert_choices or expert_T_min > 0 or expert_T_max > 0:
+            choices = expert_choices
+            choice_probs = expert_choice_probs
+            if expert_choices and expert_T_min == 0 and expert_T_max == 0:
+                T_min = min(expert_choices)
+                T_max_cfg = max(expert_choices)
+            else:
+                T_min = expert_T_min
+                T_max_cfg = expert_T_max
+            if T_min <= 0 or T_max_cfg <= 0:
+                raise ValueError(
+                    "expert_T_min and expert_T_max must both be positive "
+                    "when either expert range endpoint is configured"
+                )
+        else:
+            choices = tuple(
+                getattr(self.cfg, "tracking_T_choices", ()) or ()
+            )
+            choice_probs = tuple(
+                getattr(self.cfg, "tracking_T_choice_probs", ()) or ()
+            )
+            T_min = int(getattr(self.cfg, "tracking_T_min", 1))
+            T_max_cfg = int(getattr(self.cfg, "tracking_T_max", 16))
+        T_max = min(T_max_cfg, seq_length)
+        if T_min < 1 or T_min > T_max:
+            raise ValueError(
+                f"Invalid expert mean-z horizon range [{T_min}, {T_max_cfg}] "
+                f"for seq_length={seq_length}"
+            )
+
         if choices:
+            if choice_probs and len(choice_probs) != len(choices):
+                raise ValueError(
+                    "expert/tracking T choice probabilities must match the "
+                    f"number of choices: {len(choice_probs)} != {len(choices)}"
+                )
             kept = [
                 (choice, choice_probs[i] if choice_probs else 1.0)
                 for i, choice in enumerate(choices)
-                if choice <= seq_length
+                if T_min <= choice <= T_max
             ]
             if not kept:
                 raise ValueError(
-                    f"No tracking_T_choices fit seq_length={seq_length}: "
+                    f"No expert mean-z T choices fit seq_length={seq_length}: "
                     f"{choices}"
                 )
             choices_t = torch.tensor(
@@ -1252,9 +1304,9 @@ class FBCprAux:
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Encode expert sub-sequences through B for discriminator training.
 
-        ``disc_fixed_T > 0`` uses that fixed mean horizon independently of the
-        episodic rollout tracking-z horizon. Zero retains the legacy coupled
-        behavior and samples from ``tracking_T_*``.
+        ``disc_fixed_T > 0`` uses that fixed mean horizon. Otherwise expert_T_*
+        controls the mean when configured; zero/empty expert settings retain
+        the legacy behavior coupled to ``tracking_T_*``.
 
         Returns:
             z_expert: [batch_size, z_dim] z replicated per frame
@@ -2914,7 +2966,7 @@ class FBCprAux:
             next_obs=expert_next_obs,
             T_per_seq=expert_T_per_seq,
         )
-        train_z = train_batch["z"].to(self.device, non_blocking=True)
+        stored_train_z = train_batch["z"].to(self.device, non_blocking=True)
 
         # BFM order: disc sees ORIGINAL train_z (from rollout), THEN relabel.
         # The discriminator must train on the actual (s, z) pairs from the
@@ -2927,15 +2979,39 @@ class FBCprAux:
         # disc-z as B(train_next_obs), which the preamble already anchored under
         # a per-row RANDOM A_i ~ p_A — matching expert_z's random anchor so the
         # anchor component is i.i.d. for both. Base = identity (rollout z).
-        disc_train_z = self._disc_train_z(train_next_obs, train_z)
+        disc_train_z = self._disc_train_z(train_next_obs, stored_train_z)
 
         z = self.sample_mixed_z(train_goal=train_next_obs, expert_encodings=expert_z).clone()
         self._zbuf_add(z)
-        if self.cfg.relabel_ratio is not None:
-            mask = torch.rand(
-                (self.cfg.batch_size, 1), device=self.device
-            ) <= self.cfg.relabel_ratio
-            train_z = torch.where(mask, z, train_z)
+        value_relabel_ratio = self.cfg.relabel_ratio
+        if value_relabel_ratio is None:
+            train_z = stored_train_z
+            value_relabel_mask = torch.zeros(
+                (stored_train_z.shape[0], 1),
+                device=stored_train_z.device,
+                dtype=torch.bool,
+            )
+        else:
+            train_z, value_relabel_mask = sample_relabel_z(
+                stored_train_z,
+                z,
+                float(value_relabel_ratio),
+            )
+
+        # FB and all critics retain the value-side relabel distribution above.
+        # The actor may independently trade hindsight/expert z for paired
+        # rollout z without changing its total batch size. None shares the
+        # value-side tensor exactly for backward compatibility.
+        actor_relabel_ratio = getattr(self.cfg, "actor_relabel_ratio", None)
+        if actor_relabel_ratio is None:
+            actor_train_z = None
+            actor_relabel_mask = value_relabel_mask
+        else:
+            actor_train_z, actor_relabel_mask = sample_relabel_z(
+                stored_train_z,
+                z,
+                float(actor_relabel_ratio),
+            )
 
         # --- Anchoring seam (Global-through-Anchoring) -----------------
         # Default is identity: ``fb_goal`` is the transition's own next obs and
@@ -2957,6 +3033,8 @@ class FBCprAux:
             mixed_z=z,
             expert_z=expert_z,
         )
+        if actor_train_z is None:
+            actor_train_z = train_z
 
         q_loss_coef = self.cfg.q_loss_coef if self.cfg.q_loss_coef > 0 else None
         clip_grad_norm = self.cfg.clip_grad_norm if self.cfg.clip_grad_norm > 0 else None
@@ -3174,6 +3252,8 @@ class FBCprAux:
         metrics.update(disc_gn)
         metrics.update(fb_gn)
         metrics.update(aux_gn)
+        metrics["Relabel/value_fraction"] = value_relabel_mask.float().mean()
+        metrics["Relabel/actor_fraction"] = actor_relabel_mask.float().mean()
 
         # =============================================================
         # PHASE 2: critic. Depends on NEW disc (for disc_reward), so
@@ -3208,7 +3288,7 @@ class FBCprAux:
         actor_metrics, actor_handle = self.backward_actor(
             obs=train_obs,
             action=train_action,
-            z=train_z,
+            z=actor_train_z,
         )
         actor_gn = self.step_actor(actor_handle, clip_grad_norm)
         metrics.update(actor_metrics)
