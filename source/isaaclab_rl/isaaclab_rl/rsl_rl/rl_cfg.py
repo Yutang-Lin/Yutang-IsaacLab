@@ -1131,6 +1131,7 @@ class RslRlFBCprPolicyCfg:
         "history_actor",
     )
     forward_gamma_embed_dim: int = 0  # >0 => gamma-conditioned F(s,z,a,gamma)
+    forward_gamma_embed_type: Literal["fourier", "mlp"] = "fourier"
 
     # Actor
     actor_hidden_dim: int = 2048

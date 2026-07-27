@@ -741,17 +741,32 @@ class FourierMLP(nn.Module):
         return self.mlp(feats)
 
 
+class ScalarMLP(nn.Module):
+    """Embed a scalar directly with a small MLP."""
+
+    def __init__(self, out_dim: int) -> None:
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(1, out_dim),
+            nn.Mish(),
+            nn.Linear(out_dim, out_dim),
+            nn.Mish(),
+        )
+
+    def forward(self, value: torch.Tensor) -> torch.Tensor:
+        return self.mlp(value)
+
+
 class ForwardMap(nn.Module):
     """BFM forward map ``F(s, z, a) -> z`` (also reused as the critic / aux-critic).
 
     Optional DISCOUNT CONDITIONING (``gamma_embed_dim > 0``): the map becomes
     ``F(s, z, a, gamma)``, letting one network represent successor measures at a
     RANGE of discounts. The conditioning signal is the log effective-horizon
-    ``h = -log(1 - gamma)`` (smoother than raw gamma near 1), passed through a
-    small MLP ``embed_gamma`` (1 -> gamma_embed_dim -> gamma_embed_dim) and
-    concatenated into BOTH embedding-branch inputs. Non-conditioned instances
-    (critic / aux / entropy, and F when the feature is off) are byte-identical
-    to before.
+    ``h = -log(1 - gamma)`` (smoother than raw gamma near 1), embedded by either
+    fixed Fourier features plus an MLP or a direct scalar MLP, and concatenated
+    into BOTH embedding-branch inputs. Non-conditioned instances (critic / aux /
+    entropy, and F when the feature is off) are byte-identical to before.
     """
 
     def __init__(
@@ -767,6 +782,7 @@ class ForwardMap(nn.Module):
         input_keys: str | tp.Sequence[str] | None = None,
         output_dim: int | None = None,
         gamma_embed_dim: int = 0,
+        gamma_embed_type: str = "fourier",
     ) -> None:
         super().__init__()
         self.input_filter = build_input_filter(obs_space, input_keys)
@@ -782,6 +798,7 @@ class ForwardMap(nn.Module):
         self.hidden_dim = hidden_dim
         self.model = model
         self.gamma_embed_dim = int(gamma_embed_dim)
+        self.gamma_embed_type = str(gamma_embed_type)
 
         if model == "residual":
             embed_fn = residual_embedding
@@ -790,14 +807,19 @@ class ForwardMap(nn.Module):
         else:
             raise ValueError(f"Unsupported forward_map model {model}")
 
-        # Discount-conditioning embedding: h = -log(1-gamma) -> Fourier features
-        # -> MLP -> gamma_embed_dim. Sinusoidal (Fourier) features give the MLP a
-        # multi-scale, smooth basis over the log-horizon h (vs a raw scalar,
-        # which an MLP resolves poorly at fine frequencies). Output is expanded
+        # Discount-conditioning embedding of h=-log(1-gamma). Output is expanded
         # across the parallel ensemble in forward() and concat'd into both branches.
         gdim = self.gamma_embed_dim
         if gdim > 0:
-            self.embed_gamma = FourierMLP(out_dim=gdim)
+            if self.gamma_embed_type == "fourier":
+                self.embed_gamma = FourierMLP(out_dim=gdim)
+            elif self.gamma_embed_type == "mlp":
+                self.embed_gamma = ScalarMLP(out_dim=gdim)
+            else:
+                raise ValueError(
+                    "Unsupported gamma_embed_type "
+                    f"{self.gamma_embed_type!r}; expected 'fourier' or 'mlp'"
+                )
         else:
             self.embed_gamma = None
 
@@ -1297,6 +1319,7 @@ class FBCprNetworkCfg:
     # with a gamma_embed_dim-wide MLP embedding of h=-log(1-gamma). Only the main
     # forward map is conditioned (critics/aux/entropy stay plain).
     forward_gamma_embed_dim: int = 0
+    forward_gamma_embed_type: str = "fourier"
 
     # Actor
     actor_hidden_dim: int = 2048
@@ -1543,6 +1566,9 @@ class FBCprAuxPolicy(nn.Module):
             num_parallel=cfg.forward_num_parallel,
             input_keys=cfg.forward_input_keys,
             gamma_embed_dim=int(getattr(cfg, "forward_gamma_embed_dim", 0)),
+            gamma_embed_type=str(
+                getattr(cfg, "forward_gamma_embed_type", "fourier")
+            ),
         )
         # Whether F consumes a gamma argument (drives call sites in the algorithm).
         self.forward_gamma_conditioned = int(getattr(cfg, "forward_gamma_embed_dim", 0)) > 0
