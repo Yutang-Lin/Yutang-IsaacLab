@@ -13,12 +13,24 @@ from isaaclab_rl.rsl_rl.fb_cpr_math import (
     centered_subwindow_start,
     completed_tracking_bins,
     innovation_alignment_loss,
+    normalized_forward_value,
     normalized_gamma_loss_weights,
     sample_log_horizon_gamma,
     sample_relabel_z,
     stochastic_integral_weights,
     tracking_failure_metrics,
 )
+
+
+def test_normalized_forward_value_uses_network_output_directly():
+    q = torch.tensor([2.0, 3.0], requires_grad=True)
+    gamma = torch.tensor([0.6, 0.99])
+
+    direct = normalized_forward_value(q, gamma, True)
+    legacy = normalized_forward_value(q, gamma, False)
+
+    torch.testing.assert_close(direct, q)
+    torch.testing.assert_close(legacy, torch.tensor([0.8, 0.03]))
 
 
 def test_aux_critic_uses_fixed_reward_scale_instead_of_ema():

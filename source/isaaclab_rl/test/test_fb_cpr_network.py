@@ -24,6 +24,7 @@ _SPEC.loader.exec_module(_POLICY_MODULE)
 FourierMLP = _POLICY_MODULE.FourierMLP
 ForwardMap = _POLICY_MODULE.ForwardMap
 ScalarMLP = _POLICY_MODULE.ScalarMLP
+gamma_forward_output_to_raw = _POLICY_MODULE.gamma_forward_output_to_raw
 
 
 def _gamma_forward_map(embed_type: str) -> ForwardMap:
@@ -65,6 +66,24 @@ def test_forward_map_gamma_embedding_types(
 def test_forward_map_rejects_unknown_gamma_embedding_type():
     with pytest.raises(ValueError, match="gamma_embed_type"):
         _gamma_forward_map("unknown")
+
+
+def test_normalized_gamma_output_reconstructs_raw_f():
+    output = torch.ones(2, 2, 3, requires_grad=True)
+    gamma = torch.tensor([0.6, 0.99])
+
+    raw = gamma_forward_output_to_raw(output, gamma)
+
+    torch.testing.assert_close(raw[:, 0], torch.full((2, 3), 2.5))
+    torch.testing.assert_close(raw[:, 1], torch.full((2, 3), 100.0))
+    raw.sum().backward()
+    torch.testing.assert_close(
+        output.grad[:, 0], torch.full((2, 3), 2.5)
+    )
+    torch.testing.assert_close(
+        output.grad[:, 1], torch.full((2, 3), 100.0)
+    )
+
 
 if __name__ == "__main__":
     test_fb_networks()

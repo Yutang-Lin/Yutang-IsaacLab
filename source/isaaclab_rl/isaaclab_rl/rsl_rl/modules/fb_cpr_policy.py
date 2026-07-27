@@ -757,6 +757,15 @@ class ScalarMLP(nn.Module):
         return self.mlp(value)
 
 
+def gamma_forward_output_to_raw(
+    output: torch.Tensor,
+    gamma: torch.Tensor,
+) -> torch.Tensor:
+    """Convert learned G=(1-gamma)F output to raw successor feature F."""
+    scale = (1.0 - gamma.to(output.dtype)).clamp_min(1e-6)
+    return output / scale.view(1, -1, 1)
+
+
 class ForwardMap(nn.Module):
     """BFM forward map ``F(s, z, a) -> z`` (also reused as the critic / aux-critic).
 
@@ -1320,6 +1329,9 @@ class FBCprNetworkCfg:
     # forward map is conditioned (critics/aux/entropy stay plain).
     forward_gamma_embed_dim: int = 0
     forward_gamma_embed_type: str = "fourier"
+    # If true, the learned forward map emits G=(1-gamma)F. FB training and the
+    # public API reconstruct raw F, while the SI actor consumes G directly.
+    forward_gamma_normalized_output: bool = False
 
     # Actor
     actor_hidden_dim: int = 2048
@@ -1572,6 +1584,14 @@ class FBCprAuxPolicy(nn.Module):
         )
         # Whether F consumes a gamma argument (drives call sites in the algorithm).
         self.forward_gamma_conditioned = int(getattr(cfg, "forward_gamma_embed_dim", 0)) > 0
+        self.forward_gamma_normalized_output = bool(
+            getattr(cfg, "forward_gamma_normalized_output", False)
+        )
+        if self.forward_gamma_normalized_output and not self.forward_gamma_conditioned:
+            raise ValueError(
+                "forward_gamma_normalized_output requires "
+                "forward_gamma_embed_dim > 0"
+            )
         # Default gamma for the public forward_map() accessor when a caller omits
         # it (e.g. play/eval Q-probes). Long horizon; the algorithm always passes
         # explicit per-row gamma during training so this is inference-only.
@@ -1821,7 +1841,10 @@ class FBCprAuxPolicy(nn.Module):
             if not torch.is_tensor(gamma):
                 n = z.shape[0]
                 gamma = torch.full((n,), float(gamma), device=z.device)
-            return self._forward_map(self._normalize(obs), z, action, gamma)
+            output = self._forward_map(self._normalize(obs), z, action, gamma)
+            if self.forward_gamma_normalized_output:
+                output = gamma_forward_output_to_raw(output, gamma)
+            return output
         return self._forward_map(self._normalize(obs), z, action)
 
     @torch.no_grad()

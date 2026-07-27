@@ -46,6 +46,7 @@ from ..fb_cpr_math import (
     completed_tracking_bins,
     ema_grad_spike_state,
     innovation_alignment_loss,
+    normalized_forward_value,
     normalized_gamma_loss_weights,
     sample_log_horizon_gamma,
     sample_relabel_z,
@@ -58,6 +59,7 @@ from ..modules.fb_cpr_policy import (
     TransformerActorWrapper,
     _soft_update_params,
     eval_mode,
+    gamma_forward_output_to_raw,
     weight_init,
 )
 from ..utils import (
@@ -3649,6 +3651,10 @@ class FBCprAux:
         # into one online-F call and one target-F call.
         fb_gamma = getattr(self, "_fb_gamma", None)
         fb_gamma_alt = getattr(self, "_fb_gamma_alt", None)
+        normalized_forward = (
+            fb_gamma is not None
+            and bool(getattr(p, "forward_gamma_normalized_output", False))
+        )
         align_innovations = (
             fb_gamma is not None
             and fb_gamma_alt is not None
@@ -3678,6 +3684,12 @@ class FBCprAux:
                 f_args = (fb_gamma,) if fb_gamma is not None else ()
                 target_Fs = p._target_forward_map(next_obs, z, next_action, *f_args)
                 target_Fs_alt = None
+            if normalized_forward:
+                target_Fs = gamma_forward_output_to_raw(target_Fs, fb_gamma)
+                if target_Fs_alt is not None:
+                    target_Fs_alt = gamma_forward_output_to_raw(
+                        target_Fs_alt, fb_gamma_alt
+                    )
             target_B = p._target_backward_map(goal)  # (B, d)
             target_Ms = torch.matmul(target_Fs, target_B.T)  # (num_par, B, B)
             _, _, target_M = self._pessimistic_value(target_Ms, self.cfg.fb_pessimism_penalty)
@@ -3701,6 +3713,10 @@ class FBCprAux:
             f_args = (fb_gamma,) if fb_gamma is not None else ()
             Fs = p._forward_map(obs, z, action, *f_args)
             Fs_alt = None
+        if normalized_forward:
+            Fs = gamma_forward_output_to_raw(Fs, fb_gamma)
+            if Fs_alt is not None:
+                Fs_alt = gamma_forward_output_to_raw(Fs_alt, fb_gamma_alt)
         B = p._backward_map(goal)
         Ms = torch.matmul(Fs, B.T)
 
@@ -4291,6 +4307,9 @@ class FBCprAux:
         # term (mirrors the MLP actor path). f_gc guards non-conditioned F.
         _f_gc = bool(getattr(self.cfg, "fb_gamma_conditioned", False)) and \
             getattr(p, "forward_gamma_conditioned", False)
+        _f_normalized = _f_gc and bool(
+            getattr(p, "forward_gamma_normalized_output", False)
+        )
         _fbshort_flat = None
         if _f_gc:
             _gL = torch.full((flat_z.shape[0],), float(self.cfg.discount), device=flat_z.device)
@@ -4306,7 +4325,9 @@ class FBCprAux:
         Q_fb = Q_fb.reshape(BL)
         if _fbshort_flat is not None:
             _gL = float(self.cfg.discount); _gS = float(self.cfg.actor_gamma_short)
-            _sc = (1.0 - _gS) / max(1.0 - _gL, 1e-6) * float(self.cfg.actor_gamma_short_alpha)
+            _sc = float(self.cfg.actor_gamma_short_alpha)
+            if not _f_normalized:
+                _sc *= (1.0 - _gS) / max(1.0 - _gL, 1e-6)
             Q_fb = Q_fb + _sc * _fbshort_flat  # fold short-horizon into the FB Q used below
         Q_fb = float(getattr(self.cfg, "actor_fb_scale", 1.0)) * Q_fb
 
@@ -4423,6 +4444,9 @@ class FBCprAux:
         fb_gc = bool(getattr(self.cfg, "fb_gamma_conditioned", False)) and \
             getattr(p, "forward_gamma_conditioned", False)
         fb_si = fb_gc and bool(getattr(self.cfg, "fb_stochastic_integral", False))
+        normalized_forward = fb_gc and bool(
+            getattr(p, "forward_gamma_normalized_output", False)
+        )
         Bsz = z.shape[0]
         gL_args = ()
         Q_fb_short = None
@@ -4465,7 +4489,9 @@ class FBCprAux:
             F_bk = p._forward_map(obs_bk, z_bk, a_bk, g_bk)                      # [par, B*K, d]
             _, _, Q_bk = self._pessimistic_value((F_bk * z_bk).sum(dim=-1),
                                                  self.cfg.actor_pessimism_penalty)  # [B*K]
-            N = ((1.0 - g_bk) * Q_bk).reshape(Bsz, K)                            # online normalized [B,K]
+            N = normalized_forward_value(
+                Q_bk, g_bk, normalized_forward
+            ).reshape(Bsz, K)
             # Integral weights from the TARGET forward map (EMA), not the online
             # F — stabler weighting that doesn't chase the fast-moving online net.
             # The integrated N still uses the ONLINE F (gradient flows through N);
@@ -4474,7 +4500,9 @@ class FBCprAux:
                 Ft_bk = p._target_forward_map(obs_bk, z_bk, a_bk, g_bk)          # [par, B*K, d]
                 _, _, Qt_bk = self._pessimistic_value((Ft_bk * z_bk).sum(dim=-1),
                                                       self.cfg.actor_pessimism_penalty)
-                Nt = ((1.0 - g_bk) * Qt_bk).reshape(Bsz, K)                      # target normalized
+                Nt = normalized_forward_value(
+                    Qt_bk, g_bk, normalized_forward
+                ).reshape(Bsz, K)
                 adaptive_tau = bool(getattr(self.cfg, "fb_integral_adaptive_tau", False))
                 prior_lambda = float(getattr(self.cfg, "fb_integral_prior_lambda", 0.0))
                 w, tau = stochastic_integral_weights(
@@ -4528,14 +4556,23 @@ class FBCprAux:
             Q_fb_combined = Q_fb
             if Q_fb_short is not None:
                 gL = float(self.cfg.discount); gS = float(self.cfg.actor_gamma_short)
-                fb_short_scale = (1.0 - gS) / max(1.0 - gL, 1e-6) * float(self.cfg.actor_gamma_short_alpha)
+                fb_short_scale = float(self.cfg.actor_gamma_short_alpha)
+                if not normalized_forward:
+                    fb_short_scale *= (1.0 - gS) / max(1.0 - gL, 1e-6)
                 Q_fb_combined = Q_fb + fb_short_scale * Q_fb_short          # [B]
                 fb_short_term = fb_short_scale * Q_fb_short.mean()
                 # gamma-NORMALIZED logs: (1-gamma)*Q ~ per-step value, so the two
                 # horizons are on a comparable scale (raw Q ~ 1/(1-gamma)).
-                self._q_fb_short_log = Q_fb_short.mean().detach()          # raw (back-compat)
-                self._q_fb_L_log = ((1.0 - gL) * Q_fb.mean()).detach()
-                self._q_fb_S_log = ((1.0 - gS) * Q_fb_short.mean()).detach()
+                if normalized_forward:
+                    self._q_fb_short_log = (
+                        Q_fb_short.mean() / max(1.0 - gS, 1e-6)
+                    ).detach()
+                    self._q_fb_L_log = Q_fb.mean().detach()
+                    self._q_fb_S_log = Q_fb_short.mean().detach()
+                else:
+                    self._q_fb_short_log = Q_fb_short.mean().detach()
+                    self._q_fb_L_log = ((1.0 - gL) * Q_fb.mean()).detach()
+                    self._q_fb_S_log = ((1.0 - gS) * Q_fb_short.mean()).detach()
         # Align the actor-side FB objective without changing F's TD targets.
         # Q_fb_combined also drives scale_reg, so Q_disc/Q_aux retain their
         # relative balance with the scaled direct FB term.

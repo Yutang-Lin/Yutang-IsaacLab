@@ -2485,6 +2485,31 @@ class FBCprRunner:
         # others later wait in a collective. load_state_dict copies/casts each
         # model and optimizer tensor onto its owning parameter device.
         ckpt = torch.load(path, map_location="cpu", weights_only=False)
+        saved_policy_cfg = ckpt.get("policy_cfg", {})
+        saved_normalized_forward = bool(
+            saved_policy_cfg.get("forward_gamma_normalized_output", False)
+        )
+        current_normalized_forward = bool(
+            getattr(self.policy, "forward_gamma_normalized_output", False)
+        )
+        if saved_normalized_forward != current_normalized_forward:
+            # Raw-F and G=(1-gamma)F checkpoints have identical tensor shapes
+            # but incompatible semantics. Preserve the saved contract.
+            self.policy.forward_gamma_normalized_output = (
+                saved_normalized_forward
+            )
+            if hasattr(self.policy, "cfg"):
+                self.policy.cfg.forward_gamma_normalized_output = (
+                    saved_normalized_forward
+                )
+            self.policy_cfg["forward_gamma_normalized_output"] = (
+                saved_normalized_forward
+            )
+            print(
+                "[FBCprRunner] preserving checkpoint forward-map semantics: "
+                f"normalized_output={saved_normalized_forward}.",
+                flush=True,
+            )
         model_sd = ckpt["model"]
         # Align checkpoint keys to the current policy's prefix scheme.
         # DDP adds ``.module.``; torch.compile adds ``._orig_mod.``. The

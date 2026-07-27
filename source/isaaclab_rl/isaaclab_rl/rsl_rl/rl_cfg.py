@@ -1132,6 +1132,8 @@ class RslRlFBCprPolicyCfg:
     )
     forward_gamma_embed_dim: int = 0  # >0 => gamma-conditioned F(s,z,a,gamma)
     forward_gamma_embed_type: Literal["fourier", "mlp"] = "fourier"
+    forward_gamma_normalized_output: bool = False
+    """Learn ``G=(1-gamma)F`` instead of raw F for conditioned forward maps."""
 
     # Actor
     actor_hidden_dim: int = 2048

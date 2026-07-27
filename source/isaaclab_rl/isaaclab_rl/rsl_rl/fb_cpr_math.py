@@ -8,6 +8,17 @@ import torch
 import torch.nn.functional as F
 
 
+def normalized_forward_value(
+    q: torch.Tensor,
+    gamma: torch.Tensor,
+    output_is_normalized: bool,
+) -> torch.Tensor:
+    """Return (1-gamma)Q, avoiding a redundant scale for normalized F output."""
+    if output_is_normalized:
+        return q
+    return (1.0 - gamma) * q
+
+
 def centered_context_offsets(
     mean_widths: torch.Tensor,
     context_width: int,
