@@ -1132,6 +1132,8 @@ class RslRlFBCprPolicyCfg:
     )
     forward_gamma_embed_dim: int = 0  # >0 => gamma-conditioned F(s,z,a,gamma)
     forward_gamma_embed_type: Literal["fourier", "mlp"] = "fourier"
+    forward_gamma_scale_hidden_dim: int = 0
+    """Hidden width of an identity-initialized gamma-to-scalar raw-F shortcut."""
     forward_gamma_normalized_output: bool = False
     """Learn ``G=(1-gamma)F`` instead of raw F for conditioned forward maps."""
 

@@ -1,7 +1,9 @@
 import os
 os.environ["ENABLE_ISAACLAB"] = "False"
 
+import copy
 import importlib.util
+import math
 import sys
 from pathlib import Path
 
@@ -25,9 +27,13 @@ FourierMLP = _POLICY_MODULE.FourierMLP
 ForwardMap = _POLICY_MODULE.ForwardMap
 ScalarMLP = _POLICY_MODULE.ScalarMLP
 gamma_forward_output_to_raw = _POLICY_MODULE.gamma_forward_output_to_raw
+weight_init = _POLICY_MODULE.weight_init
 
 
-def _gamma_forward_map(embed_type: str) -> ForwardMap:
+def _gamma_forward_map(
+    embed_type: str,
+    scale_hidden_dim: int = 0,
+) -> ForwardMap:
     return ForwardMap(
         gymnasium.spaces.Box(low=-1.0, high=1.0, shape=(7,)),
         z_dim=5,
@@ -39,6 +45,7 @@ def _gamma_forward_map(embed_type: str) -> ForwardMap:
         num_parallel=2,
         gamma_embed_dim=8,
         gamma_embed_type=embed_type,
+        gamma_scale_hidden_dim=scale_hidden_dim,
     )
 
 
@@ -66,6 +73,74 @@ def test_forward_map_gamma_embedding_types(
 def test_forward_map_rejects_unknown_gamma_embedding_type():
     with pytest.raises(ValueError, match="gamma_embed_type"):
         _gamma_forward_map("unknown")
+
+
+def test_gamma_scale_shortcut_is_identity_after_policy_initialization():
+    module = _gamma_forward_map("mlp", scale_hidden_dim=4)
+    module.apply(weight_init)
+
+    gamma = torch.linspace(0.6, 0.99, 5)
+    horizon = -torch.log1p(-gamma).unsqueeze(-1)
+    gamma_embedding = module.embed_gamma(horizon)
+    scale_hidden = torch.nn.functional.mish(
+        module.gamma_scale_hidden(gamma_embedding)
+    )
+    log_scale = module.gamma_scale_output(scale_hidden)
+    scale = torch.exp(log_scale).transpose(0, 1).unsqueeze(-1)
+
+    assert scale.shape == (2, 5, 1)
+    torch.testing.assert_close(scale, torch.ones_like(scale))
+
+
+def test_gamma_scale_shortcut_multiplies_raw_f_and_receives_gradient():
+    module = _gamma_forward_map("mlp", scale_hidden_dim=4)
+    module.apply(weight_init)
+    obs = torch.randn(4, 7)
+    z = torch.randn(4, 5)
+    action = torch.randn(4, 3)
+    gamma = torch.linspace(0.6, 0.99, 4)
+
+    identity_output = module(obs, z, action, gamma).detach()
+    with torch.no_grad():
+        module.gamma_scale_output.bias.copy_(
+            torch.tensor([math.log(2.0), math.log(3.0)])
+        )
+    scaled_output = module(obs, z, action, gamma)
+
+    expected_scale = torch.tensor([2.0, 3.0]).view(2, 1, 1)
+    torch.testing.assert_close(scaled_output, expected_scale * identity_output)
+    scaled_output.sum().backward()
+    assert module.gamma_scale_output.weight.grad is not None
+    assert module.gamma_scale_output.weight.grad.abs().sum() > 0
+
+
+def test_gamma_scale_shortcut_requires_gamma_conditioning():
+    with pytest.raises(ValueError, match="requires gamma_embed_dim"):
+        ForwardMap(
+            gymnasium.spaces.Box(low=-1.0, high=1.0, shape=(7,)),
+            z_dim=5,
+            action_dim=3,
+            gamma_scale_hidden_dim=4,
+        )
+
+
+def test_gamma_scale_shortcut_is_owned_by_forward_map_target_copy():
+    online = _gamma_forward_map("mlp", scale_hidden_dim=4)
+    online.apply(weight_init)
+    target = copy.deepcopy(online)
+
+    online_names = dict(online.named_parameters())
+    target_names = dict(target.named_parameters())
+    for name in (
+        "gamma_scale_hidden.weight",
+        "gamma_scale_hidden.bias",
+        "gamma_scale_output.weight",
+        "gamma_scale_output.bias",
+    ):
+        assert name in online_names
+        assert name in target_names
+        assert online_names[name] is not target_names[name]
+        torch.testing.assert_close(online_names[name], target_names[name])
 
 
 def test_normalized_gamma_output_reconstructs_raw_f():

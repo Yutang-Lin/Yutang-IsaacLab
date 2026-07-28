@@ -792,6 +792,7 @@ class ForwardMap(nn.Module):
         output_dim: int | None = None,
         gamma_embed_dim: int = 0,
         gamma_embed_type: str = "fourier",
+        gamma_scale_hidden_dim: int = 0,
     ) -> None:
         super().__init__()
         self.input_filter = build_input_filter(obs_space, input_keys)
@@ -808,6 +809,13 @@ class ForwardMap(nn.Module):
         self.model = model
         self.gamma_embed_dim = int(gamma_embed_dim)
         self.gamma_embed_type = str(gamma_embed_type)
+        self.gamma_scale_hidden_dim = int(gamma_scale_hidden_dim)
+        if self.gamma_scale_hidden_dim < 0:
+            raise ValueError("gamma_scale_hidden_dim must be non-negative")
+        if self.gamma_scale_hidden_dim > 0 and self.gamma_embed_dim <= 0:
+            raise ValueError(
+                "gamma_scale_hidden_dim requires gamma_embed_dim > 0"
+            )
 
         if model == "residual":
             embed_fn = residual_embedding
@@ -831,6 +839,16 @@ class ForwardMap(nn.Module):
                 )
         else:
             self.embed_gamma = None
+        if self.gamma_scale_hidden_dim > 0:
+            self.gamma_scale_hidden = nn.Linear(
+                gdim, self.gamma_scale_hidden_dim
+            )
+            self.gamma_scale_output = nn.Linear(
+                self.gamma_scale_hidden_dim, self.num_parallel
+            )
+        else:
+            self.gamma_scale_hidden = None
+            self.gamma_scale_output = None
 
         # BFM quirk: the residual variant of ForwardMap/ResidualForwardMap
         # passes ``cfg.hidden_layers`` (not ``cfg.embedding_layers``) as the
@@ -851,6 +869,13 @@ class ForwardMap(nn.Module):
                 seq += [linear(hidden_dim, hidden_dim, num_parallel), nn.ReLU()]
             seq += [linear(hidden_dim, out_dim, num_parallel)]
         self.Fs = nn.Sequential(*seq)
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        """Initialize the optional F scale path as an exact identity."""
+        if self.gamma_scale_output is not None:
+            nn.init.zeros_(self.gamma_scale_output.weight)
+            nn.init.zeros_(self.gamma_scale_output.bias)
 
     def forward(
         self,
@@ -868,6 +893,17 @@ class ForwardMap(nn.Module):
             g = gamma.reshape(-1, 1).to(obs.dtype)
             h = -torch.log1p(-g.clamp(max=1 - 1e-6))
             g_emb = self.embed_gamma(h)                      # [B, gdim]
+        gamma_scale = None
+        if self.gamma_scale_hidden is not None:
+            assert g_emb is not None
+            assert self.gamma_scale_output is not None
+            scale_hidden = F.mish(self.gamma_scale_hidden(g_emb))
+            log_scale = self.gamma_scale_output(scale_hidden)
+            gamma_scale = torch.exp(
+                log_scale.clamp(min=-10.0, max=10.0)
+            )
+            if self.num_parallel > 1:
+                gamma_scale = gamma_scale.transpose(0, 1).unsqueeze(-1)
         if self.num_parallel > 1:
             obs = obs.expand(self.num_parallel, -1, -1)
             z = z.expand(self.num_parallel, -1, -1)
@@ -878,7 +914,10 @@ class ForwardMap(nn.Module):
         sa_in = torch.cat([obs, action], dim=-1) if g_emb is None else torch.cat([obs, action, g_emb], dim=-1)
         z_embedding = self.embed_z(z_in)
         sa_embedding = self.embed_sa(sa_in)
-        return self.Fs(torch.cat([sa_embedding, z_embedding], dim=-1))
+        output = self.Fs(torch.cat([sa_embedding, z_embedding], dim=-1))
+        if gamma_scale is not None:
+            output = output * gamma_scale
+        return output
 
 
 ActorStd = float | tp.Sequence[float] | torch.Tensor
@@ -1329,6 +1368,10 @@ class FBCprNetworkCfg:
     # forward map is conditioned (critics/aux/entropy stay plain).
     forward_gamma_embed_dim: int = 0
     forward_gamma_embed_type: str = "fourier"
+    # Optional positive scalar shortcut s(gamma) multiplying the final raw-F
+    # output. Zero disables it; a small hidden width (e.g. 32) lets gamma-induced
+    # successor-feature magnitude bypass the main state/action network.
+    forward_gamma_scale_hidden_dim: int = 0
     # If true, the learned forward map emits G=(1-gamma)F. FB training and the
     # public API reconstruct raw F, while the SI actor consumes G directly.
     forward_gamma_normalized_output: bool = False
@@ -1580,6 +1623,9 @@ class FBCprAuxPolicy(nn.Module):
             gamma_embed_dim=int(getattr(cfg, "forward_gamma_embed_dim", 0)),
             gamma_embed_type=str(
                 getattr(cfg, "forward_gamma_embed_type", "fourier")
+            ),
+            gamma_scale_hidden_dim=int(
+                getattr(cfg, "forward_gamma_scale_hidden_dim", 0)
             ),
         )
         # Whether F consumes a gamma argument (drives call sites in the algorithm).
