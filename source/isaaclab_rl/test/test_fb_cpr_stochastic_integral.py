@@ -292,6 +292,18 @@ def test_innovation_alignment_is_zero_for_matching_innovations():
     torch.testing.assert_close(loss, torch.zeros_like(loss))
 
 
+def test_innovation_alignment_stops_gradient_on_second_innovation():
+    innovation = torch.randn(2, 4, 4, requires_grad=True)
+    innovation_target = torch.randn(2, 4, 4, requires_grad=True)
+
+    loss = innovation_alignment_loss(innovation, innovation_target)
+    loss.backward()
+
+    assert innovation.grad is not None
+    assert innovation.grad.abs().sum() > 0
+    assert innovation_target.grad is None
+
+
 def test_zero_prior_preserves_original_softmax():
     values = torch.tensor([[0.1, -0.2, 0.7]])
     horizons = torch.tensor([[0.5, 1.0, 2.0]])

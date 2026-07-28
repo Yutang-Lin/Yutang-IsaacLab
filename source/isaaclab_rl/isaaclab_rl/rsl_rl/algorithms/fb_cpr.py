@@ -3760,6 +3760,9 @@ class FBCprAux:
             discount_alt = fb_gamma_alt * not_term
             diff_align = Ms_align - discount.view(-1, 1) * target_M
             diff_alt = Ms_alt - discount_alt.view(-1, 1) * target_M_alt
+            # The independently sampled second gamma is a fixed teacher for
+            # this update. Across updates both gamma samples still cover the
+            # full range, without two online innovations chasing each other.
             innovation_align_loss = innovation_alignment_loss(diff_align, diff_alt)
             fb_loss = fb_loss + (
                 float(getattr(self.cfg, "fb_gamma_innovation_align_coef", 1.0))

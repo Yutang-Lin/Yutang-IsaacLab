@@ -124,10 +124,10 @@ def normalized_gamma_loss_weights(
 
 def innovation_alignment_loss(
     innovation: torch.Tensor,
-    innovation_alt: torch.Tensor,
+    innovation_target: torch.Tensor,
 ) -> torch.Tensor:
-    """Return half-MSE between Bellman innovations at two discounts."""
-    return 0.5 * F.mse_loss(innovation, innovation_alt)
+    """Align one Bellman innovation to a stop-gradient second discount."""
+    return 0.5 * F.mse_loss(innovation, innovation_target.detach())
 
 
 def aux_reward_for_critic(
