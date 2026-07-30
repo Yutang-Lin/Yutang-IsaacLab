@@ -3814,7 +3814,16 @@ class FBCprAux:
         fb_diff = Ms - discount.view(-1, 1) * target_M
         fb_offdiag_sq = 0.5 * (fb_diff * self._off_diag).pow(2)
         gamma_loss_weights = None
-        if bool(getattr(self.cfg, "fb_gamma_loss_weighting", False)):
+        if actor_selects_gamma:
+            # Emphasize longer-horizon rows by 1/(1-gamma), normalized to
+            # unit expectation under the actual uniform-log-horizon sampler.
+            gamma_loss_weights = normalized_gamma_loss_weights(
+                fb_gamma.view(-1),
+                float(self.cfg.actor_gamma_short),
+                float(self.cfg.discount),
+                power=-1.0,
+            )
+        elif bool(getattr(self.cfg, "fb_gamma_loss_weighting", False)):
             if fb_gamma is None:
                 raise ValueError(
                     "fb_gamma_loss_weighting requires fb_gamma_conditioned=True"
@@ -3825,6 +3834,7 @@ class FBCprAux:
                 float(self.cfg.discount),
                 float(getattr(self.cfg, "fb_gamma_loss_weight_power", 2.0)),
             )
+        if gamma_loss_weights is not None:
             row_weights = gamma_loss_weights.view(1, -1, 1)
             fb_offdiag = (
                 fb_offdiag_sq * row_weights
@@ -3833,12 +3843,13 @@ class FBCprAux:
             fb_diag_values = torch.diagonal(
                 fb_diag_source, dim1=1, dim2=2
             )
+            fb_diag_weights = gamma_loss_weights
             if actor_selects_gamma:
-                gamma_loss_weights = gamma_loss_weights * (
+                fb_diag_weights = fb_diag_weights * (
                     1.0 - fb_gamma.view(-1)
                 )
             fb_diag = -(
-                fb_diag_values * gamma_loss_weights.view(1, -1)
+                fb_diag_values * fb_diag_weights.view(1, -1)
             ).mean() * Ms.shape[0]
         else:
             fb_offdiag = fb_offdiag_sq.sum() / self._off_diag_sum

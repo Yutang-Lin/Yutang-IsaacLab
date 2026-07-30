@@ -155,8 +155,6 @@ def normalized_gamma_loss_weights(
         raise ValueError(
             f"Expected 0 <= gamma_min < gamma_max < 1, got {gamma_min}, {gamma_max}"
         )
-    if power < 0.0:
-        raise ValueError(f"Expected power >= 0, got {power}")
     if power == 0.0:
         return torch.ones_like(gamma)
     h_min = -math.log1p(-gamma_min)
