@@ -75,6 +75,52 @@ def test_actor_horizon_head_starts_at_midpoint_and_receives_gradient():
     assert actor.horizon_head.weight.grad.abs().sum() > 0.0
 
 
+def test_actor_horizon_head_uses_final_action_hidden_activation():
+    torch.manual_seed(11)
+    actor = _actor(predict_horizon=True)
+    assert actor.horizon_head is not None
+    with torch.no_grad():
+        actor.horizon_head.weight.normal_()
+        actor.horizon_head.bias.normal_()
+    obs = torch.randn(4, 7)
+    z = torch.randn(4, 5)
+
+    _, normalized_horizon = actor(
+        obs, z, 0.05, return_horizon=True
+    )
+    z_embedding = actor.embed_z(torch.cat([obs, z], dim=-1))
+    s_embedding = actor.embed_s(obs)
+    hidden = torch.cat([s_embedding, z_embedding], dim=-1)
+    for layer in list(actor.policy.children())[:-1]:
+        hidden = layer(hidden)
+    expected = torch.sigmoid(actor.horizon_head(hidden))
+
+    torch.testing.assert_close(normalized_horizon, expected)
+
+
+def test_actor_action_and_horizon_share_one_trunk_forward():
+    actor = _actor(predict_horizon=True)
+    call_counts = [0] * len(actor.policy)
+    handles = []
+    for index, layer in enumerate(actor.policy):
+        def _count_call(_module, _inputs, _output, index=index):
+            call_counts[index] += 1
+
+        handles.append(layer.register_forward_hook(_count_call))
+    try:
+        actor(
+            torch.randn(4, 7),
+            torch.randn(4, 5),
+            0.05,
+            return_horizon=True,
+        )
+    finally:
+        for handle in handles:
+            handle.remove()
+
+    assert call_counts == [1] * len(actor.policy)
+
+
 def test_actor_rejects_horizon_output_when_head_is_disabled():
     actor = _actor(predict_horizon=False)
     with pytest.raises(RuntimeError, match="predict_horizon=True"):

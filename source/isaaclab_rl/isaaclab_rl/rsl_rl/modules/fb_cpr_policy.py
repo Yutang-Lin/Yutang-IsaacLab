@@ -1047,7 +1047,16 @@ class Actor(nn.Module):
         z_embedding = self.embed_z(torch.cat([obs, z], dim=-1))
         s_embedding = self.embed_s(obs)
         embedding = torch.cat([s_embedding, z_embedding], dim=-1)
-        out = self.policy(embedding)
+        # Retain the activation immediately before the action-output layer.
+        # The optional horizon head needs the full action trunk's computation,
+        # not only the shallow state/goal embedding.
+        action_hidden = embedding
+        final_layer_index = len(self.policy) - 1
+        for layer_index, layer in enumerate(self.policy):
+            if layer_index == final_layer_index:
+                final_hidden = action_hidden
+            action_hidden = layer(action_hidden)
+        out = action_hidden
         if self.learned_std:
             mu_raw, log_std_raw = out.split(self._action_dim, dim=-1)
             std_tensor = log_std_raw.clamp(self._log_min_std, self._log_max_std).exp()
@@ -1064,7 +1073,7 @@ class Actor(nn.Module):
             raise RuntimeError(
                 "return_horizon=True requires predict_horizon=True"
             )
-        normalized_horizon = torch.sigmoid(self.horizon_head(embedding))
+        normalized_horizon = torch.sigmoid(self.horizon_head(final_hidden))
         return action_dist, normalized_horizon
 
 
