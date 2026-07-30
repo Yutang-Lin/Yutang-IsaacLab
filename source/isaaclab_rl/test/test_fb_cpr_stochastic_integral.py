@@ -15,11 +15,44 @@ from isaaclab_rl.rsl_rl.fb_cpr_math import (
     innovation_alignment_loss,
     normalized_forward_value,
     normalized_gamma_loss_weights,
+    normalized_horizon_to_gamma,
+    sample_actor_gamma,
     sample_log_horizon_gamma,
     sample_relabel_z,
     stochastic_integral_weights,
     tracking_failure_metrics,
 )
+
+
+def test_normalized_horizon_to_gamma_endpoints_and_monotonicity():
+    normalized_horizon = torch.linspace(0.0, 1.0, 11)
+    gamma = normalized_horizon_to_gamma(
+        normalized_horizon, 0.4, 0.99
+    )
+
+    torch.testing.assert_close(gamma[0], torch.tensor(0.4))
+    torch.testing.assert_close(gamma[-1], torch.tensor(0.99))
+    assert torch.all(gamma[1:] > gamma[:-1])
+
+
+def test_actor_gamma_noise_is_clipped_and_preserves_gradient():
+    torch.manual_seed(7)
+    normalized_horizon = torch.full((128, 1), 0.5, requires_grad=True)
+    gamma, noisy_horizon = sample_actor_gamma(
+        normalized_horizon,
+        gamma_min=0.4,
+        gamma_max=0.99,
+        noise_std=100.0,
+        noise_clip=0.05,
+    )
+
+    assert torch.all(noisy_horizon >= 0.45)
+    assert torch.all(noisy_horizon <= 0.55)
+    assert torch.all(gamma >= 0.4)
+    assert torch.all(gamma <= 0.99)
+    gamma.sum().backward()
+    assert normalized_horizon.grad is not None
+    assert torch.all(normalized_horizon.grad > 0.0)
 
 
 def test_normalized_forward_value_uses_network_output_directly():

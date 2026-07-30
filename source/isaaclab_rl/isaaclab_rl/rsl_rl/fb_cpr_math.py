@@ -76,6 +76,51 @@ def sample_log_horizon_gamma(
     return 1.0 - torch.exp(-h)
 
 
+def normalized_horizon_to_gamma(
+    normalized_horizon: torch.Tensor,
+    gamma_min: float,
+    gamma_max: float,
+) -> torch.Tensor:
+    """Map a normalized effective horizon in ``[0, 1]`` to gamma."""
+    if not 0.0 <= gamma_min < gamma_max < 1.0:
+        raise ValueError(
+            f"Expected 0 <= gamma_min < gamma_max < 1, got {gamma_min}, {gamma_max}"
+        )
+    h_min = -math.log1p(-gamma_min)
+    h_max = -math.log1p(-gamma_max)
+    h = h_min + normalized_horizon * (h_max - h_min)
+    return -torch.expm1(-h)
+
+
+def sample_actor_gamma(
+    normalized_horizon: torch.Tensor,
+    gamma_min: float,
+    gamma_max: float,
+    noise_std: float,
+    noise_clip: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Add exploration in normalized-horizon space and return ``(gamma, u)``."""
+    if noise_std < 0.0:
+        raise ValueError(f"noise_std must be non-negative, got {noise_std}")
+    if noise_clip < 0.0:
+        raise ValueError(f"noise_clip must be non-negative, got {noise_clip}")
+    noise = torch.randn_like(normalized_horizon) * noise_std
+    if noise_clip > 0.0:
+        noise = noise.clamp(-noise_clip, noise_clip)
+    noisy_horizon = normalized_horizon + noise
+    clamped_horizon = noisy_horizon.clamp(0.0, 1.0)
+    # Straight-through clamp preserves actor gradients at a sampled boundary.
+    noisy_horizon = (
+        noisy_horizon
+        - noisy_horizon.detach()
+        + clamped_horizon.detach()
+    )
+    gamma = normalized_horizon_to_gamma(
+        noisy_horizon, gamma_min, gamma_max
+    )
+    return gamma, noisy_horizon
+
+
 def sample_relabel_z(
     stored_z: torch.Tensor,
     mixed_z: torch.Tensor,

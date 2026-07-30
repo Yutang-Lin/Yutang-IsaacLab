@@ -48,6 +48,8 @@ from ..fb_cpr_math import (
     innovation_alignment_loss,
     normalized_forward_value,
     normalized_gamma_loss_weights,
+    normalized_horizon_to_gamma,
+    sample_actor_gamma,
     sample_log_horizon_gamma,
     sample_relabel_z,
     stochastic_integral_weights,
@@ -339,6 +341,12 @@ class FBCprAuxAlgorithmCfg:
     actor_gamma_short: float = 0.8
     # Weight alpha on the short-horizon FB term in the actor loss.
     actor_gamma_short_alpha: float = 0.5
+    # Optional actor-horizon exploration. Active only when the policy's
+    # actor_predict_horizon flag is enabled.
+    actor_selects_gamma: bool = False
+    actor_gamma_noise_std: float = 0.02
+    actor_gamma_noise_clip: float = 0.05
+    actor_gamma_log_bins: int = 8
     # Weight each gamma-conditioned Bellman FB row by (1-gamma)^power,
     # normalized under the uniform log-horizon sampling distribution.
     fb_gamma_loss_weighting: bool = False
@@ -575,6 +583,45 @@ class FBCprAux:
             ratio = getattr(cfg, name, None)
             if ratio is not None and not 0.0 <= float(ratio) <= 1.0:
                 raise ValueError(f"{name} must be in [0, 1] or None, got {ratio}")
+        actor_selects_gamma = bool(
+            getattr(cfg, "actor_selects_gamma", False)
+        )
+        if actor_selects_gamma:
+            if not bool(getattr(policy, "actor_predict_horizon", False)):
+                raise ValueError(
+                    "actor_selects_gamma requires policy.actor_predict_horizon=True"
+                )
+            if not bool(getattr(cfg, "fb_gamma_conditioned", False)):
+                raise ValueError(
+                    "actor_selects_gamma requires fb_gamma_conditioned=True"
+                )
+            if not bool(getattr(policy, "forward_gamma_conditioned", False)):
+                raise ValueError(
+                    "actor_selects_gamma requires a gamma-conditioned forward map"
+                )
+            if bool(getattr(cfg, "fb_stochastic_integral", False)):
+                raise ValueError(
+                    "actor_selects_gamma is a non-SI objective and requires "
+                    "fb_stochastic_integral=False"
+                )
+            if bool(getattr(cfg, "fb_gamma_innovation_align", False)):
+                raise ValueError(
+                    "actor_selects_gamma requires "
+                    "fb_gamma_innovation_align=False"
+                )
+            gamma_min = float(cfg.actor_gamma_short)
+            gamma_max = float(cfg.discount)
+            if not 0.0 <= gamma_min < gamma_max < 1.0:
+                raise ValueError(
+                    "actor_selects_gamma requires "
+                    "0 <= actor_gamma_short < discount < 1"
+                )
+            if float(getattr(cfg, "actor_gamma_noise_std", 0.02)) < 0.0:
+                raise ValueError("actor_gamma_noise_std must be non-negative")
+            if float(getattr(cfg, "actor_gamma_noise_clip", 0.05)) < 0.0:
+                raise ValueError("actor_gamma_noise_clip must be non-negative")
+            if int(getattr(cfg, "actor_gamma_log_bins", 8)) <= 0:
+                raise ValueError("actor_gamma_log_bins must be positive")
         if bool(getattr(cfg, "fb_grad_spike_clip", False)):
             decay = float(getattr(cfg, "fb_grad_spike_ema_decay", 0.99))
             multiplier = float(getattr(cfg, "fb_grad_spike_multiplier", 5.0))
@@ -2846,6 +2893,9 @@ class FBCprAux:
         """
         current_lrs = self._anneal_lrs(step)
         self._cached_target_action_dist = None
+        self._cached_target_normalized_horizon = None
+        self._target_actor_gamma_log = None
+        self._target_actor_horizon_log = None
 
         expert_T_per_seq = None
         expert_sample_kwargs = {}
@@ -3621,6 +3671,14 @@ class FBCprAux:
                 src = raw if raw is not None else next_obs
                 with eval_mode(p._actor):
                     dist = p.actor(src, z, p.actor_std)
+            elif bool(getattr(self.cfg, "actor_selects_gamma", False)):
+                dist, normalized_horizon = p._actor(
+                    next_obs,
+                    z,
+                    p.actor_std,
+                    return_horizon=True,
+                )
+                self._cached_target_normalized_horizon = normalized_horizon
             else:
                 dist = p._actor(next_obs, z, p.actor_std)
             # FB, critic and aux-critic use the same actor distribution but
@@ -3628,6 +3686,29 @@ class FBCprAux:
             # forwards without correlating their target-smoothing noise.
             self._cached_target_action_dist = dist
         return dist.sample(clip=self.cfg.stddev_clip)
+
+    @torch.no_grad()
+    def _target_next_action_and_gamma(self, next_obs, z):
+        """Sample a paired next action and actor-selected target gamma."""
+        next_action = self._target_next_action(next_obs, z)
+        normalized_horizon = getattr(
+            self, "_cached_target_normalized_horizon", None
+        )
+        if normalized_horizon is None:
+            raise RuntimeError(
+                "actor-selected target gamma was requested without an actor "
+                "horizon output"
+            )
+        gamma, noisy_horizon = sample_actor_gamma(
+            normalized_horizon,
+            float(self.cfg.actor_gamma_short),
+            float(self.cfg.discount),
+            float(getattr(self.cfg, "actor_gamma_noise_std", 0.02)),
+            float(getattr(self.cfg, "actor_gamma_noise_clip", 0.05)),
+        )
+        self._target_actor_gamma_log = gamma.detach()
+        self._target_actor_horizon_log = noisy_horizon.detach()
+        return next_action, gamma
 
     def backward_fb(
         self,
@@ -3644,13 +3725,15 @@ class FBCprAux:
         Returns ``(metrics, F_handle, B_handle)``.
         """
         p = self.policy
-        # gamma-conditioned F: pass the per-row gamma sampled in update() to BOTH
-        # the online and target F. Same gamma the TD target is discounted by
-        # (``discount`` was set from _fb_gamma in update()). When innovation
-        # alignment is enabled, batch the primary and independent alternate gamma
-        # into one online-F call and one target-F call.
+        # Gamma-conditioned F normally passes the update's random gamma to both
+        # online and target F. In actor-selected-gamma mode, the online F and
+        # scalar Bellman discount still use that independent random gamma, while
+        # target F is conditioned on gamma_{t+1} emitted with a_{t+1} by policy.
         fb_gamma = getattr(self, "_fb_gamma", None)
         fb_gamma_alt = getattr(self, "_fb_gamma_alt", None)
+        actor_selects_gamma = bool(
+            getattr(self.cfg, "actor_selects_gamma", False)
+        )
         normalized_forward = (
             fb_gamma is not None
             and bool(getattr(p, "forward_gamma_normalized_output", False))
@@ -3669,7 +3752,13 @@ class FBCprAux:
         with torch.no_grad():
             # next_action via actor (raw obs for the transformer actor — see
             # _target_next_action; avoids double-normalization in the TD target)
-            next_action = self._target_next_action(next_obs, z)
+            if actor_selects_gamma:
+                next_action, target_gamma = self._target_next_action_and_gamma(
+                    next_obs, z
+                )
+            else:
+                next_action = self._target_next_action(next_obs, z)
+                target_gamma = fb_gamma
             if align_innovations:
                 batch_size = z.shape[0]
                 gamma_pair = torch.cat((fb_gamma, fb_gamma_alt), dim=0)
@@ -3681,11 +3770,13 @@ class FBCprAux:
                 )
                 target_Fs, target_Fs_alt = target_Fs_pair.split(batch_size, dim=1)
             else:
-                f_args = (fb_gamma,) if fb_gamma is not None else ()
+                f_args = (target_gamma,) if target_gamma is not None else ()
                 target_Fs = p._target_forward_map(next_obs, z, next_action, *f_args)
                 target_Fs_alt = None
             if normalized_forward:
-                target_Fs = gamma_forward_output_to_raw(target_Fs, fb_gamma)
+                target_Fs = gamma_forward_output_to_raw(
+                    target_Fs, target_gamma
+                )
                 if target_Fs_alt is not None:
                     target_Fs_alt = gamma_forward_output_to_raw(
                         target_Fs_alt, fb_gamma_alt
@@ -3738,15 +3829,32 @@ class FBCprAux:
             fb_offdiag = (
                 fb_offdiag_sq * row_weights
             ).sum() / self._off_diag_sum
-            fb_diag_values = torch.diagonal(fb_diff, dim1=1, dim2=2)
+            fb_diag_source = Ms if actor_selects_gamma else fb_diff
+            fb_diag_values = torch.diagonal(
+                fb_diag_source, dim1=1, dim2=2
+            )
+            if actor_selects_gamma:
+                gamma_loss_weights = gamma_loss_weights * (
+                    1.0 - fb_gamma.view(-1)
+                )
             fb_diag = -(
                 fb_diag_values * gamma_loss_weights.view(1, -1)
             ).mean() * Ms.shape[0]
         else:
             fb_offdiag = fb_offdiag_sq.sum() / self._off_diag_sum
-            fb_diag = -torch.diagonal(
-                fb_diff, dim1=1, dim2=2
-            ).mean() * Ms.shape[0]
+            if actor_selects_gamma:
+                # Gamma-normalized successor measure:
+                #   0.5 (M - gamma M')^2 - (1-gamma) M.
+                # Gamma remains the Bellman contraction; only the linear
+                # contrastive term is scaled.
+                fb_diag_values = torch.diagonal(Ms, dim1=1, dim2=2)
+                fb_diag = -(
+                    fb_diag_values * (1.0 - fb_gamma).view(1, -1)
+                ).mean() * Ms.shape[0]
+            else:
+                fb_diag = -torch.diagonal(
+                    fb_diff, dim1=1, dim2=2
+                ).mean() * Ms.shape[0]
         fb_loss = fb_offdiag + fb_diag
 
         innovation_align_loss = torch.zeros((), device=z.device, dtype=z.dtype)
@@ -4405,7 +4513,19 @@ class FBCprAux:
         if win is not None and isinstance(self._unwrap(self.policy._actor), TransformerActorWrapper):
             return self._backward_actor_transformer(win, z)
         p = self.policy
-        dist = p._actor(obs, z, p.actor_std)
+        actor_selects_gamma = bool(
+            getattr(self.cfg, "actor_selects_gamma", False)
+        )
+        if actor_selects_gamma:
+            dist, actor_normalized_horizon = p._actor(
+                obs,
+                z,
+                p.actor_std,
+                return_horizon=True,
+            )
+        else:
+            dist = p._actor(obs, z, p.actor_std)
+            actor_normalized_horizon = None
         sampled_action = dist.sample(clip=self.cfg.stddev_clip)
 
         # --- action saturation diagnostics ------------------------------
@@ -4447,6 +4567,7 @@ class FBCprAux:
         fb_gc = bool(getattr(self.cfg, "fb_gamma_conditioned", False)) and \
             getattr(p, "forward_gamma_conditioned", False)
         fb_si = fb_gc and bool(getattr(self.cfg, "fb_stochastic_integral", False))
+        fb_actor_gamma = fb_gc and actor_selects_gamma
         normalized_forward = fb_gc and bool(
             getattr(p, "forward_gamma_normalized_output", False)
         )
@@ -4464,8 +4585,84 @@ class FBCprAux:
         self._q_fb_w_profile = None
         self._q_fb_w_argmax_frac = None
         self._q_fb_w_tau_log = None
+        self._actor_gamma_logs = None
+        self._actor_gamma_grid_profile = None
 
-        if fb_si:
+        if fb_actor_gamma:
+            assert actor_normalized_horizon is not None
+            actor_horizon_output = actor_normalized_horizon.reshape(-1)
+            actor_gamma, noisy_horizon = sample_actor_gamma(
+                actor_normalized_horizon,
+                float(self.cfg.actor_gamma_short),
+                float(self.cfg.discount),
+                float(getattr(self.cfg, "actor_gamma_noise_std", 0.02)),
+                float(getattr(self.cfg, "actor_gamma_noise_clip", 0.05)),
+            )
+            actor_gamma = actor_gamma.reshape(-1)
+            noisy_horizon = noisy_horizon.reshape(-1)
+            Fs = p._forward_map(
+                obs, z, sampled_action, actor_gamma
+            )
+            Qs_fb_raw = (Fs * z).sum(dim=-1)
+            _, _, Q_fb_raw = self._pessimistic_value(
+                Qs_fb_raw, self.cfg.actor_pessimism_penalty
+            )
+            # The adaptive FB loss's -(1-gamma)M term already normalizes F
+            # across horizons, so the actor maximizes raw F·z.
+            Q_fb = Q_fb_raw
+            Q_fb_combined = Q_fb
+            with torch.no_grad():
+                output_gamma = normalized_horizon_to_gamma(
+                    actor_horizon_output,
+                    float(self.cfg.actor_gamma_short),
+                    float(self.cfg.discount),
+                )
+                Q_fb_times_one_minus_gamma = normalized_forward_value(
+                    Q_fb_raw, actor_gamma, normalized_forward
+                )
+                num_gamma_bins = int(
+                    getattr(self.cfg, "actor_gamma_log_bins", 8)
+                )
+                gamma_bin_indices = torch.floor(
+                    actor_horizon_output * num_gamma_bins
+                ).long().clamp_(max=num_gamma_bins - 1)
+                self._actor_gamma_grid_profile = torch.bincount(
+                    gamma_bin_indices,
+                    minlength=num_gamma_bins,
+                ).to(dtype=z.dtype) / max(actor_horizon_output.numel(), 1)
+                self._actor_gamma_logs = {
+                    "AdaptiveGamma/output_gamma_mean": output_gamma.mean(),
+                    "AdaptiveGamma/output_gamma_std": output_gamma.std(),
+                    "AdaptiveGamma/output_gamma_min": output_gamma.min(),
+                    "AdaptiveGamma/output_gamma_max": output_gamma.max(),
+                    "AdaptiveGamma/sampled_gamma_mean": actor_gamma.mean(),
+                    "AdaptiveGamma/sampled_gamma_std": actor_gamma.std(),
+                    "AdaptiveGamma/sampled_gamma_min": actor_gamma.min(),
+                    "AdaptiveGamma/sampled_gamma_max": actor_gamma.max(),
+                    "AdaptiveGamma/horizon_u_mean": actor_horizon_output.mean(),
+                    "AdaptiveGamma/horizon_u_std": actor_horizon_output.std(),
+                    "AdaptiveGamma/horizon_u_low_frac": (
+                        actor_horizon_output <= 0.05
+                    ).float().mean(),
+                    "AdaptiveGamma/horizon_u_high_frac": (
+                        actor_horizon_output >= 0.95
+                    ).float().mean(),
+                    "AdaptiveGamma/Q_fb_raw": Q_fb_raw.mean(),
+                    "AdaptiveGamma/Q_fb_times_one_minus_gamma": (
+                        Q_fb_times_one_minus_gamma.mean()
+                    ),
+                }
+                target_gamma = getattr(
+                    self, "_target_actor_gamma_log", None
+                )
+                if target_gamma is not None:
+                    self._actor_gamma_logs[
+                        "AdaptiveGamma/target_gamma_mean"
+                    ] = target_gamma.mean()
+                    self._actor_gamma_logs[
+                        "AdaptiveGamma/target_gamma_std"
+                    ] = target_gamma.std()
+        elif fb_si:
             # --- STOCHASTIC-INTEGRAL FB objective over the horizon -----------
             # Stratified-sample K horizons h_i in [h_lo, h_hi] (K even grids, one
             # uniform draw per grid, per row), gamma_i = 1-exp(-h_i). Batch-forward
@@ -4693,6 +4890,13 @@ class FBCprAux:
                 if self._q_fb_w_profile is not None:
                     for gi in range(self._q_fb_w_profile.numel()):
                         out[f"MutableGamma/w_grid{gi}"] = self._q_fb_w_profile[gi]
+            if self._actor_gamma_logs is not None:
+                out.update(self._actor_gamma_logs)
+            if self._actor_gamma_grid_profile is not None:
+                for gi in range(self._actor_gamma_grid_profile.numel()):
+                    out[f"AdaptiveGamma/output_grid{gi}"] = (
+                        self._actor_gamma_grid_profile[gi]
+                    )
             out.update(act_stats)
             out.update(extra_logs)
             if getattr(self, "_q_fb_split_logs", None):

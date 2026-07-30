@@ -951,7 +951,7 @@ def _broadcast_actor_std(mu: torch.Tensor, std: ActorStd) -> torch.Tensor:
 
 
 class Actor(nn.Module):
-    """BFM actor ``pi(a | s, z)`` returning a :class:`TruncatedNormal`."""
+    """BFM actor with an optional normalized effective-horizon head."""
 
     def __init__(
         self,
@@ -966,6 +966,7 @@ class Actor(nn.Module):
         learned_std: bool = False,
         min_std: float = 0.01,
         max_std: float = 1.0,
+        predict_horizon: bool = False,
     ) -> None:
         super().__init__()
         self.input_filter = build_input_filter(obs_space, input_keys)
@@ -977,6 +978,7 @@ class Actor(nn.Module):
         obs_dim = filtered_space.shape[0]
         self.model = model
         self.learned_std = learned_std
+        self.predict_horizon = bool(predict_horizon)
         self._log_min_std = math.log(min_std)
         self._log_max_std = math.log(max_std)
 
@@ -1002,6 +1004,12 @@ class Actor(nn.Module):
             seq += [linear(hidden_dim, out_dim)]
         self.policy = nn.Sequential(*seq)
         self._action_dim = action_dim
+        self.horizon_head = (
+            nn.Linear(hidden_dim, 1) if self.predict_horizon else None
+        )
+        if self.horizon_head is not None:
+            nn.init.zeros_(self.horizon_head.weight)
+            nn.init.zeros_(self.horizon_head.bias)
 
         # For SquashedNormal (learned_std), scale down the last layer so
         # mu_raw starts near zero (tanh(0) = 0, well inside [-1,1]) and
@@ -1022,12 +1030,19 @@ class Actor(nn.Module):
                     if hasattr(last_module, "bias") and last_module.bias is not None:
                         last_module.bias.data.zero_()
 
+    def reset_parameters(self) -> None:
+        """Keep the optional horizon head initialized at the range midpoint."""
+        if self.horizon_head is not None:
+            nn.init.zeros_(self.horizon_head.weight)
+            nn.init.zeros_(self.horizon_head.bias)
+
     def forward(
         self,
         obs: torch.Tensor | dict[str, torch.Tensor],
         z: torch.Tensor,
         std: ActorStd,
-    ) -> TruncatedNormal:
+        return_horizon: bool = False,
+    ) -> TruncatedNormal | tuple[TruncatedNormal, torch.Tensor]:
         obs = self.input_filter(obs)
         z_embedding = self.embed_z(torch.cat([obs, z], dim=-1))
         s_embedding = self.embed_s(obs)
@@ -1038,11 +1053,19 @@ class Actor(nn.Module):
             std_tensor = log_std_raw.clamp(self._log_min_std, self._log_max_std).exp()
             # SquashedNormal: sample = tanh(u), u ~ N(mu_raw, std).
             # mu_raw is NOT tanh'd here — tanh is applied inside the distribution.
-            return SquashedNormal(mu_raw, std_tensor)
+            action_dist = SquashedNormal(mu_raw, std_tensor)
         else:
             mu = torch.tanh(out)
             std_tensor = _broadcast_actor_std(mu, std)
-            return TruncatedNormal(mu, std_tensor)
+            action_dist = TruncatedNormal(mu, std_tensor)
+        if not return_horizon:
+            return action_dist
+        if self.horizon_head is None:
+            raise RuntimeError(
+                "return_horizon=True requires predict_horizon=True"
+            )
+        normalized_horizon = torch.sigmoid(self.horizon_head(embedding))
+        return action_dist, normalized_horizon
 
 
 class TransformerActorWrapper(nn.Module):
@@ -1383,6 +1406,9 @@ class FBCprNetworkCfg:
     actor_embedding_layers: int = 2
     actor_std: float | tuple[float, ...] = 0.05
     actor_input_keys: tp.Sequence[str] = ("state", "last_action", "history_actor")
+    # Optional scalar policy output u in [0,1], interpreted as normalized
+    # effective horizon and mapped to gamma by the algorithm.
+    actor_predict_horizon: bool = False
     # Actor architecture: "mlp" (default residual MLP, Actor) or "transformer"
     # (RoPE causal transformer over per-timestep tokens, RoPETransformerActor).
     # The transformer actor tokenizes each of the H+1 frames (current + H past)
@@ -1648,7 +1674,14 @@ class FBCprAuxPolicy(nn.Module):
 
         # Actor.
         _learned_std = self.soft_fb or bool(getattr(cfg, "actor_learned_std", False))
+        self.actor_predict_horizon = bool(
+            getattr(cfg, "actor_predict_horizon", False)
+        )
         if str(getattr(cfg, "actor_arch", "mlp")) == "transformer":
+            if self.actor_predict_horizon:
+                raise ValueError(
+                    "actor_predict_horizon currently requires actor_arch='mlp'"
+                )
             self._actor = TransformerActorWrapper(
                 obs_space,
                 z_dim=cfg.z_dim,
@@ -1673,6 +1706,7 @@ class FBCprAuxPolicy(nn.Module):
                 learned_std=_learned_std,
                 min_std=float(getattr(cfg, "actor_min_std", 0.01)),
                 max_std=float(getattr(cfg, "actor_max_std", 1.0)),
+                predict_horizon=self.actor_predict_horizon,
             )
 
         # Discriminator.
