@@ -76,49 +76,32 @@ def sample_log_horizon_gamma(
     return 1.0 - torch.exp(-h)
 
 
-def normalized_horizon_to_gamma(
-    normalized_horizon: torch.Tensor,
-    gamma_min: float,
-    gamma_max: float,
+def sample_discrete_gamma(
+    reference: torch.Tensor,
+    gamma_values: tuple[float, ...],
 ) -> torch.Tensor:
-    """Map a normalized effective horizon in ``[0, 1]`` to gamma."""
-    if not 0.0 <= gamma_min < gamma_max < 1.0:
-        raise ValueError(
-            f"Expected 0 <= gamma_min < gamma_max < 1, got {gamma_min}, {gamma_max}"
-        )
-    h_min = -math.log1p(-gamma_min)
-    h_max = -math.log1p(-gamma_max)
-    h = h_min + normalized_horizon * (h_max - h_min)
-    return -torch.expm1(-h)
+    """Sample uniformly from a configured finite set of discount factors."""
+    if not gamma_values:
+        raise ValueError("gamma_values must be non-empty")
+    if any(not 0.0 <= gamma < 1.0 for gamma in gamma_values):
+        raise ValueError("all gamma_values must be in [0, 1)")
+    values = reference.new_tensor(gamma_values)
+    indices = torch.randint(
+        values.numel(), reference.shape, device=reference.device
+    )
+    return values[indices]
 
 
-def sample_actor_gamma(
-    normalized_horizon: torch.Tensor,
-    gamma_min: float,
-    gamma_max: float,
-    noise_std: float,
-    noise_clip: float,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Add exploration in normalized-horizon space and return ``(gamma, u)``."""
-    if noise_std < 0.0:
-        raise ValueError(f"noise_std must be non-negative, got {noise_std}")
-    if noise_clip < 0.0:
-        raise ValueError(f"noise_clip must be non-negative, got {noise_clip}")
-    noise = torch.randn_like(normalized_horizon) * noise_std
-    if noise_clip > 0.0:
-        noise = noise.clamp(-noise_clip, noise_clip)
-    noisy_horizon = normalized_horizon + noise
-    clamped_horizon = noisy_horizon.clamp(0.0, 1.0)
-    # Straight-through clamp preserves actor gradients at a sampled boundary.
-    noisy_horizon = (
-        noisy_horizon
-        - noisy_horizon.detach()
-        + clamped_horizon.detach()
-    )
-    gamma = normalized_horizon_to_gamma(
-        noisy_horizon, gamma_min, gamma_max
-    )
-    return gamma, noisy_horizon
+def scaled_two_gamma_logsumexp(
+    normalized_q: torch.Tensor,
+    scale: float,
+) -> torch.Tensor:
+    """Aggregate two normalized Q values as scale/log(2) * logsumexp(Q)."""
+    if normalized_q.shape[-1] != 2:
+        raise ValueError("normalized_q must have exactly two values per row")
+    if scale <= 0.0:
+        raise ValueError("scale must be positive")
+    return (scale / math.log(2.0)) * torch.logsumexp(normalized_q, dim=-1)
 
 
 def sample_relabel_z(
@@ -155,6 +138,8 @@ def normalized_gamma_loss_weights(
         raise ValueError(
             f"Expected 0 <= gamma_min < gamma_max < 1, got {gamma_min}, {gamma_max}"
         )
+    if power < 0.0:
+        raise ValueError(f"Expected power >= 0, got {power}")
     if power == 0.0:
         return torch.ones_like(gamma)
     h_min = -math.log1p(-gamma_min)

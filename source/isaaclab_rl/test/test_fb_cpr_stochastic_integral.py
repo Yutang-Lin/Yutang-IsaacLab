@@ -15,44 +15,13 @@ from isaaclab_rl.rsl_rl.fb_cpr_math import (
     innovation_alignment_loss,
     normalized_forward_value,
     normalized_gamma_loss_weights,
-    normalized_horizon_to_gamma,
-    sample_actor_gamma,
+    sample_discrete_gamma,
     sample_log_horizon_gamma,
     sample_relabel_z,
+    scaled_two_gamma_logsumexp,
     stochastic_integral_weights,
     tracking_failure_metrics,
 )
-
-
-def test_normalized_horizon_to_gamma_endpoints_and_monotonicity():
-    normalized_horizon = torch.linspace(0.0, 1.0, 11)
-    gamma = normalized_horizon_to_gamma(
-        normalized_horizon, 0.4, 0.99
-    )
-
-    torch.testing.assert_close(gamma[0], torch.tensor(0.4))
-    torch.testing.assert_close(gamma[-1], torch.tensor(0.99))
-    assert torch.all(gamma[1:] > gamma[:-1])
-
-
-def test_actor_gamma_noise_is_clipped_and_preserves_gradient():
-    torch.manual_seed(7)
-    normalized_horizon = torch.full((128, 1), 0.5, requires_grad=True)
-    gamma, noisy_horizon = sample_actor_gamma(
-        normalized_horizon,
-        gamma_min=0.4,
-        gamma_max=0.99,
-        noise_std=100.0,
-        noise_clip=0.05,
-    )
-
-    assert torch.all(noisy_horizon >= 0.45)
-    assert torch.all(noisy_horizon <= 0.55)
-    assert torch.all(gamma >= 0.4)
-    assert torch.all(gamma <= 0.99)
-    gamma.sum().backward()
-    assert normalized_horizon.grad is not None
-    assert torch.all(normalized_horizon.grad > 0.0)
 
 
 def test_normalized_forward_value_uses_network_output_directly():
@@ -291,6 +260,37 @@ def test_gamma99_log_horizon_distribution():
     torch.testing.assert_close(tail, torch.tensor(0.2238), atol=0.004, rtol=0)
 
 
+def test_discrete_gamma_sampling_uses_only_configured_values():
+    torch.manual_seed(7)
+    gamma = sample_discrete_gamma(
+        torch.empty(20_000), (0.8, 0.99)
+    )
+
+    torch.testing.assert_close(
+        gamma.unique().sort().values,
+        torch.tensor([0.8, 0.99]),
+    )
+    fraction_long = (gamma == gamma.max()).float().mean()
+    torch.testing.assert_close(
+        fraction_long, torch.tensor(0.5), atol=0.015, rtol=0
+    )
+
+
+def test_scaled_two_gamma_logsumexp_matches_requested_formula():
+    normalized_q = torch.tensor(
+        [[0.0, 0.0], [1.0, 3.0]], requires_grad=True
+    )
+    output = scaled_two_gamma_logsumexp(normalized_q, scale=50.0)
+    expected = (50.0 / math.log(2.0)) * torch.log(
+        normalized_q.exp().sum(dim=-1)
+    )
+
+    torch.testing.assert_close(output, expected)
+    output.sum().backward()
+    assert normalized_q.grad is not None
+    assert torch.all(normalized_q.grad > 0.0)
+
+
 def test_gamma_loss_weights_have_unit_log_horizon_expectation():
     h_min = -math.log1p(-0.4)
     h_max = -math.log1p(-0.99)
@@ -317,22 +317,6 @@ def test_soft_gamma_loss_weights_have_unit_log_horizon_expectation():
         weights.mean(), torch.tensor(1.0, dtype=weights.dtype), atol=1e-9, rtol=0
     )
     assert weights[gamma.argmin()] > weights[gamma.argmax()]
-
-
-def test_inverse_gamma_loss_weights_have_unit_log_horizon_expectation():
-    h_min = -math.log1p(-0.6)
-    h_max = -math.log1p(-0.99)
-    edges = torch.linspace(h_min, h_max, 100_001, dtype=torch.float64)
-    h = 0.5 * (edges[:-1] + edges[1:])
-    gamma = 1.0 - torch.exp(-h)
-    weights = normalized_gamma_loss_weights(
-        gamma, 0.6, 0.99, power=-1.0
-    )
-
-    torch.testing.assert_close(
-        weights.mean(), torch.tensor(1.0, dtype=weights.dtype), atol=1e-9, rtol=0
-    )
-    assert weights[gamma.argmin()] < weights[gamma.argmax()]
 
 
 def test_innovation_alignment_is_zero_for_matching_innovations():

@@ -1148,8 +1148,6 @@ class RslRlFBCprPolicyCfg:
         "last_action",
         "history_actor",
     )
-    actor_predict_horizon: bool = False
-    """Add a scalar normalized-effective-horizon output to the MLP actor."""
 
     # Critic (twin Q for discriminator reward)
     critic_hidden_dim: int = 2048
@@ -1377,23 +1375,22 @@ class RslRlFBCprAlgorithmCfg:
     fb_gamma_conditioned: bool = False
     actor_gamma_short: float = 0.8
     actor_gamma_short_alpha: float = 0.5
-    actor_selects_gamma: bool = False
-    """Let the actor select gamma and optimize its normalized FB value directly."""
-
-    actor_gamma_noise_std: float = 0.02
-    """Exploration standard deviation in normalized effective-horizon space."""
-
-    actor_gamma_noise_clip: float = 0.05
-    """Symmetric clip applied to normalized-horizon exploration noise."""
-
-    actor_gamma_log_bins: int = 8
-    """Equal log-horizon bins used to log actor-selected gamma occupancy."""
     fb_gamma_loss_weighting: bool = False
     """Weight gamma-conditioned Bellman FB rows by ``(1-gamma)^power``,
     normalized under the configured uniform log-horizon distribution."""
 
     fb_gamma_loss_weight_power: float = 2.0
     """Exponent of ``(1-gamma)`` used when gamma loss weighting is enabled."""
+
+    fb_gamma_train_values: tuple[float, ...] = ()
+    """Optional discrete gamma support for FB updates. Empty samples uniformly
+    in log-horizon over ``[actor_gamma_short, discount]``."""
+
+    fb_actor_logsumexp_gammas: tuple[float, ...] = ()
+    """Two actor-query gammas for the normalized-Q log-sum-exp objective."""
+
+    fb_actor_logsumexp_scale: float = 1.0
+    """Scale in ``scale/log(2) * logsumexp(N_gamma0, N_gamma1)``."""
 
     fb_stochastic_integral: bool = False  # softmax-weighted horizon integral actor FB term
     fb_integral_K: int = 8
