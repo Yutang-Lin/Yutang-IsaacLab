@@ -733,7 +733,6 @@ class FBCprAux:
         #
         # Discriminator gets the same ``combined_mult`` as every other branch.
         # Target-network Polyak rates are scaled independently below.
-        import math
         REF_BATCH_SIZE = 1024
         ws = (int(torch.distributed.get_world_size())
               if self.is_distributed else 1)
