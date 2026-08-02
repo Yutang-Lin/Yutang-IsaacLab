@@ -569,6 +569,9 @@ class BackwardMap(nn.Module):
         (LayerNorm -> Linear -> Mish, with a skip), then the z head. Same
         ``hidden_dim``/``hidden_layers`` budget as ``simple`` (still lightweight)
         but with skip connections + per-block LayerNorm for stabler B gradients.
+      * ``"split_body"`` — two independent simple MLPs consume configured
+        lower/upper feature subsets. Their normalized outputs are added and
+        projected back onto the z sphere.
     """
 
     def __init__(
@@ -580,6 +583,8 @@ class BackwardMap(nn.Module):
         norm: bool = True,
         input_keys: str | tp.Sequence[str] | None = None,
         model: str = "simple",
+        lower_indices: tp.Sequence[int] = (),
+        upper_indices: tp.Sequence[int] = (),
     ) -> None:
         super().__init__()
         self.input_filter = build_input_filter(obs_space, input_keys)
@@ -589,6 +594,7 @@ class BackwardMap(nn.Module):
         )
         assert len(filtered_space.shape) == 1, "filtered_space must have a 1D shape"
         in_dim = filtered_space.shape[0]
+        self.model = model
         if model == "residual":
             # Lightweight residual MLP with LayerNorm. Input projection into the
             # hidden width, then (hidden_layers-1) pre-LN residual blocks, then
@@ -602,14 +608,73 @@ class BackwardMap(nn.Module):
             for _ in range(hidden_layers - 1):
                 seq += [nn.Linear(hidden_dim, hidden_dim), nn.ReLU()]
             seq += [nn.Linear(hidden_dim, z_dim)]
+        elif model == "split_body":
+            lower = tuple(int(index) for index in lower_indices)
+            upper = tuple(int(index) for index in upper_indices)
+            if not lower or not upper:
+                raise ValueError(
+                    "split_body requires non-empty lower and upper indices"
+                )
+            if len(set(lower)) != len(lower) or len(set(upper)) != len(upper):
+                raise ValueError("split_body indices must be unique per branch")
+            if min(lower + upper) < 0 or max(lower + upper) >= in_dim:
+                raise ValueError(
+                    f"split_body index outside backward input dimension {in_dim}"
+                )
+            if set(lower) | set(upper) != set(range(in_dim)):
+                raise ValueError(
+                    "split_body lower/upper index union must cover every input"
+                )
+
+            def _branch(branch_in_dim: int) -> nn.Sequential:
+                layers: list[nn.Module] = [
+                    nn.Linear(branch_in_dim, hidden_dim),
+                    nn.LayerNorm(hidden_dim),
+                    nn.Tanh(),
+                ]
+                for _ in range(hidden_layers - 1):
+                    layers += [
+                        nn.Linear(hidden_dim, hidden_dim),
+                        nn.ReLU(),
+                    ]
+                layers += [nn.Linear(hidden_dim, z_dim)]
+                return nn.Sequential(*layers)
+
+            self.register_buffer(
+                "lower_indices",
+                torch.tensor(lower, dtype=torch.long),
+                persistent=False,
+            )
+            self.register_buffer(
+                "upper_indices",
+                torch.tensor(upper, dtype=torch.long),
+                persistent=False,
+            )
+            self.lower_net = _branch(len(lower))
+            self.upper_net = _branch(len(upper))
+            self.output_norm = Norm() if norm else nn.Identity()
+            return
         else:
-            raise ValueError(f"BackwardMap: unknown model '{model}' (want 'simple' or 'residual').")
+            raise ValueError(
+                f"BackwardMap: unknown model '{model}' "
+                "(want 'simple', 'residual', or 'split_body')."
+            )
         if norm:
             seq += [Norm()]
         self.net = nn.Sequential(*seq)
 
     def forward(self, x: torch.Tensor | dict[str, torch.Tensor]) -> torch.Tensor:
         x = self.input_filter(x)
+        if self.model == "split_body":
+            lower = F.normalize(
+                self.lower_net(x.index_select(-1, self.lower_indices)),
+                dim=-1,
+            )
+            upper = F.normalize(
+                self.upper_net(x.index_select(-1, self.upper_indices)),
+                dim=-1,
+            )
+            return self.output_norm(lower + upper)
         return self.net(x)
 
 
@@ -1348,7 +1413,9 @@ class FBCprNetworkCfg:
     backward_hidden_dim: int = 256
     backward_hidden_layers: int = 1
     backward_norm: bool = True
-    backward_model: str = "simple"  # {"simple", "residual"} — residual = LN residual MLP
+    backward_model: str = "simple"
+    backward_lower_indices: tp.Sequence[int] = ()
+    backward_upper_indices: tp.Sequence[int] = ()
     backward_input_keys: tp.Sequence[str] = ("state", "privileged_state")
 
     # Forward map (F) / critics share this architecture
@@ -1591,6 +1658,8 @@ class FBCprAuxPolicy(nn.Module):
             norm=cfg.backward_norm,
             input_keys=cfg.backward_input_keys,
             model=cfg.backward_model,
+            lower_indices=cfg.backward_lower_indices,
+            upper_indices=cfg.backward_upper_indices,
         )
 
         # Optional reconstruction head (end-effector decoder from z).

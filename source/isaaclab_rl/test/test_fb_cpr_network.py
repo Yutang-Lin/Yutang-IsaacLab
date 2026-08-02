@@ -25,6 +25,7 @@ sys.modules[_SPEC.name] = _POLICY_MODULE
 _SPEC.loader.exec_module(_POLICY_MODULE)
 FourierMLP = _POLICY_MODULE.FourierMLP
 ForwardMap = _POLICY_MODULE.ForwardMap
+BackwardMap = _POLICY_MODULE.BackwardMap
 ScalarMLP = _POLICY_MODULE.ScalarMLP
 gamma_forward_output_to_raw = _POLICY_MODULE.gamma_forward_output_to_raw
 weight_init = _POLICY_MODULE.weight_init
@@ -47,6 +48,43 @@ def _gamma_forward_map(
         gamma_embed_type=embed_type,
         gamma_scale_hidden_dim=scale_hidden_dim,
     )
+
+
+def test_split_body_backward_map_combines_two_normalized_branches():
+    module = BackwardMap(
+        gymnasium.spaces.Box(low=-1.0, high=1.0, shape=(10,)),
+        z_dim=8,
+        hidden_dim=16,
+        hidden_layers=1,
+        norm=True,
+        model="split_body",
+        lower_indices=(0, 1, 2, 3, 4, 5),
+        upper_indices=(4, 5, 6, 7, 8, 9),
+    )
+    output = module(torch.randn(7, 10))
+
+    assert output.shape == (7, 8)
+    torch.testing.assert_close(
+        output.norm(dim=-1),
+        torch.full((7,), math.sqrt(8.0)),
+    )
+    output[:, 0].sum().backward()
+    assert module.lower_net[-1].weight.grad is not None
+    assert module.upper_net[-1].weight.grad is not None
+    assert module.lower_net[-1].weight.grad.abs().sum() > 0
+    assert module.upper_net[-1].weight.grad.abs().sum() > 0
+
+
+def test_split_body_backward_map_requires_full_input_coverage():
+    with pytest.raises(ValueError, match="union must cover"):
+        BackwardMap(
+            gymnasium.spaces.Box(low=-1.0, high=1.0, shape=(5,)),
+            z_dim=4,
+            hidden_dim=8,
+            model="split_body",
+            lower_indices=(0, 1),
+            upper_indices=(3, 4),
+        )
 
 
 @pytest.mark.parametrize(

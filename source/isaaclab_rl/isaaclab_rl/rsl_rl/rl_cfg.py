@@ -1115,8 +1115,10 @@ class RslRlFBCprPolicyCfg:
     backward_hidden_dim: int = 256
     backward_hidden_layers: int = 1
     backward_norm: bool = True
-    backward_model: str = "simple"  # {"simple", "residual"} — residual = LN residual MLP
+    backward_model: str = "simple"
     backward_input_keys: tuple[str, ...] = ("state", "privileged_state")
+    backward_lower_indices: tuple[int, ...] = ()
+    backward_upper_indices: tuple[int, ...] = ()
 
     # Forward map (F)
     forward_hidden_dim: int = 2048
