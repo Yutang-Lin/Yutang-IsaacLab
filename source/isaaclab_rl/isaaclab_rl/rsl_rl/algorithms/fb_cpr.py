@@ -45,13 +45,14 @@ from ..fb_cpr_math import (
     centered_subwindow_start,
     completed_tracking_bins,
     ema_grad_spike_state,
+    horizon_beta_coefficients,
     innovation_alignment_loss,
     normalized_forward_value,
     normalized_gamma_loss_weights,
     sample_discrete_gamma,
     sample_log_horizon_gamma,
     sample_relabel_z,
-    scaled_two_gamma_logsumexp,
+    scaled_horizon_logsumexp,
     stochastic_integral_weights,
     tracking_failure_metrics,
 )
@@ -348,12 +349,14 @@ class FBCprAuxAlgorithmCfg:
     # Optional finite support for FB gamma training. Empty preserves uniform
     # log-horizon sampling over [actor_gamma_short, discount].
     fb_gamma_train_values: tuple[float, ...] = ()
-    # Optional actor objective over exactly two gamma-conditioned normalized
-    # Q values: scale/log(2) * logsumexp((1+beta)N_gamma0,
-    #                                  (1-beta)N_gamma1).
+    # Optional actor objective over fixed gamma-conditioned normalized Q values.
+    # Beta coefficients vary linearly in log effective horizon, anchored at the
+    # configured reference and long gammas.
     fb_actor_logsumexp_gammas: tuple[float, ...] = ()
     fb_actor_logsumexp_scale: float = 1.0
     fb_actor_logsumexp_beta: float = 0.0
+    fb_actor_logsumexp_beta_anchor_gamma: float = 0.8
+    fb_actor_logsumexp_beta_long_gamma: float = 0.99
     # Stochastic-integral FB actor objective (overrides the two-gamma term when on;
     # requires fb_gamma_conditioned). Stratified-sample fb_integral_K horizons in
     # [gamma_short, discount], softmax-weight the normalized per-step values, and
@@ -606,9 +609,9 @@ class FBCprAux:
             for gamma in getattr(cfg, "fb_actor_logsumexp_gammas", ())
         )
         if actor_lse_gammas:
-            if len(actor_lse_gammas) != 2:
+            if len(actor_lse_gammas) < 2:
                 raise ValueError(
-                    "fb_actor_logsumexp_gammas must contain exactly two values"
+                    "fb_actor_logsumexp_gammas must contain at least two values"
                 )
             if not bool(getattr(cfg, "fb_gamma_conditioned", False)):
                 raise ValueError(
@@ -633,6 +636,37 @@ class FBCprAux:
             if not -1.0 < actor_lse_beta < 1.0:
                 raise ValueError(
                     "fb_actor_logsumexp_beta must be in (-1, 1)"
+                )
+            beta_anchor_gamma = float(
+                getattr(
+                    cfg, "fb_actor_logsumexp_beta_anchor_gamma", 0.8
+                )
+            )
+            beta_long_gamma = float(
+                getattr(
+                    cfg, "fb_actor_logsumexp_beta_long_gamma", 0.99
+                )
+            )
+            if not 0.0 <= beta_anchor_gamma < beta_long_gamma < 1.0:
+                raise ValueError(
+                    "logsumexp beta anchor gammas must satisfy "
+                    "0 <= anchor < long < 1"
+                )
+            h_anchor = -math.log1p(-beta_anchor_gamma)
+            h_long = -math.log1p(-beta_long_gamma)
+            coefficients = [
+                1.0
+                + actor_lse_beta
+                - 2.0
+                * actor_lse_beta
+                * (-math.log1p(-gamma) - h_anchor)
+                / (h_long - h_anchor)
+                for gamma in actor_lse_gammas
+            ]
+            if min(coefficients) <= 0.0 or sum(coefficients) <= 1.0:
+                raise ValueError(
+                    "logsumexp beta coefficients must be positive "
+                    "and sum to more than one"
                 )
         if bool(getattr(cfg, "fb_grad_spike_clip", False)):
             decay = float(getattr(cfg, "fb_grad_spike_ema_decay", 0.99))
@@ -4555,54 +4589,93 @@ class FBCprAux:
         self._q_fb_lse_log = None
 
         if fb_lse:
-            # Query both configured endpoints in one vectorized F forward.
-            # The actor maximizes:
-            #   scale/log(2) * logsumexp(
-            #       (1+beta) * N(gamma_short),
-            #       (1-beta) * N(gamma_long)).
-            num_gammas = 2
+            # Query all configured horizons in one vectorized F forward.
+            num_gammas = len(actor_lse_gammas)
 
-            def _tile_two(t):
+            def _tile_gammas(t):
                 return t.repeat_interleave(num_gammas, dim=0)
 
-            obs_b2 = (
-                {key: _tile_two(value) for key, value in obs.items()}
+            obs_bg = (
+                {
+                    key: _tile_gammas(value)
+                    for key, value in obs.items()
+                }
                 if isinstance(obs, dict)
-                else _tile_two(obs)
+                else _tile_gammas(obs)
             )
-            z_b2 = _tile_two(z)
-            action_b2 = _tile_two(sampled_action)
-            gamma_b2 = torch.tensor(
+            z_bg = _tile_gammas(z)
+            action_bg = _tile_gammas(sampled_action)
+            gamma_bg = torch.tensor(
                 actor_lse_gammas, device=z.device, dtype=z.dtype
             ).view(1, num_gammas).expand(Bsz, -1).reshape(-1)
-            F_b2 = p._forward_map(
-                obs_b2, z_b2, action_b2, gamma_b2
+            F_bg = p._forward_map(
+                obs_bg, z_bg, action_bg, gamma_bg
             )
-            _, _, Q_b2 = self._pessimistic_value(
-                (F_b2 * z_b2).sum(dim=-1),
+            _, _, Q_bg = self._pessimistic_value(
+                (F_bg * z_bg).sum(dim=-1),
                 self.cfg.actor_pessimism_penalty,
             )
             normalized_q = normalized_forward_value(
-                Q_b2, gamma_b2, normalized_forward
+                Q_bg, gamma_bg, normalized_forward
             ).reshape(Bsz, num_gammas)
-            Q_final = scaled_two_gamma_logsumexp(
+            log_horizons = -torch.log1p(
+                -gamma_bg.reshape(Bsz, num_gammas)
+            )
+            beta_anchor_gamma = float(
+                getattr(
+                    self.cfg,
+                    "fb_actor_logsumexp_beta_anchor_gamma",
+                    0.8,
+                )
+            )
+            beta_long_gamma = float(
+                getattr(
+                    self.cfg,
+                    "fb_actor_logsumexp_beta_long_gamma",
+                    0.99,
+                )
+            )
+            beta = float(
+                getattr(self.cfg, "fb_actor_logsumexp_beta", 0.0)
+            )
+            h_anchor = -math.log1p(-beta_anchor_gamma)
+            h_long = -math.log1p(-beta_long_gamma)
+            Q_final = scaled_horizon_logsumexp(
                 normalized_q,
+                log_horizons,
+                h_anchor,
+                h_long,
                 float(
                     getattr(
                         self.cfg, "fb_actor_logsumexp_scale", 1.0
                     )
                 ),
-                float(
-                    getattr(
-                        self.cfg, "fb_actor_logsumexp_beta", 0.0
-                    )
-                ),
+                beta,
+            )
+            coefficients = horizon_beta_coefficients(
+                log_horizons, h_anchor, h_long, beta
+            )
+            wd = torch.softmax(
+                (coefficients * normalized_q).detach(), dim=1
+            )
+            ent = -(
+                wd.clamp_min(1e-12) * wd.clamp_min(1e-12).log()
+            ).sum(dim=1)
+            self._q_fb_w_entropy_log = ent.mean()
+            self._q_fb_w_entropy_frac_log = ent.mean() / max(
+                math.log(num_gammas), 1e-12
+            )
+            self._q_fb_w_top_log = wd.max(dim=1).values.mean()
+            self._q_fb_w_profile = wd.mean(dim=0)
+            self._q_fb_w_argmax_frac = (
+                wd.argmax(dim=1).float().mean()
+                / max(num_gammas - 1, 1)
             )
             Q_fb = Q_final
             Q_fb_combined = Q_final
-            Fs = F_b2[:, 1::num_gammas, :]
+            Fs = F_bg[:, num_gammas - 1::num_gammas, :]
             self._q_fb_lse_short_log = normalized_q[:, 0].mean().detach()
-            self._q_fb_lse_long_log = normalized_q[:, 1].mean().detach()
+            self._q_fb_lse_long_log = normalized_q[:, -1].mean().detach()
             self._q_fb_lse_log = Q_final.mean().detach()
         elif fb_si:
             # --- STOCHASTIC-INTEGRAL FB objective over the horizon -----------

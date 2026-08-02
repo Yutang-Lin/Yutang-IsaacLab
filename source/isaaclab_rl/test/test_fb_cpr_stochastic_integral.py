@@ -12,12 +12,14 @@ from isaaclab_rl.rsl_rl.fb_cpr_math import (
     centered_context_offsets,
     centered_subwindow_start,
     completed_tracking_bins,
+    horizon_beta_coefficients,
     innovation_alignment_loss,
     normalized_forward_value,
     normalized_gamma_loss_weights,
     sample_discrete_gamma,
     sample_log_horizon_gamma,
     sample_relabel_z,
+    scaled_horizon_logsumexp,
     scaled_two_gamma_logsumexp,
     stochastic_integral_weights,
     tracking_failure_metrics,
@@ -276,6 +278,17 @@ def test_discrete_gamma_sampling_uses_only_configured_values():
     )
 
 
+def test_discrete_gamma_sampling_is_uniform_over_four_values():
+    values = (0.6, 0.9, 0.975, 0.99)
+    gamma = sample_discrete_gamma(torch.empty(40_000), values)
+    counts = torch.stack(
+        [(gamma == value).float().mean() for value in values]
+    )
+    torch.testing.assert_close(
+        counts, torch.full((4,), 0.25), atol=0.01, rtol=0
+    )
+
+
 def test_scaled_two_gamma_logsumexp_matches_requested_formula():
     normalized_q = torch.tensor(
         [[0.0, 0.0], [1.0, 3.0]], requires_grad=True
@@ -303,6 +316,41 @@ def test_scaled_two_gamma_logsumexp_applies_endpoint_beta():
         normalized_q * coefficients, dim=-1
     )
 
+    torch.testing.assert_close(output, expected)
+    output.sum().backward()
+    assert normalized_q.grad is not None
+    assert torch.all(normalized_q.grad > 0.0)
+
+
+def test_scaled_horizon_logsumexp_uses_linear_beta_schedule():
+    h_min = -math.log1p(-0.6)
+    h_max = -math.log1p(-0.99)
+    gammas = torch.tensor([[0.6, 0.9, 0.975, 0.99]])
+    horizons = -torch.log1p(-gammas)
+    normalized_q = torch.tensor(
+        [[1.0, 2.0, 3.0, 4.0]], requires_grad=True
+    )
+    coefficients = horizon_beta_coefficients(
+        horizons, h_min, h_max, beta=0.25
+    )
+    torch.testing.assert_close(
+        coefficients,
+        torch.tensor([[1.25, 1.0620981, 0.8741964, 0.75]]),
+    )
+
+    output = scaled_horizon_logsumexp(
+        normalized_q,
+        horizons,
+        h_min,
+        h_max,
+        scale=50.0,
+        beta=0.25,
+    )
+    expected = (
+        50.0
+        / coefficients.sum(dim=-1).log()
+        * torch.logsumexp(coefficients * normalized_q, dim=-1)
+    )
     torch.testing.assert_close(output, expected)
     output.sum().backward()
     assert normalized_q.grad is not None

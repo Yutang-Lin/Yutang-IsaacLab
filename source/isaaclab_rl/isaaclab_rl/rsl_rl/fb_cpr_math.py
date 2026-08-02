@@ -109,6 +109,47 @@ def scaled_two_gamma_logsumexp(
     return (scale / math.log(2.0)) * torch.logsumexp(weighted_q, dim=-1)
 
 
+def horizon_beta_coefficients(
+    log_horizons: torch.Tensor,
+    h_min: float,
+    h_max: float,
+    beta: float,
+) -> torch.Tensor:
+    """Interpolate from 1+beta to 1-beta over log effective horizon."""
+    if not h_min < h_max:
+        raise ValueError("h_min must be less than h_max")
+    if not -1.0 < beta < 1.0:
+        raise ValueError("beta must be in (-1, 1)")
+    progress = (log_horizons - h_min) / (h_max - h_min)
+    return 1.0 + beta - 2.0 * beta * progress
+
+
+def scaled_horizon_logsumexp(
+    normalized_q: torch.Tensor,
+    log_horizons: torch.Tensor,
+    h_min: float,
+    h_max: float,
+    scale: float,
+    beta: float,
+) -> torch.Tensor:
+    """Aggregate horizon-conditioned Q with a linear beta schedule."""
+    if normalized_q.shape != log_horizons.shape:
+        raise ValueError("normalized_q and log_horizons must have equal shape")
+    if normalized_q.ndim < 1 or normalized_q.shape[-1] < 2:
+        raise ValueError("at least two horizon values are required per row")
+    if scale <= 0.0:
+        raise ValueError("scale must be positive")
+    coefficients = horizon_beta_coefficients(
+        log_horizons, h_min, h_max, beta
+    )
+    coefficient_sum = coefficients.sum(dim=-1)
+    return (
+        scale
+        / coefficient_sum.log()
+        * torch.logsumexp(coefficients * normalized_q, dim=-1)
+    )
+
+
 def sample_relabel_z(
     stored_z: torch.Tensor,
     mixed_z: torch.Tensor,

@@ -1387,14 +1387,19 @@ class RslRlFBCprAlgorithmCfg:
     in log-horizon over ``[actor_gamma_short, discount]``."""
 
     fb_actor_logsumexp_gammas: tuple[float, ...] = ()
-    """Two actor-query gammas for the normalized-Q log-sum-exp objective."""
+    """Fixed actor-query gammas for the normalized-Q log-sum-exp objective."""
 
     fb_actor_logsumexp_scale: float = 1.0
-    """Scale in ``scale/log(2) * logsumexp(N_gamma0, N_gamma1)``."""
+    """Scale in ``scale/log(sum(c)) * logsumexp(c_gamma * N_gamma)``."""
 
     fb_actor_logsumexp_beta: float = 0.0
-    """Endpoint bias: multiply short Q by ``1+beta`` and long Q by
-    ``1-beta`` before the log-sum-exp."""
+    """Effective-horizon slope applied before the log-sum-exp."""
+
+    fb_actor_logsumexp_beta_anchor_gamma: float = 0.8
+    """Gamma whose coefficient is ``1+beta``."""
+
+    fb_actor_logsumexp_beta_long_gamma: float = 0.99
+    """Gamma whose coefficient is ``1-beta``."""
 
     fb_stochastic_integral: bool = False  # softmax-weighted horizon integral actor FB term
     fb_integral_K: int = 8
