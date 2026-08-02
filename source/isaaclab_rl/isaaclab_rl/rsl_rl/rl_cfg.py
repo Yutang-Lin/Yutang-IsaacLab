@@ -1392,6 +1392,10 @@ class RslRlFBCprAlgorithmCfg:
     fb_actor_logsumexp_scale: float = 1.0
     """Scale in ``scale/log(2) * logsumexp(N_gamma0, N_gamma1)``."""
 
+    fb_actor_logsumexp_beta: float = 0.0
+    """Endpoint bias: multiply short Q by ``1+beta`` and long Q by
+    ``1-beta`` before the log-sum-exp."""
+
     fb_stochastic_integral: bool = False  # softmax-weighted horizon integral actor FB term
     fb_integral_K: int = 8
     fb_integral_align_gamma: float = 0.98  # integral Q *= 1/(1-this) for scale alignment

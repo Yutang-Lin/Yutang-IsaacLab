@@ -95,13 +95,18 @@ def sample_discrete_gamma(
 def scaled_two_gamma_logsumexp(
     normalized_q: torch.Tensor,
     scale: float,
+    beta: float = 0.0,
 ) -> torch.Tensor:
-    """Aggregate two normalized Q values as scale/log(2) * logsumexp(Q)."""
+    """Aggregate beta-weighted short/long normalized Q values."""
     if normalized_q.shape[-1] != 2:
         raise ValueError("normalized_q must have exactly two values per row")
     if scale <= 0.0:
         raise ValueError("scale must be positive")
-    return (scale / math.log(2.0)) * torch.logsumexp(normalized_q, dim=-1)
+    if not -1.0 < beta < 1.0:
+        raise ValueError("beta must be in (-1, 1)")
+    coefficients = normalized_q.new_tensor((1.0 + beta, 1.0 - beta))
+    weighted_q = normalized_q * coefficients
+    return (scale / math.log(2.0)) * torch.logsumexp(weighted_q, dim=-1)
 
 
 def sample_relabel_z(

@@ -349,9 +349,11 @@ class FBCprAuxAlgorithmCfg:
     # log-horizon sampling over [actor_gamma_short, discount].
     fb_gamma_train_values: tuple[float, ...] = ()
     # Optional actor objective over exactly two gamma-conditioned normalized
-    # Q values: scale/log(2) * logsumexp(N_gamma0, N_gamma1).
+    # Q values: scale/log(2) * logsumexp((1+beta)N_gamma0,
+    #                                  (1-beta)N_gamma1).
     fb_actor_logsumexp_gammas: tuple[float, ...] = ()
     fb_actor_logsumexp_scale: float = 1.0
+    fb_actor_logsumexp_beta: float = 0.0
     # Stochastic-integral FB actor objective (overrides the two-gamma term when on;
     # requires fb_gamma_conditioned). Stratified-sample fb_integral_K horizons in
     # [gamma_short, discount], softmax-weight the normalized per-step values, and
@@ -625,6 +627,13 @@ class FBCprAux:
                 getattr(cfg, "fb_actor_logsumexp_scale", 1.0)
             ) <= 0.0:
                 raise ValueError("fb_actor_logsumexp_scale must be positive")
+            actor_lse_beta = float(
+                getattr(cfg, "fb_actor_logsumexp_beta", 0.0)
+            )
+            if not -1.0 < actor_lse_beta < 1.0:
+                raise ValueError(
+                    "fb_actor_logsumexp_beta must be in (-1, 1)"
+                )
         if bool(getattr(cfg, "fb_grad_spike_clip", False)):
             decay = float(getattr(cfg, "fb_grad_spike_ema_decay", 0.99))
             multiplier = float(getattr(cfg, "fb_grad_spike_multiplier", 5.0))
@@ -4548,7 +4557,9 @@ class FBCprAux:
         if fb_lse:
             # Query both configured endpoints in one vectorized F forward.
             # The actor maximizes:
-            #   scale/log(2) * logsumexp((1-gamma_i) * Q(gamma_i)).
+            #   scale/log(2) * logsumexp(
+            #       (1+beta) * N(gamma_short),
+            #       (1-beta) * N(gamma_long)).
             num_gammas = 2
 
             def _tile_two(t):
@@ -4579,6 +4590,11 @@ class FBCprAux:
                 float(
                     getattr(
                         self.cfg, "fb_actor_logsumexp_scale", 1.0
+                    )
+                ),
+                float(
+                    getattr(
+                        self.cfg, "fb_actor_logsumexp_beta", 0.0
                     )
                 ),
             )

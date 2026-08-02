@@ -291,6 +291,24 @@ def test_scaled_two_gamma_logsumexp_matches_requested_formula():
     assert torch.all(normalized_q.grad > 0.0)
 
 
+def test_scaled_two_gamma_logsumexp_applies_endpoint_beta():
+    normalized_q = torch.tensor(
+        [[0.5, 2.0], [3.0, -1.0]], requires_grad=True
+    )
+    output = scaled_two_gamma_logsumexp(
+        normalized_q, scale=50.0, beta=0.25
+    )
+    coefficients = torch.tensor([1.25, 0.75])
+    expected = (50.0 / math.log(2.0)) * torch.logsumexp(
+        normalized_q * coefficients, dim=-1
+    )
+
+    torch.testing.assert_close(output, expected)
+    output.sum().backward()
+    assert normalized_q.grad is not None
+    assert torch.all(normalized_q.grad > 0.0)
+
+
 def test_gamma_loss_weights_have_unit_log_horizon_expectation():
     h_min = -math.log1p(-0.4)
     h_max = -math.log1p(-0.99)
