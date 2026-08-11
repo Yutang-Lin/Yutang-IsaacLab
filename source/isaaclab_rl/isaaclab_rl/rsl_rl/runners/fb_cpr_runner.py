@@ -348,14 +348,13 @@ class FBCprRunner:
         self._use_explore_std_grad = self.explore_std_max > self.explore_std_min > 0.0
         self._explore_std: torch.Tensor | None = None
 
-        # --- Async S3 checkpoint mirror ------------------------------- #
-        # If set, every light checkpoint is uploaded (head rank only) to this
-        # S3 prefix in a BACKGROUND daemon thread — non-blocking, training
-        # never waits on the network and never crashes on upload failure. We
-        # maintain ONE rolling object (overwrite the same key each time) so S3
-        # holds the latest checkpoint, not a growing pile. Configurable via
+        # --- Async best-eval S3 checkpoint mirror --------------------- #
+        # If set, a checkpoint is uploaded only when tracking evaluation
+        # reaches a new all-time-low EMD. Upload runs on the head rank in a
+        # background daemon thread and overwrites one rolling S3 object.
+        # Ordinary periodic/final checkpoints remain local-only. Configurable via
         #   cfg.s3_ckpt_uri  = "s3://bucket/prefix"   (None/"" disables)
-        #   cfg.s3_ckpt_name = "model_latest.pt"      (the single rolling key)
+        #   cfg.s3_ckpt_name = "model_latest.pt"      (the rolling best key)
         # Env override: BFM_S3_CKPT_URI takes precedence over the cfg value.
         self.s3_ckpt_uri = str(
             os.environ.get("BFM_S3_CKPT_URI", self.cfg.get("s3_ckpt_uri", "")) or "").rstrip("/")
@@ -387,6 +386,7 @@ class FBCprRunner:
         self.eval_priority_scale = float(self.alg_cfg.get("eval_priority_scale", 2.0))
         self.eval_priority_mode = str(self.alg_cfg.get("eval_priority_mode", "exp"))
         self._last_eval_step = 0
+        self._best_eval_emd = float("inf")
 
         # --- Logging ---------------------------------------------------
         self.num_steps_per_env = int(self.cfg.get("num_steps_per_env", 1))
@@ -845,6 +845,8 @@ class FBCprRunner:
             if self._is_head:
                 print(f"[FBCprRunner] running initial tracking eval (no priority update) ...", flush=True)
             eval0 = self._run_tracking_eval(update_priorities=False)
+            if eval0 is not None:
+                self._maybe_save_best_eval_checkpoint(eval0)
             if self._is_head and eval0 is not None and self.log_dir is not None and self.writer is not None:
                 env_steps = int(self.log_timesteps)
                 # Log the initial eval on the SAME curve as subsequent
@@ -1357,6 +1359,7 @@ class FBCprRunner:
                     / max(tracking_failure_eligible_steps, 1)
                 ),
                 "Event/tracking_eval": 0.0,
+                "Event/best_emd_checkpoint": 0.0,
                 "Event/checkpoint": float(it % self.save_interval == 0),
             }
             if tracking_failure_eligible_steps > 0:
@@ -1515,6 +1518,7 @@ class FBCprRunner:
             # snapshot the env, roll out each motion tracking for
             # ``eval_rollout_length`` env-steps, compute per-motion MPJPE,
             # update the expert buffer's sampling priorities, and restore.
+            eval_metrics_for_checkpoint = None
             if (
                 not warmup_flag
                 and self.eval_every_steps > 0
@@ -1523,6 +1527,7 @@ class FBCprRunner:
                 self._last_eval_step = local_timesteps
                 eval_metrics = self._run_tracking_eval()
                 if eval_metrics is not None:
+                    eval_metrics_for_checkpoint = eval_metrics
                     loss_dict["Event/tracking_eval"] = 1.0
                     # Treat eval as a rollout boundary even though the env
                     # snapshot now restores hidden state. This guarantees that
@@ -1546,6 +1551,14 @@ class FBCprRunner:
 
             learn_time = time.time() - start
             self.current_learning_iteration = it
+            self._local_timesteps = local_timesteps
+            if (
+                eval_metrics_for_checkpoint is not None
+                and self._maybe_save_best_eval_checkpoint(
+                    eval_metrics_for_checkpoint
+                )
+            ):
+                loss_dict["Event/best_emd_checkpoint"] = 1.0
             self.tot_time += collection_time + learn_time
 
             # ----- log (head rank only) -----
@@ -1569,9 +1582,6 @@ class FBCprRunner:
                     n_between = int(self.alg_cfg.get("save_replay_every_n", 10))
                     save_replay = n_between > 0 and ((it // self.save_interval) % n_between == 0)
                     self.save(save_iter_path, save_replay=save_replay)
-                    # Mirror the light checkpoint to S3 in the background
-                    # (rolling single object). No-op if s3_ckpt_uri unset.
-                    self._mirror_checkpoint_to_s3(save_iter_path)
                     # Ring-buffer pruning: keep only the last
                     # ``keep_last_n_checkpoints`` model_<iter>.pt files (and
                     # their optional .replay.pt siblings). Each light ckpt
@@ -1594,15 +1604,10 @@ class FBCprRunner:
             final_path = os.path.join(
                 self.log_dir, f"model_{self.current_learning_iteration}.pt")
             self.save(final_path, save_replay=True)
-            # Final S3 mirror. Wait for any in-flight upload to finish first so
-            # this last checkpoint isn't skipped, then BLOCK on it (bounded) so
-            # the process doesn't exit mid-upload.
-            if self.s3_ckpt_uri:
-                if self._s3_thread is not None and self._s3_thread.is_alive():
-                    self._s3_thread.join(timeout=600)
-                self._mirror_checkpoint_to_s3(final_path)
-                if self._s3_thread is not None:
-                    self._s3_thread.join(timeout=600)
+            # Do not mirror the final checkpoint. Only ensure an in-flight
+            # best-EMD upload gets a chance to finish before process exit.
+            if self._s3_thread is not None and self._s3_thread.is_alive():
+                self._s3_thread.join(timeout=600)
 
     # --- B-spectrum diagnostic ------------------------------------------- #
 
@@ -2291,6 +2296,34 @@ class FBCprRunner:
 
     # --- checkpoint I/O -------------------------------------------------- #
 
+    def _maybe_save_best_eval_checkpoint(
+        self,
+        eval_metrics: Dict[str, float],
+    ) -> bool:
+        """Save and mirror the model only for a strict all-time-low eval EMD."""
+        if not self._is_head or self.log_dir is None:
+            return False
+        emd = float(eval_metrics.get("Eval/emd", float("nan")))
+        if not math.isfinite(emd) or emd >= self._best_eval_emd:
+            return False
+
+        previous_best = self._best_eval_emd
+        self._best_eval_emd = emd
+        path = os.path.join(self.log_dir, "model_best_emd.pt")
+        try:
+            self.save(path)
+        except Exception:
+            self._best_eval_emd = previous_best
+            raise
+
+        print(
+            f"[FBCprRunner] new best eval EMD: {emd:.6g} "
+            f"(previous={previous_best:.6g}); saved {path}",
+            flush=True,
+        )
+        self._mirror_checkpoint_to_s3(path)
+        return True
+
     def save(
         self,
         path: str,
@@ -2320,6 +2353,7 @@ class FBCprRunner:
             "world_size": self.gpu_world_size,
             "local_timesteps": getattr(self, "_local_timesteps", 0),
             "last_eval_step": self._last_eval_step,
+            "best_eval_emd": self._best_eval_emd,
             "expert_priority_state": (
                 self.expert_buffer.priority_state_dict()
                 if (
@@ -2390,17 +2424,20 @@ class FBCprRunner:
         daemon thread, maintaining ONE rolling object (``s3_ckpt_name``). The
         file is COPIED to a temp path first so the in-flight upload is immune to
         the checkpoint being pruned/overwritten by later iters. Non-blocking;
-        upload failures are logged, never raised. If a previous upload is still
-        running, this one is skipped (the next save will catch up) so threads
-        don't pile up on a slow link.
+        upload failures are logged, never raised. A new best waits for any
+        previous best upload so it cannot be silently skipped.
         """
         if not self.s3_ckpt_uri or not self._is_head:
             return
         if self._s3_thread is not None and self._s3_thread.is_alive():
-            print("[FBCprRunner] S3 mirror: previous upload still running — "
-                  f"skipping {os.path.basename(local_path)} (will catch up next save).",
-                  flush=True)
-            return
+            self._s3_thread.join(timeout=600)
+            if self._s3_thread.is_alive():
+                print(
+                    "[FBCprRunner] WARN: previous best-EMD S3 upload did not "
+                    f"finish; cannot upload {os.path.basename(local_path)}.",
+                    flush=True,
+                )
+                return
         if not os.path.exists(local_path):
             return
         # Snapshot the file so the upload is decoupled from disk churn.
@@ -2702,6 +2739,9 @@ class FBCprRunner:
                 self.tot_timesteps * saved_log_world_size / saved_world_size
             )
         self._last_eval_step = ckpt.get("last_eval_step", self._last_eval_step)
+        self._best_eval_emd = float(
+            ckpt.get("best_eval_emd", self._best_eval_emd)
+        )
         priority_state = ckpt.get("expert_priority_state")
         if (
             priority_state is not None
