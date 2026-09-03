@@ -999,18 +999,7 @@ class ForwardMap(nn.Module):
             g = gamma.reshape(-1, 1).to(obs.dtype)
             h = -torch.log1p(-g.clamp(max=1 - 1e-6))
             g_emb = self.embed_gamma(h)                      # [B, gdim]
-        # Backward-mask flags ride along with the gamma embedding (raw concat).
-        if self.mask_dim > 0:
-            if mask is None:
-                mask = obs.new_ones(obs.shape[0], self.mask_dim)
-            mask = mask.to(dtype=obs.dtype)
-            if mask.shape != (obs.shape[0], self.mask_dim):
-                raise ValueError(
-                    f"forward mask must be [{obs.shape[0]}, {self.mask_dim}], got {tuple(mask.shape)}"
-                )
-            g_emb = mask if g_emb is None else torch.cat([g_emb, mask], dim=-1)
-        elif mask is not None:
-            raise ValueError("ForwardMap received a mask but mask_dim == 0")
+        # The gamma-scale head consumes the PURE gamma embedding (gdim wide).
         gamma_scale = None
         if self.gamma_scale_hidden is not None:
             assert g_emb is not None
@@ -1022,14 +1011,28 @@ class ForwardMap(nn.Module):
             )
             if self.num_parallel > 1:
                 gamma_scale = gamma_scale.transpose(0, 1).unsqueeze(-1)
+        # Branch conditioning = [gamma embedding | backward-mask flags]. The
+        # mask joins ONLY the branch inputs (never the gamma-scale head).
+        cond = g_emb
+        if self.mask_dim > 0:
+            if mask is None:
+                mask = obs.new_ones(obs.shape[0], self.mask_dim)
+            mask = mask.to(dtype=obs.dtype)
+            if mask.shape != (obs.shape[0], self.mask_dim):
+                raise ValueError(
+                    f"forward mask must be [{obs.shape[0]}, {self.mask_dim}], got {tuple(mask.shape)}"
+                )
+            cond = mask if cond is None else torch.cat([cond, mask], dim=-1)
+        elif mask is not None:
+            raise ValueError("ForwardMap received a mask but mask_dim == 0")
         if self.num_parallel > 1:
             obs = obs.expand(self.num_parallel, -1, -1)
             z = z.expand(self.num_parallel, -1, -1)
             action = action.expand(self.num_parallel, -1, -1)
-            if g_emb is not None:
-                g_emb = g_emb.expand(self.num_parallel, -1, -1)
-        z_in = torch.cat([obs, z], dim=-1) if g_emb is None else torch.cat([obs, z, g_emb], dim=-1)
-        sa_in = torch.cat([obs, action], dim=-1) if g_emb is None else torch.cat([obs, action, g_emb], dim=-1)
+            if cond is not None:
+                cond = cond.expand(self.num_parallel, -1, -1)
+        z_in = torch.cat([obs, z], dim=-1) if cond is None else torch.cat([obs, z, cond], dim=-1)
+        sa_in = torch.cat([obs, action], dim=-1) if cond is None else torch.cat([obs, action, cond], dim=-1)
         z_embedding = self.embed_z(z_in)
         sa_embedding = self.embed_sa(sa_in)
         output = self.Fs(torch.cat([sa_embedding, z_embedding], dim=-1))

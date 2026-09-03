@@ -183,7 +183,7 @@ def test_backward_map_masks_groups_and_appends_flags():
 def test_forward_map_accepts_mask_and_defaults_to_all_visible():
     F = policy_mod.ForwardMap(_space(("state",)), z_dim=8, action_dim=3, hidden_dim=16, model="simple",
                               hidden_layers=1, embedding_layers=2, num_parallel=2, input_keys=("state",),
-                              gamma_embed_dim=4, gamma_embed_type="mlp", mask_dim=7)
+                              gamma_embed_dim=4, gamma_embed_type="mlp", gamma_scale_hidden_dim=3, mask_dim=7)
     obs = {"state": torch.randn(5, 64)}
     z = torch.randn(5, 8); a = torch.randn(5, 3); g = torch.full((5,), 0.9)
     out_none = F(obs, z, a, g)
