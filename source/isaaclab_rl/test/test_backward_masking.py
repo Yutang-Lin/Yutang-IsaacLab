@@ -2,7 +2,7 @@
 # All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Tests for BFM-0.7 backward masking (group layout, sampling, B/F wiring).
+"""Tests for BFM-0.7 backward masking (group layout, sampling, B wiring).
 
 Loads the masking helpers by path and the policy / algorithm modules with Isaac
 Lab and gymnasium stubbed, so the real ``BackwardMap`` / ``ForwardMap`` run on
@@ -129,26 +129,6 @@ def test_backward_map_masks_groups_and_appends_flags():
         pass
 
 
-def test_forward_map_accepts_mask_and_defaults_to_all_visible():
-    F = policy_mod.ForwardMap(_space(("state",)), z_dim=8, action_dim=3, hidden_dim=16, model="simple",
-                              hidden_layers=1, embedding_layers=2, num_parallel=2, input_keys=("state",),
-                              gamma_embed_dim=4, gamma_embed_type="mlp", gamma_scale_hidden_dim=3, mask_dim=7)
-    obs = {"state": torch.randn(5, 64)}
-    z = torch.randn(5, 8); a = torch.randn(5, 3); g = torch.full((5,), 0.9)
-    out_none = F(obs, z, a, g)
-    out_full = F(obs, z, a, g, mask=torch.ones(5, 7))
-    assert out_none.shape == (2, 5, 8) and torch.allclose(out_none, out_full)
-    m = torch.ones(5, 7); m[:, 2] = 0.0
-    assert not torch.allclose(F(obs, z, a, g, mask=m), out_full)
-    F0 = policy_mod.ForwardMap(_space(("state",)), z_dim=8, action_dim=3, hidden_dim=16, model="simple",
-                               hidden_layers=1, embedding_layers=2, num_parallel=2, input_keys=("state",))
-    try:
-        F0(obs, z, a, mask=torch.ones(5, 7))
-        raise AssertionError("expected ValueError")
-    except ValueError:
-        pass
-
-
 # --------------------------------------------------------------------------- #
 # algorithm helpers
 # --------------------------------------------------------------------------- #
@@ -229,21 +209,20 @@ def _full_space():
 def test_full_policy_wires_mask_groups_into_B_and_F():
     pol = policy_mod.FBCprAuxPolicy(_full_space(), action_dim=29, cfg=_small_policy_cfg(backward_mask_groups=True))
     assert pol.num_mask_groups == 7 and pol.mask_group_names == masking.MASK_GROUP_NAMES
-    assert pol._backward_map.num_mask_groups == 7 and pol._forward_map.mask_dim == 7
+    assert pol._backward_map.num_mask_groups == 7
+    assert not hasattr(pol._forward_map, "mask_dim")   # F is not mask-conditioned
     obs = dict(_obs(3), last_action=torch.randn(3, 29))
     m = torch.ones(3, 7); m[:, 6] = 0.0
     z_a = pol.backward_map(obs, mask=m)
     z_b = pol.backward_map(obs)
     assert z_a.shape == (3, 8) and not torch.allclose(z_a, z_b)
-    out = pol.forward_map(obs, z_a, torch.randn(3, 29), gamma=0.9, mask=m)
+    out = pol.forward_map(obs, z_a, torch.randn(3, 29), gamma=0.9)
     assert out.shape == (2, 3, 8)
-    # critics / discriminator are NOT mask-conditioned
-    assert pol._critic.mask_dim == 0 and pol._aux_critic.mask_dim == 0
 
 
 def test_full_policy_without_masking_is_unchanged():
     pol = policy_mod.FBCprAuxPolicy(_full_space(), action_dim=29, cfg=_small_policy_cfg())
-    assert pol.num_mask_groups == 0 and pol._forward_map.mask_dim == 0
+    assert pol.num_mask_groups == 0
     assert pol._backward_map.net[0].in_features == 531
     obs = dict(_obs(3), last_action=torch.randn(3, 29))
     assert pol.backward_map(obs).shape == (3, 8)

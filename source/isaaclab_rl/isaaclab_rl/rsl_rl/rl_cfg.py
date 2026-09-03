@@ -1119,7 +1119,7 @@ class RslRlFBCprPolicyCfg:
     backward_input_keys: tuple[str, ...] = ("state", "privileged_state")
     backward_lower_indices: tuple[int, ...] = ()
     backward_upper_indices: tuple[int, ...] = ()
-    # BFM-0.7 backward masking: B(m * s, m) over 7 body-part groups, F(s,a,z,m).
+    # BFM-0.7 backward masking: B(m * s, m) over 7 body-part groups (F unchanged).
     backward_mask_groups: bool = False
 
     # Forward map (F)

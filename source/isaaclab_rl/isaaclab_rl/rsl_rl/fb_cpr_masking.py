@@ -8,9 +8,9 @@ The backward map ``B`` encodes a state into ``z`` from a concatenation of obs
 keys. Backward masking partitions that flat input into named body-part groups
 and lets ``B`` see only a random subset of them: ``B(m * s, m)`` where ``m`` is
 the per-group active flag (1 = visible, 0 = zeroed) and is also appended to the
-input. The forward map ``F(s, a, z, m)`` is conditioned on the same flags. The
-mask is a VIEW SELECTOR for the encoder only: once a ``z`` is produced, no mask
-travels with it (actor, critics, discriminator, replay never see it).
+input. The mask is a VIEW SELECTOR for the encoder only: once a ``z`` is
+produced, no mask travels with it (F, actor, critics, discriminator and the
+replay never see it).
 
 Groups (G1 29-DoF, BFM keypoint layout): left_arm, right_arm, torso, left_leg,
 right_leg, pelvis, contacts. See :func:`build_backward_mask_groups`.

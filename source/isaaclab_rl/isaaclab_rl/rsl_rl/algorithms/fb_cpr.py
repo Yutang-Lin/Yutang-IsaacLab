@@ -410,11 +410,12 @@ class FBCprAuxAlgorithmCfg:
     # zeros for them (width from the env obs group). Placeholder only.
     expert_placeholder_obs_keys: tuple[str, ...] = ()
     # --- BFM-0.7: backward masking --------------------------------------------
-    # B(m * s, m) over the 7 body-part groups (fb_cpr_masking.MASK_GROUP_NAMES)
-    # and F(s, a, z, m). The mask is a view selector for B only; no mask is
-    # paired with a z downstream. Where masks are drawn:
-    #   * FB update / actor: one fresh random mask per batch row (F and the
-    #     row's B(goal) share it; off-diagonal columns keep their own row mask).
+    # B(m * s, m) over the 7 body-part groups (fb_cpr_masking.MASK_GROUP_NAMES).
+    # F, actor, critics and the discriminator never see the mask: it is a view
+    # selector for the encoder only, and no mask is paired with a z downstream.
+    # Where masks are drawn:
+    #   * FB update: one fresh random mask per batch row for that row's B(goal)
+    #     (online and target); F(s, a, z, gamma) is unchanged.
     #   * goal-encoded relabel z: fresh random mask per row.
     #   * expert z (disc positives, tracking, eval): random per sequence with
     #     ``mask_expert_forced_off`` groups always masked (expert has no labels).
@@ -1727,7 +1728,7 @@ class FBCprAux:
         return mask
 
     def _mk(self, mask: torch.Tensor | None) -> dict:
-        """kwargs for B / F calls: ``{"mask": m}`` when masking, else ``{}`` so
+        """kwargs for B calls: ``{"mask": m}`` when masking, else ``{}`` so
         unmasked policies see byte-identical call signatures."""
         return {"mask": mask} if (self._masking_enabled() and mask is not None) else {}
 
@@ -3247,9 +3248,8 @@ class FBCprAux:
         self._train_actor_window = train_batch.get("actor_window", None)
         train_terminated = train_batch["next"]["terminated"].to(self.device, non_blocking=True)
         not_term = (~train_terminated.bool()).float()
-        # Backward masking: one random view per row for this update. F is
-        # conditioned on it and the row's B(goal) is encoded under it (FB loss
-        # and actor). None when masking is off.
+        # Backward masking: one random view per row for this update; the row's
+        # B(goal) is encoded under it (FB loss, online + target). None when off.
         self._fb_row_mask = self._sample_mask(self.cfg.batch_size)
         # --- gamma-conditioned F: sample a per-row gamma for the FB TD update ---
         # h = -log(1-gamma) ~ Uniform[h_S, h_L]; gamma = 1-exp(-h). The SAME
@@ -4084,11 +4084,9 @@ class FBCprAux:
                 return {key: torch.cat((value, value), dim=0) for key, value in x.items()}
             return torch.cat((x, x), dim=0)
 
-        # Backward masking: per-row view shared by F (conditioning) and the
-        # row's B(goal). Empty kwargs when masking is off.
-        row_mask = self._fb_row_mask
-        mk = self._mk(row_mask)
-        mk_pair = self._mk(torch.cat((row_mask, row_mask), dim=0)) if row_mask is not None else {}
+        # Backward masking: per-row view for the row's B(goal) (online and
+        # target). F is NOT mask-conditioned. Empty kwargs when masking is off.
+        mk = self._mk(self._fb_row_mask)
 
         with torch.no_grad():
             # next_action via actor (raw obs for the transformer actor — see
@@ -4102,12 +4100,11 @@ class FBCprAux:
                     torch.cat((z, z), dim=0),
                     torch.cat((next_action, next_action), dim=0),
                     gamma_pair,
-                    **mk_pair,
                 )
                 target_Fs, target_Fs_alt = target_Fs_pair.split(batch_size, dim=1)
             else:
                 f_args = (fb_gamma,) if fb_gamma is not None else ()
-                target_Fs = p._target_forward_map(next_obs, z, next_action, *f_args, **mk)
+                target_Fs = p._target_forward_map(next_obs, z, next_action, *f_args)
                 target_Fs_alt = None
             if normalized_forward:
                 target_Fs = gamma_forward_output_to_raw(target_Fs, fb_gamma)
@@ -4132,12 +4129,11 @@ class FBCprAux:
                 torch.cat((z, z), dim=0),
                 torch.cat((action, action), dim=0),
                 torch.cat((fb_gamma, fb_gamma_alt), dim=0),
-                **mk_pair,
             )
             Fs, Fs_alt = Fs_pair.split(z.shape[0], dim=1)
         else:
             f_args = (fb_gamma,) if fb_gamma is not None else ()
-            Fs = p._forward_map(obs, z, action, *f_args, **mk)
+            Fs = p._forward_map(obs, z, action, *f_args)
             Fs_alt = None
         if normalized_forward:
             Fs = gamma_forward_output_to_raw(Fs, fb_gamma)
@@ -4833,8 +4829,6 @@ class FBCprAux:
         p = self.policy
         dist = p._actor(obs, z, p.actor_std)
         sampled_action = dist.sample(clip=self.cfg.stddev_clip)
-        # Backward masking: F queries use the per-row view drawn in update().
-        row_mask = self._fb_row_mask
 
         # --- action saturation diagnostics ------------------------------
         # ``loc`` is the actor's pre-sample mean; TruncatedNormal clamps
@@ -4924,8 +4918,7 @@ class FBCprAux:
                 actor_lse_gammas, device=z.device, dtype=z.dtype
             ).view(1, num_gammas).expand(Bsz, -1).reshape(-1)
             F_bg = p._forward_map(
-                obs_bg, z_bg, action_bg, gamma_bg,
-                **self._mk(_tile_gammas(row_mask) if row_mask is not None else None),
+                obs_bg, z_bg, action_bg, gamma_bg
             )
             _, _, Q_bg = self._pessimistic_value(
                 (F_bg * z_bg).sum(dim=-1),
@@ -5017,8 +5010,7 @@ class FBCprAux:
             z_bk = _tileK(z)                                                     # [B*K, d]
             a_bk = _tileK(sampled_action)                                        # [B*K, A]
             g_bk = gammas_k.reshape(-1)                                          # [B*K]
-            mk_bk = self._mk(_tileK(row_mask) if row_mask is not None else None)
-            F_bk = p._forward_map(obs_bk, z_bk, a_bk, g_bk, **mk_bk)             # [par, B*K, d]
+            F_bk = p._forward_map(obs_bk, z_bk, a_bk, g_bk)                      # [par, B*K, d]
             _, _, Q_bk = self._pessimistic_value((F_bk * z_bk).sum(dim=-1),
                                                  self.cfg.actor_pessimism_penalty)  # [B*K]
             N = normalized_forward_value(
@@ -5029,7 +5021,7 @@ class FBCprAux:
             # The integrated N still uses the ONLINE F (gradient flows through N);
             # w is target-derived AND detached, so it's a fixed importance weight.
             with torch.no_grad():
-                Ft_bk = p._target_forward_map(obs_bk, z_bk, a_bk, g_bk, **mk_bk)  # [par, B*K, d]
+                Ft_bk = p._target_forward_map(obs_bk, z_bk, a_bk, g_bk)          # [par, B*K, d]
                 _, _, Qt_bk = self._pessimistic_value((Ft_bk * z_bk).sum(dim=-1),
                                                       self.cfg.actor_pessimism_penalty)
                 Nt = normalized_forward_value(
@@ -5074,10 +5066,10 @@ class FBCprAux:
                 gL = torch.full((Bsz,), float(self.cfg.discount), device=z.device)
                 gS = torch.full((Bsz,), float(self.cfg.actor_gamma_short), device=z.device)
                 gL_args = (gL,)
-                Fs_S = p._forward_map(obs, z, sampled_action, gS, **self._mk(row_mask))
+                Fs_S = p._forward_map(obs, z, sampled_action, gS)
                 _, _, Q_fb_short = self._pessimistic_value((Fs_S * z).sum(dim=-1),
                                                            self.cfg.actor_pessimism_penalty)
-            Fs = p._forward_map(obs, z, sampled_action, *gL_args, **self._mk(row_mask))
+            Fs = p._forward_map(obs, z, sampled_action, *gL_args)
             Qs_fb = (Fs * z).sum(dim=-1)
             _, _, Q_fb = self._pessimistic_value(Qs_fb, self.cfg.actor_pessimism_penalty)
             # Short-horizon FB term added to the actor objective (0 when off).
