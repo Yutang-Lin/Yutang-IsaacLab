@@ -3220,6 +3220,16 @@ class FBCprAux:
         else:
             phase1_ctx = contextlib.nullcontext()
 
+        # Build the shared TD-target next-action distribution HERE, on the
+        # default stream, before phase 1 forks. backward_fb (FB stream) and
+        # backward_aux_critic (aux stream) both sample from this cache; a lazy
+        # fill from whichever side stream ran first left the other side stream
+        # reading ``loc``/``scale`` with no inter-stream dependency (a race).
+        # Every side stream waits on the default stream below, so a cache
+        # produced here is visible to all of them. FB, critic and aux all pass
+        # the same (train_next_obs, train_z), so one distribution serves all.
+        self._target_action_dist(train_next_obs, train_z)
+
         # Stream-parallel uses three dedicated CUDA streams so the three
         # backward passes run concurrently. Each stream waits on the
         # current (default) stream so the upstream tensors (train_obs,
@@ -3714,8 +3724,8 @@ class FBCprAux:
         return train_obs, train_next_obs, train_next_obs, train_z
 
     @torch.no_grad()
-    def _target_next_action(self, next_obs, z):
-        """Sample the TD-target next_action from the actor (clip=stddev_clip).
+    def _target_action_dist(self, next_obs, z):
+        """Build (once per update) and return the TD-target actor distribution.
 
         MLP actor: call directly on the (already per-key-normalized) ``next_obs``.
         Transformer actor: it is a RAW-obs consumer (owns its frame BatchNorm), so
@@ -3724,6 +3734,12 @@ class FBCprAux:
         eval_mode so frame_norm does NOT update its running stats from the target
         pass. This avoids the double-normalization that would otherwise corrupt
         every FB/critic/aux/entropy TD target.
+
+        The distribution is cached on ``_cached_target_action_dist`` (reset at the
+        top of ``update``). ``update`` warms the cache on the DEFAULT stream before
+        phase 1 forks onto side streams; do not rely on a lazy fill from inside a
+        side stream, since a second side stream could read ``loc``/``scale`` before
+        the producing stream has finished them.
         """
         p = self.policy
         dist = getattr(self, "_cached_target_action_dist", None)
@@ -3739,6 +3755,12 @@ class FBCprAux:
             # independently sample from it. Caching removes two identical actor
             # forwards without correlating their target-smoothing noise.
             self._cached_target_action_dist = dist
+        return dist
+
+    @torch.no_grad()
+    def _target_next_action(self, next_obs, z):
+        """Sample the TD-target next_action from the actor (clip=stddev_clip)."""
+        dist = self._target_action_dist(next_obs, z)
         return dist.sample(clip=self.cfg.stddev_clip)
 
     def backward_fb(

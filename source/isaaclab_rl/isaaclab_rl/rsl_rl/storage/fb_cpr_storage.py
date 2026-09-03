@@ -171,6 +171,13 @@ class FBCprReplayBuffer:
         self._z = self._alloc((self.time_capacity, self.num_envs, self.z_dim))
         self._terminated = self._alloc((self.time_capacity, self.num_envs, 1), dtype=torch.bool)
         self._truncated = self._alloc((self.time_capacity, self.num_envs, 1), dtype=torch.bool)
+        # ``truncated`` marks a SAMPLING boundary (no (t, t+1) pair may straddle
+        # it). ``history_reset`` marks rows whose env actually RESET (rings
+        # zeroed) — the history recompose must zero frames reaching back past a
+        # reset, but NOT past a boundary that was marked while the env state was
+        # preserved (e.g. the conservative post-eval boundary). Callers that do
+        # not supply ``history_reset`` get ``history_reset := truncated``.
+        self._history_reset = self._alloc((self.time_capacity, self.num_envs, 1), dtype=torch.bool)
         self._aux_rewards: dict[str, torch.Tensor] = {
             name: self._alloc((self.time_capacity, self.num_envs, 1)) for name in self.aux_reward_names
         }
@@ -263,12 +270,16 @@ class FBCprReplayBuffer:
 
         Boundary zeroing: ``stored[r]`` holds the proprio frame the env pushed at
         the END of step r-1 (its slot-0 at row r is the lag-1 frame). That frame
-        is zero (env zeroed the ring on reset) exactly when a ``truncated`` row
-        lies in the closed interval ``[r, t]`` — i.e. a new episode began at or
-        after the source row, so it's out of the sample's current episode. Since
-        ``truncated[r]`` marks the FIRST row of a new episode, scanning newest
-        (j=0)->oldest with a cummax over the gathered ``truncated`` flags gives
-        the invalid set. Plus unwritten/stale masking as in _gather_actor_window.
+        is zero (env zeroed the ring on reset) exactly when a ``history_reset``
+        row lies in the closed interval ``[r, t]`` — i.e. the env was reset at or
+        after the source row, so the frame predates the current episode. Since
+        ``history_reset[r]`` marks the FIRST row after an env reset, scanning
+        newest (j=0)->oldest with a cummax over the gathered flags gives the
+        invalid set. NOTE: this deliberately uses ``history_reset`` and not
+        ``truncated`` — a sampling boundary can be marked without an env reset
+        (post-eval, with the sim restored exactly), and there the env's ring was
+        NOT zeroed, so the rollout obs carried the full history. Plus
+        unwritten/stale masking as in _gather_actor_window.
         """
         spec = self._hist_recompose
         H = spec["H"]
@@ -283,11 +294,11 @@ class FBCprReplayBuffer:
         ew = env_idx.unsqueeze(1).expand(-1, H)                          # [B, H]
         frames = stored[rows, ew]                                        # [B, H, frame]
 
-        # --- boundary / stale zeroing (matches env reset ring-zeroing) ---
-        # valid[j] = NO truncated row in [t-j, t] = NOT any(truncated at gathered
-        # rows 0..j). cummax over offset j (newest->oldest) gives that prefix-OR.
-        trunc_rows = self._truncated[rows, ew].squeeze(-1)              # [B, H] bool
-        boundary = torch.cummax(trunc_rows.long(), dim=1).values.bool()  # [B, H]
+        # --- reset / stale zeroing (matches env reset ring-zeroing) ---
+        # valid[j] = NO env-reset row in [t-j, t] = NOT any(history_reset at
+        # gathered rows 0..j). cummax over offset j (newest->oldest) = prefix-OR.
+        reset_rows = self._history_reset[rows, ew].squeeze(-1)          # [B, H] bool
+        boundary = torch.cummax(reset_rows.long(), dim=1).values.bool()  # [B, H]
         valid = ~boundary
 
         # Unwritten / evicted-region masking. Reaching back offset ``j`` (source
@@ -358,6 +369,7 @@ class FBCprReplayBuffer:
             "_z": _snap(self._z),
             "_terminated": _snap(self._terminated),
             "_truncated": _snap(self._truncated),
+            "_history_reset": _snap(self._history_reset),
             "_aux_rewards": {k: _snap(v) for k, v in self._aux_rewards.items()},
             "_extras": {k: _snap(v) for k, v in self._extras.items()},
             "_idx": int(self._idx),
@@ -382,6 +394,10 @@ class FBCprReplayBuffer:
         self._z.copy_(sd["_z"].to(self._z.device))
         self._terminated.copy_(sd["_terminated"].to(self._terminated.device))
         self._truncated.copy_(sd["_truncated"].to(self._truncated.device))
+        # Replays saved before ``history_reset`` existed: every boundary was
+        # treated as a reset, so reproduce that (conservative) semantics.
+        hist_reset_src = sd.get("_history_reset", sd["_truncated"])
+        self._history_reset.copy_(hist_reset_src.to(self._history_reset.device))
         for name in self.aux_reward_names:
             if name in sd["_aux_rewards"]:
                 self._aux_rewards[name].copy_(
@@ -435,6 +451,15 @@ class FBCprReplayBuffer:
         if trunc.dim() == 1:
             trunc = trunc.unsqueeze(-1)
         _copy(self._truncated[t], trunc)
+        hist_reset = batch_dict.get("history_reset", None)
+        if hist_reset is None:
+            hist_reset = trunc
+        else:
+            if hist_reset.dtype != torch.bool:
+                hist_reset = hist_reset.bool()
+            if hist_reset.dim() == 1:
+                hist_reset = hist_reset.unsqueeze(-1)
+        _copy(self._history_reset[t], hist_reset)
         aux = batch_dict.get("aux_rewards", {})
         for name in self.aux_reward_names:
             if name not in aux:

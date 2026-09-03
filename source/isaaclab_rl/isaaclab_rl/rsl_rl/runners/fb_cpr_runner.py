@@ -821,6 +821,13 @@ class FBCprRunner:
             dtype=torch.bool,
             device=self.device,
         )
+        # ``history_reset`` tells the replay's history recompose which rows
+        # follow a REAL env reset (rings zeroed). It tracks ``dones`` and the
+        # explicit RSI resets below, but NOT the conservative post-eval
+        # boundary (the sim is restored exactly there, so the rollout obs kept
+        # its full history). The env was freshly reset at construction, so the
+        # first rows after a restored replay are true resets.
+        prev_history_reset = prev_truncated.clone()
 
         start_iter = self.current_learning_iteration
         tot_iter = start_iter + num_learning_iterations
@@ -1204,6 +1211,7 @@ class FBCprRunner:
                         "z": z_context,
                         "terminated": prev_terminated,
                         "truncated": prev_truncated,
+                        "history_reset": prev_history_reset,
                         "aux_rewards": aux_rewards_dict,
                     }
                     # Anchored variant: attach the PRE-step world pose captured
@@ -1228,6 +1236,9 @@ class FBCprRunner:
                     # are disabled so terminated≡False and truncated≡done.
                     prev_terminated = terminated.clone()
                     prev_truncated = dones.bool().view(-1, 1)
+                    # Every done (timeout, termination, failure teleport) goes
+                    # through ``_reset_idx`` -> rings zeroed -> real reset.
+                    prev_history_reset = prev_truncated.clone()
 
                     # Book-keeping
                     cur_reward_sum += rewards
@@ -1303,6 +1314,7 @@ class FBCprRunner:
                         dones[env_ids] = 1
                         prev_terminated[env_ids] = False
                         prev_truncated[env_ids] = True
+                        prev_history_reset[env_ids] = True  # _reset_idx zeroed rings
                         fresh_obs, fresh_extras = self.env.get_observations()
                         new_obs = self._obs_to_device(fresh_obs, fresh_extras)
                         if _robot is not None:
@@ -1535,6 +1547,11 @@ class FBCprRunner:
                     # pre-eval -> post-eval replay transition.
                     # The previous flags were produced inside inference_mode,
                     # so they are inference tensors and cannot be mutated here.
+                    # Only the SAMPLING boundary is marked here. ``prev_history_reset``
+                    # is intentionally left untouched: restore_state put the env
+                    # (incl. history rings) back exactly, so the next rollout obs
+                    # carries its full pre-eval history and the replay's recompose
+                    # must not zero it.
                     if bool(self.alg_cfg.get("replay_mark_eval_boundary", True)):
                         prev_terminated = torch.zeros(
                             (self.env.num_envs, 1),
