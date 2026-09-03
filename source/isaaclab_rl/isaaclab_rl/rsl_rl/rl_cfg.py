@@ -1119,6 +1119,8 @@ class RslRlFBCprPolicyCfg:
     backward_input_keys: tuple[str, ...] = ("state", "privileged_state")
     backward_lower_indices: tuple[int, ...] = ()
     backward_upper_indices: tuple[int, ...] = ()
+    # BFM-0.7 backward masking: B(m * s, m) over 7 body-part groups, F(s,a,z,m).
+    backward_mask_groups: bool = False
 
     # Forward map (F)
     forward_hidden_dim: int = 2048
@@ -1495,6 +1497,14 @@ class RslRlFBCprAlgorithmCfg:
     terrain_variant_root_h_prob: float = 0.50
     global_fb_zero_prob: float = 0.5
     z_buffer_size: int = 8192
+    # BFM-0.7: replay trajectories as rollout "motions" (see FBCprAuxAlgorithmCfg).
+    rollout_replay_trajectories_percentage: float = 0.0
+    # BFM-0.7 backward masking (see FBCprAuxAlgorithmCfg).
+    backward_masking: bool = False
+    mask_group_prob: float = 0.1
+    mask_expert_forced_off: tuple[str, ...] = ("contacts",)
+    mask_fallback_group: str = "pelvis"
+    expert_placeholder_obs_keys: tuple[str, ...] = ()
     tracking_T_min: int = 1
     tracking_T_max: int = 16
     tracking_T_choices: tuple[int, ...] = ()

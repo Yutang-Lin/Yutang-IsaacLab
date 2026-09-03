@@ -585,6 +585,7 @@ class BackwardMap(nn.Module):
         model: str = "simple",
         lower_indices: tp.Sequence[int] = (),
         upper_indices: tp.Sequence[int] = (),
+        mask_groups: tp.Sequence[tp.Sequence[int]] | None = None,
     ) -> None:
         super().__init__()
         self.input_filter = build_input_filter(obs_space, input_keys)
@@ -594,6 +595,21 @@ class BackwardMap(nn.Module):
         )
         assert len(filtered_space.shape) == 1, "filtered_space must have a 1D shape"
         in_dim = filtered_space.shape[0]
+        # Backward masking (BFM-0.7): ``mask_groups`` partitions the flat input
+        # into G groups. forward() zeroes masked groups and appends the G active
+        # flags, so the net input is ``[m * x | m]`` (in_dim + G). ``mask=None``
+        # means every group visible.
+        self.num_mask_groups = 0
+        if mask_groups:
+            from ..fb_cpr_masking import group_expand_matrix
+            groups = [list(int(i) for i in g) for g in mask_groups]
+            self.num_mask_groups = len(groups)
+            self.register_buffer(
+                "mask_expand", group_expand_matrix(groups, in_dim), persistent=False
+            )
+            in_dim = in_dim + self.num_mask_groups
+            if model == "split_body":
+                raise ValueError("backward masking is not supported with split_body")
         self.model = model
         if model == "residual":
             # Lightweight residual MLP with LayerNorm. Input projection into the
@@ -663,8 +679,23 @@ class BackwardMap(nn.Module):
             seq += [Norm()]
         self.net = nn.Sequential(*seq)
 
-    def forward(self, x: torch.Tensor | dict[str, torch.Tensor]) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor | dict[str, torch.Tensor],
+        mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         x = self.input_filter(x)
+        if self.num_mask_groups > 0:
+            if mask is None:
+                mask = x.new_ones(x.shape[0], self.num_mask_groups)
+            mask = mask.to(dtype=x.dtype)
+            if mask.shape != (x.shape[0], self.num_mask_groups):
+                raise ValueError(
+                    f"backward mask must be [{x.shape[0]}, {self.num_mask_groups}], got {tuple(mask.shape)}"
+                )
+            x = torch.cat([x * (mask @ self.mask_expand), mask], dim=-1)
+        elif mask is not None:
+            raise ValueError("BackwardMap received a mask but has no mask groups configured")
         if self.model == "split_body":
             lower = F.normalize(
                 self.lower_net(x.index_select(-1, self.lower_indices)),
@@ -858,6 +889,7 @@ class ForwardMap(nn.Module):
         gamma_embed_dim: int = 0,
         gamma_embed_type: str = "fourier",
         gamma_scale_hidden_dim: int = 0,
+        mask_dim: int = 0,
     ) -> None:
         super().__init__()
         self.input_filter = build_input_filter(obs_space, input_keys)
@@ -867,6 +899,13 @@ class ForwardMap(nn.Module):
         )
         assert len(filtered_space.shape) == 1, "filtered_space must have a 1D shape"
         obs_dim = filtered_space.shape[0]
+
+        # Backward-mask conditioning (BFM-0.7): the G active flags of the view B
+        # encoded z under are concatenated (raw) into both embedding branches.
+        # ``mask=None`` at call time means all groups visible. 0 = off.
+        self.mask_dim = int(mask_dim)
+        if self.mask_dim < 0:
+            raise ValueError("mask_dim must be non-negative")
 
         self.z_dim = z_dim
         self.num_parallel = num_parallel
@@ -920,9 +959,10 @@ class ForwardMap(nn.Module):
         # embedding depth — see BFM-Zero nn_models.py:484-485. The simple
         # variant honours ``embedding_layers``. Keep parity.
         embed_depth = hidden_layers if model == "residual" else embedding_layers
-        # Conditioning widens BOTH branch inputs by gamma_embed_dim (concat).
-        self.embed_z = embed_fn(obs_dim + z_dim + gdim, hidden_dim, embed_depth, num_parallel)
-        self.embed_sa = embed_fn(obs_dim + action_dim + gdim, hidden_dim, embed_depth, num_parallel)
+        # Conditioning widens BOTH branch inputs by gamma_embed_dim + mask_dim (concat).
+        cond = gdim + self.mask_dim
+        self.embed_z = embed_fn(obs_dim + z_dim + cond, hidden_dim, embed_depth, num_parallel)
+        self.embed_sa = embed_fn(obs_dim + action_dim + cond, hidden_dim, embed_depth, num_parallel)
 
         out_dim = output_dim if output_dim is not None else z_dim
         if model == "residual":
@@ -948,6 +988,7 @@ class ForwardMap(nn.Module):
         z: torch.Tensor,
         action: torch.Tensor,
         gamma: torch.Tensor | None = None,
+        mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         obs = self.input_filter(obs)
         g_emb = None
@@ -958,6 +999,18 @@ class ForwardMap(nn.Module):
             g = gamma.reshape(-1, 1).to(obs.dtype)
             h = -torch.log1p(-g.clamp(max=1 - 1e-6))
             g_emb = self.embed_gamma(h)                      # [B, gdim]
+        # Backward-mask flags ride along with the gamma embedding (raw concat).
+        if self.mask_dim > 0:
+            if mask is None:
+                mask = obs.new_ones(obs.shape[0], self.mask_dim)
+            mask = mask.to(dtype=obs.dtype)
+            if mask.shape != (obs.shape[0], self.mask_dim):
+                raise ValueError(
+                    f"forward mask must be [{obs.shape[0]}, {self.mask_dim}], got {tuple(mask.shape)}"
+                )
+            g_emb = mask if g_emb is None else torch.cat([g_emb, mask], dim=-1)
+        elif mask is not None:
+            raise ValueError("ForwardMap received a mask but mask_dim == 0")
         gamma_scale = None
         if self.gamma_scale_hidden is not None:
             assert g_emb is not None
@@ -1416,6 +1469,9 @@ class FBCprNetworkCfg:
     backward_model: str = "simple"
     backward_lower_indices: tp.Sequence[int] = ()
     backward_upper_indices: tp.Sequence[int] = ()
+    # Backward masking (BFM-0.7): B(m * s, m) over the 7 body-part groups of
+    # fb_cpr_masking, and F(s, a, z, m) conditioned on the same flags.
+    backward_mask_groups: bool = False
     backward_input_keys: tp.Sequence[str] = ("state", "privileged_state")
 
     # Forward map (F) / critics share this architecture
@@ -1649,6 +1705,21 @@ class FBCprAuxPolicy(nn.Module):
             allow_mismatching_keys=cfg.obs_normalizer_allow_mismatching_keys,
         )
 
+        # Backward masking (BFM-0.7, opt-in): partition B's flat input into the
+        # 7 body-part groups; F is conditioned on the same 7 flags. Off by
+        # default -> B/F are byte-identical to the unmasked networks.
+        self._backward_mask_groups: list[list[int]] | None = None
+        self.mask_group_names: tuple[str, ...] = ()
+        self.num_mask_groups: int = 0
+        if bool(getattr(cfg, "backward_mask_groups", False)):
+            from ..fb_cpr_masking import build_backward_mask_groups
+            b_keys = tuple(cfg.backward_input_keys) if cfg.backward_input_keys else tuple(obs_space.spaces.keys())
+            key_dims = {k: int(obs_space.spaces[k].shape[0]) for k in b_keys}
+            names, groups = build_backward_mask_groups(b_keys, key_dims)
+            self._backward_mask_groups = groups
+            self.mask_group_names = tuple(names)
+            self.num_mask_groups = len(groups)
+
         # Backward map.
         self._backward_map = BackwardMap(
             obs_space,
@@ -1660,6 +1731,7 @@ class FBCprAuxPolicy(nn.Module):
             model=cfg.backward_model,
             lower_indices=cfg.backward_lower_indices,
             upper_indices=cfg.backward_upper_indices,
+            mask_groups=self._backward_mask_groups,
         )
 
         # Optional reconstruction head (end-effector decoder from z).
@@ -1696,6 +1768,7 @@ class FBCprAuxPolicy(nn.Module):
             gamma_scale_hidden_dim=int(
                 getattr(cfg, "forward_gamma_scale_hidden_dim", 0)
             ),
+            mask_dim=self.num_mask_groups,
         )
         # Whether F consumes a gamma argument (drives call sites in the algorithm).
         self.forward_gamma_conditioned = int(getattr(cfg, "forward_gamma_embed_dim", 0)) > 0
@@ -1936,7 +2009,15 @@ class FBCprAuxPolicy(nn.Module):
     # ---- no-grad inference wrappers (match BFM's convention) ----
 
     @torch.no_grad()
-    def backward_map(self, obs: torch.Tensor | dict[str, torch.Tensor]) -> torch.Tensor:
+    def backward_map(
+        self,
+        obs: torch.Tensor | dict[str, torch.Tensor],
+        mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """B(obs) with normalization. ``mask`` [N, G] active flags (masked
+        policies only); None = every group visible."""
+        if self.num_mask_groups > 0:
+            return self._backward_map(self._normalize(obs), mask)
         return self._backward_map(self._normalize(obs))
 
     @torch.no_grad()
@@ -1946,7 +2027,9 @@ class FBCprAuxPolicy(nn.Module):
         z: torch.Tensor,
         action: torch.Tensor,
         gamma: torch.Tensor | float | None = None,
+        mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        mask_kw = {"mask": mask} if self.num_mask_groups > 0 else {}
         if self.forward_gamma_conditioned:
             # Default to the long horizon (fb_gamma_default) when a caller (e.g.
             # a play/eval Q-probe) does not supply gamma, so external callers do
@@ -1956,11 +2039,11 @@ class FBCprAuxPolicy(nn.Module):
             if not torch.is_tensor(gamma):
                 n = z.shape[0]
                 gamma = torch.full((n,), float(gamma), device=z.device)
-            output = self._forward_map(self._normalize(obs), z, action, gamma)
+            output = self._forward_map(self._normalize(obs), z, action, gamma, **mask_kw)
             if self.forward_gamma_normalized_output:
                 output = gamma_forward_output_to_raw(output, gamma)
             return output
-        return self._forward_map(self._normalize(obs), z, action)
+        return self._forward_map(self._normalize(obs), z, action, **mask_kw)
 
     @torch.no_grad()
     def actor(

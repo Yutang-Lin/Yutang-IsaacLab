@@ -38,6 +38,7 @@ from torch import autograd
 
 from isaaclab.utils import configclass
 
+from ..fb_cpr_masking import full_mask, sample_group_mask
 from ..fb_cpr_math import (
     advance_tracking_phases,
     aux_q_for_actor,
@@ -49,6 +50,7 @@ from ..fb_cpr_math import (
     innovation_alignment_loss,
     normalized_forward_value,
     normalized_gamma_loss_weights,
+    rolling_window_mean,
     sample_discrete_gamma,
     sample_log_horizon_gamma,
     sample_relabel_z,
@@ -394,6 +396,37 @@ class FBCprAuxAlgorithmCfg:
     rollout_expert_trajectories_length: int = 250
     rollout_expert_trajectories_percentage: float = 0.5
     z_buffer_size: int = 8192
+    # --- BFM-0.7: recorded replay trajectories as rollout "motions" -----------
+    # Fraction of ALL envs that, instead of a z-buffer z, follow a recorded
+    # replay window of ``rollout_expert_trajectories_length`` steps with a per-
+    # step rolling-mean z (per-env T ~ tracking_T_*), exactly like expert
+    # tracking envs. Drawn from envs not assigned to expert tracking; falls back
+    # to the z-buffer z while the replay holds no window that long. 0 = off.
+    # The training-time relabel distribution (sample_mixed_z) is unchanged:
+    # its goal-encoded z stays B of a single next state.
+    rollout_replay_trajectories_percentage: float = 0.0
+    # Env obs keys consumed by B / disc that the expert dataset does not carry
+    # (e.g. sim contact labels). The runner tells the expert buffer to emit
+    # zeros for them (width from the env obs group). Placeholder only.
+    expert_placeholder_obs_keys: tuple[str, ...] = ()
+    # --- BFM-0.7: backward masking --------------------------------------------
+    # B(m * s, m) over the 7 body-part groups (fb_cpr_masking.MASK_GROUP_NAMES)
+    # and F(s, a, z, m). The mask is a view selector for B only; no mask is
+    # paired with a z downstream. Where masks are drawn:
+    #   * FB update / actor: one fresh random mask per batch row (F and the
+    #     row's B(goal) share it; off-diagonal columns keep their own row mask).
+    #   * goal-encoded relabel z: fresh random mask per row.
+    #   * expert z (disc positives, tracking, eval): random per sequence with
+    #     ``mask_expert_forced_off`` groups always masked (expert has no labels).
+    #   * rollout: each env draws a mask at reset (step_count == 0), used when
+    #     that env's z is next encoded from states (expert / replay windows).
+    # Each group is masked independently with ``mask_group_prob``; if every
+    # group is masked, ``mask_fallback_group`` is re-enabled. Requires the
+    # policy cfg ``backward_mask_groups=True``. Off = unmasked networks.
+    backward_masking: bool = False
+    mask_group_prob: float = 0.1
+    mask_expert_forced_off: tuple[str, ...] = ("contacts",)
+    mask_fallback_group: str = "pelvis"
     # --- Analytic z-bar from the linear-W feature decoder (BFM-0.5) -------
     # When >0, a fraction of tracking-rollout z's (and of relabel z's) are built
     # analytically as z_bar_g = W^T c_g from the learned no-bias linear recon
@@ -668,6 +701,25 @@ class FBCprAux:
                     "logsumexp beta coefficients must be positive "
                     "and sum to more than one"
                 )
+        # Backward masking (BFM-0.7) consistency checks.
+        self._env_mask: torch.Tensor | None = None
+        self._fb_row_mask: torch.Tensor | None = None
+        if bool(getattr(cfg, "backward_masking", False)):
+            n_groups = int(getattr(self.policy, "num_mask_groups", 0))
+            if n_groups <= 0:
+                raise ValueError(
+                    "backward_masking=True requires policy cfg backward_mask_groups=True"
+                )
+            names = tuple(self.policy.mask_group_names)
+            for name in tuple(getattr(cfg, "mask_expert_forced_off", ())):
+                if name not in names:
+                    raise ValueError(f"mask_expert_forced_off group {name!r} not in {names}")
+            if str(getattr(cfg, "mask_fallback_group", "pelvis")) not in names:
+                raise ValueError("mask_fallback_group must be one of the mask groups")
+            if not 0.0 <= float(getattr(cfg, "mask_group_prob", 0.1)) < 1.0:
+                raise ValueError("mask_group_prob must be in [0, 1)")
+            if isinstance(self._unwrap(self.policy._actor), TransformerActorWrapper):
+                raise ValueError("backward_masking is not supported with the transformer actor")
         if bool(getattr(cfg, "fb_grad_spike_clip", False)):
             decay = float(getattr(cfg, "fb_grad_spike_ema_decay", 0.99))
             multiplier = float(getattr(cfg, "fb_grad_spike_multiplier", 5.0))
@@ -1238,7 +1290,9 @@ class FBCprAux:
         # channel to the DESTINATION row's anchor A_i so z[i] and obs_i share a
         # frame (matching deployment). Base leaves ``shuffled`` unchanged.
         shuffled = self._reanchor_goal_z(shuffled, perm)
-        goals = self.policy._backward_map(shuffled)
+        # Backward masking: a fresh random view per goal row (replay states
+        # carry real contact labels, so no group is forced off).
+        goals = self.policy._backward_map(shuffled, **self._mk(self._sample_mask(batch)))
         goals = self.policy.project_z(goals)
         z = torch.where(mix_idxs == 0, goals, z)
 
@@ -1407,8 +1461,16 @@ class FBCprAux:
             disc_mask: [batch_size] bool, True for frames within the configured
                 positive window. None when all sequence frames are positive.
         """
-        B_expert = self.policy._backward_map(next_obs).detach()
         seq_length = self.policy.seq_length
+        # Backward masking: one random view per expert SEQUENCE (shared by its
+        # frames, so the T-frame mean is taken in one view), with the forced-off
+        # groups (contacts) masked because the expert carries no such labels.
+        expert_mask = None
+        if self._masking_enabled():
+            first = next(iter(next_obs.values())) if isinstance(next_obs, dict) else next_obs
+            n_seq = first.shape[0] // seq_length
+            expert_mask = self._sample_mask(n_seq, expert=True).repeat_interleave(seq_length, dim=0)
+        B_expert = self.policy._backward_map(next_obs, **self._mk(expert_mask)).detach()
         # Use the actual batch returned (may be _disc_batch_size, not cfg.batch_size).
         N = B_expert.shape[0] // seq_length
         B_expert = B_expert.view(N, seq_length, B_expert.shape[-1])
@@ -1488,10 +1550,13 @@ class FBCprAux:
         robot_root_xy: torch.Tensor | None = None,
         robot_root_quat: torch.Tensor | None = None,
         terrain_z_fn=None,
+        replay_buffer: Any | None = None,
     ) -> tuple[torch.Tensor, dict | None]:
         """Update the rollout-time z context.
 
         Called once per env step by the runner with per-env ``step_count``.
+        ``replay_buffer`` (BFM-0.7) enables replay-trajectory tracking envs when
+        ``rollout_replay_trajectories_percentage > 0``.
 
         Returns:
             (z, terrain_reset_env_ids): z is the updated per-env latent.
@@ -1499,6 +1564,10 @@ class FBCprAux:
             assigned terrain-required motions and need an env reset to
             align with the terrain, or None.
         """
+        replay_tracking_enabled = self._replay_tracking_enabled(replay_buffer)
+        # Backward masking: envs that just reset (step_count == 0) draw the
+        # episodic mask used when their z is next encoded from states.
+        self._refresh_env_masks(step_count)
         tracking_fraction = float(self.cfg.rollout_expert_trajectories_percentage)
         if not 0.0 <= tracking_fraction <= 1.0:
             raise ValueError(
@@ -1513,16 +1582,20 @@ class FBCprAux:
 
         if z is None:
             z = self.policy.sample_z(step_count.shape[0], device=self.device)
+            terrain_envs = None
             if tracking_enabled:
                 terrain_envs = self._resample_tracking(
                     step_count, expert_buffer, robot_root_xy, robot_root_quat,
                     terrain_z_fn=terrain_z_fn,
                 )
                 z[self._tracking_env_idx] = self._tracking_z[:, 0]
-                return z, terrain_envs
             else:
                 self._tracking_env_idx = None
-            return z, None
+            if replay_tracking_enabled:
+                self._replay_tracking_phase = 0
+                self._resample_replay_tracking(step_count, replay_buffer)
+                z = self._apply_replay_tracking_z(z)
+            return z, terrain_envs
 
         # Periodic z refresh for non-tracking envs.
         mask_reset_z = (step_count % self.cfg.update_z_every_step == 0).view(-1, 1)
@@ -1586,7 +1659,202 @@ class FBCprAux:
                 z[self._tracking_env_idx] = self._tracking_z[
                     torch.arange(n, device=self.device), mod_time,
                 ]
+
+        # BFM-0.7: replay-trajectory tracking envs. Own clock of the same
+        # length as the expert tracking window; on wrap, envs leaving the set
+        # fall back to the fresh z-buffer z and a new set/window is drawn.
+        if replay_tracking_enabled:
+            traj_len_r = int(self.cfg.rollout_expert_trajectories_length)
+            phase_r = int(getattr(self, "_replay_tracking_phase", 0)) + 1
+            if phase_r >= traj_len_r:
+                old_idx = self._resample_replay_tracking(step_count, replay_buffer)
+                if old_idx is not None:
+                    z[old_idx] = new_z[old_idx]
+                phase_r = 0
+            self._replay_tracking_phase = phase_r
+            z = self._apply_replay_tracking_z(z)
         return z, terrain_envs
+
+    # --- BFM-0.7: backward masking helpers ----------------------------------- #
+
+    def _masking_enabled(self) -> bool:
+        return bool(getattr(self.cfg, "backward_masking", False))
+
+    def _mask_forced_off_idx(self) -> tuple[int, ...]:
+        names = tuple(self.policy.mask_group_names)
+        return tuple(
+            names.index(n) for n in tuple(getattr(self.cfg, "mask_expert_forced_off", ()))
+        )
+
+    def _sample_mask(self, num: int, expert: bool = False) -> torch.Tensor | None:
+        """Random [num, G] active flags, or None when masking is off.
+
+        ``expert=True`` additionally forces the ``mask_expert_forced_off`` groups
+        (contacts) masked, for states that carry no real labels.
+        """
+        if not self._masking_enabled():
+            return None
+        names = tuple(self.policy.mask_group_names)
+        return sample_group_mask(
+            int(num),
+            len(names),
+            float(getattr(self.cfg, "mask_group_prob", 0.1)),
+            names.index(str(getattr(self.cfg, "mask_fallback_group", "pelvis"))),
+            self._mask_forced_off_idx() if expert else (),
+            device=self.device,
+        )
+
+    def expert_encode_mask(self, num: int) -> torch.Tensor | None:
+        """Canonical expert view: every group visible except the forced-off ones.
+        None when masking is off (callers pass it straight to ``backward_map``)."""
+        if not self._masking_enabled():
+            return None
+        return full_mask(
+            int(num), len(self.policy.mask_group_names),
+            self._mask_forced_off_idx(), device=self.device,
+        )
+
+    def _apply_forced_off(self, mask: torch.Tensor) -> torch.Tensor:
+        """Force the expert forced-off groups masked, re-enabling the fallback
+        group for rows that end up fully masked."""
+        mask = mask.clone()
+        for g in self._mask_forced_off_idx():
+            mask[:, g] = 0.0
+        names = tuple(self.policy.mask_group_names)
+        fb = names.index(str(getattr(self.cfg, "mask_fallback_group", "pelvis")))
+        none_active = mask.sum(dim=1) <= 0
+        mask[none_active, fb] = 1.0
+        return mask
+
+    def _mk(self, mask: torch.Tensor | None) -> dict:
+        """kwargs for B / F calls: ``{"mask": m}`` when masking, else ``{}`` so
+        unmasked policies see byte-identical call signatures."""
+        return {"mask": mask} if (self._masking_enabled() and mask is not None) else {}
+
+    def _refresh_env_masks(self, step_count: torch.Tensor) -> None:
+        """Rollout: (re)draw the per-env mask for envs that just reset."""
+        if not self._masking_enabled():
+            return
+        n_envs = int(step_count.shape[0])
+        if self._env_mask is None or self._env_mask.shape[0] != n_envs:
+            self._env_mask = self._sample_mask(n_envs)
+            return
+        reset = (step_count == 0)
+        n_reset = int(reset.sum().item())
+        if n_reset > 0:
+            self._env_mask[reset] = self._sample_mask(n_reset)
+
+    def _env_mask_for(self, env_ids: torch.Tensor, num_frames: int, expert: bool) -> torch.Tensor | None:
+        """Per-frame mask for encoding ``num_frames`` states of each env in
+        ``env_ids`` under the env's episodic mask (expert: contacts forced off).
+        Falls back to a fresh draw if env masks are not initialised."""
+        if not self._masking_enabled():
+            return None
+        if self._env_mask is None:
+            m = self._sample_mask(int(env_ids.numel()), expert=expert)
+        else:
+            m = self._env_mask[env_ids.to(self._env_mask.device)]
+            if expert:
+                m = self._apply_forced_off(m)
+        return m.repeat_interleave(int(num_frames), dim=0)
+
+    # --- BFM-0.7: recorded replay trajectories as rollout "motions" ---------- #
+
+    def _replay_tracking_enabled(self, replay_buffer) -> bool:
+        frac = float(getattr(self.cfg, "rollout_replay_trajectories_percentage", 0.0))
+        if not 0.0 <= frac <= 1.0:
+            raise ValueError(
+                "rollout_replay_trajectories_percentage must be in [0, 1], "
+                f"got {frac}"
+            )
+        if frac > 0.0 and bool(getattr(self.cfg, "rollout_tracking_legacy_schedule", False)):
+            raise ValueError(
+                "rollout_replay_trajectories_percentage is not supported with "
+                "rollout_tracking_legacy_schedule"
+            )
+        return replay_buffer is not None and frac > 0.0
+
+    @property
+    def replay_tracking_count(self) -> int:
+        idx = getattr(self, "_replay_tracking_env_idx", None)
+        return 0 if idx is None else int(idx.numel())
+
+    def _sample_rollout_T(self, n: int) -> torch.Tensor:
+        """Per-env rolling-mean horizon for rollout tracking (tracking_T_*)."""
+        choices = tuple(getattr(self.cfg, "tracking_T_choices", ()) or ())
+        choice_probs = tuple(getattr(self.cfg, "tracking_T_choice_probs", ()) or ())
+        T_min = int(getattr(self.cfg, "tracking_T_min", 1))
+        T_max = int(getattr(self.cfg, "tracking_T_max", 16))
+        if choices:
+            choices_t = torch.tensor(choices, device=self.device, dtype=torch.long)
+            if choice_probs and len(choice_probs) == len(choices):
+                w = torch.tensor(choice_probs, device=self.device, dtype=torch.float32)
+                sel = torch.multinomial(w, n, replacement=True)
+            else:
+                sel = torch.randint(0, len(choices), (n,), device=self.device)
+            return choices_t[sel]
+        if T_min < T_max:
+            return torch.randint(T_min, T_max + 1, (n,), device=self.device)
+        return torch.full((n,), T_min, device=self.device, dtype=torch.long)
+
+    @torch.no_grad()
+    def _resample_replay_tracking(
+        self, step_count: torch.Tensor, replay_buffer: Any,
+    ) -> torch.Tensor | None:
+        """Draw a new set of replay-tracking envs and encode their z schedule.
+
+        Envs are chosen among those NOT in the expert tracking set. Each gets a
+        recorded window of ``rollout_expert_trajectories_length`` transitions
+        from the replay; z_t = project(mean B(s_{t+1 .. t+T})) with a per-env T
+        from ``tracking_T_*`` (the expert tracking-z rule). Returns the PREVIOUS
+        env index set (so the caller can hand those envs a fresh z), or None.
+        When the replay has no window that long yet, no envs are assigned.
+        """
+        old_idx = getattr(self, "_replay_tracking_env_idx", None)
+        self._replay_tracking_env_idx = None
+        self._replay_tracking_z = None
+        n_envs = int(step_count.shape[0])
+        frac = float(self.cfg.rollout_replay_trajectories_percentage)
+        n_r = min(n_envs, max(1, int(frac * n_envs)))
+        avail = torch.ones(n_envs, dtype=torch.bool, device=self.device)
+        expert_idx = getattr(self, "_tracking_env_idx", None)
+        if expert_idx is not None:
+            avail[expert_idx] = False
+        cand = avail.nonzero(as_tuple=False).squeeze(-1)
+        n_r = min(n_r, int(cand.numel()))
+        if n_r == 0:
+            return old_idx
+        traj_len = int(self.cfg.rollout_expert_trajectories_length)
+        keys = tuple(self._unwrap(self.policy).cfg.backward_input_keys)
+        batch = replay_buffer.sample_trajectory_windows(n_r, traj_len, keys)
+        if batch is None:
+            return old_idx
+        idx = cand[torch.randperm(int(cand.numel()), device=self.device)[:n_r]]
+        # Rows 1..L are the next states of the L recorded transitions.
+        flat = {
+            k: v[:, 1:].to(self.device).reshape(n_r * traj_len, v.shape[-1])
+            for k, v in batch["observation"].items()
+        }
+        flat = self.policy._normalize(flat)
+        # Backward masking: the env's episodic mask; replay states carry real
+        # contact labels, so nothing is forced off.
+        replay_mask = self._env_mask_for(idx, traj_len, expert=False)
+        Bz = self.policy._backward_map(flat, **self._mk(replay_mask)).view(n_r, traj_len, -1)
+        T = self._sample_rollout_T(n_r)
+        z = self.policy.project_z(rolling_window_mean(Bz, T))
+        self._replay_tracking_env_idx = idx
+        self._replay_tracking_z = z
+        self._replay_tracking_T = T
+        return old_idx
+
+    def _apply_replay_tracking_z(self, z: torch.Tensor) -> torch.Tensor:
+        idx = getattr(self, "_replay_tracking_env_idx", None)
+        if idx is None:
+            return z
+        zr = self._replay_tracking_z
+        phase = min(int(getattr(self, "_replay_tracking_phase", 0)), zr.shape[1] - 1)
+        z[idx] = zr[:, phase]
+        return z
 
     def _resample_tracking(
         self,
@@ -2641,7 +2909,15 @@ class FBCprAux:
         if float(getattr(self.cfg, "zbar_tracking_ratio", 0.0)) > 0.0:
             _zbar_flat = self._zbar_from_obs(next_obs)  # [B*T, d] or None
         next_obs = self.policy._normalize(next_obs)
-        z = self.policy._backward_map(next_obs)
+        # Backward masking: encode each env's expert window under that env's
+        # episodic mask (contacts forced off: expert frames have no labels).
+        track_mask = None
+        if self._masking_enabled():
+            env_ids = self._tracking_env_idx
+            if tracking_slots is not None:
+                env_ids = env_ids[tracking_slots]
+            track_mask = self._env_mask_for(env_ids, traj_length, expert=True)
+        z = self.policy._backward_map(next_obs, **self._mk(track_mask))
         z = z.view(batch_dim, traj_length, z.shape[-1])
 
         # Variable-T rolling mean: per-env window from self._tracking_T
@@ -2971,6 +3247,10 @@ class FBCprAux:
         self._train_actor_window = train_batch.get("actor_window", None)
         train_terminated = train_batch["next"]["terminated"].to(self.device, non_blocking=True)
         not_term = (~train_terminated.bool()).float()
+        # Backward masking: one random view per row for this update. F is
+        # conditioned on it and the row's B(goal) is encoded under it (FB loss
+        # and actor). None when masking is off.
+        self._fb_row_mask = self._sample_mask(self.cfg.batch_size)
         # --- gamma-conditioned F: sample a per-row gamma for the FB TD update ---
         # h = -log(1-gamma) ~ Uniform[h_S, h_L]; gamma = 1-exp(-h). The SAME
         # per-row gamma feeds F's conditioning input AND the TD-target discount,
@@ -3378,6 +3658,10 @@ class FBCprAux:
         metrics.update(aux_gn)
         metrics["Relabel/value_fraction"] = value_relabel_mask.float().mean()
         metrics["Relabel/actor_fraction"] = actor_relabel_mask.float().mean()
+        if self._fb_row_mask is not None:
+            metrics["Mask/active_fraction"] = self._fb_row_mask.mean()
+            for gi, gname in enumerate(self.policy.mask_group_names):
+                metrics[f"Mask/active_{gname}"] = self._fb_row_mask[:, gi].mean()
 
         # =============================================================
         # PHASE 2: critic. Depends on NEW disc (for disc_reward), so
@@ -3800,6 +4084,12 @@ class FBCprAux:
                 return {key: torch.cat((value, value), dim=0) for key, value in x.items()}
             return torch.cat((x, x), dim=0)
 
+        # Backward masking: per-row view shared by F (conditioning) and the
+        # row's B(goal). Empty kwargs when masking is off.
+        row_mask = self._fb_row_mask
+        mk = self._mk(row_mask)
+        mk_pair = self._mk(torch.cat((row_mask, row_mask), dim=0)) if row_mask is not None else {}
+
         with torch.no_grad():
             # next_action via actor (raw obs for the transformer actor — see
             # _target_next_action; avoids double-normalization in the TD target)
@@ -3812,11 +4102,12 @@ class FBCprAux:
                     torch.cat((z, z), dim=0),
                     torch.cat((next_action, next_action), dim=0),
                     gamma_pair,
+                    **mk_pair,
                 )
                 target_Fs, target_Fs_alt = target_Fs_pair.split(batch_size, dim=1)
             else:
                 f_args = (fb_gamma,) if fb_gamma is not None else ()
-                target_Fs = p._target_forward_map(next_obs, z, next_action, *f_args)
+                target_Fs = p._target_forward_map(next_obs, z, next_action, *f_args, **mk)
                 target_Fs_alt = None
             if normalized_forward:
                 target_Fs = gamma_forward_output_to_raw(target_Fs, fb_gamma)
@@ -3824,7 +4115,7 @@ class FBCprAux:
                     target_Fs_alt = gamma_forward_output_to_raw(
                         target_Fs_alt, fb_gamma_alt
                     )
-            target_B = p._target_backward_map(goal)  # (B, d)
+            target_B = p._target_backward_map(goal, **mk)  # (B, d)
             target_Ms = torch.matmul(target_Fs, target_B.T)  # (num_par, B, B)
             _, _, target_M = self._pessimistic_value(target_Ms, self.cfg.fb_pessimism_penalty)
             if target_Fs_alt is not None:
@@ -3841,17 +4132,18 @@ class FBCprAux:
                 torch.cat((z, z), dim=0),
                 torch.cat((action, action), dim=0),
                 torch.cat((fb_gamma, fb_gamma_alt), dim=0),
+                **mk_pair,
             )
             Fs, Fs_alt = Fs_pair.split(z.shape[0], dim=1)
         else:
             f_args = (fb_gamma,) if fb_gamma is not None else ()
-            Fs = p._forward_map(obs, z, action, *f_args)
+            Fs = p._forward_map(obs, z, action, *f_args, **mk)
             Fs_alt = None
         if normalized_forward:
             Fs = gamma_forward_output_to_raw(Fs, fb_gamma)
             if Fs_alt is not None:
                 Fs_alt = gamma_forward_output_to_raw(Fs_alt, fb_gamma_alt)
-        B = p._backward_map(goal)
+        B = p._backward_map(goal, **mk)
         Ms = torch.matmul(Fs, B.T)
 
         fb_diff = Ms - discount.view(-1, 1) * target_M
@@ -4541,6 +4833,8 @@ class FBCprAux:
         p = self.policy
         dist = p._actor(obs, z, p.actor_std)
         sampled_action = dist.sample(clip=self.cfg.stddev_clip)
+        # Backward masking: F queries use the per-row view drawn in update().
+        row_mask = self._fb_row_mask
 
         # --- action saturation diagnostics ------------------------------
         # ``loc`` is the actor's pre-sample mean; TruncatedNormal clamps
@@ -4630,7 +4924,8 @@ class FBCprAux:
                 actor_lse_gammas, device=z.device, dtype=z.dtype
             ).view(1, num_gammas).expand(Bsz, -1).reshape(-1)
             F_bg = p._forward_map(
-                obs_bg, z_bg, action_bg, gamma_bg
+                obs_bg, z_bg, action_bg, gamma_bg,
+                **self._mk(_tile_gammas(row_mask) if row_mask is not None else None),
             )
             _, _, Q_bg = self._pessimistic_value(
                 (F_bg * z_bg).sum(dim=-1),
@@ -4722,7 +5017,8 @@ class FBCprAux:
             z_bk = _tileK(z)                                                     # [B*K, d]
             a_bk = _tileK(sampled_action)                                        # [B*K, A]
             g_bk = gammas_k.reshape(-1)                                          # [B*K]
-            F_bk = p._forward_map(obs_bk, z_bk, a_bk, g_bk)                      # [par, B*K, d]
+            mk_bk = self._mk(_tileK(row_mask) if row_mask is not None else None)
+            F_bk = p._forward_map(obs_bk, z_bk, a_bk, g_bk, **mk_bk)             # [par, B*K, d]
             _, _, Q_bk = self._pessimistic_value((F_bk * z_bk).sum(dim=-1),
                                                  self.cfg.actor_pessimism_penalty)  # [B*K]
             N = normalized_forward_value(
@@ -4733,7 +5029,7 @@ class FBCprAux:
             # The integrated N still uses the ONLINE F (gradient flows through N);
             # w is target-derived AND detached, so it's a fixed importance weight.
             with torch.no_grad():
-                Ft_bk = p._target_forward_map(obs_bk, z_bk, a_bk, g_bk)          # [par, B*K, d]
+                Ft_bk = p._target_forward_map(obs_bk, z_bk, a_bk, g_bk, **mk_bk)  # [par, B*K, d]
                 _, _, Qt_bk = self._pessimistic_value((Ft_bk * z_bk).sum(dim=-1),
                                                       self.cfg.actor_pessimism_penalty)
                 Nt = normalized_forward_value(
@@ -4778,10 +5074,10 @@ class FBCprAux:
                 gL = torch.full((Bsz,), float(self.cfg.discount), device=z.device)
                 gS = torch.full((Bsz,), float(self.cfg.actor_gamma_short), device=z.device)
                 gL_args = (gL,)
-                Fs_S = p._forward_map(obs, z, sampled_action, gS)
+                Fs_S = p._forward_map(obs, z, sampled_action, gS, **self._mk(row_mask))
                 _, _, Q_fb_short = self._pessimistic_value((Fs_S * z).sum(dim=-1),
                                                            self.cfg.actor_pessimism_penalty)
-            Fs = p._forward_map(obs, z, sampled_action, *gL_args)
+            Fs = p._forward_map(obs, z, sampled_action, *gL_args, **self._mk(row_mask))
             Qs_fb = (Fs * z).sum(dim=-1)
             _, _, Q_fb = self._pessimistic_value(Qs_fb, self.cfg.actor_pessimism_penalty)
             # Short-horizon FB term added to the actor objective (0 when off).

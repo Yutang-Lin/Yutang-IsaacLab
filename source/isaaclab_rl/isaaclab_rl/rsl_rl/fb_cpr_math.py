@@ -311,6 +311,34 @@ def advance_tracking_phases(
     ).clamp(max=max_phase)
 
 
+def rolling_window_mean(
+    frames: torch.Tensor,
+    window: torch.Tensor,
+) -> torch.Tensor:
+    """Per-step forward rolling mean with a per-row window, clamped at the end.
+
+    ``frames`` is ``[N, L, d]``; ``window`` is ``[N]`` (long, >= 1). Row ``n``
+    at step ``t`` returns ``mean(frames[n, t : min(t + window[n], L)])``. This is
+    the expert tracking-z convention (mean over the next ``T`` encoded frames,
+    shrinking at the trajectory end), vectorized with a cumulative sum.
+    """
+    if frames.ndim != 3:
+        raise ValueError("frames must be [N, L, d]")
+    N, L, d = frames.shape
+    if window.shape != (N,):
+        raise ValueError("window must be [N]")
+    if bool((window < 1).any()):
+        raise ValueError("window entries must be >= 1")
+    cum = torch.cat(
+        [frames.new_zeros(N, 1, d), torch.cumsum(frames, dim=1)], dim=1
+    )  # [N, L+1, d]
+    steps = torch.arange(L, device=frames.device)
+    end = (steps.unsqueeze(0) + window.unsqueeze(1)).clamp(max=L)  # [N, L]
+    count = (end - steps.unsqueeze(0)).to(frames.dtype).unsqueeze(-1)
+    rows = torch.arange(N, device=frames.device).unsqueeze(1)
+    return (cum[rows, end] - cum[rows, steps.unsqueeze(0)]) / count
+
+
 def stochastic_integral_weights(
     target_values: torch.Tensor,
     horizons: torch.Tensor,

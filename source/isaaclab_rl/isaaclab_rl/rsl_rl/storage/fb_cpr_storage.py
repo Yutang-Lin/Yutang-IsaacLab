@@ -683,6 +683,45 @@ class FBCprReplayBuffer:
         return out
 
     @torch.no_grad()
+    def sample_trajectory_windows(
+        self,
+        num_windows: int,
+        length: int,
+        keys: tuple[str, ...],
+    ) -> dict | None:
+        """Sample ``num_windows`` contiguous same-segment windows of ``length+1`` rows.
+
+        Used to treat recorded replay trajectories as "motions" for rollout
+        tracking: the caller encodes rows ``1..length`` (the next states) with
+        B and rolls a per-env mean over them, exactly like an expert window.
+        Windows are drawn with the buffer's sampling mode (uniform over all
+        valid window starts under ``uniform_transition``). Returns
+        ``{"observation": {k: [N, length+1, dim]}}`` or ``None`` when no segment
+        is long enough yet. ``keys`` must not include the recomposed history key.
+        """
+        if len(self) == 0:
+            return None
+        self._ensure_traj_info()
+        need = int(length) + 1
+        eligible = self._lengths >= need
+        eligible_idx = eligible.nonzero(as_tuple=False).squeeze(-1)
+        if eligible_idx.numel() == 0:
+            return None
+        for k in keys:
+            if self._hist_recompose is not None and k == self._hist_recompose["key"]:
+                raise ValueError("sample_trajectory_windows cannot return the recomposed history key")
+        eligible_lengths = self._lengths[eligible_idx]
+        eligible_starts = self._start_idx[eligible_idx]
+        traj_sel, rel = self._sample_valid_starts(
+            eligible_lengths, int(num_windows), seq_length=int(length),
+        )
+        sel_starts = eligible_starts[traj_sel]                                 # [N, 2]
+        arange = torch.arange(need, device=self.device)                        # [length+1]
+        rows = (sel_starts[:, 0:1] + rel.unsqueeze(1) + arange.unsqueeze(0)) % self.time_capacity
+        ew = sel_starts[:, 1:2].expand(-1, need)
+        return {"observation": {k: self._obs[k][rows, ew] for k in keys}}
+
+    @torch.no_grad()
     def _gather_actor_window(self, time_idx: torch.Tensor, env_idx: torch.Tensor) -> dict:
         """Gather the transformer actor's H+1 timestep window ending at the
         sampled ``time_idx`` (current step). Returns per-position obs windows and
@@ -850,8 +889,16 @@ class FBCprExpertBuffer:
         compose_device: str | torch.device | None = None,
         expert_tracking_circular_wrap: bool = False,
         tracking_failure_bin_frames: int = 0,
+        placeholder_obs_dims: dict[str, int] | None = None,
     ) -> None:
         """Expert motion buffer.
+
+        ``placeholder_obs_dims``: ``{obs_key: dim}`` of env obs keys that B /
+        the discriminator consume but that this dataset does not carry (e.g.
+        BFM-0.7 ``contact_labels`` from the sim contact sensor). Every obs dict
+        this buffer returns gets a zero tensor for each key so the shared
+        networks can be built and run; the values are a stand-in until the
+        dataset provides real labels.
 
         ``history_len_override``: if set, compose the minimal-dataset
         ``history_actor`` at this many frames instead of the dataset's baked
@@ -878,6 +925,14 @@ class FBCprExpertBuffer:
         self._tracking_failure_bin_frames = max(
             int(tracking_failure_bin_frames), 0
         )
+        self._placeholder_obs_dims: dict[str, int] = {
+            str(k): int(v) for k, v in (placeholder_obs_dims or {}).items()
+        }
+        for k, v in self._placeholder_obs_dims.items():
+            if k in ("state", "privileged_state", "last_action", "history_actor"):
+                raise ValueError(f"placeholder_obs_dims cannot override dataset key {k!r}")
+            if v <= 0:
+                raise ValueError(f"placeholder_obs_dims[{k!r}] must be positive, got {v}")
         # Device for the ONE-TIME load-time FK compose (chain build + batched
         # FK). Defaults to the storage device. Set to a GPU when the buffer
         # itself is stored on CPU (device="cpu") so the compose stays fast
@@ -1383,6 +1438,7 @@ class FBCprExpertBuffer:
             "num_frames": L,
             "start_frame": s,
         }
+        self._add_placeholder_obs(out, L, out["state"].device)
         if self.supports_reset_states:
             out.update({
                 "joint_pos": self._per_motion_joint_pos[motion_id][s:e],
@@ -1393,6 +1449,13 @@ class FBCprExpertBuffer:
                 "root_ang_vel": self._per_motion_root_ang_vel[motion_id][s:e],
             })
         return out
+
+    def _add_placeholder_obs(self, obs: dict, num_rows: int, device) -> None:
+        """Attach zero tensors for obs keys the dataset lacks (see __init__)."""
+        # getattr: test fixtures build the buffer via __new__ (no __init__).
+        for key, dim in getattr(self, "_placeholder_obs_dims", {}).items():
+            if key not in obs:
+                obs[key] = torch.zeros(int(num_rows), dim, device=device)
 
     @torch.no_grad()
     def compute_body_pos(self, global_frames: torch.Tensor) -> torch.Tensor | None:
@@ -1588,6 +1651,8 @@ class FBCprExpertBuffer:
             "last_action": self._flat_last_action[global_nxt],
             "history_actor": self._flat_history_actor[global_nxt],
         }
+        self._add_placeholder_obs(obs, global_cur.shape[0], obs["state"].device)
+        self._add_placeholder_obs(next_obs, global_nxt.shape[0], next_obs["state"].device)
         # Anchored variant: attach expert anchored_pose A^-1 g, each row's pose
         # canonicalised to its OWN window-start frame (start_flat) so it
         # self-zeros like a rollout episode. The shared T-window mean then
@@ -2054,6 +2119,8 @@ class FBCprExpertBuffer:
             "last_action": out_act_n,
             "history_actor": out_hist_n,
         }
+        self._add_placeholder_obs(obs_dict, B, out_state.device)
+        self._add_placeholder_obs(next_obs_dict, B, out_state_n.device)
         # Anchored variant: attach the expert's anchored pose A^-1 g. Each row's
         # pose is canonicalised to its OWN window-start frame (start_flat), then
         # an anchor A ~ p_A is applied — so expert windows self-zero like rollout

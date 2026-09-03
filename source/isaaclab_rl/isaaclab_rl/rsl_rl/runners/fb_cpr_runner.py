@@ -277,6 +277,12 @@ class FBCprRunner:
                 self.alg_cfg.get("expert_tracking_circular_wrap", False)
             ),
             tracking_failure_bin_frames=tracking_bin_frames,
+            # BFM-0.7: env obs keys B/disc consume that the dataset lacks (sim
+            # contact labels). Zero placeholders sized from the env obs groups.
+            placeholder_obs_dims={
+                str(k): int(self._obs_key_groups[k]["dim"])
+                for k in tuple(self.alg_cfg.get("expert_placeholder_obs_keys", ()) or ())
+            },
         )
         # Forward to the env so RSI can pull from it.
         if hasattr(self.env_unwrapped, "set_expert_buffer"):
@@ -750,6 +756,7 @@ class FBCprRunner:
         _terrain_z_fn = getattr(self.env_unwrapped, "_get_terrain_height_xy", None)
         z_context, terrain_reset = self.alg.maybe_update_rollout_context(
             z=None, step_count=step_count, expert_buffer=self.expert_buffer,
+            replay_buffer=self.replay_buffer,
             robot_root_xy=_robot.data.root_pos_w[:, :2].to(self.device) if _robot else None,
             robot_root_quat=_robot.data.root_quat_w.to(self.device) if _robot else None,
             terrain_z_fn=_terrain_z_fn,
@@ -1288,6 +1295,7 @@ class FBCprRunner:
                     # Update z context for next step.
                     z_context, terrain_reset = self.alg.maybe_update_rollout_context(
                         z=z_context, step_count=step_count, expert_buffer=self.expert_buffer,
+                        replay_buffer=self.replay_buffer,
                         robot_root_xy=_robot.data.root_pos_w[:, :2].to(self.device) if _robot else None,
                         robot_root_quat=_robot.data.root_quat_w.to(self.device) if _robot else None,
                         terrain_z_fn=_terrain_z_fn,
@@ -1356,6 +1364,9 @@ class FBCprRunner:
                 ),
                 "Rollout/tracking_phase": float(
                     int(getattr(self.alg, "_tracking_phase", 0))
+                ),
+                "Rollout/replay_tracking_envs": float(
+                    getattr(self.alg, "replay_tracking_count", 0)
                 ),
                 "Rollout/reset_fraction": (
                     rollout_done_count / max(rollout_transition_count, 1)
@@ -1812,6 +1823,12 @@ class FBCprRunner:
                     "last_action": win["last_action"][1:].to(self.device, non_blocking=True),
                     "history_actor": win["history_actor"][1:].to(self.device, non_blocking=True),
                 }
+                # Dataset-less B/disc keys (BFM-0.7 contact labels): the window
+                # already carries the zero placeholders; forward them so B's
+                # input filter finds every key it was built with.
+                for _pk in tuple(self.alg_cfg.get("expert_placeholder_obs_keys", ()) or ()):
+                    if _pk in win:
+                        next_obs_dict[_pk] = win[_pk][1:].to(self.device, non_blocking=True)
                 # Anchored variant: B also reads ``anchored_pose`` (A^-1 g). For
                 # tracking eval the goal is self-anchored (anchor = each frame's
                 # own pose), i.e. zero displacement -> [0, 0, cos0, sin0]=[0,0,1,0].
@@ -1820,7 +1837,11 @@ class FBCprRunner:
                     ap = torch.zeros(n, 4, device=self.device)
                     ap[:, 2] = 1.0  # cos(theta=0)
                     next_obs_dict["anchored_pose"] = ap
-                z = self.policy.backward_map(next_obs_dict)   # [L-1, z_dim]
+                # Backward masking (BFM-0.7): expert frames use the canonical
+                # expert view (all groups visible except contacts). None when off.
+                _emask = self.alg.expert_encode_mask(next_obs_dict["state"].shape[0]) \
+                    if hasattr(self.alg, "expert_encode_mask") else None
+                z = self.policy.backward_map(next_obs_dict, mask=_emask)   # [L-1, z_dim]
                 # Match UFO's eval z-encoding exactly: one next-reference frame,
                 # i.e. no temporal averaging is needed here.
                 z = self.policy.project_z(z)
