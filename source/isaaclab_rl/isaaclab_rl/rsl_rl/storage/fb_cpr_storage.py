@@ -202,10 +202,13 @@ class FBCprReplayBuffer:
 
         self._idx = 0
         self._is_full = False
-        self._recompute_traj_info = True
+        self._mark_traj_dirty()
         # Cached trajectory start/stop/length info (recomputed lazily).
         self._start_idx: torch.Tensor | None = None
         self._lengths: torch.Tensor | None = None
+        # Physical (real-reset) segments for replay trajectory windows.
+        self._reset_start_idx: torch.Tensor | None = None
+        self._reset_lengths: torch.Tensor | None = None
 
     def _alloc(self, shape: tuple[int, ...], dtype: torch.dtype = torch.float32) -> torch.Tensor:
         if self._pin_memory and self.device.type == "cpu":
@@ -408,7 +411,7 @@ class FBCprReplayBuffer:
                 self._extras[name].copy_(sd["_extras"][name].to(self._extras[name].device))
         self._idx = int(sd["_idx"])
         self._is_full = bool(sd["_is_full"])
-        self._recompute_traj_info = True
+        self._mark_traj_dirty()
 
     # -- extend (one time-step across all envs) ----------------------------
 
@@ -481,19 +484,47 @@ class FBCprReplayBuffer:
         if self._idx >= self.time_capacity:
             self._is_full = True
             self._idx = 0
-        self._recompute_traj_info = True
+        self._mark_traj_dirty()
 
     # -- trajectory segmentation (BFM's find_start_stop_traj) ---------------
 
+    def _mark_traj_dirty(self) -> None:
+        self._recompute_traj_info = True
+        self._recompute_reset_traj_info = True
+
     def _ensure_traj_info(self) -> None:
+        """SAMPLING segments: split at every ``truncated`` row (real resets AND
+        conservative boundaries such as the post-eval marker)."""
         if not self._recompute_traj_info:
             return
         done = self._truncated[:len(self)].squeeze(-1)  # [T, E] bool
+        self._start_idx, self._lengths = self._compute_segments(done)
+        self._recompute_traj_info = False
+
+    def _ensure_reset_traj_info(self) -> None:
+        """PHYSICAL segments: split only at real env resets (``history_reset``).
+
+        A post-eval sampling boundary does not break the recorded motion (the
+        sim is restored exactly), so replay trajectory windows used as rollout
+        "motions" may span it. Without this, a frequent tracking eval caps every
+        segment at the eval interval and no 250-step window ever exists.
+        """
+        if not self._recompute_reset_traj_info:
+            return
+        done = self._history_reset[:len(self)].squeeze(-1)  # [T, E] bool
+        self._reset_start_idx, self._reset_lengths = self._compute_segments(done)
+        self._recompute_reset_traj_info = False
+
+    def _compute_segments(self, done: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Segment the written rows at every True in ``done`` [T, E].
+
+        ``done[t]`` marks row t as the FIRST observation of a new segment.
+        Traverse the ring in chronological order and split immediately before
+        each such row. The newest written row is an ordinary open-segment
+        endpoint, not a synthetic boundary. Returns ``(start_idx [N, 2] =
+        (time_row, env), lengths [N])``.
+        """
         T = done.shape[0]
-        # ``truncated[t]`` marks row t as the FIRST observation after a reset.
-        # Traverse the ring in chronological order and split immediately before
-        # each such row. The newest written row is an ordinary open-trajectory
-        # endpoint, not a synthetic reset boundary.
         if self._is_full:
             time_order = (
                 torch.arange(T, device=self.device, dtype=torch.long) + self._idx
@@ -512,13 +543,8 @@ class FBCprReplayBuffer:
         end_pos = torch.full_like(start_pos, T)
         same_env = env_ids[:-1] == env_ids[1:]
         end_pos[:-1] = torch.where(same_env, start_pos[1:], end_pos[:-1])
-
-        self._start_idx = torch.stack(
-            (time_order[start_pos], env_ids),
-            dim=1,
-        )
-        self._lengths = end_pos - start_pos
-        self._recompute_traj_info = False
+        start_idx = torch.stack((time_order[start_pos], env_ids), dim=1)
+        return start_idx, end_pos - start_pos
 
     # -- sampling (BFM's get_idxs + _tensor_slices_from_startend) -----------
 
@@ -695,23 +721,26 @@ class FBCprReplayBuffer:
         tracking: the caller encodes rows ``1..length`` (the next states) with
         B and rolls a per-env mean over them, exactly like an expert window.
         Windows are drawn with the buffer's sampling mode (uniform over all
-        valid window starts under ``uniform_transition``). Returns
+        valid window starts under ``uniform_transition``). Segments are the
+        PHYSICAL trajectories (split at real env resets, ``history_reset``), not
+        the sampling segments (``truncated``): a window may span a post-eval
+        boundary, where the sim was restored exactly. Returns
         ``{"observation": {k: [N, length+1, dim]}}`` or ``None`` when no segment
         is long enough yet. ``keys`` must not include the recomposed history key.
         """
         if len(self) == 0:
             return None
-        self._ensure_traj_info()
+        self._ensure_reset_traj_info()
         need = int(length) + 1
-        eligible = self._lengths >= need
+        eligible = self._reset_lengths >= need
         eligible_idx = eligible.nonzero(as_tuple=False).squeeze(-1)
         if eligible_idx.numel() == 0:
             return None
         for k in keys:
             if self._hist_recompose is not None and k == self._hist_recompose["key"]:
                 raise ValueError("sample_trajectory_windows cannot return the recomposed history key")
-        eligible_lengths = self._lengths[eligible_idx]
-        eligible_starts = self._start_idx[eligible_idx]
+        eligible_lengths = self._reset_lengths[eligible_idx]
+        eligible_starts = self._reset_start_idx[eligible_idx]
         traj_sel, rel = self._sample_valid_starts(
             eligible_lengths, int(num_windows), seq_length=int(length),
         )

@@ -127,3 +127,40 @@ def test_expert_placeholder_obs_adds_zero_keys_only_when_configured():
     obs["contact_labels"] += 1
     buffer._add_placeholder_obs(obs, 3, "cpu")
     assert bool(obs["contact_labels"].all())
+
+
+def _extend_flags(buf, value, truncated, history_reset):
+    n = buf.num_envs
+    buf.extend({
+        "observation": {"state": torch.full((n, 1), float(value)), "other": torch.zeros(n, 1)},
+        "action": torch.zeros(n, 1), "z": torch.zeros(n, 1),
+        "terminated": torch.zeros(n, 1, dtype=torch.bool),
+        "truncated": torch.full((n, 1), bool(truncated)),
+        "history_reset": torch.full((n, 1), bool(history_reset)),
+    })
+
+
+def test_trajectory_windows_span_eval_boundaries_but_not_resets():
+    """Post-eval marker: truncated=True, history_reset=False. Real reset: both True."""
+    buf = _make_buffer(time_cap=64)
+    for t in range(40):
+        real_reset = t in (0, 30)
+        eval_marker = t in (8, 16, 24)
+        _extend_flags(buf, t, truncated=real_reset or eval_marker, history_reset=real_reset)
+    # Sampling segments are capped by the eval markers (max 8 rows) ...
+    buf._ensure_traj_info()
+    assert int(buf._lengths.max()) == 10   # rows 30..39
+    # ... but physical segments ignore them: rows 0..29 (30 rows) and 30..39.
+    buf._ensure_reset_traj_info()
+    assert sorted(buf._reset_lengths.tolist()) == [10, 30]
+    torch.manual_seed(0)
+    out = buf.sample_trajectory_windows(32, 20, keys=("state",))
+    assert out is not None
+    st = out["observation"]["state"][:, :, 0]
+    assert torch.equal(st[:, 1:] - st[:, :-1], torch.ones_like(st[:, 1:]))
+    assert bool((st.max(dim=1).values <= 29).all())          # never crosses the reset at 30
+    assert bool(((st[:, 0] <= 8) & (st[:, -1] >= 9)).any())   # does cross an eval marker
+    # FB transition sampling still respects the eval markers
+    batch = buf.sample_flat(512)
+    cur = batch["observation"]["state"][:, 0]
+    assert not bool(torch.isin(cur, torch.tensor([7.0, 15.0, 23.0, 29.0])).any())

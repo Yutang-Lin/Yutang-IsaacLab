@@ -10,52 +10,12 @@ replay-tracking rollout context can run on CPU without simulator dependencies.
 
 from __future__ import annotations
 
-import dataclasses
-import importlib
-import os
-import sys
-import types
-
 import torch
 
-_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "isaaclab_rl"))
+from _fb_stubs import load as _load_module
 
 
-def _stub(name: str, **attrs):
-    m = types.ModuleType(name)
-    m.__dict__.update(attrs)
-    sys.modules[name] = m
-    return m
-
-
-def _load_fb_cpr():
-    if "isaaclab" not in sys.modules:
-        _stub("isaaclab")
-        _stub("isaaclab.utils", configclass=dataclasses.dataclass)
-    if "gymnasium" not in sys.modules:
-        class _Box:
-            def __init__(self, *a, **k):
-                pass
-
-        class _Dict(dict):
-            pass
-
-        spaces = _stub("gymnasium.spaces", Box=_Box, Dict=_Dict)
-        _stub("gymnasium", spaces=spaces)
-    for name, path in (
-        ("isaaclab_rl", _ROOT),
-        ("isaaclab_rl.rsl_rl", f"{_ROOT}/rsl_rl"),
-        ("isaaclab_rl.rsl_rl.modules", f"{_ROOT}/rsl_rl/modules"),
-        ("isaaclab_rl.rsl_rl.algorithms", f"{_ROOT}/rsl_rl/algorithms"),
-    ):
-        if name not in sys.modules:
-            m = types.ModuleType(name)
-            m.__path__ = [path]
-            sys.modules[name] = m
-    return importlib.import_module("isaaclab_rl.rsl_rl.algorithms.fb_cpr")
-
-
-fb = _load_fb_cpr()
+fb = _load_module("algorithms.fb_cpr")
 FBCprAux = fb.FBCprAux
 AlgoCfg = fb.FBCprAuxAlgorithmCfg
 

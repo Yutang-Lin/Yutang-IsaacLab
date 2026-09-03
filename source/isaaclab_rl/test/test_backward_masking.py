@@ -11,68 +11,17 @@ CPU with the mask path exercised end to end.
 
 from __future__ import annotations
 
-import dataclasses
-import importlib
-import importlib.util
-import os
-import sys
-import types
-
 import numpy as np
 import torch
 
-_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "isaaclab_rl"))
+from _fb_stubs import Box as _Box
+from _fb_stubs import Dict as _Dict
+from _fb_stubs import load as _load_module
 
 
-def _stub(name: str, **attrs):
-    m = types.ModuleType(name)
-    m.__dict__.update(attrs)
-    sys.modules[name] = m
-    return m
-
-
-class _Box:
-    def __init__(self, low, high, shape=None, dtype=np.float32):
-        low = np.asarray(low, dtype=dtype)
-        high = np.asarray(high, dtype=dtype)
-        self.low = low
-        self.high = high
-        self.shape = tuple(shape) if shape is not None else low.shape
-        self.dtype = dtype
-
-
-class _Dict:
-    def __init__(self, spaces):
-        self.spaces = dict(spaces)
-
-    def __getitem__(self, key):
-        return self.spaces[key]
-
-
-def _load_modules():
-    if "isaaclab" not in sys.modules:
-        _stub("isaaclab")
-        _stub("isaaclab.utils", configclass=dataclasses.dataclass)
-    if "gymnasium" not in sys.modules or not hasattr(sys.modules["gymnasium"].spaces, "Box"):
-        spaces = _stub("gymnasium.spaces", Box=_Box, Dict=_Dict, Space=object)
-        _stub("gymnasium", spaces=spaces)
-    for name, path in (
-        ("isaaclab_rl", _ROOT),
-        ("isaaclab_rl.rsl_rl", f"{_ROOT}/rsl_rl"),
-        ("isaaclab_rl.rsl_rl.modules", f"{_ROOT}/rsl_rl/modules"),
-        ("isaaclab_rl.rsl_rl.algorithms", f"{_ROOT}/rsl_rl/algorithms"),
-    ):
-        if name not in sys.modules:
-            m = types.ModuleType(name)
-            m.__path__ = [path]
-            sys.modules[name] = m
-    masking = importlib.import_module("isaaclab_rl.rsl_rl.fb_cpr_masking")
-    policy = importlib.import_module("isaaclab_rl.rsl_rl.modules.fb_cpr_policy")
-    algo = importlib.import_module("isaaclab_rl.rsl_rl.algorithms.fb_cpr")
-    return masking, policy, algo
-
-
-masking, policy_mod, algo_mod = _load_modules()
+masking = _load_module("fb_cpr_masking")
+policy_mod = _load_module("modules.fb_cpr_policy")
+algo_mod = _load_module("algorithms.fb_cpr")
 
 KEY_DIMS = {"state": 64, "privileged_state": 463, "contact_labels": 4}
 KEYS = ("state", "privileged_state", "contact_labels")
